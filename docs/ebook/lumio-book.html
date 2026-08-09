@@ -1431,7 +1431,7 @@ def test_settings_override(monkeypatch):
 2. <strong>后台慢慢算</strong> — 查账单、翻历史、调模型, 可能花 2~5 秒
 3. <strong>算完主动通知</strong> — 客户不用一直占着线路</p>
 <p>这就是本章的核心矛盾: <strong>对话是"一问一答"的同步交互, 但 AI 处理是"多步流水线"的异步计算</strong>. 怎么把两者接起来, 还要扛住百万级并发、不能让一条消息丢、不能让同一个客户的几句话乱序——就是 Bot 服务要解决的全部问题.</p>
-<p>看完本章你会理解: 消息怎么"接了再说" (异步入口), 怎么保证"不丢不乱" (Redis Stream + per-session Worker), <code>LumioAgent</code> 怎么 6 步决策, 工具调用怎么等客户确认, LLM 挂了怎么仍服务客户.</p>
+<p>看完本章你会理解: 消息怎么"接了再说" (异步入口), 怎么保证"不丢不乱" (Redis Stream + per-session Worker), 整条消息处理流 (3.4 完整路径) 怎么从 HTTP 一路走到结果回写, <code>LumioAgent</code> 怎么 6 步决策, 工具调用怎么等客户确认, LLM 挂了怎么仍服务客户.</p>
 <h2 id="3.1-全链路时序图">3.1 全链路时序图</h2>
 <h3 id="3.1.1-先看图:-一次完整对话的-5-个阶段">3.1.1 先看图: 一次完整对话的 5 个阶段</h3>
 <pre><code class="language-mermaid">sequenceDiagram
@@ -1620,15 +1620,160 @@ async def _claim_stale(self):
 <h3 id="3.3.3-MAXLEN-10000-—-&quot;单据堆不能无限高&quot;">3.3.3 MAXLEN 10000 — "单据堆不能无限高"</h3>
 <p>Stream 设上限 10000 条, 超长自动裁剪. 防止 Redis 内存无限增长. 在 dev 环境不重要, 生产环境是必选.</p>
 <p><strong>业务含义</strong>: 万一消费端整体故障 (比如 Redis 网络分区), 消息池会持续堆高. 上限保证 Redis 内存有界 — 宁可丢最老的消息, 不能让 Redis 内存爆掉拖垮整个系统.</p>
-<h2 id="3.4-per-session-Worker:-串行消费">3.4 per-session Worker: 串行消费</h2>
+<h2 id="3.4-消息处理流:从-HTTP-到结果的完整路径">3.4 消息处理流:从 HTTP 到结果的完整路径</h2>
+<p>在展开 3.5 (Worker) 之前,先把<strong>一条消息从 HTTP 进入到结果回写</strong>的整条路径捋清楚.后续每一节的子节都是这条主链上的一个环节.</p>
+<pre><code class="language-mermaid">sequenceDiagram
+    participant C as 客户 App
+    participant H as chat_send&lt;br/&gt;HTTP 入口
+    participant S as Redis Stream&lt;br/&gt;lumio:chat:stream
+    participant G as _consumer_loop&lt;br/&gt;消费组读取
+    participant D as _dispatch_message&lt;br/&gt;路由派发
+    participant Q as _session_queues&lt;br/&gt;per-session 队列
+    participant W as _session_worker&lt;br/&gt;专属消费协程
+    participant P as _process_message&lt;br/&gt;单条处理
+    participant A as LumioAgent&lt;br/&gt;6 步决策
+    participant R as _finish_message&lt;br/&gt;结果落库+通知
+    participant P1 as poll/fast_reply&lt;br/&gt;客户端拉取
+
+    C-&gt;&gt;H: POST /api/chat/send
+    H-&gt;&gt;S: XADD 追加消息
+    H--&gt;&gt;C: 202 Accepted&lt;br/&gt;(请求返回, 不等处理)
+
+    Note over S,G: 异步消费端启动后持续运行
+    G-&gt;&gt;S: XREADGROUP bot-group
+    S--&gt;&gt;G: msg_id + fields
+    G-&gt;&gt;D: create_task(_dispatch_message)
+    D-&gt;&gt;Q: 按 session_id 路由&lt;br/&gt;无则建队+启 Worker
+    Q-&gt;&gt;W: put(msg_id, fields)
+
+    W-&gt;&gt;P: queue.get() (串行)
+    P-&gt;&gt;P: ① 审计落库&lt;br/&gt;② 幂等检查&lt;br/&gt;③ 过期跳过&lt;br/&gt;④ trace 恢复
+    P-&gt;&gt;A: agent.run(message)
+    A--&gt;&gt;P: reply / intent / source
+    P-&gt;&gt;R: _finish_message&lt;br/&gt;(+ XACK + mark_processed)
+    R--&gt;&gt;P1: 写 lumio:response:{sid}&lt;br/&gt;+ PUBLISH lumio:notify:{sid}
+    P1--&gt;&gt;C: 客户端轮询取走结果
+</code></pre>
+<p><strong>主链上的 6 个角色</strong> (后面 3.5/3.6 会逐个展开):</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>角色</th>
+<th>代码位置</th>
+<th>单一职责</th>
+<th>协作方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>chat_send</code> HTTP 入口</td>
+<td><code>router.py:951</code></td>
+<td>校验 + 写 Stream + 立刻 202</td>
+<td>同步路径, 毫秒级返回</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>_consumer_loop</code> 后台读取</td>
+<td><code>router.py:78</code> 起</td>
+<td>XREADGROUP 阻塞读 + XAUTOCLAIM 兜底</td>
+<td>长驻协程, 每实例 1 个</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>_dispatch_message</code> 派发</td>
+<td><code>router.py:328</code></td>
+<td>按 session_id 路由到队列, 首条触发 Worker</td>
+<td>短任务, 立刻结束</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>per-session Queue</code> 串行化</td>
+<td><code>router.py:85</code></td>
+<td>同会话消息 FIFO</td>
+<td>asyncio.Queue, 每会话 1 个</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>_session_worker</code> 专属消费</td>
+<td><code>router.py:347</code></td>
+<td>串行取消息 + 调 Agent + XACK + 空闲退出</td>
+<td>每活跃会话 1 个协程</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>_process_message</code> 单条处理</td>
+<td><code>router.py</code> 内</td>
+<td>幂等/过期/Audit/Trace/调 Agent/落结果</td>
+<td>由 Worker 串行调用</td>
+</tr>
+</tbody>
+</table>
+<p><strong>谁先做、谁后做</strong>: 客户端只跟 ① 交互 (毫秒级),后面 ②~⑥ 全是异步. 任何一个角色挂掉, 上一级都有兜底: Stream 数据持久化 → 60s 接管; Worker 崩溃 → 同会话队列被其他实例消费; Agent 超时 → 走快速兜底话术; 客户端断网 → 30s 内重连重试. 这就是 Bot 服务"任何单点失败都不丢消息、不卡客户"的工程基础.</p>
+<h2 id="3.5-per-session-Worker:-串行消费">3.5 per-session Worker: 串行消费</h2>
 <p><strong>业务场景</strong>: 客户在对话框里连发 3 条消息 — "在吗?" → "我的卡丢了" → "怎么挂失?". 这 3 条几乎同时到达. 如果被 3 个 Worker 并行处理, 回答顺序可能变成"怎么挂失"的答案先到、"我的卡丢了"后到 — 客户看到的对话完全错乱. 更糟的是, 第 3 条消息的意图依赖前两条的上下文 ("怎么挂失"承接"卡丢了"), 顺序一乱, AI 理解就错.</p>
 <p><strong>解法</strong>: 给每个会话配一个<strong>专属处理员</strong> (per-session Worker), 该会话的消息永远只由它按顺序处理 — 像银行柜台一对一的服务专员, 一个客户全程一个专员接待, 谁先来谁先办.</p>
-<p><strong>为什么消费组还不够 — 顺序问题</strong>: Consumer Group 只保证"一条消息只被一个 consumer 读到", 不保证"同一会话的消息被同一 worker 按序处理"。批量 XREADGROUP 后消息经 <code>create_task</code> 并行分发, 同一会话的两条消息可能被两个协程同时处理 — 顺序颠倒, 且后一条的意图依赖前一条的上下文 ("怎么挂失"承接"卡丢了"), 顺序一乱 AI 理解就错。</p>
-<p><strong>per-session Worker 的形态</strong>: 每个 session_id 一个常驻 <code>asyncio.Queue</code> + 一个专属消费协程 (<code>_session_worker</code>)。消息经 <code>_dispatch_message</code> 路由进该会话的队列 (队列不存在则现场创建 Worker), 由它串行消费:</p>
+<p><strong>为什么消费组还不够 — 顺序问题</strong>: Consumer Group 只保证"一条消息只被一个 consumer 读到", 不保证"同一会话的消息被同一 worker 按序处理". 批量 XREADGROUP 后消息经 <code>create_task</code> 并行分发, 同一会话的两条消息可能被两个协程同时处理 — 顺序颠倒, 且后一条的意图依赖前一条的上下文 ("怎么挂失"承接"卡丢了"), 顺序一乱 AI 理解就错.</p>
+<h3 id="3.5.1-Worker-是什么-—-协程,不是进程/线程">3.5.1 Worker 是什么 — 协程,不是进程/线程</h3>
+<p><strong>一句话定义</strong>: <code>_session_worker</code> 是 Bot 服务进程内的一个 <code>asyncio</code> 协程 (coroutine), 由事件循环调度, 跟同进程内的其他协程共用一个 OS 线程.</p>
+<ul>
+<li><strong>不是独立进程</strong> — 几千个活跃会话 = 几千个协程, 全部跑在 Bot 服务那一个 Python 进程里, 共享一个事件循环;</li>
+<li><strong>不是独立线程</strong> — asyncio 协程不占 OS 线程, 阻塞操作会让整个事件循环停摆 (这就是为什么下游 IO 全用 <code>await</code>);</li>
+<li><strong>不是常驻的</strong> — 队列空 300 秒就自动 <code>return</code> 退出, 释放协程栈和队列内存, 新消息到来时按需重建;</li>
+<li><strong>不是有状态的</strong> — 它的全部状态就是 <code>_session_queues[session_id]</code> 这个 asyncio.Queue, 进程重启即清空 (真正的会话状态在 Redis 的 SessionState 里, 不在 Worker 里).</li>
+</ul>
+<h3 id="3.5.2-Worker-的核心职责-—-5-步生命周期">3.5.2 Worker 的核心职责 — 5 步生命周期</h3>
+<p><code>_session_worker</code> 被 <code>_dispatch_message</code> 首次触发, 进入以下循环, 直到空闲退出:</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>动作</th>
+<th>关键代码</th>
+<th>失败兜底</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 阻塞取消息</td>
+<td><code>await asyncio.wait_for(queue.get(), timeout=300)</code></td>
+<td><code>router.py:366</code></td>
+<td>TimeoutError → break 退出</td>
+</tr>
+<tr>
+<td>② 审计落库</td>
+<td><code>write_chat_message</code> 写 PostgreSQL <code>chat_messages</code> 表</td>
+<td><code>router.py:380-391</code></td>
+<td>落库失败仅记日志, 不阻塞处理</td>
+</tr>
+<tr>
+<td>③ 过期跳过</td>
+<td><code>now - enqueue_time &gt; message_ttl</code> → 走超时话术 + 标 <code>source=timeout</code></td>
+<td><code>router.py:415-436</code></td>
+<td>过期消息不浪费 LLM 调用</td>
+</tr>
+<tr>
+<td>④ 调 Agent</td>
+<td><code>await agent.run(session_id, message)</code> 经 6 步决策返回结果</td>
+<td><code>router.py:703</code></td>
+<td>全局 <code>wait_for</code> 超时 → 走 timeout 话术</td>
+</tr>
+<tr>
+<td>⑤ 落结果 + 确认</td>
+<td><code>_finish_message</code> 写结果缓存 + <code>PUBLISH</code> 通知 + <code>XACK</code> 标记消费完成 + <code>_mark_processed</code> 幂等键</td>
+<td><code>router.py:692-698</code></td>
+<td>任何一步异常都进入 <code>finally</code> 走 XACK, 避免 PEL 堆积</td>
+</tr>
+</tbody>
+</table>
+<p><strong>这 5 步里最关键的是 ④ 调 Agent</strong> — 它把"消息已被接收"的承诺, 兑现为"客户能看到的回答". ①~③ 是预处理 (审计/去重), ⑤ 是收尾 (通知/确认), 都是围绕 ④ 的支撑.</p>
+<h3 id="3.5.3-per-session-Queue-+-Worker-的形态">3.5.3 per-session Queue + Worker 的形态</h3>
+<p>每个 session_id 一个常驻 <code>asyncio.Queue</code> + 一个专属消费协程 (<code>_session_worker</code>). 消息经 <code>_dispatch_message</code> 路由进该会话的队列 (队列不存在则现场创建 Worker), 由它串行消费:</p>
 <ul>
 <li>消费循环: <code>queue.get()</code> → 交给 Agent 处理 → <code>XACK</code> 确认 → 取下一条;</li>
 <li><strong>同一会话严格串行, 不同会话并行</strong> — 客户消息按发送顺序处理, 各会话之间互不阻塞;</li>
-<li><strong>空闲回收</strong>: <code>asyncio.wait_for(queue.get(), timeout=300)</code> 5 分钟无消息 → Worker 退出并注销 (<code>_session_queues.pop</code>), 新消息到来时自动重建 — 高峰期 1000 个活跃会话对应 1000 个协程, 低谷自动收缩, 无常驻泄漏。</li>
+<li><strong>空闲回收</strong>: <code>asyncio.wait_for(queue.get(), timeout=300)</code> 5 分钟无消息 → Worker 退出并注销 (<code>_session_queues.pop</code>), 新消息到来时自动重建 — 高峰期 1000 个活跃会话对应 1000 个协程, 低谷自动收缩, 无常驻泄漏.</li>
 </ul>
 <p><code>router.py:289-340</code> <code>_session_worker</code> 实现:</p>
 <pre><code class="language-python"># 简化版 — 关键逻辑: 取一条 → 处理 + XACK; 300s 无消息退出
@@ -1651,8 +1796,8 @@ async def _session_worker(self, session_id: str) -&gt; None:
             queue.task_done()
 </code></pre>
 <p><strong>实现说明</strong>: 有序性不依赖锁 — 旧实现用 per-session Lock 串行化, 现改为每会话一个 asyncio.Queue (router.py:81-83), 队列天然 FIFO, 省去锁竞争.</p>
-<p><strong>这里有个取舍要讲清楚</strong>: 每个会话一个 Worker, 意味着一个客户的 3 条消息是<strong>排队逐个处理</strong>的 — 第 1 条处理完才轮到第 2 条. 如果每条要 2 秒, 第 3 条要等 6 秒. 会不会太慢? 答案看下一节 3.4.1 — <strong>排队中的消息会被合并</strong>, 一次 AI 调用回答多条, 实际等待远小于逐条之和.</p>
-<h3 id="3.4.1-队列合并:-软打断语义">3.4.1 队列合并: 软打断语义</h3>
+<p><strong>这里有个取舍要讲清楚</strong>: 每个会话一个 Worker, 意味着一个客户的 3 条消息是<strong>排队逐个处理</strong>的 — 第 1 条处理完才轮到第 2 条. 如果每条要 2 秒, 第 3 条要等 6 秒. 会不会太慢? 答案看下一节 3.5.4 — <strong>排队中的消息会被合并</strong>, 一次 AI 调用回答多条, 实际等待远小于逐条之和.</p>
+<h3 id="3.5.4-队列合并:-软打断语义">3.5.4 队列合并: 软打断语义</h3>
 <p>用户生成期间连发多条消息 → 不排队等待逐条处理, 而是<strong>合并进一次 LLM 调用</strong> (上限 5 条 / 4000 字符, 超限放回队列不丢失):</p>
 <pre><code class="language-python"># router.py:514-521 (简化)
 merged_message = (
@@ -1664,7 +1809,7 @@ merged_message = (
 被合并消息逐一审计落库 (<code>source="merged"</code>) 并立即 XACK — 过期排队消息 (8s TTL) 直接跳过并提示.</p>
 <p><strong>对刚才场景的回答</strong>: 客户连发"在吗? / 我的卡丢了 / 怎么挂失?" — Worker 正在处理第 1 条时, 第 2、3 条进入队列. 处理第 1 条前先"看一眼队列", 把后面两条一起合并成一次调用: 大模型一次性看到三句连续的话, 完整理解"客户卡丢了要挂失", 一次回答到位. 客户不用等三条消息轮番处理.</p>
 <p><strong>这算"打断"吗?</strong> 算一种<strong>软打断</strong>: 用户最新的话不会被旧回答覆盖, 而是和新消息一起被综合处理. 真正的"硬打断" (正在生成的回答被取消) 在 WebSocket 流式通道实现 (ws_router.py 的 cancel 协议), 见后续章节.</p>
-<h3 id="3.4.2-快速兜底:-domain-键对齐-+-冷却">3.4.2 快速兜底: domain 键对齐 + 冷却</h3>
+<h3 id="3.5.5-快速兜底:-domain-键对齐-+-冷却">3.5.5 快速兜底: domain 键对齐 + 冷却</h3>
 <p>Semaphore (默认 10) 满荷时, 系统<strong>不排队死等</strong> — 立刻用 <code>&lt;5ms</code> 正则快速兜底话术 (<code>_FAST_REPLIES</code>) 回应 (挂失 → "正在优先处理", 账单 → "稍后返回"), 并写 <code>lumio:fast_reply:{session_id}</code> 冷却时间戳 (<code>fast_reply_cooldown=5s</code>), 冷却期内同一会话不重复兜底, 避免连续模板话术。RuleLoader 返回的是
 domain (<code>card</code>/<code>bill</code>/<code>limit</code>), 与话术键名 (<code>lost_card</code>/<code>bill_query</code>) 不一致 → 通过别名映射对齐:</p>
 <pre><code class="language-python">_DOMAIN_TO_FAST_KEY = {&quot;card&quot;: &quot;lost_card&quot;, &quot;complaint&quot;: &quot;complaint&quot;,
@@ -1672,7 +1817,7 @@ domain (<code>card</code>/<code>bill</code>/<code>limit</code>), 与话术键名
 </code></pre>
 <p><strong>冷却期</strong>: <code>BOT_FAST_REPLY</code> 后写 <code>lumio:fast_reply:{session_id}</code> 时间戳
 (<code>fast_reply_cooldown=5s</code>) — 冷却期内同一会话不再二次快速兜底, 避免连续模板话术.</p>
-<h2 id="3.5-LumioAgent-6-步决策树">3.5 <code>LumioAgent</code> 6 步决策树</h2>
+<h2 id="3.6-LumioAgent-6-步决策树">3.6 <code>LumioAgent</code> 6 步决策树</h2>
 <p><strong>业务背景</strong>: 消息到了 Worker, 现在要"真正思考"了. 但"思考"不等于"什么都交给大模型" — 银行场景里, 有些话不能乱说 (挂失要转人工), 有些事不能乱做 (调额要确认), 有些问题不能乱答 (知识要查库). 所以 <code>LumioAgent</code> 是一个<strong>规则优先的决策器</strong>: 能用规则判断的绝不让模型自由发挥, 模型只负责"分类"和"生成"两件最需要它的事.</p>
 <p><strong>用一个真实对话走一遍 6 步</strong>: 客户说"我想把额度提到 8 万".</p>
 <table>
@@ -1759,7 +1904,7 @@ class LumioAgent:
         return BotResponse(content=FALLBACK_SYSTEM_PROMPT.format(input=user_input), source=&quot;fallback&quot;)
 </code></pre>
 <p><strong>关键设计</strong>: 6 步严格顺序, 每步有 fallback. LLM 仅在第 3 步分类 + 第 4 步生成时用, 其他都是<strong>纯规则</strong>. 这就是"确定性路由主类"含义 — 业务流程可预测, LLM 不黑盒.</p>
-<h3 id="3.5.1-_handle_knowledge-知识类-(bot_agent.py:201-249)">3.5.1 <code>_handle_knowledge</code> 知识类 (bot_agent.py:201-249)</h3>
+<h3 id="3.6.1-_handle_knowledge-知识类-(bot_agent.py:201-249)">3.6.1 <code>_handle_knowledge</code> 知识类 (bot_agent.py:201-249)</h3>
 <pre><code class="language-python"># 简化
 async def _handle_knowledge(self, session_id, user_input, intent):
     # 1. RAG 检索
@@ -1774,7 +1919,7 @@ async def _handle_knowledge(self, session_id, user_input, intent):
     return BotResponse(content=answer, source=&quot;llm&quot;, chunks=chunks)
 </code></pre>
 <p><strong>关键设计</strong>: 历史摘要与 LLM 生成<strong>并行</strong>, 摘要结果写入 Redis 供下一轮用. 这一轮不阻塞.</p>
-<h3 id="3.5.2-_handle_business-业务类-(bot_agent.py:250-340)">3.5.2 <code>_handle_business</code> 业务类 (bot_agent.py:250-340)</h3>
+<h3 id="3.6.2-_handle_business-业务类-(bot_agent.py:250-340)">3.6.2 <code>_handle_business</code> 业务类 (bot_agent.py:250-340)</h3>
 <p>业务类更复杂, 因为涉及挂失/投诉/调额等<strong>敏感操作</strong>:</p>
 <pre><code class="language-python"># 简化
 async def _handle_business(self, session_id, user_input, intent):
@@ -1795,7 +1940,7 @@ async def _handle_business(self, session_id, user_input, intent):
     return BotResponse(content=answer, source=&quot;llm&quot;)
 </code></pre>
 <p><strong>关键设计</strong>: <code>CARD_LOSS</code> (挂失) 不让 LLM 处理, 直接走 <code>_initiate_transfer</code> 转人工. 银行场景下, 挂失是高风险操作, 不可能让 AI 自由发挥.</p>
-<h3 id="3.5.3-_handle_tool-工具类-(bot_agent.py:341-401)">3.5.3 <code>_handle_tool</code> 工具类 (bot_agent.py:341-401)</h3>
+<h3 id="3.6.3-_handle_tool-工具类-(bot_agent.py:341-401)">3.6.3 <code>_handle_tool</code> 工具类 (bot_agent.py:341-401)</h3>
 <p>工具类走 MCP 工具循环, 详见 <a href="chapters/17-tool-calling-and-confirmation.md">第 17 章 工具调用与确认状态机</a>. 本节仅列关键摘要:</p>
 <ul>
 <li><strong>5 工具意图</strong>: BILL_QUERY (账单查询) / TRANSACTION_QUERY (交易查询) / LIMIT_QUERY (额度查询) / INSTALLMENT_INQUIRY (分期咨询) / REWARD_QUERY (积分查询)</li>
@@ -1803,7 +1948,7 @@ async def _handle_business(self, session_id, user_input, intent):
 <li><strong>4 分支循环</strong>: 无 tool_call / 护栏拒绝 / 敏感 pending / 非敏感执行</li>
 <li><strong>5 态确认</strong>: pending / confirm / cancel / unclear / expired, 详细状态机见 17.4 节</li>
 </ul>
-<h3 id="3.5.4-_handle_pending_action-确认状态机-(bot_agent.py:402-535)">3.5.4 <code>_handle_pending_action</code> 确认状态机 (bot_agent.py:402-535)</h3>
+<h3 id="3.6.4-_handle_pending_action-确认状态机-(bot_agent.py:402-535)">3.6.4 <code>_handle_pending_action</code> 确认状态机 (bot_agent.py:402-535)</h3>
 <p><strong>这是 Bot 设计最精彩的部分</strong>. 敏感工具 (挂失/调额/兑换) 不立即执行, 而是<strong>等客户确认</strong>. 详细 5 态状态机 / <code>PendingAction</code> 字段 / <code>detect_confirmation</code> 关键词优先级见 <a href="chapters/17-tool-calling-and-confirmation.md#174-5-态确认状态机">第 17.4 节 5 态确认状态机</a>. 本节仅给个高层摘要:</p>
 <pre><code class="language-python"># 简化
 async def _handle_pending_action(self, session_id, user_input, pending):
@@ -1839,7 +1984,7 @@ async def _handle_pending_action(self, session_id, user_input, pending):
     expired --&gt; [*]: 清除 pending
 </code></pre>
 <p><strong>关键设计</strong>: <code>pending_action</code> 存 Redis (<code>lumio:session:{id}:pending_action</code> Hash), 跨轮持久化. 客户这一轮说"调额到 5 万", 下一轮说"确认", 就能定位到原工具调用. <code>detect_confirmation</code> (tool_executor.py:75) 解析自然语言, <strong>cancel 关键词优先</strong> (规避"不确认"歧义).</p>
-<h2 id="3.6-槽位追踪:-SlotTracker">3.6 槽位追踪: <code>SlotTracker</code></h2>
+<h2 id="3.7-槽位追踪:-SlotTracker">3.7 槽位追踪: <code>SlotTracker</code></h2>
 <blockquote>
 <p><strong>本章保留摘要, 槽位与上下文注入的联动见 <a href="chapters/15-context-engineering.md">第 15 章 上下文工程</a></strong> + <a href="appendix/A-glossary.md#a41-上下文工程术语-第-15-章">附录 A.4.1 上下文工程术语</a>.</p>
 </blockquote>
@@ -1918,7 +2063,7 @@ class SlotTracker:
 </table>
 <p><strong>注意</strong>: 槽位名是程序里的<strong>通用字段标识</strong>, 具体含义随意图变化 — 同是 <code>amount</code>, 在分期咨询里是"分期金额", 在交易查询里是"交易金额"; 同是 <code>period</code>, 在账单查询里是"账单周期", 在交易查询里是"查询时段". 必填槽缺失时 Bot 主动追问 (追问话术定义在代码 <code>SlotDef.prompt</code>), 可选槽缺失不追问. 另注: <code>CARD_LOSS</code> 虽定义了验证槽位, 但当前实现里挂失是高风险操作, 直接转人工坐席验证, 不走槽位填充.</p>
 <p>实体抽取 (entity_pool) 自动联动: <code>PHONE → phone_number</code> (手机号) / <code>DATE → period</code> (时间) 等 7 映射. 完整实体→槽位映射 + 三段式 prompt 注入 (已收集/待收集/追问提示) 见 <a href="chapters/15-context-engineering.md">第 15 章</a>.</p>
-<h2 id="3.7-3-级降级:-不拒客">3.7 3 级降级: 不拒客</h2>
+<h2 id="3.8-3-级降级:-不拒客">3.8 3 级降级: 不拒客</h2>
 <p><strong>业务背景</strong>: 每年信用卡账单日, 全行客户同时涌入查账单 — 流量是平时的 10 倍. 更糟的是, 大模型服务可能恰好在这时被挤爆 (它比我们更忙). 这时候如果 Bot 直接返回"系统繁忙, 请稍后再试", 等于把客户拒之门外 — 银行客服的 KPI 是"接起率", 客户打不进电话是要上新闻的.</p>
 <p><strong>设计原则: 服务可以变差, 但不能拒绝</strong>. 模型忙 → 用模板话术; 模板也没有 → 引导转人工; 人工也满 → 至少告诉客户"排队中". 层层兜底, 保证客户永远得到"回应", 而不是"拒绝".</p>
 <p><code>agent/lumio/services/bot/router.py:79, 92-98</code> 实现了"Semaphore 满载不拒客"原则:</p>
@@ -1973,7 +2118,7 @@ class BotWorkerPool:
 </tr>
 </tbody>
 </table>
-<h2 id="3.8-文件上传-50MB-限制">3.8 文件上传 50MB 限制</h2>
+<h2 id="3.9-文件上传-50MB-限制">3.9 文件上传 50MB 限制</h2>
 <p><strong>业务背景</strong>: 客户传个 PDF (信用卡章程/流水单) 让 Bot 解读 — 这是知识库的入口, 也是 DoS 攻击的高发点. 如果不对上传设限, 1GB 的文件直接进 Redis Stream + 大模型, 内存和 token 都会被瞬间打爆.</p>
 <p><code>agent/lumio/services/bot/router.py:1194-1270</code> <code>upload_document</code> 端点有双重限制:</p>
 <pre><code class="language-python"># 简化
@@ -2000,7 +2145,7 @@ async def upload_document(file: UploadFile, request: Request):
     ...
 </code></pre>
 <p><strong>设计动机</strong>: 入口不设限, 1MB 消息 / 1GB 文件都能进 Redis Stream + LLM, 引发 DoS 风险. 因此 message <code>max_length=2000</code> + 文件 50MB + 扩展名白名单三道关.</p>
-<h2 id="3.9-客户画像-+-知识图谱">3.9 客户画像 + 知识图谱</h2>
+<h2 id="3.10-客户画像-+-知识图谱">3.10 客户画像 + 知识图谱</h2>
 <blockquote>
 <p><strong>本章保留摘要, 详细机制见 <a href="chapters/16-customer-memory-and-kg.md">第 16 章 客户记忆与知识图谱</a></strong> + <a href="appendix/A-glossary.md">附录 A.4.2 / A.4.3 术语</a>.</p>
 </blockquote>
@@ -2010,7 +2155,7 @@ async def upload_document(file: UploadFile, request: Request):
 <li><strong>KnowledgeGraph</strong>: 5 实体 (信用卡/账单/额度/分期/挂失) × 3 关系 × 8 谓词的内存版图谱, 仅在 <code>_handle_knowledge</code> 分支注入 RAG 上下文 (Markdown <code>## 知识图谱补充信息:</code> 格式).</li>
 </ul>
 <p>这些都是渐进增强, 当前不是核心路径. 触发时机 / 失败兜底 / 设计取舍 (正则 vs LLM / 90 天 window / 内存版 vs Neo4j) 见 <a href="chapters/16-customer-memory-and-kg.md">第 16 章</a>.</p>
-<h2 id="3.10-监控指标">3.10 监控指标</h2>
+<h2 id="3.11-监控指标">3.11 监控指标</h2>
 <p><code>shared/metrics.py</code> 发射 12 个 Bot 相关指标 (含 3 个全局复用) — 运维看这些指标就能回答"系统现在忙不忙、回答得好不好、有没有被拒"：</p>
 <table>
 <thead>
@@ -2109,7 +2254,7 @@ async def upload_document(file: UploadFile, request: Request):
 </tr>
 </tbody>
 </table>
-<h2 id="3.11-测试覆盖">3.11 测试覆盖</h2>
+<h2 id="3.12-测试覆盖">3.12 测试覆盖</h2>
 <p><code>agent/tests/</code> 中 Bot 相关测试:</p>
 <ul>
 <li><code>test_bot_api.py</code> (e2e, CI 排除): 完整 chat 流程</li>
@@ -2120,15 +2265,18 @@ async def upload_document(file: UploadFile, request: Request):
 <li><code>test_chat_poll.py</code> (e2e, CI 排除): 长轮询验证</li>
 <li><code>test_session_lifecycle_e2e.py</code> (e2e, CI 排除): 会话生命周期</li>
 </ul>
-<h2 id="3.12-本章小结">3.12 本章小结</h2>
+<h2 id="3.13-本章小结">3.13 本章小结</h2>
 <p>Bot 自助问答服务是 Lumio 流量最大的入口. 回到开头的银行场景, 现在你能完整回答"一条客户消息从发出到收到回答, 系统都做了什么":</p>
 <ol>
-<li><strong>接了再说</strong> — 异步提交, 消息进 Redis Stream, 客户立刻收到"已收到"</li>
-<li><strong>不丢不乱</strong> — 消费组保证单条只被处理一次, 60s 兜底接管崩溃 Worker, 幂等键防重复</li>
-<li><strong>按号排队</strong> — 每会话一个 Worker, 同客户消息严格有序; 连发消息合并成一次 AI 调用</li>
-<li><strong>规则优先决策</strong> — LumioAgent 6 步: 先处理待确认操作, 再分类路由, 敏感操作等客户确认</li>
-<li><strong>永不拒客</strong> — 模型忙走模板, 模板也没有引导转人工, 层层降级</li>
+<li><strong>接了再说 (3.1 / 3.2)</strong> — 异步提交, 消息进 Redis Stream, 客户立刻收到 202</li>
+<li><strong>不丢不乱 (3.3)</strong> — 消费组保证单条只被处理一次, 60s 兜底接管崩溃 Worker, PEL + XAUTOCLAIM 防丢</li>
+<li><strong>路由派发 (3.4.3)</strong> — <code>_dispatch_message</code> 按 session_id 投到 per-session Queue, 首条触发 Worker</li>
+<li><strong>专属消费 (3.5)</strong> — 每会话一个 <code>_session_worker</code> 协程, 同客户消息严格串行, 空闲 300s 退出</li>
+<li><strong>单条处理 (3.5.2)</strong> — 审计落库 / 幂等检查 / 过期跳过 / 调 Agent / XACK, 5 步生命周期</li>
+<li><strong>规则优先决策 (3.6)</strong> — LumioAgent 6 步: 先处理待确认操作, 再分类路由, 敏感操作等客户确认</li>
+<li><strong>永不拒客 (3.8)</strong> — Semaphore 满荷走 5ms 模板兜底, 模型忙走降级话术, 层层保接起率</li>
 </ol>
+<p><strong>6 个角色一条链</strong>: chat_send (HTTP) → _consumer_loop (Stream) → _dispatch_message (路由) → _session_queues (FIFO) → _session_worker (消费) → _process_message (处理) → _finish_message (落结果). 任何一个角色挂掉, 上一级都有兜底 (Stream 持久化 / XAUTOCLAIM 接管 / Agent 超时走模板 / 客户端 30s 重连重试) — 这就是 Bot 服务"任何单点失败都不丢消息、不卡客户"的工程基础.</p>
 <p>设计哲学一句话: <strong>异步吸收流量, 队列保证有序, 规则保证安全, 降级保证可用</strong> — 四条合起来, 就是银行客服系统"百万并发下不丢消息、不错顺序、不违规操作、不拒绝客户"的全部秘密.</p>
 <blockquote>
 <p><strong>下一章预告</strong>: <a href="04-assist-engine.md">第 4 章 坐席辅助引擎</a> 深入 D1/D2/D3 + E1/E2/E3 五阶段编排 + 仲裁器融合 + WS 双模式.</p>
