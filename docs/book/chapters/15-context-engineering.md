@@ -25,7 +25,7 @@ code_references:
   - "agent/lumio/services/bot/prompts.py:104"
   - "agent/lumio/shared/config.py:115-121"
 last_updated: "2026-08-05"
-summary: "Lumio Bot 上下文工程的 3 层架构 (结构化记忆 / 近期历史 / RAG 检索), token 预算 LIFO 累加算法, 关键轮次豁免, 增量对话摘要与 fire-and-forget 异步调度, KV Cache 命中率优化 (稳态/半稳态/动态分层 + cache_control 锚点)."
+summary: "Lumio Bot 上下文工程的 3 层架构 (结构化记忆 / 近期历史 / RAG 检索), token 预算 LIFO 累加算法, 关键轮次豁免, 增量对话摘要与 fire-and-forget 异步调度, KV Cache 命中率优化 (稳态/半稳态/动态分层 + cache_control 锚点) 含端到端 messages 数组示例."
 tags: ["上下文工程", "token 预算", "对话摘要", "fire-and-forget", "3 层架构", "kv-cache", "PagedAttention"]
 ---
 
@@ -657,7 +657,215 @@ if not kv.kv_cache_enabled:
 
 **为什么不能完全替代 15.1 的 3 层**: KV cache 优化解决"如何让 prompt 字符串字面稳定", 15.1 的 3 层上下文解决"什么内容值得送给 LLM". 两者正交 — KV cache 命中再高, 内容选错也是白搭; 内容选对但字符串总变, TTFT 一样 500ms.
 
-## 15.12 延伸阅读
+## 15.12 端到端示例: 一次实际 LLM 调用的 messages 数组
+
+> 本节用一个真实对话走完一遍 `build_layered_messages` 实际生成的 messages 数组, 逐条对比"客户说第 1 句时"和"客户说第 5 句时"的差异, 看清**哪些 message 是字面稳定的、哪些是字面必变的、推理引擎到底能 cache 多少**.
+
+### 15.12.1 场景设定
+
+- **客户**: VIP 白金卡客户 `customer_id=cust-9527`, 当前 session `sess-A`, 历史 4 轮 (已问过"年费多少/怎么免年费/白金卡权益/机场贵宾厅")
+- **第 5 轮客户说**: "上次刷了 5800 块还没出账单, 这笔什么时候记账?"
+- **意图**: primary_intent = `bill_query` (账单类, 命中 few-shot 的 bill_query 分组)
+- **检索**: 命中知识库 3 条关于"账单日/记账时点"的条文
+- **槽位**: 已抽取 `{amount=5800, transaction_time=未提供}`
+
+### 15.12.2 `build_layered_messages` 实际生成的 messages 数组
+
+下面展示的就是**第 5 轮请求**实际送给 LLM 的完整 messages 数组 (6 条). 每条都标注了它在哪个层、字面是否稳定.
+
+```python
+# 第 5 轮 LLM 请求的 messages 数组 (实际结构)
+messages = [
+    # ── [1] L1 静态前缀 (稳态, 跨 session 100% 命中) ──────────────
+    {
+        "role": "system",
+        "content": "[STATIC_PREFIX_v1]\n你是一名专业的银行信用卡客服, 负责为客户解答信用卡相关问题.\n回答原则:\n1. 基于知识库检索结果回答, 不编造信息.\n2. 不确定的答复请明确告知并引导至人工.\n3. 保持简洁, 避免冗长.\n",
+        "cache_control": {"type": "ephemeral"},  # 推理引擎的 cache 锚点
+    },
+
+    # ── [2] L1.5 few-shot 半稳态 (按 primary_intent 分组命中) ─────
+    {
+        "role": "system",
+        "content": "## 参考案例\n[例 1]\n客户: 我这个月账单日是哪天?\n客服: 您的账单日是每月 5 号, 账单出账后 3 天内还款即可...\n[例 2]\n客户: 上个月消费了 3000 怎么没出账?\n客服: 单笔交易入账时间通常在交易完成后 1-2 个工作日, 请稍候...\n[例 3]\n客户: 还款日忘了, 会逾期吗?\n客服: 建议设置自动扣款或在还款日前 3 天主动还款, 可避免逾期...\n",
+        "cache_control": {"type": "ephemeral"},
+    },
+
+    # ── [3] L2 半稳态 (同 customer 跨 session 命中) ──────────────
+    {
+        "role": "system",
+        "content": "[CUSTOMER_CONTEXT_v1]\n客户卡种: 白金卡\nVIP 等级: VIP5\n风险偏好: 保守型\n信用额度: 80,000 元\n",
+        "cache_control": {"type": "ephemeral"},
+    },
+
+    # ── [4] L3 动态 system prompt (每轮必变, 0% 命中) ────────────
+    {
+        "role": "system",
+        "content": "## 会话记忆\n对话摘要: 客户咨询白金卡年费减免政策及机场贵宾厅权益, 现询问特定交易入账时点.\n\n## 槽位追踪\n已知: amount=5800\n待收集: transaction_time (交易时间)\n",
+    },
+
+    # ── [5] L3 对话历史 (动态, 0% 命中) ──────────────────────────
+    {"role": "user",      "content": "白金卡年费多少?"},
+    {"role": "assistant", "content": "您的白金卡年费为 980 元/年, 满足以下任一条件可减免: ..."},
+    {"role": "user",      "content": "怎么才能免年费?"},
+    {"role": "assistant", "content": "您当年消费满 5 万元或分期满 12 期, 可自动减免次年年费."},
+    {"role": "user",      "content": "白金卡有什么权益?"},
+    {"role": "assistant", "content": "白金卡权益包括: 机场贵宾厅 (全年 6 次)、酒店自助餐买一赠一、..."},
+    {"role": "user",      "content": "机场贵宾厅怎么用?"},
+    {"role": "assistant", "content": "出示您的白金卡和登机牌, 在合作机场贵宾厅前台登记即可使用."},
+
+    # ── [6] L3 当前轮 (动态, 0% 命中, RAG 放 user role 物理隔离) ──
+    {
+        "role": "user",
+        "content": "<retrieved_context>\n[1] 账单日: 每月 5 号\n[2] 入账时点: 交易完成后 1-2 个工作日入账, 部分海外交易 3-5 个工作日\n[3] 未出账单查询: 客户可在交易完成后 24 小时在 App 内查看"未出账单"项\n</retrieved_context>\n\n上次刷了 5800 块还没出账单, 这笔什么时候记账?",
+    },
+]
+```
+
+**总 token 分布** (按 7B 中文 1.5 token/字):
+
+| 消息 | 字数 | tokens | 所在层 | 跨 session 命中 |
+|---|---|---|---|---|
+| [1] 静态前缀 | ~95 字 | ~140 t | L1 稳态 | 100% (跨所有 session) |
+| [2] few-shot | ~200 字 | ~300 t | L1.5 半稳态 | 100% (同 intent 分组) |
+| [3] 客户画像 | ~50 字 | ~75 t | L2 半稳态 | 100% (同 customer 跨 session) |
+| [4] 动态 system | ~80 字 | ~120 t | L3 动态 | 0% (每轮变) |
+| [5] 4 轮历史 | ~250 字 | ~375 t | L3 动态 | 0% (新轮会变) |
+| [6] RAG+用户 | ~150 字 | ~225 t | L3 动态 | 0% |
+| **合计** | **~825 字** | **~1235 t** | | |
+
+### 15.12.3 第 1 轮 vs 第 5 轮的差异 — 推理引擎到底能 cache 多少
+
+**第 1 轮** (客户首次说"白金卡年费多少?"), messages 数组结构相同但内容不同:
+
+```python
+# 第 1 轮: 历史为空, RAG 检索结果不同
+messages = [
+    # [1] 静态前缀 — 字面完全一致
+    # [2] few-shot — 字面完全一致 (按 intent 分组, 都是 bill_query)
+    # [3] 客户画像 — 字面完全一致
+    # [4] 动态 system — 字面不同 (摘要为空, 槽位为空)
+    # [5] 历史 — 空数组
+    # [6] RAG+用户 — 字面不同 (检索内容不同 + 用户输入不同)
+]
+```
+
+**对比** — 哪几条**字面完全一致**、哪几条**字面必变**:
+
+| # | 消息 | 第 1 轮 vs 第 5 轮 | 字面一致? | cache 命中 |
+|---|---|---|---|---|
+| [1] | 静态前缀 | `[STATIC_PREFIX_v1]\n你是一名专业的银行信用卡...` | ✅ 完全一致 | 100% 命中 |
+| [2] | few-shot | 同一 intent 分组, 案例文本完全一致 | ✅ 完全一致 | 100% 命中 (按意图分组) |
+| [3] | 客户画像 | `客户卡种: 白金卡\nVIP 等级: VIP5\n...` | ✅ 完全一致 | 100% 命中 (同 customer) |
+| [4] | 动态 system | 第 1 轮: `## 会话记忆\n` (空), 第 5 轮: 4 轮摘要 | ❌ 不同 | 0% 命中 |
+| [5] | 历史 | 第 1 轮: `[]`, 第 5 轮: 4 条 user+assistant | ❌ 不同 | 0% 命中 |
+| [6] | RAG+用户 | 检索内容和用户输入均不同 | ❌ 不同 | 0% 命中 |
+
+**关键观察**: 消息 [1][2][3] 共 3 条 system message 占了约 **515 tokens** (140+300+75), 在第 5 轮请求时**完全不用重算** — 推理引擎直接复用第 1 轮的 K/V tensor, 仅重算 [4][5][6] 共 3 条 (720 tokens).
+
+### 15.12.4 这个设计的工程细节 (逐条说明为什么这么写)
+
+**消息 [1] 静态前缀 — 标志串前缀锚定**
+
+```python
+# kv_cache.py:62
+f"{STATIC_PREFIX_MARKER}\n{domain_prompt}"
+```
+
+- `STATIC_PREFIX_MARKER = "[STATIC_PREFIX_v1]"` (kv_cache.py:42) 是个**永不变化**的字符串前缀
+- 推理引擎按字符串前缀 hash 复用 K/V, 这个 marker 让 hash 计算更稳
+- 同一个 Bot 服务启动后, 所有 session 同一 domain_prompt 都共享这一段
+- `_v1` 后缀是**版本控制位** — 改 domain_prompt 内容时把 `_v1` 改成 `_v2`, 老 session 的 cache 自动失效 (不会读到旧内容)
+
+**消息 [2] few-shot — 按意图分桶, 半稳态**
+
+```python
+# bot_agent.py:347-358 传入
+few_shot_examples=few_shot_text  # 由 few_shot.py 按 primary_intent 选 top_k=3
+```
+
+- 同一 primary_intent 的所有 session 共用同一段 few-shot 案例 (例如所有 `bill_query` 客户共享)
+- 跨 intent 时字符串变化 (例如客户从"问年费"切到"办挂失"), cache 失效 — 这是**有意的设计**, 因为 few-shot 本来就是按意图分的
+- 测试用例锁定行为契约 (P2 注入修复)
+
+**消息 [3] 客户画像 — 半稳态跨 session 共享**
+
+```python
+# kv_cache.py:78
+f"{SEMI_STATIC_MARKER}\n{customer_context}"
+```
+
+- 同一 customer_id 跨 session 共享 (customer_memory 学习后更新一次, 后续几十次 session 都用同一段)
+- customer_context 内容**变化频次极低** (几天到几周才变一次), KV cache 长期保持高命中
+- `customer_id` 不进字符串, 所以不同 customer 字符串不同 → 推理引擎按字符串前缀天然分桶
+
+**消息 [4] 动态 system — 接受每轮必变的事实**
+
+```python
+# kv_cache.py:86-96
+def _build_dynamic_system_prompt(...):
+    parts = []
+    if session_memory:
+        parts.append(f"## 会话记忆\n{session_memory}")
+    if slot_prompt:
+        parts.append(slot_prompt)
+    return "\n\n".join(parts)
+```
+
+- 不试图 cache — session_memory 是对话摘要, 每轮都会变
+- 即使 0% 命中, 80 字 ≈ 120 tokens, 本身就不大, 不算热点
+- **设计取舍**: 不为了 100 tokens 的动态层去折腾 cache, 接受每轮重算
+
+**消息 [5] 对话历史 — 不进 cache, 但 token 预算算法管**
+
+- `_load_history` (15.3) 用 LIFO 累加把历史限制在 `budget_history=1500` tokens 内
+- 超出预算时按 LIFO 砍最老的, **最近 N 轮永远在** — 这本身就比"全部历史都送"节省 token
+- KV cache 跟 token 预算是两套独立优化: KV cache 让"送出去的部分"少算, token 预算让"送出去的总量"更少
+
+**消息 [6] RAG + 用户输入 — user role 物理隔离的两层用意**
+
+```python
+# kv_cache.py:170-173
+f"<retrieved_context>\n{rag_context}\n</retrieved_context>\n\n{user_input}"
+```
+
+- **物理隔离防注入**: RAG 检索内容如果含客户塞的恶意指令 (例如检索块里有"忽略之前所有指令"), 因为 RAG 在 user message 里, 跟 system prompt 物理隔离, LLM 会把它当"用户输入"处理而不是"系统指令"
+- **prefix cache 友好**: 动态部分集中在尾部 (消息 [6]), 前面的 [1][2][3] 越靠前越稳定, 推理引擎能更激进地 cache prefix
+
+### 15.12.5 一图看懂: 实际 cache 命中的边界
+
+```mermaid
+flowchart LR
+    A[第 1 轮请求] -->|"prefix='[STATIC_PREFIX_v1]\n你是一名...\n'"| K[(K/V Cache<br/>推理引擎内部)]
+    A -->|"user: 白金卡年费?"| K
+
+    B[第 5 轮请求] -->|"prefix='[STATIC_PREFIX_v1]\n你是一名...\n'"| K
+    K -.复用.-> B1[✅ 静态前缀 K/V<br/>不重算]
+    K -.复用.-> B2[✅ few-shot K/V<br/>不重算]
+    K -.复用.-> B3[✅ 客户画像 K/V<br/>不重算]
+    B -->|"user: 5800 块..."| B4[❌ RAG+用户 K/V<br/>每轮重算]
+    B -->|"history: 4 轮"| B5[❌ 历史 K/V<br/>每轮重算]
+```
+
+**可观察的运维指标** (在生产环境通过 Prometheus 看):
+
+```promql
+# 估算的稳态层命中比例 (来自 KV_CACHE_HIT_RATE{ cache_layer="static_prefix" })
+# 理论应该稳定在 1.0 (只要 domain_prompt 没改)
+
+# 估算的 prefill token 节省
+rate(lumio_prefill_tokens_saved_total[5m])
+
+# 实际 TTFT (time to first token) — 端到端真实数据
+# 应该从优化前的 ~500ms 降到优化后的 ~75-150ms
+histogram_quantile(0.5, rate(lumio_llm_ttft_seconds_bucket[5m]))
+```
+
+**怎么判断 KV cache 优化有没有生效**:
+- 看到 `static_prefix` 命中比例稳定在 1.0 → L1 稳态层生效
+- 看到 `semi_static` 在 0.6 附近 → L2 半稳态层生效 (略低是因为不同 customer 切分)
+- 看到 `TTFT p50` 稳定在 200ms 以下 → 整体命中
+
+## 15.13 延伸阅读
 
 - **第 3 章 Bot 自助问答**: 全链路时序 + 6 步决策树, 上下文工程是其中的"上下文拼装"环节
 - **第 5 章 RAG 检索全链路**: Layer 3 的 RAG 部分详细解析 (4 路径降级 + RRF 融合)
