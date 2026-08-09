@@ -1869,7 +1869,7 @@ _DOMAIN_TO_FAST_KEY = {
     &quot;default&quot;:    &quot;default&quot;,
 }
 </code></pre>
-<p><strong>这就是 P2-18 修复的核心</strong>: 早期代码直接用 <code>intent</code> 当 <code>_FAST_REPLIES</code> 的键查表, 结果 <code>card</code> 查不到 <code>lost_card</code> → 一律掉 <code>default</code> 话术, 挂失这种<strong>最紧急的紧急业务</strong>反而收到"请稍候"这种通用模板, 客户体验事故. 加了映射层之后, 挂失一定走挂失话术.</p>
+<p><strong>这就是 P2-18 修复的核心</strong> (代码已合并, 见 <code>router.py:111-124</code>, 测试覆盖 <code>test_bot_router_core.py::test_quick_intent_match_domain_mapping</code>): 早期代码直接用 <code>intent</code> 当 <code>_FAST_REPLIES</code> 的键查表, 结果 <code>card</code> 查不到 <code>lost_card</code> → 一律掉 <code>default</code> 话术, 挂失这种<strong>最紧急的紧急业务</strong>反而收到"请稍候"这种通用模板, 客户体验事故. 加了映射层之后, 挂失一定走挂失话术, 测试用例也明确锁定"挂失 → lost_card"、"未识别 → default"两条行为契约.</p>
 <h4 id="3.5.5.3-兜底话术内容-(为什么是这些文案)">3.5.5.3 兜底话术内容 (为什么是这些文案)</h4>
 <pre><code class="language-python"># router.py:95-101
 _FAST_REPLIES = {

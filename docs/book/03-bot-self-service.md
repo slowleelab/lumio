@@ -418,7 +418,7 @@ _DOMAIN_TO_FAST_KEY = {
 }
 ```
 
-**这就是 P2-18 修复的核心**: 早期代码直接用 `intent` 当 `_FAST_REPLIES` 的键查表, 结果 `card` 查不到 `lost_card` → 一律掉 `default` 话术, 挂失这种**最紧急的紧急业务**反而收到"请稍候"这种通用模板, 客户体验事故. 加了映射层之后, 挂失一定走挂失话术.
+**这就是 P2-18 修复的核心** (代码已合并, 见 `router.py:111-124`, 测试覆盖 `test_bot_router_core.py::test_quick_intent_match_domain_mapping`): 早期代码直接用 `intent` 当 `_FAST_REPLIES` 的键查表, 结果 `card` 查不到 `lost_card` → 一律掉 `default` 话术, 挂失这种**最紧急的紧急业务**反而收到"请稍候"这种通用模板, 客户体验事故. 加了映射层之后, 挂失一定走挂失话术, 测试用例也明确锁定"挂失 → lost_card"、"未识别 → default"两条行为契约.
 
 #### 3.5.5.3 兜底话术内容 (为什么是这些文案)
 
