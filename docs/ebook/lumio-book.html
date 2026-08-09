@@ -1809,14 +1809,176 @@ merged_message = (
 被合并消息逐一审计落库 (<code>source="merged"</code>) 并立即 XACK — 过期排队消息 (8s TTL) 直接跳过并提示.</p>
 <p><strong>对刚才场景的回答</strong>: 客户连发"在吗? / 我的卡丢了 / 怎么挂失?" — Worker 正在处理第 1 条时, 第 2、3 条进入队列. 处理第 1 条前先"看一眼队列", 把后面两条一起合并成一次调用: 大模型一次性看到三句连续的话, 完整理解"客户卡丢了要挂失", 一次回答到位. 客户不用等三条消息轮番处理.</p>
 <p><strong>这算"打断"吗?</strong> 算一种<strong>软打断</strong>: 用户最新的话不会被旧回答覆盖, 而是和新消息一起被综合处理. 真正的"硬打断" (正在生成的回答被取消) 在 WebSocket 流式通道实现 (ws_router.py 的 cancel 协议), 见后续章节.</p>
-<h3 id="3.5.5-快速兜底:-domain-键对齐-+-冷却">3.5.5 快速兜底: domain 键对齐 + 冷却</h3>
-<p>Semaphore (默认 10) 满荷时, 系统<strong>不排队死等</strong> — 立刻用 <code>&lt;5ms</code> 正则快速兜底话术 (<code>_FAST_REPLIES</code>) 回应 (挂失 → "正在优先处理", 账单 → "稍后返回"), 并写 <code>lumio:fast_reply:{session_id}</code> 冷却时间戳 (<code>fast_reply_cooldown=5s</code>), 冷却期内同一会话不重复兜底, 避免连续模板话术。RuleLoader 返回的是
-domain (<code>card</code>/<code>bill</code>/<code>limit</code>), 与话术键名 (<code>lost_card</code>/<code>bill_query</code>) 不一致 → 通过别名映射对齐:</p>
-<pre><code class="language-python">_DOMAIN_TO_FAST_KEY = {&quot;card&quot;: &quot;lost_card&quot;, &quot;complaint&quot;: &quot;complaint&quot;,
-                       &quot;bill&quot;: &quot;bill_query&quot;, &quot;limit&quot;: &quot;limit_query&quot;, ...}
+<h3 id="3.5.5-快速兜底:-Semaphore-满荷时的-&lt;5ms-模板话术">3.5.5 快速兜底: Semaphore 满荷时的 &lt;5ms 模板话术</h3>
+<p><strong>业务背景</strong>: Bot 服务的 <code>_agent_semaphore</code> 是个全局并发上限 (默认 10, 见 <code>config.py:max_concurrent_agents</code>), 用来<strong>限制同时调 LLM 的消息数</strong>. 超过 10 个的请求本应该排队等, 但银行场景里"接起率"是死命令 — 让客户干等 = 拒客. 所以满荷时<strong>不排队</strong>, 走一个 "&lt;5ms 出话"的模板兜底通道, 让客户先得到"已受理"的回复, 真回答等他轮到了再补.</p>
+<p><strong>走一个真实场景</strong>: 账单日早上 9 点, 全行客户同时涌入查账单, 流量是平时的 10 倍. 同一时刻第 11 个客户发来"挂失", 此时 <code>_agent_semaphore.locked()</code> 为 True (10 个槽位全被占了) — 系统不让他等, 直接走快速兜底.</p>
+<h4 id="3.5.5.1-三个判断条件-(任一不满足就跳过兜底)">3.5.5.1 三个判断条件 (任一不满足就跳过兜底)</h4>
+<pre><code class="language-python"># router.py:454-463 (简化)
+cooldown_ok = True
+cooldown_ts = await redis_client.get(f&quot;lumio:fast_reply:{session_id}&quot;)
+if cooldown_ts:
+    if time.time() - float(cooldown_ts) &lt; fast_reply_cooldown:  # 默认 5s
+        cooldown_ok = False
+
+if _agent_semaphore.locked() and cooldown_ok:
+    # 走快速兜底
 </code></pre>
-<p><strong>冷却期</strong>: <code>BOT_FAST_REPLY</code> 后写 <code>lumio:fast_reply:{session_id}</code> 时间戳
-(<code>fast_reply_cooldown=5s</code>) — 冷却期内同一会话不再二次快速兜底, 避免连续模板话术.</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>含义</th>
+<th>不满足时的行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>_agent_semaphore.locked()</code></td>
+<td>10 个槽位确实占满了</td>
+<td>没满就正常走 Agent, 不触发兜底</td>
+</tr>
+<tr>
+<td><code>cooldown_ok</code></td>
+<td>这个会话过去 5s 内没走过兜底</td>
+<td>在冷却期内 → 不再二次兜底, 改为正常排队等 Agent (宁可慢一点也别连发模板)</td>
+</tr>
+<tr>
+<td><code>_quick_intent_match</code> 命中</td>
+<td>regex 至少匹配出 lost_card / bill_query / limit_query / complaint 之一</td>
+<td>匹配不上 → <code>default</code> 话术</td>
+</tr>
+</tbody>
+</table>
+<h4 id="3.5.5.2-两套命名不一致-—-domain-键对齐映射">3.5.5.2 两套命名不一致 — domain 键对齐映射</h4>
+<p><strong>为什么需要"对齐"</strong>: 系统里有两套<strong>意图命名空间</strong>, 出自不同历史时期, 命名不统一:</p>
+<ul>
+<li><strong>RuleLoader 返回的 <code>domain</code></strong> (意图分类器的标准命名): <code>card</code> / <code>bill</code> / <code>limit</code> / <code>installment</code> / <code>reward</code> / <code>transfer</code> / <code>chitchat</code> / <code>complaint</code> / <code>default</code></li>
+<li><strong>快速兜底话术的键名 <code>_FAST_REPLIES</code></strong> (业务侧最在意的"是哪种急事"): <code>lost_card</code> / <code>bill_query</code> / <code>limit_query</code> / <code>complaint</code> / <code>default</code></li>
+</ul>
+<p><strong>直接对应行不通</strong>: <code>card</code> 到底是"挂失"还是"补卡"还是"开卡" ? <code>limit</code> 到底是"提额"还是"降额"还是"查额度" ? 在兜底场景, 我们没时间调模型去细分, 只能粗粒度映射:</p>
+<pre><code class="language-python"># router.py:114-124
+_DOMAIN_TO_FAST_KEY = {
+    &quot;card&quot;:       &quot;lost_card&quot;,     # 卡片类一律按&quot;挂失&quot;走 (最紧急)
+    &quot;complaint&quot;:  &quot;complaint&quot;,     # 投诉 = 投诉
+    &quot;bill&quot;:       &quot;bill_query&quot;,    # 账单类 = 查账单
+    &quot;limit&quot;:      &quot;limit_query&quot;,   # 额度类 = 查/调额度
+    &quot;installment&quot;: &quot;default&quot;,      # 分期/积分/转人工/闲聊 → 没专属话术, 走通用模板
+    &quot;reward&quot;:     &quot;default&quot;,
+    &quot;transfer&quot;:   &quot;default&quot;,
+    &quot;chitchat&quot;:   &quot;default&quot;,
+    &quot;default&quot;:    &quot;default&quot;,
+}
+</code></pre>
+<p><strong>这就是 P2-18 修复的核心</strong>: 早期代码直接用 <code>intent</code> 当 <code>_FAST_REPLIES</code> 的键查表, 结果 <code>card</code> 查不到 <code>lost_card</code> → 一律掉 <code>default</code> 话术, 挂失这种<strong>最紧急的紧急业务</strong>反而收到"请稍候"这种通用模板, 客户体验事故. 加了映射层之后, 挂失一定走挂失话术.</p>
+<h4 id="3.5.5.3-兜底话术内容-(为什么是这些文案)">3.5.5.3 兜底话术内容 (为什么是这些文案)</h4>
+<pre><code class="language-python"># router.py:95-101
+_FAST_REPLIES = {
+    &quot;lost_card&quot;:   &quot;挂失为紧急业务，正在为您优先处理，请稍候。如超过 10 秒未回复，请直接输入'转人工'。&quot;,
+    &quot;complaint&quot;:   &quot;您的投诉已记录，正在转接人工处理。&quot;,
+    &quot;bill_query&quot;:  &quot;当前咨询量较大，账单查询结果稍后返回，也可输入'转人工'联系客服。&quot;,
+    &quot;limit_query&quot;: &quot;您的问题正在处理中，预计 30 秒内回复。&quot;,
+    &quot;default&quot;:     &quot;当前咨询量较大，请稍候或输入'转人工'。&quot;,
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>话术设计要点</th>
+<th>业务解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>明确告知"在处理中"</strong></td>
+<td>客户最怕"消息发出去没人理", 必须给确定性</td>
+</tr>
+<tr>
+<td><strong>给出明确等待时长</strong></td>
+<td>"10 秒 / 30 秒" 比 "稍候" 更可信 (时间感)</td>
+</tr>
+<tr>
+<td><strong>挂失提示"超过 X 秒请转人工"</strong></td>
+<td>兜底不是真办挂失, 必须给客户逃生通道 (转人工走另一条路径, 不再卡模板)</td>
+</tr>
+<tr>
+<td><strong>每句都带"转人工"</strong></td>
+<td>兜底本质是降级, 任何兜底客户都应该能立即跳到人工, 不让客户被模板话术困住</td>
+</tr>
+</tbody>
+</table>
+<h4 id="3.5.5.4-冷却期机制-(为什么-5s-内不再二次兜底)">3.5.5.4 冷却期机制 (为什么 5s 内不再二次兜底)</h4>
+<p><strong>问题</strong>: 兜底话术是"延迟响应", 真回答会在 Semaphore 有空时补上. 但补的过程里客户可能又发一条 ("在吗?") , 触发第二次兜底, 然后又补, 又触发 — 客户可能连续收到 3 条模板话术, 体验极差.</p>
+<p><strong>解法</strong>: 走完一次快速兜底后, 在 Redis 写一个时间戳 <code>lumio:fast_reply:{session_id}</code> (TTL 60s, 实际只用 5s):</p>
+<pre><code class="language-python"># router.py:472
+await redis_client.set(f&quot;lumio:fast_reply:{session_id}&quot;, str(time.time()), ex=60)
+</code></pre>
+<p>5 秒内 (可配 <code>fast_reply_cooldown</code>) 同会话再进来 → <code>cooldown_ok = False</code> → <strong>不走兜底, 改为正常排队等 Agent</strong>. 代价是这 5 秒内客户可能慢一点 (排队而不是秒回模板), 但保证不会被模板话术连击.</p>
+<h4 id="3.5.5.5-兜底的完整数据流">3.5.5.5 兜底的完整数据流</h4>
+<pre><code>客户: &quot;我的卡丢了&quot;
+  ↓
+Worker → _process_message → 检查 Semaphore 满荷? 是
+  ↓
+cooldown_ok? 是 (5s 内没走过)
+  ↓
+_quick_intent_match(&quot;我的卡丢了&quot;) → RuleLoader.match → intent=&quot;card&quot;
+  ↓
+_DOMAIN_TO_FAST_KEY[&quot;card&quot;] → &quot;lost_card&quot;
+  ↓
+_FAST_REPLIES[&quot;lost_card&quot;] → &quot;挂失为紧急业务，正在为您优先处理...&quot;
+  ↓
+_finish_message(..., source=&quot;fast_reply&quot;)
+  ├─ 写 lumio:response:{sid} (TTL 120s, 客户轮询拉走)
+  ├─ PUBLISH lumio:notify:{sid} (长轮询立即返回)
+  └─ XACK 标记消费完成
+  ↓
+redis SET lumio:fast_reply:{sid} = now, ex=60  (冷却开始)
+  ↓
+指标 BOT_FAST_REPLY.inc()
+  ↓
+return (Worker 继续取下一条消息)
+
+─────────────────────────────────
+后台: Semaphore 有空 → 标准 Agent 路径处理 → 真正调 LLM → 真回答写入历史
+(客户可能再发消息, 但因 5s 冷却, 走正常排队而不是二次兜底)
+</code></pre>
+<h4 id="3.5.5.6-兜底不是真办业务-—-跟&quot;真调-LLM&quot;的边界">3.5.5.6 兜底不是真办业务 — 跟"真调 LLM"的边界</h4>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>快速兜底 (本节)</th>
+<th>标准 Agent 路径 (3.6)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>耗时</strong></td>
+<td>&lt;5ms (regex + dict.get)</td>
+<td>1~5s (LLM 调用 + 可能检索)</td>
+</tr>
+<tr>
+<td><strong>走的工具</strong></td>
+<td>无</td>
+<td>RAG / MCP 工具 / pending_action</td>
+</tr>
+<tr>
+<td><strong>写不写历史</strong></td>
+<td>写 <code>chat_messages</code> 表 (source=fast_reply)</td>
+<td>写 <code>chat_messages</code> 表 (source=knowledge/tool/business)</td>
+</tr>
+<tr>
+<td><strong>能不能触发转人工</strong></td>
+<td>兜底话术只建议"转人工", 不真转</td>
+<td>视意图和规则, 满足条件就走 <code>should_transfer</code></td>
+</tr>
+<tr>
+<td><strong>是不是终态</strong></td>
+<td><strong>不是</strong> — 真回答会在后续补上</td>
+<td>是 — 终态回复</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键设计哲学</strong>: 快速兜底是<strong>对客户的"接了"承诺</strong> (HTTP 200 + 立即看到话术), 不是<strong>对业务的"办了"承诺</strong> (没调工具、没查知识、没改数据库). 真业务由后续标准路径补办. 客户视角: 体验上<strong>永远立刻有回应</strong>; 系统视角: 实际工作量在 Semaphore 释放后再批量消化, 不会因为流量尖刺把后端打穿.</p>
 <h2 id="3.6-LumioAgent-6-步决策树">3.6 <code>LumioAgent</code> 6 步决策树</h2>
 <p><strong>业务背景</strong>: 消息到了 Worker, 现在要"真正思考"了. 但"思考"不等于"什么都交给大模型" — 银行场景里, 有些话不能乱说 (挂失要转人工), 有些事不能乱做 (调额要确认), 有些问题不能乱答 (知识要查库). 所以 <code>LumioAgent</code> 是一个<strong>规则优先的决策器</strong>: 能用规则判断的绝不让模型自由发挥, 模型只负责"分类"和"生成"两件最需要它的事.</p>
 <p><strong>用一个真实对话走一遍 6 步</strong>: 客户说"我想把额度提到 8 万".</p>
