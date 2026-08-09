@@ -8023,13 +8023,248 @@ system: 参考知识: ... (RAG 文档)
 <td>SessionState.version</td>
 <td>CAS 写次数, 间接反映写频</td>
 </tr>
+<tr>
+<td><code>lumio_kv_cache_hit_rate</code></td>
+<td><code>KV_CACHE_HIT_RATE</code> (kv_cache.py 估算)</td>
+<td><strong>估算值</strong>, 稳态/半稳态/动态的命中比例</td>
+</tr>
+<tr>
+<td><code>lumio_prefill_tokens_saved</code></td>
+<td><code>PREFILL_TOKENS_SAVED</code> (kv_cache.py 估算)</td>
+<td><strong>估算值</strong>, 本轮比全部重算节省的 prefill token</td>
+</tr>
 </tbody>
 </table>
 <p><strong>典型问题诊断</strong>:
 - 客户说"我前面说过了" 抱怨多 → 检查 <code>summary_size_chars</code> 是否过小, 摘要可能截断过早
 - LLM 响应慢 (1.5s+) → 检查 <code>prompt_tokens</code> 是否超 4K, 触发了"超长上下文" LLM 慢分支
 - 客户画像不准 → 检查 <code>last_summarized_turn_id</code> 是否正确推进, 增量摘要是否卡住</p>
-<h2 id="15.11-延伸阅读">15.11 延伸阅读</h2>
+<h2 id="15.11-KV-Cache-命中率优化:-kv_cache.py">15.11 KV Cache 命中率优化: <code>kv_cache.py</code></h2>
+<blockquote>
+<p>重要区分: 本节讲的"3 层"是 <strong>KV Cache 视角的稳态/半稳态/动态层</strong> (控制推理引擎 prefix cache 命中), 不是 15.1 讲的"3 层上下文" (L1 结构化记忆 / L2 历史 / L3 RAG). 两套分层各自独立, 但最终在 <code>build_layered_messages</code> 里合流.</p>
+</blockquote>
+<h3 id="15.11.1-业务背景:-为什么-TTFT-是生死线">15.11.1 业务背景: 为什么 TTFT 是生死线</h3>
+<p><strong>核心问题</strong>: 银行客服每一轮都要重算整个 system prompt + 历史. 7B 模型 ~25ms/100 token, 一个 2KB system prompt 就要 500ms prefill. 客户连发 20 条消息 = 20 次重算 = 10 秒纯等 prefill — 体感"AI 在发呆".</p>
+<p><strong>推理引擎的解药 — prefix cache</strong>: vLLM (PagedAttention) / Anthropic (prompt cache) / Ollama (部分支持) 都允许<strong>字符串前缀完全一致</strong>时直接复用 K/V tensor, 跳过 prefill. 命中时单轮 prefill 从 500ms 降到 ~75ms. <strong>但前提是前缀字符串字面完全一致</strong> — 任何变化 (时间戳/session_id/拼出来的多行) 都让 cache 失效.</p>
+<p><strong>原实现的致命缺陷</strong>: <code>bot_agent</code> 用 f-string 拼 system_prompt (<code>f"对话摘要: {summary}\n客户画像: {profile}\n..."</code>) , 每次字符串都不同 → 命中率 0%. 整个推理引擎的 cache 机制被浪费.</p>
+<p><code>kv_cache.py</code> 的目标: <strong>把 prompt 拆成"稳定 + 半稳定 + 动态"3 块</strong>, 让稳态部分永远字符串一致, 推理引擎可 100% 命中.</p>
+<h3 id="15.11.2-3-层机制:-稳态-/-半稳态-/-动态">15.11.2 3 层机制: 稳态 / 半稳态 / 动态</h3>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>字符串稳定性</th>
+<th>KV cache 命中</th>
+<th>内容</th>
+<th>标志串</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>L1 静态前缀</strong></td>
+<td>跨 session 永不变化</td>
+<td>~100%</td>
+<td>角色定义 / 合规规则 / 工具描述 / 输出格式</td>
+<td><code>[STATIC_PREFIX_v1]</code></td>
+</tr>
+<tr>
+<td><strong>L1.5 半稳态 (few-shot)</strong></td>
+<td>同意图内稳定</td>
+<td>按意图分组命中</td>
+<td>3 条参考案例 (按 primary_intent 分桶)</td>
+<td>(无独立标志, 走 cache_control)</td>
+</tr>
+<tr>
+<td><strong>L2 半稳态 (客户画像)</strong></td>
+<td>同 customer 跨 session 稳定</td>
+<td>~60%</td>
+<td>customer_context (卡种/VIP 等级)</td>
+<td><code>[CUSTOMER_CONTEXT_v1]</code></td>
+</tr>
+<tr>
+<td><strong>L3 动态</strong></td>
+<td>每轮必变</td>
+<td>0%</td>
+<td>会话记忆 / 槽位 / 对话历史 / RAG 检索 / 用户输入</td>
+<td>(无标志)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>两个标志串的工程意义</strong>: <code>STATIC_PREFIX_MARKER</code> 和 <code>SEMI_STATIC_MARKER</code> 是模块顶部常量 (<code>kv_cache.py:42/45</code>), 一是<strong>作为前缀锚点</strong>让推理引擎识别"这里开始是 cache 区", 二是<strong>作为 metrics 估算的分隔符</strong> (<code>estimate_cache_metrics</code> 扫 marker 决定哪段算哪层).</p>
+<p><strong><code>cache_control: {"type": "ephemeral"}</code> 字段</strong>: Anthropic 风格的 API 标记, vLLM/Anthropic 识别后会缓存此 message 之前所有 prefix 的 K/V; OpenAI 兼容 API 会忽略此字段, 不报错也不生效 (优雅降级). 这是协议层的"软依赖" — 不绑定具体推理引擎.</p>
+<h3 id="15.11.3-消息构建器-build_layered_messages-(kv_cache.py:99)">15.11.3 消息构建器 <code>build_layered_messages</code> (<code>kv_cache.py:99</code>)</h3>
+<p><code>bot_agent.py:347-358</code> 在每次 LLM 调用前调用, 返回 messages 数组 (按顺序):</p>
+<pre><code class="language-python"># bot_agent.py:347-358
+messages = build_layered_messages(
+    domain_prompt=KNOWLEDGE_SYSTEM_PROMPT,    # L1 锚定
+    user_input=user_input,                     # L3 动态
+    customer_context=session_memory,           # L2 半稳态
+    session_memory=&quot;&quot;,                         # 已合并到 customer_context
+    slot_prompt=slot_prompt or &quot;&quot;,             # L3 动态
+    rag_context=context or &quot;&quot;,                 # L3 动态 (放 user role 而非 system)
+    history=history,                           # L3 动态
+    few_shot_examples=few_shot_text,           # L1.5 半稳态
+)
+</code></pre>
+<p><strong>返回结构</strong> (<code>kv_cache.py:111-117</code>):</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>role</th>
+<th>内容</th>
+<th>缓存层</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>system</td>
+<td><code>[STATIC_PREFIX_v1] + domain_prompt</code> (含 <code>cache_control</code>)</td>
+<td>L1 稳态, 100% 命中</td>
+</tr>
+<tr>
+<td>2</td>
+<td>system</td>
+<td><code>## 参考案例 + few_shot</code> (含 <code>cache_control</code>)</td>
+<td>L1.5 半稳态</td>
+</tr>
+<tr>
+<td>3</td>
+<td>system</td>
+<td><code>[CUSTOMER_CONTEXT_v1] + customer_context</code> (含 <code>cache_control</code>)</td>
+<td>L2 半稳态</td>
+</tr>
+<tr>
+<td>4</td>
+<td>system</td>
+<td><code>## 会话记忆 + ## 槽位追踪</code> 动态拼</td>
+<td>L3 动态, 0% 命中</td>
+</tr>
+<tr>
+<td>5</td>
+<td>user/assistant (多条)</td>
+<td>对话历史</td>
+<td>L3 动态, 0% 命中</td>
+</tr>
+<tr>
+<td>6</td>
+<td>user</td>
+<td><code>&lt;retrieved_context&gt;...&lt;/retrieved_context&gt; + user_input</code></td>
+<td>L3 动态, 0% 命中</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键设计 — RAG 内容放 user 而非 system role</strong>: 第 6 步的 RAG 检索结果用 <code>&lt;retrieved_context&gt;...&lt;/retrieved_context&gt;</code> 包起来当 user message, 不放进 system prompt. 两个原因: ① 物理隔离防 prompt injection (客户在 user input 里塞恶意指令影响不了 system 层); ② 动态部分集中在尾部, prefix 越靠前越稳定, 推理引擎能更激进地 cache.</p>
+<h3 id="15.11.4-性能估算-(按-7B-模型-/-2KB-system_prompt-/-20-轮对话)">15.11.4 性能估算 (按 7B 模型 / 2KB system_prompt / 20 轮对话)</h3>
+<p>来源: <code>kv_cache.py</code> 模块 docstring 顶部声明的预期值, 由 <code>estimate_cache_metrics</code> 函数实际计算并上报.</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>优化前 (f-string 拼接)</th>
+<th>优化后 (分层)</th>
+<th>节省</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>稳态层 prefill</td>
+<td>20 轮 × 2KB = 40KB</td>
+<td>1 轮 (后续全 cache)</td>
+<td>~95%</td>
+</tr>
+<tr>
+<td>半稳态层 prefill</td>
+<td>(原 f-string 一并算了)</td>
+<td>同 customer 跨 session 1 次</td>
+<td>~60%</td>
+</tr>
+<tr>
+<td>动态层 prefill</td>
+<td>20 轮 × 1KB = 20KB</td>
+<td>20 轮 × 1KB = 20KB (必算)</td>
+<td>0%</td>
+</tr>
+<tr>
+<td><strong>单轮 TTFT</strong></td>
+<td><strong>~500ms</strong></td>
+<td><strong>~75ms</strong> (稳态全命中时)</td>
+<td><strong>~85%</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>为什么是估算不是实测</strong>: 真实 KV cache 命中率由推理引擎 (vLLM <code>prompt_cache_stats</code> / Ollama 内部计数器) 上报, 应用层拿不到精确值. <code>estimate_cache_metrics</code> (P1-4 修复后) <strong>只用于 metrics 上报, 明确标 <code>estimated</code></strong>, 旧实现把假设值当真实值上报, 误导监控 — 现已修正 (<code>kv_cache.py:208-213</code> 注释 + P1-4 上下文工程修复).</p>
+<h3 id="15.11.5-启用/降级开关-(config.py:117-119)">15.11.5 启用/降级开关 (<code>config.py:117-119</code>)</h3>
+<pre><code class="language-python"># LLMSettings (config.py:115-121)
+kv_cache_enabled: bool = True         # 总开关, 关闭时退化到 _legacy_build_messages
+static_prefix_anchor: bool = True    # L1 静态前缀锚定
+layered_injection: bool = True       # L2 半稳态层注入
+inference_engine: str = &quot;ollama&quot;     # ollama (0% prefix cache) / vllm (PagedAttention) / tgi
+</code></pre>
+<p><strong>降级路径</strong> (<code>kv_cache.py:131-133</code>):</p>
+<pre><code class="language-python">if not kv.kv_cache_enabled:
+    # 未启用 KV cache 优化, 退化到原行为
+    return _legacy_build_messages(domain_prompt, user_input, customer_context + session_memory, history)
+</code></pre>
+<p><code>_legacy_build_messages</code> (<code>kv_cache.py:180-194</code>) 是 f-string 拼 system prompt 的原版, 保留向后兼容. <strong>关掉 KV cache 不影响功能, 只是 TTFT 回到 500ms</strong> — 适合推理引擎未知/不支持的灰度环境.</p>
+<p><strong>推理引擎差异</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>引擎</th>
+<th>prefix cache 支持</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>vLLM</strong> (PagedAttention)</td>
+<td>✅ 完整支持</td>
+<td>通过字符串前缀 hash 自动复用 K/V block</td>
+</tr>
+<tr>
+<td><strong>Anthropic</strong> (prompt cache)</td>
+<td>✅ 支持, 需 <code>cache_control: ephemeral</code></td>
+<td>5min TTL, 命中后单轮 prefill 接近 0</td>
+</tr>
+<tr>
+<td><strong>Ollama</strong></td>
+<td>⚠️ 部分支持, 命中率不稳定</td>
+<td>0% prefix cache 时 (旧版本) 完全无效, 启用后才有收益</td>
+</tr>
+<tr>
+<td><strong>TGI</strong></td>
+<td>✅ 支持 (新版本)</td>
+<td>与 vLLM 类似</td>
+</tr>
+</tbody>
+</table>
+<h3 id="15.11.6-与本章其他节的协作">15.11.6 与本章其他节的协作</h3>
+<table>
+<thead>
+<tr>
+<th>相关机制</th>
+<th>协作方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>15.1-15.4 (3 层上下文)</strong></td>
+<td><code>_build_session_memory</code> / <code>_load_history</code> / <code>_ensure_summary</code> 算出的结果, 作为 <code>customer_context</code> / <code>session_memory</code> / <code>history</code> 参数传入 <code>build_layered_messages</code></td>
+</tr>
+<tr>
+<td><strong>第 5 章 RAG 检索</strong></td>
+<td>RAG 检索结果作为 <code>rag_context</code> 参数, 走 user role 物理隔离 (防注入)</td>
+</tr>
+<tr>
+<td><strong>15.10 监控</strong></td>
+<td><code>KV_CACHE_HIT_RATE</code> / <code>PREFILL_TOKENS_SAVED</code> 指标由 <code>estimate_cache_metrics</code> 上报, 但需明确是估算值</td>
+</tr>
+</tbody>
+</table>
+<p><strong>为什么不能完全替代 15.1 的 3 层</strong>: KV cache 优化解决"如何让 prompt 字符串字面稳定", 15.1 的 3 层上下文解决"什么内容值得送给 LLM". 两者正交 — KV cache 命中再高, 内容选错也是白搭; 内容选对但字符串总变, TTFT 一样 500ms.</p>
+<h2 id="15.12-延伸阅读">15.12 延伸阅读</h2>
 <ul>
 <li><strong>第 3 章 Bot 自助问答</strong>: 全链路时序 + 6 步决策树, 上下文工程是其中的"上下文拼装"环节</li>
 <li><strong>第 5 章 RAG 检索全链路</strong>: Layer 3 的 RAG 部分详细解析 (4 路径降级 + RRF 融合)</li>
