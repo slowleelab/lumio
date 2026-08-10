@@ -7407,10 +7407,75 @@ disallow_untyped_defs = false
 <h1 class="chapter-title">15 上下文工程</h1>
 <h1 id="第-15-章:-上下文工程-—-3-层上下文-+-token-预算-+-增量摘要">第 15 章: 上下文工程 — 3 层上下文 + token 预算 + 增量摘要</h1>
 <blockquote>
-<p>本章深入 Lumio Bot 区别于一般 LLM 应用的<strong>最关键设计</strong> — 上下文工程. 银行客服场景下, 客户对话常跨数十轮, 含敏感信息 (卡号/金额/挂失) 与关键承诺 (投诉/转人工), 简单地把全部历史塞进 LLM 会撞 token 上限且丢失关键实体. Lumio 设计了 <strong>3 层上下文架构</strong> + <strong>token 预算 LIFO 累加算法</strong> + <strong>19 关键词豁免</strong> + <strong>增量摘要 fire-and-forget</strong>, 既保证 LLM 总在预算内, 又保证关键信息永不丢失. 看完本章你会理解: 为何 Bot 能"记住"30 轮前客户说"我是白金卡"但又不会因为历史太长爆 token, 为何对话中途能"接着说"而不需要客户重复, 为何摘要生成失败也不会让对话中断.</p>
+<p>银行客服对话常跨 30 轮, 一轮 50-100 字, 累加 3000+ 字 ≈ 1500+ tokens. 而 LLM 上下文窗口 (默认 8K) 还要留给 system prompt (500) + RAG 检索 (1200) + 回答 (1024) — 留给历史的只剩 ~1500 tokens. <strong>Lumio 设计 3 层上下文 + LIFO 预算 + 增量摘要 + KV cache 分层, 在严格 token 预算内既保留关键信息不丢, 又把单轮 TTFT 从 500ms 降到 75ms.</strong> 看完本章你会理解: 为何 Bot 能"记住"30 轮前客户说"我是白金卡"但又不会爆 token, 为何对话中途能"接着说"而不需要客户重复, 为何摘要生成失败也不会让对话中断.</p>
 </blockquote>
-<h2 id="15.1-3-层上下文模型">15.1 3 层上下文模型</h2>
-<p>Lumio Bot 每次 LLM 调用前, 在 <code>bot_agent._handle_*</code> (bot_agent.py:201-339) 中拼装 3 层上下文, 按<strong>作用范围 + 重要度</strong>分层注入:</p>
+<h2 id="15.1-30-秒概览-—-主线图">15.1 30 秒概览 — 主线图</h2>
+<p><strong>每一次 LLM 调用前, 系统在拼什么</strong>:</p>
+<pre><code class="language-mermaid">flowchart TB
+    User([客户说 user_input]) --&gt; Build[bot_agent._handle_*&lt;br/&gt;3 层上下文拼装]
+
+    subgraph L1[&quot;Layer 1: 结构化会话记忆 (永不裁剪)&quot;]
+        L1Sum[对话摘要]
+        L1Profile[客户画像: VIP/卡种/风险]
+        L1Entity[实体池: 卡号/金额/日期]
+        L1Intent[意图历史 + 当前意图]
+    end
+
+    subgraph L2[&quot;Layer 2: 近期历史 (token 预算 1500)&quot;]
+        L2Get[get_history limit=20]
+        L2Cmp{超预算?}
+        L2LIFO[LIFO 累加&lt;br/&gt;关键轮次豁免]
+        L2Out[user/assistant messages 数组]
+    end
+
+    subgraph L3[&quot;Layer 3: RAG 检索 (自带截断)&quot;]
+        L3Rag[BM25 + 向量 RRF]
+        L3Kg[知识图谱增强]
+    end
+
+    Build --&gt; L1
+    Build --&gt; L2
+    Build --&gt; L3
+
+    L1 --&gt; KV[&quot;build_layered_messages&lt;br/&gt;分 6 段送 LLM&quot;]
+    L2 --&gt; KV
+    L3 --&gt; KV
+
+    KV --&gt; KV1[&quot;[1] L1 静态前缀 (稳态, 100% 命中)&quot;]
+    KV --&gt; KV2[&quot;[2] L1.5 few-shot (半稳态, 同意图命中)&quot;]
+    KV --&gt; KV3[&quot;[3] L2 客户画像 (半稳态, 同 customer)&quot;]
+    KV --&gt; KV4[&quot;[4] L3 动态 system (会话记忆 + 槽位)&quot;]
+    KV --&gt; KV5[&quot;[5] L3 对话历史&quot;]
+    KV --&gt; KV6[&quot;[6] L3 RAG + 用户 (user role 物理隔离)&quot;]
+
+    KV1 --&gt; LLM[LLM 调用]
+    KV2 --&gt; LLM
+    KV3 --&gt; LLM
+    KV4 --&gt; LLM
+    KV5 --&gt; LLM
+    KV6 --&gt; LLM
+
+    LLM --&gt; Resp([Bot 答复])
+
+    style L1 fill:#d4f4dd
+    style L2 fill:#fff4e1
+    style L3 fill:#e1efff
+    style KV1 fill:#d4f4dd
+    style KV2 fill:#d4f4dd
+    style KV3 fill:#d4f4dd
+    style KV4 fill:#ffe1e1
+    style KV5 fill:#ffe1e1
+    style KV6 fill:#ffe1e1
+</code></pre>
+<p><strong>3 个关键设计</strong> (后续 7 节逐步展开):</p>
+<ol>
+<li><strong>3 层上下文</strong>: 结构化记忆 (永不裁) / 近期历史 (LIFO 预算) / RAG 检索 (自带截断)</li>
+<li><strong>增量摘要</strong>: 被裁掉的历史不直接丢, LLM 生成摘要写回 Layer 1, 下轮复用</li>
+<li><strong>KV cache 分层</strong>: 6 段 messages 中, 前 3 段 (稳态/半稳态) 跨 session 共享, 推理引擎 prefix cache 命中率高</li>
+</ol>
+<hr />
+<h2 id="15.2-3-层上下文模型">15.2 3 层上下文模型</h2>
+<p>每一次 LLM 调用前, <code>_handle_knowledge / _handle_biz / _handle_fallback</code> 入口处都会调用 3 个独立的拼装函数, 按作用范围 + 重要度分层注入:</p>
 <table>
 <thead>
 <tr>
@@ -7425,34 +7490,38 @@ disallow_untyped_defs = false
 <tr>
 <td><strong>Layer 1: 结构化会话记忆</strong></td>
 <td><code>system_prompt</code> 头部</td>
-<td>对话摘要/客户画像/已知实体/意图历史/当前意图</td>
+<td>对话摘要 / 客户画像 / 已知实体 / 意图历史 / 当前意图</td>
 <td><strong>永不裁剪</strong></td>
 <td>异常 → 返回空字符串</td>
 </tr>
 <tr>
 <td><strong>Layer 2: 近期对话历史</strong></td>
-<td><code>messages</code> 数组 (user/assistant 角色)</td>
+<td><code>messages</code> 数组 (user/assistant)</td>
 <td>近 20 轮 turn</td>
 <td><strong>token 预算 LIFO 累加</strong></td>
 <td>异常 → 返回空列表</td>
 </tr>
 <tr>
 <td><strong>Layer 3: RAG 检索上下文</strong></td>
-<td><code>messages</code> 数组 (system 角色)</td>
+<td><code>messages</code> 数组 (user role)</td>
 <td>BM25+向量 RRF 融合的文档块 + 知识图谱增强</td>
 <td>N/A (RAG 自带截断)</td>
-<td>失败 → context=""</td>
+<td>失败 → <code>context=""</code></td>
 </tr>
 </tbody>
 </table>
-<p><strong>核心约束</strong>:
-- Layer 1 永远在 <code>system_prompt</code> 头部注入, 永不进入 token 预算计算. 哪怕历史全被裁掉, 客户画像 + 实体池 + 意图栈仍可见.
-- Layer 2 token 预算 = <code>max(MaxContext - Reserved, 1024)</code>, 默认 <code>8192 - 1024 = 7168</code> 可用, 历史层预算 <code>budget_history=1500</code>, 但最低 1024 (避免极小模型失效).
-- Layer 3 由调用方传入, RAG 检索本身已截断到 <code>top_k</code> (默认 5-8 块), 不参与裁剪.</p>
-<p><strong>为什么不只让 LLM "全部读"</strong>: 银行客户对话常 30+ 轮, 一轮 50-100 字, 累加可达 3000+ 字 ≈ 1500+ tokens. 而 LLM 上下文 (8192 tokens) 还要留给回答 (1024) + system_prompt (500) + RAG 上下文 (1000). 实际留给历史的预算只有 ~500 tokens ≈ 2-3 轮 — <strong>显然不够</strong>. 必须做主动上下文管理.</p>
-<h2 id="15.2-Layer-1-—-_build_session_memory-5-段拼接">15.2 Layer 1 — <code>_build_session_memory</code> 5 段拼接</h2>
-<p><code>bot_agent.py:725-779</code> 在每次 <code>_handle_knowledge/biz/fallback</code> 开头调用, 永不抛出:</p>
-<pre><code class="language-python"># bot_agent.py:725
+<p><strong>核心约束</strong> (3 条, 缺一不可):</p>
+<ul>
+<li><strong>Layer 1 永远在 system 头部</strong>: 哪怕历史全被裁掉, 客户画像 + 实体池 + 意图栈仍可见, LLM 不会重问</li>
+<li><strong>Layer 2 预算 = <code>max(budget_history, 1024)</code> = 1500</strong>: 不再是 <code>max_context − reserved</code> (旧值 7168, 占上下文 87%, 违反主流分配框架 system 10-15% / history 25-30% / retrieval 25-30% / output 20-25%)</li>
+<li><strong>Layer 3 由 RAG 自带截断</strong>: 调用方传入, RAG 已截到 <code>top_k=5-8</code> 块, 不参与裁剪</li>
+</ul>
+<p><strong>为什么不是『全部读』</strong>: 30 轮对话 3000 字 ≈ 1500 tokens. 加上 system (500) + RAG (1200) + 回答 (1024), 实际留给历史的只有 ~1500 tokens ≈ 8-10 轮. <strong>必须主动管理</strong>, 否则 LLM 收到超长 prompt 走慢分支, 客户感受卡顿.</p>
+<p><strong>为什么用 3 层而不是 1 层统一管理</strong>: 结构化记忆 (JSON 风格) 与对话历史 (自然语言) 是两种信息密度, 合并管理会让 LLM 难以分别处理. 3 层分离让每一层用最合适的注入位置 (system vs messages) 和最合适的裁剪策略 (永不裁 vs LIFO vs 自带截断).</p>
+<hr />
+<h2 id="15.3-Layer-1-—-结构化会话记忆">15.3 Layer 1 — 结构化会话记忆</h2>
+<p><code>bot_agent.py:1185-1300</code> 实现 <code>_build_session_memory</code>, 在每次 <code>_handle_*</code> 开头调用, <strong>永不抛出</strong> (任何异常都返回空字符串):</p>
+<pre><code class="language-python"># bot_agent.py:1185
 async def _build_session_memory(self, session_id: str) -&gt; str:
     try:
         state = await self._session_manager.get_session(session_id)
@@ -7460,7 +7529,7 @@ async def _build_session_memory(self, session_id: str) -&gt; str:
             return &quot;&quot;
 
         parts: list[str] = []
-        # 1. 对话摘要 (被裁剪轮次的脉络, 最高优先级)
+        # 1. 对话摘要
         if state.conversation_summary:
             parts.append(f&quot;[对话摘要]\n{state.conversation_summary}&quot;)
         # 2. 客户画像
@@ -7487,52 +7556,101 @@ async def _build_session_memory(self, session_id: str) -&gt; str:
 
         return &quot;\n&quot;.join(parts)
     except Exception:
-        return &quot;&quot;  # bot_agent.py:779, 任何异常都静默降级为空字符串
+        return &quot;&quot;  # bot_agent.py:1300, 任何异常都静默降级为空字符串
 </code></pre>
-<p><strong>为什么是这个拼接顺序</strong>: 五段不是按代码里出现的顺序随手排的, 而是按<strong>一旦 token 被截断, 哪一段丢失对 LLM 决策伤害最大</strong>来倒推的——重要度越高越靠前, 因为靠前的内容在 LLM 注意力的"近因"区域 (模型对 prompt 头部的关注度高于尾部), 越靠前越不容易被淹没. 逐段解释:</p>
+<h3 id="15.3.1-拼接顺序的-why">15.3.1 拼接顺序的 why</h3>
+<p>5 段不是按代码出现顺序随手排的, 而是<strong>按一旦 token 被截断哪段丢失对 LLM 决策伤害最大倒推</strong> — 重要度越高越靠前. LLM 对 prompt 头部内容的关注度高于尾部, 靠前的内容不容易被淹没:</p>
+<table>
+<thead>
+<tr>
+<th>顺序</th>
+<th>段</th>
+<th>丢失的影响</th>
+<th>重要度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>对话摘要</td>
+<td>客户前 20 轮谈了什么、承诺了什么, LLM 完全失忆</td>
+<td>⭐⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>2</td>
+<td>客户画像</td>
+<td>白金卡 / VIP 客户能听"提升额度到 8 万", 普通卡听到就是空头支票</td>
+<td>⭐⭐⭐⭐</td>
+</tr>
+<tr>
+<td>3</td>
+<td>实体池</td>
+<td>卡号/金额/日期一旦丢, LLM 下一轮还得让客户重说</td>
+<td>⭐⭐⭐</td>
+</tr>
+<tr>
+<td>4</td>
+<td>意图历史</td>
+<td>话题切换轨迹, 丢了 LLM 顶多以为"前后聊两件不相关的事"</td>
+<td>⭐⭐</td>
+</tr>
+<tr>
+<td>5</td>
+<td>当前意图</td>
+<td>业务侧已经把当前意图传到下游路由, 这段更像"提示"</td>
+<td>⭐</td>
+</tr>
+</tbody>
+</table>
+<h3 id="15.3.2-默认值不写入的-why">15.3.2 默认值不写入的 why</h3>
 <ul>
-<li><strong>第一段是对话摘要</strong>: 摘要丢失等于整个对话脉络归零——客户前 20 轮谈了什么、承诺了什么、抱怨了什么, LLM 完全失忆. 哪怕只剩一段, 也必须是它.</li>
-<li><strong>第二段是客户画像</strong>: 卡种和会员等级决定<strong>回答的语气和能给的方案</strong>——白金卡 / VIP 客户能听"提升额度到 8 万", 普通卡客户听到就是空头支票. 画像丢了对 VIP 客户的体验立刻崩.</li>
-<li><strong>第三段是实体池</strong>: 已经抽出来的卡号、金额、日期是<strong>事实数据</strong>——一旦丢掉, LLM 下一轮还得让客户重说一遍, 体验极差. 但实体本身可以在对话历史里重现 (15.3 的 LIFO 累加兜底), 所以排在画像后面.</li>
-<li><strong>第四段是意图历史</strong>: 客户从"问年费"切到"办挂失"的轨迹, 给 LLM 看的目的是<strong>理解话题切换的合理性</strong>. 这一段丢了, LLM 顶多以为客户在"前后聊两件不相关的事", 影响有限.</li>
-<li><strong>第五段是当前意图</strong>: 当前轮的意图分类结果, 在 LLM 收到这条 prompt 的同时, <strong>业务侧其实已经把当前意图传到了下游路由</strong> (第 3 章 LumioAgent 6 步已经分派完意图), 这段更像是给 LLM 的"提示", 不是关键决策依据. 排在最后, 截断就截断, 不致命.</li>
+<li><code>vip_level != "普通"</code>: 普通是默认值, 写进 prompt LLM 要花算力去理解这个中性词, 属于噪声</li>
+<li><code>risk_tolerance != "R2"</code>: R2 在产品定义里就是中位档, 写出来等同于没写. 只有 R1 (保守) 或 R3 (激进) 偏离默认才需要让 LLM 注意</li>
+<li>实体池<strong>全量写入</strong>: 实体一旦抽出来就是事实, 过滤反而丢真值</li>
 </ul>
-<p><strong>为什么默认值不写入</strong>:
-- <code>vip_level != "普通"</code>: 普通就是默认值, 把"客户是普通会员"写进 prompt, LLM 反而要花算力去理解这个中性词, 属于噪声.
-- <code>risk_tolerance != "R2"</code>: R2 在产品定义里就是中位档, 写出来等同于没写. 只有 R1 (保守) 或 R3 (激进) 这类偏离默认的才需要让 LLM 注意.
-- 实体池是<strong>全量写入</strong>: 实体一旦抽出来, 就是事实, 过滤反而会丢真值.</p>
-<p><strong>互补设计</strong>: 第一层注入的是<strong>结构化记忆</strong> (用中括号标签 + 等号串的 JSON 风格), 不含自然语言冗余, 500 tokens 内可表达 100+ 实体. 跟第二层 (自然语言对话历史) 形成"结构化 + 非结构化"互补——结构化层告诉 LLM 客户"是什么状态", 非结构化层告诉 LLM 客户"具体怎么说的".</p>
-<h2 id="15.3-Layer-2-—-_load_history-token-预算算法">15.3 Layer 2 — <code>_load_history</code> token 预算算法</h2>
-<p><code>bot_agent.py:687-770</code> 实现银行客服核心的 token 预算裁剪. 这是 Lumio 的"上下文管理心脏":</p>
-<pre><code class="language-python"># bot_agent.py (第五轮修复后)
+<h3 id="15.3.3-互补设计">15.3.3 互补设计</h3>
+<p>Layer 1 用中括号标签 + 等号串的 JSON 风格, 不含自然语言冗余 — 500 tokens 可表达 100+ 实体. 跟 Layer 2 (自然语言对话历史) 形成<strong>"结构化 + 非结构化"互补</strong>: 结构化层告诉 LLM 客户"是什么状态", 非结构化层告诉 LLM 客户"具体怎么说的".</p>
+<h3 id="15.3.4-为何-Layer-1-注入-system-而非-messages">15.3.4 为何 Layer 1 注入 system 而非 messages</h3>
+<p>Layer 1 走 <code>system_prompt</code> 注入, Layer 2/3 走 <code>messages=</code> 形参. 这种设计:</p>
+<ul>
+<li><strong>system_prompt 干净</strong>: 不会被历史污染, 每次回答 system 部分稳定 → LLM 行为更可预测</li>
+<li><strong>分层消息直传 LLM</strong>: <code>build_layered_messages</code> 构建的 6 段结构 (<code>bot_agent.py:347-358</code>) 原样送达, 不再压平拼接 — 前缀缓存锚点真实生效</li>
+<li><strong>RAG 物理隔离</strong>: 检索内容以 user message 的 <code>&lt;retrieved_context&gt;</code> 包裹注入 (而非 system), 防注入 + 不破坏缓存前缀 (详见 15.6.4)</li>
+</ul>
+<hr />
+<h2 id="15.4-Layer-2-—-token-预算算法">15.4 Layer 2 — token 预算算法</h2>
+<p><code>bot_agent.py:1003-1071</code> 是 Lumio 的"上下文管理心脏". 银行客服核心需求: 既不能超 token 限额, 又不能让 Bot 重复收集已说过的关键信息.</p>
+<h3 id="15.4.1-_load_history-主流程">15.4.1 <code>_load_history</code> 主流程</h3>
+<pre><code class="language-python"># bot_agent.py:1003
 async def _load_history(self, session_id: str) -&gt; list[dict[str, str]]:
-    &quot;&quot;&quot;三层上下文策略 (银行客服最佳实践):
-    - Layer 1: 结构化会话记忆 + 对话摘要 (注入 system prompt, 永不裁剪)
-    - Layer 2: 近期对话历史 (token 预算裁剪, 被裁剪部分生成摘要/压缩)
-    - Layer 3: 检索知识 (RAG context, 由调用方传入)
-    &quot;&quot;&quot;
     try:
         turns = await self._session_manager.get_history(session_id, limit=20)
         if not turns:
             return []
 
         settings = get_settings()
-        # 分层预算: 历史层固定 1500 (max(budget_history, 1024)),
-        # 而非 max_context - reserved (旧实现 7168 = 上下文 87%)
         budget = max(settings.llm.budget_history, 1024)  # 1500
 
-        # 超预算且轮次足够时, 先尝试选择性压缩 (质量门不达标才走摘要裁剪)
+        # P1-1: 超预算时先尝试压缩 (而非直接裁剪), 压缩不达标才走摘要裁剪
         total_est = sum(_estimate_tokens(t.content) for t in turns)
         if total_est &gt; budget and len(turns) &gt;= settings.compression.min_history_turns:
-            compressed = compress_history(dict_turns, max_tokens=budget)
-            if any(&quot;_compressed&quot; in m for m in compressed):
-                turns = [t.model_copy(update={&quot;content&quot;: m[&quot;content&quot;]}) ...]
+            try:
+                from lumio.services.bot.context_compressor import compress_history
+                dict_turns = [
+                    {&quot;role&quot;: &quot;user&quot; if t.speaker == &quot;customer&quot; else &quot;assistant&quot;, &quot;content&quot;: t.content}
+                    for t in turns
+                ]
+                compressed = compress_history(dict_turns, max_tokens=budget)
+                if any(&quot;_compressed&quot; in m for m in compressed):
+                    turns = [t.model_copy(update={&quot;content&quot;: m[&quot;content&quot;]}) for m, t in zip(compressed, turns, strict=False)]
+            except Exception:
+                logger.debug(&quot;历史压缩失败, 走摘要裁剪: session=%s&quot;, session_id)
 
+        # LIFO 累加: 从最近往最旧扫描, 累加 token, 超预算就停
+        # 关键轮次 (投诉/承诺/转人工) 永不裁剪
         kept_turns: list = []
         used = 0
         split_idx = len(turns)
-        # LIFO 累加: 从最近往最旧扫描, 累加 token, 超预算就停
-        # 关键轮次 (投诉/承诺/转人工) 永不裁剪
         for i in range(len(turns) - 1, -1, -1):
             t = turns[i]
             est = _estimate_tokens(t.content)
@@ -7548,15 +7666,19 @@ async def _load_history(self, session_id: str) -&gt; list[dict[str, str]]:
         if trimmed_turns:
             self._spawn_task(self._ensure_summary(session_id, trimmed_turns))
 
-        return [{&quot;role&quot;: &quot;user&quot; if t.speaker == &quot;customer&quot; else &quot;assistant&quot;,
-                 &quot;content&quot;: t.content} for t in kept_turns]
+        return [{&quot;role&quot;: &quot;user&quot; if t.speaker == &quot;customer&quot; else &quot;assistant&quot;, &quot;content&quot;: t.content} for t in kept_turns]
     except Exception:
         return []
 </code></pre>
-<p><strong>预算演进 (设计决策)</strong>: 历史层从"上下文剩余全给 history"(8192−1024=7168, 占 87%) 收敛为<strong>分层预算强制分配</strong> — history 1500 / RAG 1200 / 客户画像 400 / few-shot 半稳态层, 与主流上下文管理框架 (system 10-15% / history 25-30% / retrieval 25-30% / output 20-25%) 对齐. 被裁剪轮次的语义由<strong>增量摘要 + 选择性压缩</strong>双通道兜底, 关键信息不丢.</p>
-<h3 id="15.3.1-token-估算函数-_estimate_tokens">15.3.1 token 估算函数 <code>_estimate_tokens</code></h3>
-<p><code>bot_agent.py:61-74</code> 用<strong>字符类加权</strong>估算 token 数, 替代 <code>tiktoken</code> 等重型库:</p>
-<pre><code class="language-python"># bot_agent.py:61
+<p>3 个关键步骤:</p>
+<ol>
+<li><strong>预算设置</strong>: <code>max(budget_history, 1024) = 1500</code> (而非 <code>max_context − reserved = 7168</code>)</li>
+<li><strong>先压缩后裁剪</strong>: 超预算时优先调 <code>compress_history</code> (context_compressor.py:387) 把超长 turn 压短, 压不动才走摘要裁剪</li>
+<li><strong>LIFO 累加 + 关键轮次豁免</strong>: 从最近往最旧累加, 关键轮次永不裁</li>
+</ol>
+<h3 id="15.4.2-token-估算-_estimate_tokens">15.4.2 token 估算 <code>_estimate_tokens</code></h3>
+<p><code>bot_agent.py:51-57</code> 用<strong>字符类加权</strong>估算 token 数, 替代 <code>tiktoken</code>:</p>
+<pre><code class="language-python"># bot_agent.py:51
 def _estimate_tokens(text: str) -&gt; int:
     &quot;&quot;&quot;基于字符类的 token 数估算
     CJK 字符: ~2 chars/token → 系数 0.55
@@ -7564,331 +7686,8 @@ def _estimate_tokens(text: str) -&gt; int:
     其他(数字/标点/空格): ~1.2 chars/token → 系数 0.8
     +4 为消息格式开销 (role/content 包装)
     &quot;&quot;&quot;
-    import re
-    cjk = len(re.findall(r&quot;[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]&quot;, text))
-    latin = len(re.findall(r&quot;[a-zA-Z]&quot;, text))
-    other = len(text) - cjk - latin
-    return int(cjk * 0.55 + latin * 0.3 + other * 0.8) + 4
 </code></pre>
-<p><strong>为何不用 <code>tiktoken</code></strong>: 
-- <code>tiktoken</code> 启动需加载 5-10MB BPE 表, 100ms+ 启动延迟
-- LLM 选型可能切换 (Ollama/OpenAI/Claude), 每个模型的 tokenizer 都不同
-- 银行客服 99% 是中文, CJK 系数 0.55 准确度 95%+</p>
-<p><strong>为何 +4</strong>: OpenAI ChatCompletion 每条 message 都要 <code>{"role": "...", "content": "..."}</code> JSON 包装, 实测约 4 tokens 开销.</p>
-<h3 id="15.3.2-关键轮次豁免-—-19-个-_IMPORTANT_KEYWORDS">15.3.2 关键轮次豁免 — 19 个 <code>_IMPORTANT_KEYWORDS</code></h3>
-<p><code>bot_agent.py:79-89</code> 定义了<strong>永远不会</strong>被裁剪的关键词, 这些轮次即便超出 token 预算也强制保留:</p>
-<pre><code class="language-python"># bot_agent.py:79
-_IMPORTANT_KEYWORDS = [
-    &quot;投诉&quot;, &quot;举报&quot;, &quot;银保监&quot;, &quot;银监会&quot;, &quot;人行&quot;, &quot;央行&quot;,   # 监管/投诉
-    &quot;律师函&quot;, &quot;法务&quot;, &quot;法院&quot;, &quot;起诉&quot;,                  # 法律
-    &quot;盗刷&quot;, &quot;挂失&quot;, &quot;冻结&quot;, &quot;风险&quot;,                    # 风险
-    &quot;承诺&quot;, &quot;保证&quot;, &quot;一定解决&quot;,                         # Bot 承诺
-    &quot;转人工&quot;, &quot;人工客服&quot;,                              # 升级
-]
-
-def _is_important(content: str) -&gt; bool:
-    return any(kw in content for kw in _IMPORTANT_KEYWORDS)
-</code></pre>
-<p><strong>为何必须豁免</strong>: 这 17 关键词对应的场景 (投诉/盗刷/转人工等) 是<strong>合规高敏</strong>的, 一旦裁剪, LLM 后续回答可能:
-- 不知道客户已投诉, 重复追问问题详情 → 激怒客户
-- 不知道客户要转人工, 继续推 Bot 处理 → 延误处理
-- 忘记之前的"承诺" → 客户投诉 Bot 推诿</p>
-<p><strong>豁免的代价</strong>: 极端情况下 (一段 10K tokens 全部含 "投诉"), 预算可能爆. 但这是<strong>有意的设计取舍</strong> — 合规 &gt; 性能.</p>
-<h3 id="15.3.3-LIFO-累加-vs-固定窗口">15.3.3 LIFO 累加 vs 固定窗口</h3>
-<p>Lumio 选 <strong>LIFO (Last-In-First-Out)</strong> 而非<strong>固定 N 轮窗口</strong>:</p>
-<table>
-<thead>
-<tr>
-<th>方案</th>
-<th>优点</th>
-<th>缺点</th>
-<th>Lumio 决策</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>固定 N=10 轮</td>
-<td>实现简单</td>
-<td>长轮次被裁, 短轮次浪费预算</td>
-<td>❌</td>
-</tr>
-<tr>
-<td>时间窗口 (最近 5 分钟)</td>
-<td>时序公平</td>
-<td>30 轮短对话全部丢弃</td>
-<td>❌</td>
-</tr>
-<tr>
-<td><strong>LIFO + token 预算</strong></td>
-<td><strong>按内容长度动态调整, 长内容少保留几轮, 短内容多保留几轮</strong></td>
-<td>实现复杂</td>
-<td>✅</td>
-</tr>
-</tbody>
-</table>
-<p>示例: 客户发了 30 条短问句 (各 10 字 ≈ 5 tokens) + 5 条长解释 (各 200 字 ≈ 100 tokens), 预算 200 tokens:
-- LIFO 累加: 保留 20 条短问句 (100 tokens) + 1 条长解释 (100 tokens) = 21 轮
-- 固定 10 轮: 仅保留 10 轮短问句 (50 tokens), 浪费 150 tokens 预算</p>
-<h3 id="15.3.4-LIFO-裁剪与-KV-Cache-的冲突-(本章盲点)">15.3.4 LIFO 裁剪与 KV Cache 的冲突 (本章盲点)</h3>
-<blockquote>
-<p>重要承认: 这一节是<strong>写完 KV Cache (15.11) 后回头补的</strong>——之前讲 Layer 2 和讲 KV Cache 是分开写的, 没意识到它们会打架. 这是本章的结构性盲点, 现在补上.</p>
-</blockquote>
-<p><strong>冲突场景</strong>: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组<strong>完全相同</strong> (同一段对话历史, 没新增也没裁剪), 推理引擎应该能跨这 10 轮命中 100% 的 KV cache. 但如果<strong>第 25 轮到第 28 轮之间</strong>有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息挤爆了预算), 后面 6 轮 history 数组的字面内容就<strong>全部变了</strong> (少了几条), 推理引擎识别为新 prompt → 前面 24 轮的 prefix cache 全部失效, 哪怕稳态层 (消息 [1][2][3]) 字符字面没变, 推理引擎因为 prefix 不连续也用不了.</p>
-<p><strong>为什么这是真问题, 不是理论问题</strong>:
-- 银行客服客户经常在对话中途发<strong>长消息</strong> (粘贴交易明细、上传文件OCR结果、贴投诉原文)
-- 一次长消息就触发 LIFO 裁剪
-- 之后每一轮<strong>整个 prompt 字符串都变</strong> (因为 history 数组少了一条)
-- KV cache 命中率从设计预期的"长期稳态 100% 命中"塌缩成"触发裁剪后所有轮 0% 命中"</p>
-<p><strong>实际影响的量化</strong> (按 7B 模型 / 第 25 轮触发 LIFO 估算):</p>
-<table>
-<thead>
-<tr>
-<th>指标</th>
-<th>不裁剪 (理想)</th>
-<th>触发 LIFO 后</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>稳态层 prefix cache 命中</td>
-<td>100%</td>
-<td>0% (prefix 不连续)</td>
-</tr>
-<tr>
-<td>半稳态层 prefix cache 命中</td>
-<td>100%</td>
-<td>0% (同上)</td>
-</tr>
-<tr>
-<td>单轮 prefill</td>
-<td>~75ms</td>
-<td>~500ms (退回到全量重算)</td>
-</tr>
-<tr>
-<td>第 25 轮到第 30 轮 TTFT 累计</td>
-<td>~450ms</td>
-<td>~3000ms</td>
-</tr>
-</tbody>
-</table>
-<p><strong>Lumio 的处理方式 — 接受冲突, 不强行优化</strong>:</p>
-<pre><code class="language-python"># bot_agent.py:1052-1060
-for i in range(len(turns) - 1, -1, -1):
-    t = turns[i]
-    est = _estimate_tokens(t.content)
-    is_important = _is_important(t.content)
-    if used + est &gt; budget and kept_turns and not is_important:
-        split_idx = i + 1
-        break
-    kept_turns.insert(0, t)
-    used += est
-</code></pre>
-<ul>
-<li><strong>没做</strong> prefix-cache-aware 的 LIFO (比如"宁可爆预算也保留上一轮的全部 history"来维持 cache 命中) — 因为会<strong>语义丢失</strong> (爆预算等于超长 prompt 进 LLM, 更糟)</li>
-<li><strong>没做</strong> history 消息的"软裁剪" (用 <code>truncated: true</code> 标记只截字段不删消息) — 会让 messages 数组里残留 <code>truncated</code> 这种<strong>字面不一致</strong>的字段, <strong>反而让 cache 永远不命中</strong></li>
-<li><strong>没做</strong> history 按 turn_id 锚定 (用 <code>[TURN_25_START]</code> 这种 marker 开头) — 想过但放弃了, 因为 turn_id 跨 session 跨 customer 都不一样, 实际等于<strong>永远不命中</strong>, 比 LIFO 触发的"偶尔失效一次"更差</li>
-</ul>
-<p><strong>为什么接受这个 trade-off</strong>: 银行客服场景的<strong>对话长度有限</strong> — 真实场景下 90% 的对话在 10 轮以内结束, 触发 LIFO 的概率本身就低; 而真触发 LIFO 时的"一次性 3 秒 TTFT 退化"可以靠<strong>前端流式打字机动画掩盖</strong> (用户看不到 prefill, 只看到 token-by-token 输出). 把"语义正确性"放在"绝对 cache 命中"前面, 是这个场景的必然取舍.</p>
-<p><strong>未来可能的优化方向</strong> (当前未做):
-1. <strong>history 兜底填充</strong>: 裁剪后用 <code>[EARLIER_TURNS_SUMMARIZED]</code> 占位, 保持 messages 数组长度恒定, 让 prefix 尽量连续
-2. <strong>压缩替代裁剪</strong> (P1-1 修复已部分实现, <code>bot_agent.py:1029-1045</code>): 优先调 <code>compress_history</code> 把超长 turn 压短, 压不短才裁, 减少 LIFO 触发频率
-3. <strong>per-turn cache_control 标记</strong>: Anthropic 风格的 <code>cache_control: ephemeral</code> 加在每条 history message 上, 推理引擎按 message 级别 cache (而不是按整个 prefix). 这能解决"LIFO 触发后 prefix 不连续"问题, 但需要推理引擎支持 message 级 cache 控制, 当前 vLLM/Ollama 都不支持</p>
-<p><strong>对其他层的影响</strong>: 这个冲突<strong>不影响</strong>消息 [1] 静态前缀 / [2] few-shot / [3] 客户画像——这些层不参与 history 数组变化, 字面稳定. 只影响消息 [4] 动态 system (因为它包含 history 摘要) 和 [5] history 本体.</p>
-<h2 id="15.4-增量对话摘要-_ensure_summary">15.4 增量对话摘要 <code>_ensure_summary</code></h2>
-<p><code>bot_agent.py:631-723</code> 解决"LIFO 裁掉的旧轮次不能直接丢"的问题 — 用 LLM 生成摘要写回 SessionState. <strong>关键设计是增量</strong>:</p>
-<pre><code class="language-python"># bot_agent.py:631
-async def _ensure_summary(self, session_id: str, trimmed_turns: list) -&gt; None:
-    &quot;&quot;&quot;用 last_summarized_turn_id 精确追踪已摘要位置, 避免 LTRIM 导致计数失准.
-    增量策略:
-    - 在 trimmed_turns 中查找 last_summarized_turn_id 的位置
-    - 如果找到: 对该位置之后的轮次生成增量摘要
-    - 如果未找到 (LTRIM 删除了已摘要的轮次): 对所有 trimmed_turns 重新生成摘要
-    - LLM 不可用时跳过 (降级为无摘要, 结构化记忆仍保证关键实体不丢)
-    &quot;&quot;&quot;
-    try:
-        state = await self._session_manager.get_session(session_id)
-        if state is None:
-            return
-        last_summarized_id = state.last_summarized_turn_id
-        last_turn = trimmed_turns[-1]
-        if last_turn.turn_id == last_summarized_id:
-            return  # 已被摘要过, 跳过
-
-        # 找增量起点
-        split_idx = 0
-        if last_summarized_id:
-            for i, t in enumerate(trimmed_turns):
-                if t.turn_id == last_summarized_id:
-                    split_idx = i + 1
-                    break
-            # 未找到 (LTRIM 删了) → split_idx 保持 0 → 重新摘要全部
-        new_turns = trimmed_turns[split_idx:]
-        if not new_turns:
-            return
-
-        # 构造 prompt: 已有摘要 + 新增对话
-        conversation = &quot;\n&quot;.join(
-            f&quot;[{ {'customer': '客户', 'agent': '坐席', 'bot': '机器人'}.get(t.speaker, t.speaker) }] {t.content}&quot;
-            for t in new_turns
-        )
-        existing_summary = state.conversation_summary if split_idx &gt; 0 else &quot;&quot;
-        summary_prompt = _SUMMARIZE_SYSTEM_PROMPT  # prompts.py:104
-        user_content = (
-            f&quot;已有摘要:\n{existing_summary}\n\n新增对话:\n{conversation}&quot;
-            if existing_summary else f&quot;对话记录:\n{conversation}&quot;
-        )
-
-        # 调 LLM 摘要, 3s 超时
-        llm_client = self._degradation_mgr._llm
-        if llm_client is None:
-            return  # LLM 不可用 → 静默跳过
-        try:
-            new_summary = await llm_client.chat(
-                messages=[
-                    {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: summary_prompt},
-                    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_content},
-                ],
-                timeout=3.0,
-            )
-        except Exception:
-            return  # bot_agent.py:696, LLM 失败也静默跳过
-        ...
-</code></pre>
-<p><strong>为何用 <code>last_summarized_turn_id</code> 而非计数</strong>: Redis Stream 的 <code>LTRIM</code> 会把最旧的 turn 物理删除, 如果摘要用 "已摘要 N 轮" 计数, LTRIM 后 N 会偏移, 导致重复摘要或漏摘要. 用 turn_id (UUID v7, 单调递增) 精确追踪, LTRIM 不影响.</p>
-<p><strong>3s 超时的 why</strong>: 摘要不是用户可见请求, 慢一点无所谓, 但不能慢到拖垮 LLM 服务的整体并发. 3s 是 LLM 99 分位响应时间, 超时直接放弃 (下轮再试).</p>
-<p><strong>失败兜底 (bot_agent.py:696, 715-723)</strong>:
-- LLM 调用失败 → <code>logger.debug(...)</code> 静默
-- 摘要内容空 → 静默
-- CAS patch 失败 → <code>logger.warning(...)</code> 可见, 但不抛</p>
-<p><strong>为什么不阻塞主请求</strong>: 摘要是<strong>锦上添花</strong>, 不是必需. 结构化记忆 (Layer 1) 已经有对话摘要 + 客户画像 + 实体池, 摘要缺失只会让 LLM "不知道旧轮次的细节", 但不会让对话中断.</p>
-<p><strong>并发串行化 (per-session 锁)</strong>: 多轮快速对话时每轮裁剪都会 spawn 一个摘要任务, 并发读写同一
-<code>last_summarized_turn_id</code> → CAS 重试后到者失败, 摘要滞后. <code>_ensure_summary</code> 外层包 per-session
-<code>asyncio.Lock</code> (<code>self._summary_locks[session_id]</code>), 同会话摘要任务<strong>串行执行</strong>:</p>
-<pre><code class="language-python"># bot_agent.py (简化)
-lock = self._summary_locks.setdefault(session_id, asyncio.Lock())
-async with lock:
-    await self._summary_locked(session_id, trimmed_turns)   # 实际摘要逻辑
-</code></pre>
-<p>锁字典随会话自然增长 (上限 = 活跃会话数), 无需清理.</p>
-<h2 id="15.5-3-层降级矩阵">15.5 3 层降级矩阵</h2>
-<p>3 层上下文各层都有<strong>独立的失败路径</strong>, 不互阻塞:</p>
-<table>
-<thead>
-<tr>
-<th>失败</th>
-<th>触发</th>
-<th>降级行为</th>
-<th>用户感知</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Layer 1 <code>_build_session_memory</code> 异常</td>
-<td>DB 慢/Redis 抖动</td>
-<td><code>except: return ""</code> (bot_agent.py:779)</td>
-<td>LLM 不知道历史客户画像, 但对话照常</td>
-</tr>
-<tr>
-<td>Layer 2 <code>_load_history</code> 异常</td>
-<td>Redis 拉取失败</td>
-<td><code>except: return []</code> (bot_agent.py:628)</td>
-<td>LLM 不知道最近说了啥, 但会基于本轮 input 答</td>
-</tr>
-<tr>
-<td>Layer 3 <code>_retrieve</code> 失败</td>
-<td>ES/Milvus 不可用</td>
-<td><code>DegradationLevel.FALLBACK → return ""</code> (bot_agent.py:539)</td>
-<td>LLM 走纯生成模式, 知识问答降级为通用回答</td>
-</tr>
-<tr>
-<td>摘要生成失败</td>
-<td>LLM 不可用/超时</td>
-<td>静默跳过, 下轮再试</td>
-<td>旧轮次无摘要, 但结构化记忆仍有</td>
-</tr>
-<tr>
-<td><code>get_history</code> 返回空</td>
-<td>新会话/无历史</td>
-<td><code>return []</code> (bot_agent.py:597)</td>
-<td>LLM 仅看本轮 input</td>
-</tr>
-</tbody>
-</table>
-<p><strong>降级哲学</strong>: "<strong>宁降级, 不可用</strong>". 银行客服不能因为上下文组件挂了就 500, 必须继续服务. 最坏情况是 LLM 退化到"看本轮 + 静态 system_prompt"模式, 但仍能给出基础答复.</p>
-<p><strong>示例降级场景</strong>: PG 挂了 + Redis 也抖 → 全部 Layer 1/2 拿不到数据 → LLM 收到 <code>system_prompt="你是银行信用卡智能客服"</code> + <code>user_input=本轮问题</code> + <code>context=""</code> → LLM 用预训练知识回答, 答错了用户也能接受 (因为 Bot 系统也明确告知 "知识库可能不全").</p>
-<h2 id="15.6-上下文工程-3-层流程图">15.6 上下文工程 3 层流程图</h2>
-<pre><code class="language-mermaid">%% 完整源码: docs/book/diagrams/context-engineering.mmd
-flowchart TB
-    Start([用户问 user_input]) --&gt; Build[bot_agent._handle_*&lt;br/&gt;拼装 3 层上下文]
-
-    subgraph L1[&quot;Layer 1: 结构化会话记忆&quot;]
-        direction TB
-        L1a[SessionManager.get_session] --&gt; L1b{state 有效?}
-        L1b -- 是 --&gt; L1c[5 段拼接]
-        L1c --&gt; L1c1[对话摘要]
-        L1c1 --&gt; L1c2[客户画像]
-        L1c2 --&gt; L1c3[已知实体]
-        L1c3 --&gt; L1c4[意图历史]
-        L1c4 --&gt; L1c5[当前意图]
-        L1c5 --&gt; L1d[format 系统 prompt 头部]
-        L1b -- 否/异常 --&gt; L1Empty[返回 空字符串]
-    end
-
-    subgraph L2[&quot;Layer 2: 近期对话历史 (token 预算裁剪)&quot;]
-        direction TB
-        L2a[get_history limit=20] --&gt; L2b[turns 非空?]
-        L2b -- 否 --&gt; L2Empty[返回 空列表]
-        L2b -- 是 --&gt; L2c[Budget = MaxContext - Reserved]
-        L2c --&gt; L2d[LIFO 累加, 关键轮次豁免]
-        L2d --&gt; L2e{超预算?}
-        L2e -- 否 --&gt; L2Keep[保留 + 累加]
-        L2e -- 是 + 普通 --&gt; L2Trim[标记 trimmed_turns]
-        L2e -- 是 + 重要 --&gt; L2Keep
-        L2Keep --&gt; L2f[转换 role 字段]
-        L2Trim --&gt; L2g{trimmed 非空?}
-        L2g -- 是 --&gt; L2h[asyncio.create_task&lt;br/&gt;增量摘要]
-        L2g -- 否 --&gt; L2Skip[跳过]
-    end
-
-    subgraph L3[&quot;Layer 3: RAG 检索 + 知识图谱&quot;]
-        direction TB
-        L3a[_retrieve 4 路径降级] --&gt; L3b{context 非空?}
-        L3b -- 否 --&gt; L3Empty[FALLBACK → 跳过]
-        L3b -- 是 --&gt; L3c[enrich_retrieval_context]
-        L3c --&gt; L3d{命中 5 实体?}
-        L3d -- 是 --&gt; L3e[追加 ## 知识图谱补充信息]
-        L3d -- 否 --&gt; L3NoKG[不追加]
-    end
-
-    Build --&gt; L1
-    Build --&gt; L2
-    Build --&gt; L3
-
-    L1d --&gt; Sum[生成最终 messages 列表]
-    L1Empty --&gt; Sum
-    L2f --&gt; Sum
-    L2Skip --&gt; Sum
-    L2Empty --&gt; Sum
-    L3e --&gt; Sum
-    L3NoKG --&gt; Sum
-    L3Empty --&gt; Sum
-
-    Sum --&gt; LLM[送入 LLM]
-    LLM --&gt; Resp([Bot 答复])
-
-    style L1Empty fill:#ffe1e1
-    style L2Empty fill:#ffe1e1
-    style L3Empty fill:#ffe1e1
-    style L2Skip fill:#ffe1e1
-    style L3NoKG fill:#fff4e1
-    style L1d fill:#d4f4dd
-    style L2Keep fill:#d4f4dd
-    style L3e fill:#d4f4dd
-    style LLM fill:#cce5ff
-</code></pre>
-<p><strong>怎么读这张图 — "每次回答前, 系统在拼什么"</strong>: 客户每说一句话, 系统要回答前先<strong>组装三样东西</strong> — ① Layer 1 结构化记忆 (摘要/画像/实体, 永在); ② Layer 2 近期历史 (超预算就裁最旧的, 但投诉/承诺类轮次豁免); ③ Layer 3 检索知识 (没搜到就跳过, 搜到了再附加知识图谱补关系). 三样都齐了才送进 LLM. <strong>红色分支 (L1Empty/L2Empty/L3Empty) 是降级路径</strong> — 任何一层失败, 系统照常回答, 只是少一份信息, 对话绝不中断. 这就是"能记住 30 轮前的事, 但永远不会爆 token"的秘密.</p>
-<h2 id="15.7-设计取舍深度分析">15.7 设计取舍深度分析</h2>
-<h3 id="15.7.1-为何用字符类-token-估算而非-tiktoken">15.7.1 为何用字符类 token 估算而非 <code>tiktoken</code></h3>
+<p><strong>为何不用 <code>tiktoken</code></strong>:</p>
 <table>
 <thead>
 <tr>
@@ -7918,217 +7717,211 @@ flowchart TB
 <td>0</td>
 <td>BPE 表需随模型更新</td>
 </tr>
-<tr>
-<td>极端长文本误差</td>
-<td>±5%</td>
-<td>±1%</td>
-</tr>
 </tbody>
 </table>
-<p><strong>5% 误差值得吗</strong>: 值得. 银行客服平均 30 字/轮, 5% 误差 = 1.5 字, 在 200 tokens 预算下相当于多裁或少裁 0.3 轮, 完全可接受.</p>
-<h3 id="15.7.2-为何-17-关键词而非白名单/正则">15.7.2 为何 17 关键词而非白名单/正则</h3>
-<p><code>grep "_IMPORTANT_KEYWORDS" bot_agent.py</code> 看到的是个简单 <code>any(kw in content for kw in _LIST)</code>. 这故意设计成<strong>关键词字面子串匹配</strong>, 而非白名单 (按业务事件类型) 或正则 (按模式):</p>
+<p>银行客服 99% 是中文, 5% 误差在 200 tokens 预算下相当于多裁或少裁 0.3 轮, 完全可接受. <strong>+4 是 OpenAI ChatCompletion message JSON 包装开销</strong>.</p>
+<h3 id="15.4.3-19-关键词豁免">15.4.3 19 关键词豁免</h3>
+<p><code>bot_agent.py:80-100</code> 定义了<strong>永远不会</strong>被裁剪的 19 个关键词:</p>
+<pre><code class="language-python"># bot_agent.py:80
+_IMPORTANT_KEYWORDS = [
+    &quot;投诉&quot;, &quot;举报&quot;, &quot;银保监&quot;, &quot;银监会&quot;, &quot;人行&quot;, &quot;央行&quot;,   # 监管/投诉 (6)
+    &quot;律师函&quot;, &quot;法务&quot;, &quot;法院&quot;, &quot;起诉&quot;,                  # 法律 (4)
+    &quot;盗刷&quot;, &quot;挂失&quot;, &quot;冻结&quot;, &quot;风险&quot;,                    # 风险 (4)
+    &quot;承诺&quot;, &quot;保证&quot;, &quot;一定解决&quot;,                         # Bot 承诺 (3)
+    &quot;转人工&quot;, &quot;人工客服&quot;,                              # 升级 (2)
+]
+</code></pre>
+<p><strong>为何必须豁免</strong>: 这 19 关键词对应的场景是<strong>合规高敏</strong>的. 一旦裁剪, LLM 后续可能:</p>
+<ul>
+<li>不知道客户已投诉 → 重复追问详情激怒客户</li>
+<li>不知道客户要转人工 → 继续推 Bot 处理延误</li>
+<li>忘记之前的"承诺" → 客户投诉 Bot 推诿</li>
+</ul>
+<p><strong>豁免的代价</strong>: 极端情况下 (10K tokens 全部含"投诉") 预算可能爆. 但这是<strong>有意的设计取舍 — 合规 &gt; 性能</strong>.</p>
+<p><strong>为何是关键词字面而非白名单/正则</strong>:</p>
 <ul>
 <li><strong>关键词字面</strong>: 0 维护成本, 业务方加新词只需加一行</li>
 <li><strong>白名单 (事件类型)</strong>: 需要 LLM 先分类事件, 又多一次 LLM 调用, 慢且脆</li>
 <li><strong>正则 (如 <code>r"投诉[银保监人行]")</code></strong>: 过度抽象, 银行新业务 (如"投诉消保") 容易漏</li>
 </ul>
-<p><strong>实际运营</strong>: 业务方根据客户投诉/法务反馈, 1 分钟加一个关键词即可, 无需发版.</p>
-<h3 id="15.7.3-为何-limit=20-而非更多/更少">15.7.3 为何 <code>limit=20</code> 而非更多/更少</h3>
+<h3 id="15.4.4-LIFO-vs-固定窗口">15.4.4 LIFO vs 固定窗口</h3>
+<p>Lumio 选 <strong>LIFO (Last-In-First-Out)</strong> 而非<strong>固定 N 轮窗口</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优点</th>
+<th>缺点</th>
+<th>决策</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>固定 N=10 轮</td>
+<td>实现简单</td>
+<td>长轮次被裁, 短轮次浪费预算</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>时间窗口 (最近 5 分钟)</td>
+<td>时序公平</td>
+<td>30 轮短对话全部丢弃</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong>LIFO + token 预算</strong></td>
+<td><strong>按内容长度动态调整, 长内容少保留几轮, 短内容多保留几轮</strong></td>
+<td>实现复杂</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<p>示例: 30 条短问句 (各 5 tokens) + 5 条长解释 (各 100 tokens), 预算 200 tokens:</p>
 <ul>
-<li><strong>20 轮的 why</strong>: 客服平均对话 10-15 轮, 20 轮覆盖 95% 场景, 极少有 30+ 轮 (除非 Bot 一直解决不了, 这种情况早该转人工)</li>
-<li><strong>20 轮的 token 上限</strong>: 假设每轮 50 字, 20 轮 = 1000 字 ≈ 550 tokens, 加上 Layer 1 + RAG + 回答, 总 1500-2000 tokens, 在 4K 模型内</li>
-<li><strong>更少 (如 10 轮)</strong>: 客户"我前面说过了" 抱怨增多</li>
-<li><strong>更多 (如 50 轮)</strong>: Redis 拉取 + token 估算耗时, 反而拖慢响应</li>
+<li>LIFO 累加: 保留 20 条短问句 (100 tokens) + 1 条长解释 (100 tokens) = <strong>21 轮</strong></li>
+<li>固定 10 轮: 仅保留 10 轮短问句 (50 tokens), <strong>浪费 150 tokens 预算</strong></li>
 </ul>
-<h3 id="15.7.4-为何-fire-and-forget-摘要">15.7.4 为何 fire-and-forget 摘要</h3>
-<pre><code class="language-python"># bot_agent.py:623
-asyncio.create_task(self._ensure_summary(session_id, trimmed_turns))
+<hr />
+<h2 id="15.5-增量摘要-+-降级矩阵">15.5 增量摘要 + 降级矩阵</h2>
+<p>LIFO 裁掉的旧轮次不能直接丢, 用 LLM 生成摘要写回 SessionState. <strong>关键设计是增量</strong> — 只对新增的裁剪轮次摘要, 旧摘要不丢.</p>
+<h3 id="15.5.1-_ensure_summary-增量逻辑">15.5.1 <code>_ensure_summary</code> 增量逻辑</h3>
+<p><code>bot_agent.py:1073-1183</code> 实现增量摘要:</p>
+<pre><code class="language-python"># bot_agent.py:1073
+async def _ensure_summary(self, session_id: str, trimmed_turns: list) -&gt; None:
+    try:
+        state = await self._session_manager.get_session(session_id)
+        if state is None:
+            return
+        last_summarized_id = state.last_summarized_turn_id
+        last_turn = trimmed_turns[-1]
+        if last_turn.turn_id == last_summarized_id:
+            return  # 已被摘要过, 跳过
+
+        # 找增量起点
+        split_idx = 0
+        if last_summarized_id:
+            for i, t in enumerate(trimmed_turns):
+                if t.turn_id == last_summarized_id:
+                    split_idx = i + 1
+                    break
+            # 未找到 (LTRIM 删了) → split_idx 保持 0 → 重新摘要全部
+        new_turns = trimmed_turns[split_idx:]
+        if not new_turns:
+            return
+
+        # 构造 prompt: 已有摘要 + 新增对话
+        conversation = &quot;\n&quot;.join(
+            f&quot;[{ {'customer': '客户', 'agent': '坐席', 'bot': '机器人'}.get(t.speaker, t.speaker) }] {t.content}&quot;
+            for t in new_turns
+        )
+        existing_summary = state.conversation_summary if split_idx &gt; 0 else &quot;&quot;
+        summary_prompt = _SUMMARIZE_SYSTEM_PROMPT  # prompts/__init__.py:40
+        user_content = (
+            f&quot;已有摘要:\n{existing_summary}\n\n新增对话:\n{conversation}&quot;
+            if existing_summary else f&quot;对话记录:\n{conversation}&quot;
+        )
+
+        # 调 LLM 摘要, 3s 超时
+        llm_client = self._degradation_mgr._llm
+        if llm_client is None:
+            return
+        try:
+            new_summary = await llm_client.chat(
+                messages=[
+                    {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: summary_prompt},
+                    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_content},
+                ],
+                timeout=3.0,
+            )
+        except Exception:
+            return  # LLM 失败静默跳过
+        ...
 </code></pre>
-<p><strong>为何不 await</strong>: 主请求 P99 延迟 1.5s 是硬指标 (SLO), 摘要 LLM 调用 500-1500ms, 如果 await 摘要, 主请求要 2-3s 才返回, 客户感受明显卡顿.</p>
+<p><strong>为何用 <code>last_summarized_turn_id</code> 而非计数</strong>: Redis Stream 的 <code>LTRIM</code> 会把最旧的 turn 物理删除, 摘要用"已摘要 N 轮"计数, LTRIM 后 N 会偏移, 导致重复摘要或漏摘要. 用 turn_id (UUID v7, 单调递增) 精确追踪, LTRIM 不影响.</p>
+<p><strong>3s 超时的 why</strong>: 摘要不是用户可见请求, 慢一点无所谓, 但不能慢到拖垮 LLM 服务整体并发. 3s 是 LLM 99 分位响应时间, 超时直接放弃 (下轮再试).</p>
+<h3 id="15.5.2-per-session-锁">15.5.2 per-session 锁</h3>
+<p>多轮快速对话时每轮裁剪都会 spawn 一个摘要任务, 并发读写同一 <code>last_summarized_turn_id</code> → CAS 重试后到者失败, 摘要滞后. <code>_ensure_summary</code> 外层包 per-session <code>asyncio.Lock</code> (<code>self._summary_locks[session_id]</code>, <code>bot_agent.py:144</code>), 同会话摘要任务<strong>串行执行</strong>:</p>
+<pre><code class="language-python"># bot_agent.py:144-151
+self._summary_locks: dict[str, asyncio.Lock] = {}  # 锁字典, 随会话自然增长
+
+def _spawn_task(self, coro):
+    &quot;&quot;&quot;asyncio.create_task 包装, 持有 task 引用防 GC&quot;&quot;&quot;
+    task = asyncio.create_task(coro)
+    self._pending_tasks.add(task)
+    task.add_done_callback(self._pending_tasks.discard)
+    return task
+</code></pre>
+<p>锁字典随会话自然增长 (上限 = 活跃会话数), 无需清理. <code>_pending_tasks</code> 持有后台 task 引用, 防止 asyncio GC 在 <code>await</code> 期间回收.</p>
+<h3 id="15.5.3-fire-and-forget-异步调度">15.5.3 fire-and-forget 异步调度</h3>
+<p>摘要任务用 <code>asyncio.create_task</code> (<code>bot_agent.py:146-151</code>) 后台调度, <strong>不 await 主请求</strong>:</p>
+<pre><code class="language-python"># bot_agent.py:1065
+self._spawn_task(self._ensure_summary(session_id, trimmed_turns))
+</code></pre>
+<p><strong>为何不 await</strong>: 主请求 P99 延迟 1.5s 是硬指标 (SLO), 摘要 LLM 调用 500-1500ms, await 摘要会让主请求 2-3s 才返回, 客户感受明显卡顿.</p>
 <p><strong>为何不怕丢摘要</strong>: <code>_ensure_summary</code> 内部<strong>幂等</strong> — 下次轮次如果仍需摘要, <code>last_summarized_turn_id</code> 追踪保证只对新增轮次摘要, 旧摘要不丢.</p>
 <p><strong>故障场景</strong>: 主进程崩溃 → <code>asyncio.create_task</code> 的 task 一起死, 摘要未生成 → 下次启动新会话, <code>last_summarized_turn_id</code> 还是旧值, 增量摘要继续. 不影响正确性, 只影响"摘要可能漏一段".</p>
-<h3 id="15.7.5-为何不在-_handle_knowledge-也注入-Layer-1-之外">15.7.5 为何不在 <code>_handle_knowledge</code> 也注入 Layer 1 之外</h3>
-<p><code>bot_agent.py:223-225</code>:</p>
-<pre><code class="language-python">system_prompt = KNOWLEDGE_SYSTEM_PROMPT  # 静态 system_prompt (3 段: 角色/记忆使用规范/回复规范)
-system_prompt = f&quot;{KNOWLEDGE_SYSTEM_PROMPT}\n\n## 会话记忆\n{session_memory}&quot;  # Layer 1 注入
-system_prompt = f&quot;{system_prompt}\n\n{slot_prompt}&quot;  # 槽位 (第 3 章 §3.6 详谈)
-</code></pre>
-<p><strong>注意 Layer 1 注入</strong>而非 Layer 2/3: Layer 2 (历史) 和 Layer 3 (RAG) 走 <code>messages=</code> 形参, 由 <code>build_layered_messages</code> 组装 (第五轮修复后). 这种设计:
-- <strong>system_prompt 干净</strong>: 不会被历史污染, 每次回答 system 部分稳定 → LLM 行为更可预测
-- <strong>分层消息直传 LLM</strong>: <code>_handle_knowledge</code> 构建的 L1 静态锚点 / L2 半稳态画像 / L3 动态记忆 / RAG user-role 物理隔离结构, 通过 <code>generate_with_fallback(messages=...)</code> 原样送达 LLM, 不再压平拼接 — 前缀缓存锚点 (cache_control: ephemeral) 真实生效
-- <strong>RAG 物理隔离</strong>: 检索内容以 user message 的 <code>&lt;retrieved_context&gt;</code> 包裹注入 (而非第 2 条 system), 防注入 + 不破坏缓存前缀</p>
-<h3 id="15.7.6-为何接受-LIFO-触发-KV-cache-失效-(不强行做-prefix-cache-aware-LIFO)">15.7.6 为何接受 LIFO 触发 KV cache 失效 (不强行做 prefix-cache-aware LIFO)</h3>
-<p>15.3.4 详细量化了这个冲突: 长对话中途一旦触发 LIFO 裁剪, 后续 5-10 轮的 KV cache 命中率从 100% 塌缩到 0%, 单轮 prefill 从 75ms 退到 500ms. 三种"强行避免"的方案都没采用, 各自的代价:</p>
-<ul>
-<li><strong>爆预算也不裁</strong>: 等于超长 prompt 进 LLM, 直接吃 token 限额, 比 3s 退化更糟</li>
-<li><strong>history 软裁剪 (<code>truncated: true</code>)</strong>: messages 数组里字段不一致, cache 永远不命中, 比偶尔失效更差</li>
-<li><strong>turn_id 锚定 (<code>[TURN_25_START]</code>)</strong>: turn_id 跨 session 跨 customer 都不同, 实际等于永远不命中</li>
-</ul>
-<p><strong>最终决策</strong>: 接受"偶尔一次 3s 退化", 靠前端流式打字机动画掩盖, 把语义正确性放在绝对 cache 命中之前. 详见 15.3.4.</p>
-<h2 id="15.8-上下游集成点">15.8 上下游集成点</h2>
-<p>上下文工程的 3 层不是孤岛, 与其他模块深度集成:</p>
+<p><strong>为何不阻塞主请求</strong>: 摘要是<strong>锦上添花</strong>, 不是必需. 结构化记忆 (Layer 1) 已经有对话摘要 + 客户画像 + 实体池, 摘要缺失只会让 LLM "不知道旧轮次的细节", 但不会让对话中断.</p>
+<h3 id="15.5.4-5-路径降级矩阵">15.5.4 5 路径降级矩阵</h3>
+<p>3 层上下文各层都有<strong>独立的失败路径</strong>, 不互阻塞. Lumio 的降级哲学是"<strong>宁降级, 不可用</strong>" — 银行客服不能因为上下文组件挂了就 500, 必须继续服务:</p>
 <table>
 <thead>
 <tr>
-<th>上游/下游</th>
-<th>集成方式</th>
-<th>行号</th>
+<th>失败</th>
+<th>触发</th>
+<th>降级行为</th>
+<th>用户感知</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>SessionManager (SessionState 持久化)</td>
-<td><code>get_session</code> / <code>patch_state</code> / <code>get_history</code></td>
-<td>session.py:198-236, 618-631</td>
+<td>Layer 1 <code>_build_session_memory</code> 异常</td>
+<td>DB 慢/Redis 抖动</td>
+<td><code>except: return ""</code> (bot_agent.py:1300)</td>
+<td>LLM 不知道历史画像, 但对话照常</td>
 </tr>
 <tr>
-<td>IntentClassifier (意图分类)</td>
-<td>Layer 2 历史喂入分类器, 让分类更准</td>
-<td>bot_agent.py:154</td>
+<td>Layer 2 <code>_load_history</code> 异常</td>
+<td>Redis 拉取失败</td>
+<td><code>except: return []</code> (bot_agent.py:1071)</td>
+<td>LLM 不知道最近说了啥, 但会基于本轮 input 答</td>
 </tr>
 <tr>
-<td>EntityExtractor (实体抽取)</td>
-<td><code>last_entities</code> 写到 Layer 1</td>
-<td>bot_agent.py:760-763</td>
+<td>Layer 3 <code>_retrieve</code> 失败</td>
+<td>ES/Milvus 不可用</td>
+<td><code>DegradationLevel.FALLBACK → return ""</code></td>
+<td>LLM 走纯生成模式, 知识问答降级为通用回答</td>
 </tr>
 <tr>
-<td>知识图谱增强</td>
-<td>Layer 3 追加 <code>## 知识图谱补充信息</code></td>
-<td>bot_agent.py:213-216</td>
+<td>摘要生成失败</td>
+<td>LLM 不可用/超时</td>
+<td>静默跳过, 下轮再试</td>
+<td>旧轮次无摘要, 但结构化记忆仍有</td>
 </tr>
 <tr>
-<td>RAG 检索</td>
-<td>4 路径降级 → 写入 Layer 3 (限 1200 token)</td>
-<td>bot_agent.py:610-680</td>
-</tr>
-<tr>
-<td>客户记忆学习 (跨会话)</td>
-<td>CAS patch 写入 Layer 1 的客户画像字段</td>
-<td>bot_agent.py:124-135</td>
-</tr>
-<tr>
-<td>上下文压缩器</td>
-<td>超预算先压缩 (质量门) 再裁剪</td>
-<td>context_compressor.py:265-305</td>
-</tr>
-<tr>
-<td>Few-shot 选择</td>
-<td>按意图注入 L1.5 半稳态层 (top_k=3)</td>
-<td>few_shot.py:132 + kv_cache.py:99</td>
-</tr>
-<tr>
-<td>总预算截断 (兜底)</td>
-<td>Σ各层 &gt; context−reserved 时从最旧 user 历史裁剪 (RAG/当前轮保留)</td>
-<td>bot_agent.py:365-380</td>
+<td><code>get_history</code> 返回空</td>
+<td>新会话/无历史</td>
+<td><code>return []</code></td>
+<td>LLM 仅看本轮 input</td>
 </tr>
 </tbody>
 </table>
-<p><strong>总预算截断逻辑</strong>: 分层预算各自生效后仍可能超 <code>max_context_tokens − reserved_tokens</code>
-(8192−1024). 此时<strong>实际裁剪</strong>而非仅告警: 从最旧的 user 历史消息开始丢弃, RAG 上下文 /
-当前轮 / 连续消息标记 (<code>（用户连续发送</code> / <code>&lt;retrieved_context&gt;</code> / <code>客户问:</code>) 保留 —
-历史可被摘要覆盖, 检索结果和当前诉求不可丢.</p>
-<h2 id="15.9-实战案例:-30-轮对话的第-31-轮">15.9 实战案例: 30 轮对话的第 31 轮</h2>
-<p>假设客户与 Bot 聊了 30 轮, 涉及:
-- 轮 1-5: 问白金卡权益
-- 轮 6: 投诉"上次承诺的 1 万积分没到账"
-- 轮 7-15: 反复问积分到账
-- 轮 16-20: 转人工失败, 回到 Bot
-- 轮 21-30: 重新问账单分期</p>
-<p>第 31 轮客户输入 "我还有多少积分?". 上下文工程处理:</p>
-<ol>
-<li><strong>Layer 1</strong> (bot_agent.py:725-779):
-   - <code>conversation_summary</code>: 之前 30 轮被裁的轮次的浓缩, 大约 "客户投诉积分未到账, 1 万积分, 转人工失败"
-   - 客户画像: vip_level=platinum (从历史学习)
-   - 已知实体: amount=10000 (积分)
-   - 意图历史: reward_query → complaint → transfer_agent → reward_query
-   - 当前意图: reward_query (本轮)</li>
-<li><strong>Layer 2</strong> (bot_agent.py:583-629):
-   - limit=20 拉到最近 20 轮 (轮 11-30)
-   - 历史层预算 1500, 估算 20 轮 ≈ 1100 tokens
-   - 全部装下, 不需要裁
-   - 轮 6 "投诉" + 轮 16 "转人工" 必保留</li>
-<li><strong>Layer 3</strong>:
-   - RAG 检索 "还有多少积分" → 命中《积分查询指引》文档
-   - 知识图谱: 命中 "积分" 实体相关 (虽然图谱当前没 "积分" 实体, 所以无 KG 增强)</li>
-</ol>
-<p>最终 LLM 收到的 messages:</p>
-<pre><code>system: 你是银行信用卡智能客服... [静态]
-system: ## 会话记忆
-  [对话摘要] 客户投诉积分未到账...
-  [客户画像] VIP等级=platinum
-  [已知实体] amount=10000
-  [意图历史] reward_query → complaint → transfer_agent → reward_query
-  [当前意图] reward_query
-user: 我还有多少积分?
-assistant: ... (轮 30 的回答)
-user: ...
-[... 20 轮历史 ...]
-system: 参考知识: ... (RAG 文档)
-</code></pre>
-<p>LLM 能在不重复 "您是白金卡吗" 的前提下, 直接回答积分余额, 还能识别"投诉"标记不会再次承诺未到账积分 (因为对话摘要已记录此前的承诺).</p>
-<h2 id="15.10-监控与可观测性">15.10 监控与可观测性</h2>
-<p>上下文工程的 3 层都有自己的<strong>隐式指标</strong>, 可通过 Prometheus 拉取:</p>
-<table>
-<thead>
-<tr>
-<th>指标</th>
-<th>来源</th>
-<th>含义</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>lumio_session_history_turns</code></td>
-<td>SessionManager.get_history 返回值</td>
-<td>当前会话历史轮数</td>
-</tr>
-<tr>
-<td><code>lumio_session_memory_size_chars</code></td>
-<td><code>_build_session_memory</code> 返回长度</td>
-<td>Layer 1 注入字符数</td>
-</tr>
-<tr>
-<td><code>lumio_summary_size_chars</code></td>
-<td><code>state.conversation_summary</code> 长度</td>
-<td>对话摘要长度</td>
-</tr>
-<tr>
-<td>LLM 请求日志的 <code>prompt_tokens</code></td>
-<td>LLMClient 响应</td>
-<td>实际送入 LLM 的 token 数 (含 system+history+RAG)</td>
-</tr>
-<tr>
-<td><code>lumio_session_state_version</code></td>
-<td>SessionState.version</td>
-<td>CAS 写次数, 间接反映写频</td>
-</tr>
-<tr>
-<td><code>lumio_kv_cache_hit_rate</code></td>
-<td><code>KV_CACHE_HIT_RATE</code> (kv_cache.py 估算)</td>
-<td><strong>估算值</strong>, 稳态/半稳态/动态的命中比例</td>
-</tr>
-<tr>
-<td><code>lumio_prefill_tokens_saved</code></td>
-<td><code>PREFILL_TOKENS_SAVED</code> (kv_cache.py 估算)</td>
-<td><strong>估算值</strong>, 本轮比全部重算节省的 prefill token</td>
-</tr>
-</tbody>
-</table>
-<p><strong>典型问题诊断</strong>:
-- 客户说"我前面说过了" 抱怨多 → 检查 <code>summary_size_chars</code> 是否过小, 摘要可能截断过早
-- LLM 响应慢 (1.5s+) → 检查 <code>prompt_tokens</code> 是否超 4K, 触发了"超长上下文" LLM 慢分支
-- 客户画像不准 → 检查 <code>last_summarized_turn_id</code> 是否正确推进, 增量摘要是否卡住</p>
-<h2 id="15.11-KV-Cache-命中率优化:-kv_cache.py">15.11 KV Cache 命中率优化: <code>kv_cache.py</code></h2>
+<p><strong>最坏情况</strong>: PG 挂了 + Redis 也抖 → 全部 Layer 1/2 拿不到数据 → LLM 收到 <code>system_prompt="你是银行信用卡智能客服"</code> + <code>user_input=本轮问题</code> + <code>context=""</code> → LLM 用预训练知识回答, 答错了用户也能接受 (因为 Bot 系统也明确告知"知识库可能不全").</p>
+<hr />
+<h2 id="15.6-KV-Cache-优化">15.6 KV Cache 优化</h2>
 <blockquote>
-<p>重要区分: 本节讲的"3 层"是 <strong>KV Cache 视角的稳态/半稳态/动态层</strong> (控制推理引擎 prefix cache 命中), 不是 15.1 讲的"3 层上下文" (L1 结构化记忆 / L2 历史 / L3 RAG). 两套分层各自独立, 但最终在 <code>build_layered_messages</code> 里合流.</p>
+<p><strong>重要区分</strong>: 本节的"3 层"是 <strong>KV Cache 视角的稳态/半稳态/动态层</strong> (控制推理引擎 prefix cache 命中), 与 15.2 的"3 层上下文" (L1 结构化记忆 / L2 历史 / L3 RAG) 是两套独立的分层. 两者最终在 <code>build_layered_messages</code> 里合流, 但设计目标不同.</p>
 </blockquote>
-<h3 id="15.11.1-业务背景:-为什么-TTFT-是生死线">15.11.1 业务背景: 为什么 TTFT 是生死线</h3>
+<h3 id="15.6.1-业务背景-—-TTFT-是生死线">15.6.1 业务背景 — TTFT 是生死线</h3>
 <p><strong>核心问题</strong>: 银行客服每一轮都要重算整个 system prompt + 历史. 7B 模型 ~25ms/100 token, 一个 2KB system prompt 就要 500ms prefill. 客户连发 20 条消息 = 20 次重算 = 10 秒纯等 prefill — 体感"AI 在发呆".</p>
-<p><strong>推理引擎的解药 — prefix cache</strong>: vLLM (PagedAttention) / Anthropic (prompt cache) / Ollama (部分支持) 都允许<strong>字符串前缀完全一致</strong>时直接复用 K/V tensor, 跳过 prefill. 命中时单轮 prefill 从 500ms 降到 ~75ms. <strong>但前提是前缀字符串字面完全一致</strong> — 任何变化 (时间戳/session_id/拼出来的多行) 都让 cache 失效.</p>
-<p><strong>原实现的致命缺陷</strong>: <code>bot_agent</code> 用 f-string 拼 system_prompt (<code>f"对话摘要: {summary}\n客户画像: {profile}\n..."</code>) , 每次字符串都不同 → 命中率 0%. 整个推理引擎的 cache 机制被浪费.</p>
+<p><strong>推理引擎的解药 — prefix cache</strong>: vLLM (PagedAttention) / Anthropic (prompt cache) / TGI 都允许<strong>字符串前缀完全一致</strong>时直接复用 K/V tensor, 跳过 prefill. 命中时单轮 prefill 从 500ms 降到 ~75ms. <strong>但前提是前缀字符串字面完全一致</strong> — 任何变化 (时间戳/session_id/拼出来的多行) 都让 cache 失效.</p>
+<p><strong>原实现的致命缺陷</strong>: <code>bot_agent</code> 用 f-string 拼 system_prompt, 每次字符串都不同 → 命中率 0%. 整个推理引擎的 cache 机制被浪费.</p>
 <p><code>kv_cache.py</code> 的目标: <strong>把 prompt 拆成"稳定 + 半稳定 + 动态"3 块</strong>, 让稳态部分永远字符串一致, 推理引擎可 100% 命中.</p>
-<h3 id="15.11.2-3-层机制:-稳态-/-半稳态-/-动态">15.11.2 3 层机制: 稳态 / 半稳态 / 动态</h3>
+<h3 id="15.6.2-3-层机制-+-标志串">15.6.2 3 层机制 + 标志串</h3>
+<p><code>kv_cache.py:36-45</code> 定义了两个<strong>永不变化</strong>的标志串, 一是<strong>作为前缀锚点</strong>让推理引擎识别"这里开始是 cache 区", 二是<strong>作为 metrics 估算的分隔符</strong> (<code>estimate_cache_metrics</code> 扫 marker 决定哪段算哪层):</p>
+<pre><code class="language-python"># kv_cache.py:36
+STATIC_PREFIX_MARKER = &quot;[STATIC_PREFIX_v1]&quot;   # L1 稳态锚点
+SEMI_STATIC_MARKER = &quot;[CUSTOMER_CONTEXT_v1]&quot;  # L2 半稳态锚点
+</code></pre>
 <table>
 <thead>
 <tr>
@@ -8152,7 +7945,7 @@ system: 参考知识: ... (RAG 文档)
 <td>同意图内稳定</td>
 <td>按意图分组命中</td>
 <td>3 条参考案例 (按 primary_intent 分桶)</td>
-<td>(无独立标志, 走 cache_control)</td>
+<td>(走 <code>cache_control</code>)</td>
 </tr>
 <tr>
 <td><strong>L2 半稳态 (客户画像)</strong></td>
@@ -8170,9 +7963,9 @@ system: 参考知识: ... (RAG 文档)
 </tr>
 </tbody>
 </table>
-<p><strong>两个标志串的工程意义</strong>: <code>STATIC_PREFIX_MARKER</code> 和 <code>SEMI_STATIC_MARKER</code> 是模块顶部常量 (<code>kv_cache.py:42/45</code>), 一是<strong>作为前缀锚点</strong>让推理引擎识别"这里开始是 cache 区", 二是<strong>作为 metrics 估算的分隔符</strong> (<code>estimate_cache_metrics</code> 扫 marker 决定哪段算哪层).</p>
+<p><strong><code>_v1</code> 后缀是版本控制位</strong> — 改 domain_prompt 内容时把 <code>_v1</code> 改成 <code>_v2</code>, 老 session 的 cache 自动失效 (不会读到旧内容).</p>
 <p><strong><code>cache_control: {"type": "ephemeral"}</code> 字段</strong>: Anthropic 风格的 API 标记, vLLM/Anthropic 识别后会缓存此 message 之前所有 prefix 的 K/V; OpenAI 兼容 API 会忽略此字段, 不报错也不生效 (优雅降级). 这是协议层的"软依赖" — 不绑定具体推理引擎.</p>
-<h3 id="15.11.3-消息构建器-build_layered_messages-(kv_cache.py:99)">15.11.3 消息构建器 <code>build_layered_messages</code> (<code>kv_cache.py:99</code>)</h3>
+<h3 id="15.6.3-build_layered_messages-返回结构">15.6.3 <code>build_layered_messages</code> 返回结构</h3>
 <p><code>bot_agent.py:347-358</code> 在每次 LLM 调用前调用, 返回 messages 数组 (按顺序):</p>
 <pre><code class="language-python"># bot_agent.py:347-358
 messages = build_layered_messages(
@@ -8235,9 +8028,179 @@ messages = build_layered_messages(
 </tr>
 </tbody>
 </table>
-<p><strong>关键设计 — RAG 内容放 user 而非 system role</strong>: 第 6 步的 RAG 检索结果用 <code>&lt;retrieved_context&gt;...&lt;/retrieved_context&gt;</code> 包起来当 user message, 不放进 system prompt. 两个原因: ① 物理隔离防 prompt injection (客户在 user input 里塞恶意指令影响不了 system 层); ② 动态部分集中在尾部, prefix 越靠前越稳定, 推理引擎能更激进地 cache.</p>
-<h3 id="15.11.4-性能估算-(按-7B-模型-/-2KB-system_prompt-/-20-轮对话)">15.11.4 性能估算 (按 7B 模型 / 2KB system_prompt / 20 轮对话)</h3>
-<p>来源: <code>kv_cache.py</code> 模块 docstring 顶部声明的预期值, 由 <code>estimate_cache_metrics</code> 函数实际计算并上报.</p>
+<p><strong>关键设计 — RAG 内容放 user 而非 system role</strong> (消息 6): ① <strong>物理隔离防 prompt injection</strong> (客户在 user input 里塞恶意指令影响不了 system 层); ② <strong>prefix cache 友好</strong> (动态部分集中在尾部, 前面的 [1][2][3] 越靠前越稳定, 推理引擎能更激进地 cache).</p>
+<h3 id="15.6.4-端到端示例-—-一次实际-LLM-调用的-messages-数组">15.6.4 端到端示例 — 一次实际 LLM 调用的 messages 数组</h3>
+<blockquote>
+<p>场景: VIP 白金卡客户 <code>cust-9527</code>, session <code>sess-A</code>, 已问过"年费多少/怎么免年费/白金卡权益/机场贵宾厅" 4 轮. 第 5 轮问"上次刷了 5800 块还没出账单, 这笔什么时候记账?"</p>
+</blockquote>
+<pre><code class="language-python"># 第 5 轮 LLM 请求的 messages 数组 (实际结构)
+messages = [
+    # ── [1] L1 静态前缀 (稳态, 跨 session 100% 命中) ──────────────
+    {
+        &quot;role&quot;: &quot;system&quot;,
+        &quot;content&quot;: &quot;[STATIC_PREFIX_v1]\n你是一名专业的银行信用卡客服...\n&quot;,
+        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
+    },
+
+    # ── [2] L1.5 few-shot 半稳态 (按 primary_intent 分组命中) ─────
+    {
+        &quot;role&quot;: &quot;system&quot;,
+        &quot;content&quot;: &quot;## 参考案例\n[例 1]\n客户: 我这个月账单日是哪天?\n客服: ...\n[例 2]...\n[例 3]...\n&quot;,
+        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
+    },
+
+    # ── [3] L2 半稳态 (同 customer 跨 session 命中) ──────────────
+    {
+        &quot;role&quot;: &quot;system&quot;,
+        &quot;content&quot;: &quot;[CUSTOMER_CONTEXT_v1]\n客户卡种: 白金卡\nVIP 等级: VIP5\n...&quot;,
+        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
+    },
+
+    # ── [4] L3 动态 system (每轮必变, 0% 命中) ──────────────────
+    {
+        &quot;role&quot;: &quot;system&quot;,
+        &quot;content&quot;: &quot;## 会话记忆\n对话摘要: 客户咨询白金卡年费减免政策...\n\n## 槽位追踪\n已知: amount=5800\n待收集: transaction_time\n&quot;,
+    },
+
+    # ── [5] L3 对话历史 (动态, 0% 命中) ──────────────────────────
+    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;白金卡年费多少?&quot;},
+    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;您的白金卡年费为 980 元/年...&quot;},
+    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;怎么才能免年费?&quot;},
+    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;您当年消费满 5 万元或分期满 12 期...&quot;},
+    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;白金卡有什么权益?&quot;},
+    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;白金卡权益包括: 机场贵宾厅...&quot;},
+    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;机场贵宾厅怎么用?&quot;},
+    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;出示您的白金卡和登机牌...&quot;},
+
+    # ── [6] L3 当前轮 (动态, 0% 命中, RAG 放 user role 物理隔离) ──
+    {
+        &quot;role&quot;: &quot;user&quot;,
+        &quot;content&quot;: &quot;&lt;retrieved_context&gt;\n[1] 账单日: 每月 5 号\n[2] 入账时点: 交易完成后 1-2 个工作日...\n[3] 未出账单查询: 客户可在交易完成后 24 小时...\n&lt;/retrieved_context&gt;\n\n上次刷了 5800 块还没出账单, 这笔什么时候记账?&quot;,
+    },
+]
+</code></pre>
+<p><strong>Token 分布</strong> (按 7B 中文 1.5 token/字):</p>
+<table>
+<thead>
+<tr>
+<th>消息</th>
+<th>字数</th>
+<th>tokens</th>
+<th>所在层</th>
+<th>跨 session 命中</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>[1] 静态前缀</td>
+<td>~95 字</td>
+<td>~140 t</td>
+<td>L1 稳态</td>
+<td><strong>100%</strong></td>
+</tr>
+<tr>
+<td>[2] few-shot</td>
+<td>~200 字</td>
+<td>~300 t</td>
+<td>L1.5 半稳态</td>
+<td>100% (同 intent 分组)</td>
+</tr>
+<tr>
+<td>[3] 客户画像</td>
+<td>~50 字</td>
+<td>~75 t</td>
+<td>L2 半稳态</td>
+<td>100% (同 customer)</td>
+</tr>
+<tr>
+<td>[4] 动态 system</td>
+<td>~80 字</td>
+<td>~120 t</td>
+<td>L3 动态</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>[5] 4 轮历史</td>
+<td>~250 字</td>
+<td>~375 t</td>
+<td>L3 动态</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>[6] RAG+用户</td>
+<td>~150 字</td>
+<td>~225 t</td>
+<td>L3 动态</td>
+<td>0%</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>~825 字</strong></td>
+<td><strong>~1235 t</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键观察</strong>: 消息 [1][2][3] 共 3 条 system message 占了约 <strong>515 tokens</strong> (140+300+75), 在第 5 轮请求时<strong>完全不用重算</strong> — 推理引擎直接复用第 1 轮的 K/V tensor, 仅重算 [4][5][6] 共 3 条 (720 tokens).</p>
+<h3 id="15.6.5-LIFO-触发与-KV-cache-的冲突-(本章诚实承认)">15.6.5 LIFO 触发与 KV cache 的冲突 (本章诚实承认)</h3>
+<blockquote>
+<p>重要承认: 15.4 的 LIFO 算法和本节的 KV cache 优化<strong>会打架</strong>. 这是 Lumio 上下文工程的结构性取舍, 值得单独讲清楚.</p>
+</blockquote>
+<p><strong>冲突场景</strong>: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组<strong>完全相同</strong>, 推理引擎应该能跨这 10 轮命中 100% KV cache. 但如果<strong>第 25 轮到第 28 轮之间</strong>有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息挤爆了预算), 后面 6 轮 history 数组的字面内容就<strong>全部变了</strong> (少了几条), 推理引擎识别为新 prompt → 前面 24 轮的 prefix cache 全部失效, 哪怕稳态层 (消息 [1][2][3]) 字符字面没变, 推理引擎因为 prefix 不连续也用不了.</p>
+<p><strong>为什么这是真问题, 不是理论问题</strong>:</p>
+<ul>
+<li>银行客服客户经常在对话中途发<strong>长消息</strong> (粘贴交易明细、上传文件 OCR 结果、贴投诉原文)</li>
+<li>一次长消息就触发 LIFO 裁剪</li>
+<li>之后每一轮<strong>整个 prompt 字符串都变</strong> (因为 history 数组少了一条)</li>
+<li>KV cache 命中率从设计预期的"长期稳态 100% 命中"塌缩成"触发裁剪后所有轮 0% 命中"</li>
+</ul>
+<p><strong>实际影响的量化</strong> (按 7B 模型 / 第 25 轮触发 LIFO 估算):</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>不裁剪 (理想)</th>
+<th>触发 LIFO 后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>稳态层 prefix cache 命中</td>
+<td>100%</td>
+<td>0% (prefix 不连续)</td>
+</tr>
+<tr>
+<td>半稳态层 prefix cache 命中</td>
+<td>100%</td>
+<td>0% (同上)</td>
+</tr>
+<tr>
+<td>单轮 prefill</td>
+<td>~75ms</td>
+<td>~500ms (退回全量重算)</td>
+</tr>
+<tr>
+<td>第 25 轮到第 30 轮 TTFT 累计</td>
+<td>~450ms</td>
+<td>~3000ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Lumio 的处理方式 — 接受冲突, 不强行优化</strong>:</p>
+<ul>
+<li><strong>没做</strong> prefix-cache-aware 的 LIFO (比如"宁可爆预算也保留上一轮的全部 history"来维持 cache 命中) — 因为会<strong>语义丢失</strong> (爆预算等于超长 prompt 进 LLM, 更糟)</li>
+<li><strong>没做</strong> history 消息的"软裁剪" (用 <code>truncated: true</code> 标记只截字段不删消息) — 会让 messages 数组里残留 <code>truncated</code> 这种<strong>字面不一致</strong>的字段, <strong>反而让 cache 永远不命中</strong></li>
+<li><strong>没做</strong> history 按 turn_id 锚定 (用 <code>[TURN_25_START]</code> 这种 marker 开头) — 想过但放弃了, 因为 turn_id 跨 session 跨 customer 都不一样, 实际等于<strong>永远不命中</strong>, 比 LIFO 触发的"偶尔失效一次"更差</li>
+</ul>
+<p><strong>为什么接受这个 trade-off</strong>: 银行客服场景的<strong>对话长度有限</strong> — 真实场景下 90% 的对话在 10 轮以内结束, 触发 LIFO 的概率本身就低; 而真触发 LIFO 时的"一次性 3 秒 TTFT 退化"可以靠<strong>前端流式打字机动画掩盖</strong> (用户看不到 prefill, 只看到 token-by-token 输出). 把"语义正确性"放在"绝对 cache 命中"前面, 是这个场景的必然取舍.</p>
+<p><strong>未来可能的优化方向</strong> (当前未做):
+1. <strong>history 兜底填充</strong>: 裁剪后用 <code>[EARLIER_TURNS_SUMMARIZED]</code> 占位, 保持 messages 数组长度恒定, 让 prefix 尽量连续
+2. <strong>压缩替代裁剪</strong> (P1-1 修复已部分实现, <code>bot_agent.py:1029-1043</code>): 优先调 <code>compress_history</code> 把超长 turn 压短, 压不短才裁, 减少 LIFO 触发频率
+3. <strong>per-turn cache_control 标记</strong>: Anthropic 风格的 <code>cache_control: ephemeral</code> 加在每条 history message 上, 推理引擎按 message 级别 cache (而非按整个 prefix). 需要推理引擎支持 message 级 cache 控制, 当前 vLLM/Ollama 都不支持</p>
+<p><strong>对其他层的影响</strong>: 这个冲突<strong>不影响</strong>消息 [1] 静态前缀 / [2] few-shot / [3] 客户画像 — 这些层不参与 history 数组变化, 字面稳定. 只影响消息 [4] 动态 system (因为它包含 history 摘要) 和 [5] history 本体.</p>
+<h3 id="15.6.6-性能估算-+-开关降级">15.6.6 性能估算 + 开关降级</h3>
+<p><strong>性能估算</strong> (按 7B 模型 / 2KB system_prompt / 20 轮对话), 来源: <code>kv_cache.py</code> 模块 docstring 顶部声明的预期值, 由 <code>estimate_cache_metrics</code> 实际计算并上报 (<code>kv_cache.py:207-274</code>):</p>
 <table>
 <thead>
 <tr>
@@ -8274,20 +8237,15 @@ messages = build_layered_messages(
 </tr>
 </tbody>
 </table>
-<p><strong>为什么是估算不是实测</strong>: 真实 KV cache 命中率由推理引擎 (vLLM <code>prompt_cache_stats</code> / Ollama 内部计数器) 上报, 应用层拿不到精确值. <code>estimate_cache_metrics</code> (P1-4 修复后) <strong>只用于 metrics 上报, 明确标 <code>estimated</code></strong>, 旧实现把假设值当真实值上报, 误导监控 — 现已修正 (<code>kv_cache.py:208-213</code> 注释 + P1-4 上下文工程修复).</p>
-<h3 id="15.11.5-启用/降级开关-(config.py:117-119)">15.11.5 启用/降级开关 (<code>config.py:117-119</code>)</h3>
-<pre><code class="language-python"># LLMSettings (config.py:115-121)
+<p><strong>为什么是估算不是实测</strong>: 真实 KV cache 命中率由推理引擎 (vLLM <code>prompt_cache_stats</code> / Ollama 内部计数器) 上报, 应用层拿不到精确值. <code>estimate_cache_metrics</code> <strong>只用于 metrics 上报, 明确标 <code>estimated</code></strong>, 旧实现把假设值当真实值上报, 误导监控 — 现已修正 (<code>kv_cache.py:208-213</code> 注释 + P1-4 上下文工程修复).</p>
+<p><strong>开关与降级</strong> (<code>config.py:91-129</code>):</p>
+<pre><code class="language-python"># LLMSettings
 kv_cache_enabled: bool = True         # 总开关, 关闭时退化到 _legacy_build_messages
 static_prefix_anchor: bool = True    # L1 静态前缀锚定
 layered_injection: bool = True       # L2 半稳态层注入
 inference_engine: str = &quot;ollama&quot;     # ollama (0% prefix cache) / vllm (PagedAttention) / tgi
 </code></pre>
-<p><strong>降级路径</strong> (<code>kv_cache.py:131-133</code>):</p>
-<pre><code class="language-python">if not kv.kv_cache_enabled:
-    # 未启用 KV cache 优化, 退化到原行为
-    return _legacy_build_messages(domain_prompt, user_input, customer_context + session_memory, history)
-</code></pre>
-<p><code>_legacy_build_messages</code> (<code>kv_cache.py:180-194</code>) 是 f-string 拼 system prompt 的原版, 保留向后兼容. <strong>关掉 KV cache 不影响功能, 只是 TTFT 回到 500ms</strong> — 适合推理引擎未知/不支持的灰度环境.</p>
+<p><strong>降级路径</strong> (<code>kv_cache.py:131-133</code>): 未启用 KV cache 优化时退回 <code>_legacy_build_messages</code> (kv_cache.py:180-194) 的 f-string 拼 system prompt 原版. <strong>关掉 KV cache 不影响功能, 只是 TTFT 回到 500ms</strong> — 适合推理引擎未知/不支持的灰度环境.</p>
 <p><strong>推理引擎差异</strong>:</p>
 <table>
 <thead>
@@ -8311,7 +8269,7 @@ inference_engine: str = &quot;ollama&quot;     # ollama (0% prefix cache) / vllm
 <tr>
 <td><strong>Ollama</strong></td>
 <td>⚠️ 部分支持, 命中率不稳定</td>
-<td>0% prefix cache 时 (旧版本) 完全无效, 启用后才有收益</td>
+<td>旧版本完全无效, 启用后才有收益</td>
 </tr>
 <tr>
 <td><strong>TGI</strong></td>
@@ -8320,315 +8278,180 @@ inference_engine: str = &quot;ollama&quot;     # ollama (0% prefix cache) / vllm
 </tr>
 </tbody>
 </table>
-<h3 id="15.11.6-与本章其他节的协作">15.11.6 与本章其他节的协作</h3>
+<hr />
+<h2 id="15.7-实战案例-+-监控">15.7 实战案例 + 监控</h2>
+<h3 id="15.7.1-30-轮对话的第-31-轮">15.7.1 30 轮对话的第 31 轮</h3>
+<p>假设客户与 Bot 聊了 30 轮: 轮 1-5 问白金卡权益 / 轮 6 投诉"上次承诺的 1 万积分没到账" / 轮 7-15 反复问积分到账 / 轮 16-20 转人工失败回到 Bot / 轮 21-30 重新问账单分期. 第 31 轮问"我还有多少积分?".</p>
+<p>3 层上下文处理:</p>
+<ol>
+<li><strong>Layer 1</strong>: <code>conversation_summary</code> ≈ "客户投诉积分未到账, 1 万积分, 转人工失败"; 客户画像 <code>vip_level=platinum</code>; 已知实体 <code>amount=10000</code>; 意图历史 <code>reward_query → complaint → transfer_agent → reward_query</code></li>
+<li><strong>Layer 2</strong>: limit=20 拉到最近 20 轮 (轮 11-30), 估算 20 轮 ≈ 1100 tokens, 全部装下不裁. 轮 6 "投诉" + 轮 16 "转人工" 必保留</li>
+<li><strong>Layer 3</strong>: RAG 检索"还有多少积分" → 命中《积分查询指引》; 知识图谱当前无"积分"实体, 无 KG 增强</li>
+</ol>
+<p>最终 LLM 收到 messages (结构如 15.6.4, 这里不重复列). LLM 能在不重复"您是白金卡吗"的前提下, 直接回答积分余额, 还能识别"投诉"标记不会再次承诺未到账积分 (因为对话摘要已记录此前的承诺).</p>
+<h3 id="15.7.2-监控指标">15.7.2 监控指标</h3>
+<p>上下文工程的 3 层都有自己的<strong>隐式指标</strong>, 可通过 Prometheus 拉取:</p>
 <table>
 <thead>
 <tr>
-<th>相关机制</th>
-<th>协作方式</th>
+<th>指标</th>
+<th>来源</th>
+<th>含义</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><strong>15.1-15.4 (3 层上下文)</strong></td>
-<td><code>_build_session_memory</code> / <code>_load_history</code> / <code>_ensure_summary</code> 算出的结果, 作为 <code>customer_context</code> / <code>session_memory</code> / <code>history</code> 参数传入 <code>build_layered_messages</code></td>
+<td><code>lumio_session_history_turns</code></td>
+<td>SessionManager.get_history 返回值</td>
+<td>当前会话历史轮数</td>
 </tr>
 <tr>
-<td><strong>第 5 章 RAG 检索</strong></td>
-<td>RAG 检索结果作为 <code>rag_context</code> 参数, 走 user role 物理隔离 (防注入)</td>
+<td><code>lumio_session_memory_size_chars</code></td>
+<td><code>_build_session_memory</code> 返回长度</td>
+<td>Layer 1 注入字符数</td>
 </tr>
 <tr>
-<td><strong>15.10 监控</strong></td>
-<td><code>KV_CACHE_HIT_RATE</code> / <code>PREFILL_TOKENS_SAVED</code> 指标由 <code>estimate_cache_metrics</code> 上报, 但需明确是估算值</td>
+<td><code>lumio_summary_size_chars</code></td>
+<td><code>state.conversation_summary</code> 长度</td>
+<td>对话摘要长度</td>
+</tr>
+<tr>
+<td>LLM 请求日志的 <code>prompt_tokens</code></td>
+<td>LLMClient 响应</td>
+<td>实际送入 LLM 的 token 数</td>
+</tr>
+<tr>
+<td><code>lumio_session_state_version</code></td>
+<td>SessionState.version</td>
+<td>CAS 写次数</td>
+</tr>
+<tr>
+<td><code>lumio_kv_cache_hit_rate</code></td>
+<td><code>KV_CACHE_HIT_RATE</code> (kv_cache.py 估算)</td>
+<td><strong>估算值</strong>, 稳态/半稳态/动态的命中比例</td>
+</tr>
+<tr>
+<td><code>lumio_prefill_tokens_saved</code></td>
+<td><code>PREFILL_TOKENS_SAVED</code> (kv_cache.py 估算)</td>
+<td><strong>估算值</strong>, 本轮比全部重算节省的 prefill token</td>
 </tr>
 </tbody>
 </table>
-<p><strong>为什么不能完全替代 15.1 的 3 层</strong>: KV cache 优化解决"如何让 prompt 字符串字面稳定", 15.1 的 3 层上下文解决"什么内容值得送给 LLM". 两者正交 — KV cache 命中再高, 内容选错也是白搭; 内容选对但字符串总变, TTFT 一样 500ms.</p>
-<h2 id="15.12-端到端示例:-一次实际-LLM-调用的-messages-数组">15.12 端到端示例: 一次实际 LLM 调用的 messages 数组</h2>
-<blockquote>
-<p>本节用一个真实对话走完一遍 <code>build_layered_messages</code> 实际生成的 messages 数组, 逐条对比"客户说第 1 句时"和"客户说第 5 句时"的差异, 看清<strong>哪些 message 是字面稳定的、哪些是字面必变的、推理引擎到底能 cache 多少</strong>.</p>
-</blockquote>
-<h3 id="15.12.1-场景设定">15.12.1 场景设定</h3>
-<ul>
-<li><strong>客户</strong>: VIP 白金卡客户 <code>customer_id=cust-9527</code>, 当前 session <code>sess-A</code>, 历史 4 轮 (已问过"年费多少/怎么免年费/白金卡权益/机场贵宾厅")</li>
-<li><strong>第 5 轮客户说</strong>: "上次刷了 5800 块还没出账单, 这笔什么时候记账?"</li>
-<li><strong>意图</strong>: primary_intent = <code>bill_query</code> (账单类, 命中 few-shot 的 bill_query 分组)</li>
-<li><strong>检索</strong>: 命中知识库 3 条关于"账单日/记账时点"的条文</li>
-<li><strong>槽位</strong>: 已抽取 <code>{amount=5800, transaction_time=未提供}</code></li>
-</ul>
-<h3 id="15.12.2-build_layered_messages-实际生成的-messages-数组">15.12.2 <code>build_layered_messages</code> 实际生成的 messages 数组</h3>
-<p>下面展示的就是<strong>第 5 轮请求</strong>实际送给 LLM 的完整 messages 数组 (6 条). 每条都标注了它在哪个层、字面是否稳定.</p>
-<pre><code class="language-python"># 第 5 轮 LLM 请求的 messages 数组 (实际结构)
-messages = [
-    # ── [1] L1 静态前缀 (稳态, 跨 session 100% 命中) ──────────────
-    {
-        &quot;role&quot;: &quot;system&quot;,
-        &quot;content&quot;: &quot;[STATIC_PREFIX_v1]\n你是一名专业的银行信用卡客服, 负责为客户解答信用卡相关问题.\n回答原则:\n1. 基于知识库检索结果回答, 不编造信息.\n2. 不确定的答复请明确告知并引导至人工.\n3. 保持简洁, 避免冗长.\n&quot;,
-        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},  # 推理引擎的 cache 锚点
-    },
-
-    # ── [2] L1.5 few-shot 半稳态 (按 primary_intent 分组命中) ─────
-    {
-        &quot;role&quot;: &quot;system&quot;,
-        &quot;content&quot;: &quot;## 参考案例\n[例 1]\n客户: 我这个月账单日是哪天?\n客服: 您的账单日是每月 5 号, 账单出账后 3 天内还款即可...\n[例 2]\n客户: 上个月消费了 3000 怎么没出账?\n客服: 单笔交易入账时间通常在交易完成后 1-2 个工作日, 请稍候...\n[例 3]\n客户: 还款日忘了, 会逾期吗?\n客服: 建议设置自动扣款或在还款日前 3 天主动还款, 可避免逾期...\n&quot;,
-        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
-    },
-
-    # ── [3] L2 半稳态 (同 customer 跨 session 命中) ──────────────
-    {
-        &quot;role&quot;: &quot;system&quot;,
-        &quot;content&quot;: &quot;[CUSTOMER_CONTEXT_v1]\n客户卡种: 白金卡\nVIP 等级: VIP5\n风险偏好: 保守型\n信用额度: 80,000 元\n&quot;,
-        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
-    },
-
-    # ── [4] L3 动态 system prompt (每轮必变, 0% 命中) ────────────
-    {
-        &quot;role&quot;: &quot;system&quot;,
-        &quot;content&quot;: &quot;## 会话记忆\n对话摘要: 客户咨询白金卡年费减免政策及机场贵宾厅权益, 现询问特定交易入账时点.\n\n## 槽位追踪\n已知: amount=5800\n待收集: transaction_time (交易时间)\n&quot;,
-    },
-
-    # ── [5] L3 对话历史 (动态, 0% 命中) ──────────────────────────
-    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;白金卡年费多少?&quot;},
-    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;您的白金卡年费为 980 元/年, 满足以下任一条件可减免: ...&quot;},
-    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;怎么才能免年费?&quot;},
-    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;您当年消费满 5 万元或分期满 12 期, 可自动减免次年年费.&quot;},
-    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;白金卡有什么权益?&quot;},
-    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;白金卡权益包括: 机场贵宾厅 (全年 6 次)、酒店自助餐买一赠一、...&quot;},
-    {&quot;role&quot;: &quot;user&quot;,      &quot;content&quot;: &quot;机场贵宾厅怎么用?&quot;},
-    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;出示您的白金卡和登机牌, 在合作机场贵宾厅前台登记即可使用.&quot;},
-
-    # ── [6] L3 当前轮 (动态, 0% 命中, RAG 放 user role 物理隔离) ──
-    {
-        &quot;role&quot;: &quot;user&quot;,
-        &quot;content&quot;: &quot;&lt;retrieved_context&gt;\n[1] 账单日: 每月 5 号\n[2] 入账时点: 交易完成后 1-2 个工作日入账, 部分海外交易 3-5 个工作日\n[3] 未出账单查询: 客户可在交易完成后 24 小时在 App 内查看&quot;未出账单&quot;项\n&lt;/retrieved_context&gt;\n\n上次刷了 5800 块还没出账单, 这笔什么时候记账?&quot;,
-    },
-]
-</code></pre>
-<p><strong>总 token 分布</strong> (按 7B 中文 1.5 token/字):</p>
-<table>
-<thead>
-<tr>
-<th>消息</th>
-<th>字数</th>
-<th>tokens</th>
-<th>所在层</th>
-<th>跨 session 命中</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>[1] 静态前缀</td>
-<td>~95 字</td>
-<td>~140 t</td>
-<td>L1 稳态</td>
-<td>100% (跨所有 session)</td>
-</tr>
-<tr>
-<td>[2] few-shot</td>
-<td>~200 字</td>
-<td>~300 t</td>
-<td>L1.5 半稳态</td>
-<td>100% (同 intent 分组)</td>
-</tr>
-<tr>
-<td>[3] 客户画像</td>
-<td>~50 字</td>
-<td>~75 t</td>
-<td>L2 半稳态</td>
-<td>100% (同 customer 跨 session)</td>
-</tr>
-<tr>
-<td>[4] 动态 system</td>
-<td>~80 字</td>
-<td>~120 t</td>
-<td>L3 动态</td>
-<td>0% (每轮变)</td>
-</tr>
-<tr>
-<td>[5] 4 轮历史</td>
-<td>~250 字</td>
-<td>~375 t</td>
-<td>L3 动态</td>
-<td>0% (新轮会变)</td>
-</tr>
-<tr>
-<td>[6] RAG+用户</td>
-<td>~150 字</td>
-<td>~225 t</td>
-<td>L3 动态</td>
-<td>0%</td>
-</tr>
-<tr>
-<td><strong>合计</strong></td>
-<td><strong>~825 字</strong></td>
-<td><strong>~1235 t</strong></td>
-<td></td>
-<td></td>
-</tr>
-</tbody>
-</table>
-<h3 id="15.12.3-第-1-轮-vs-第-5-轮的差异-—-推理引擎到底能-cache-多少">15.12.3 第 1 轮 vs 第 5 轮的差异 — 推理引擎到底能 cache 多少</h3>
-<p><strong>第 1 轮</strong> (客户首次说"白金卡年费多少?"), messages 数组结构相同但内容不同:</p>
-<pre><code class="language-python"># 第 1 轮: 历史为空, RAG 检索结果不同
-messages = [
-    # [1] 静态前缀 — 字面完全一致
-    # [2] few-shot — 字面完全一致 (按 intent 分组, 都是 bill_query)
-    # [3] 客户画像 — 字面完全一致
-    # [4] 动态 system — 字面不同 (摘要为空, 槽位为空)
-    # [5] 历史 — 空数组
-    # [6] RAG+用户 — 字面不同 (检索内容不同 + 用户输入不同)
-]
-</code></pre>
-<p><strong>对比</strong> — 哪几条<strong>字面完全一致</strong>、哪几条<strong>字面必变</strong>:</p>
-<table>
-<thead>
-<tr>
-<th>#</th>
-<th>消息</th>
-<th>第 1 轮 vs 第 5 轮</th>
-<th>字面一致?</th>
-<th>cache 命中</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>[1]</td>
-<td>静态前缀</td>
-<td><code>[STATIC_PREFIX_v1]\n你是一名专业的银行信用卡...</code></td>
-<td>✅ 完全一致</td>
-<td>100% 命中</td>
-</tr>
-<tr>
-<td>[2]</td>
-<td>few-shot</td>
-<td>同一 intent 分组, 案例文本完全一致</td>
-<td>✅ 完全一致</td>
-<td>100% 命中 (按意图分组)</td>
-</tr>
-<tr>
-<td>[3]</td>
-<td>客户画像</td>
-<td><code>客户卡种: 白金卡\nVIP 等级: VIP5\n...</code></td>
-<td>✅ 完全一致</td>
-<td>100% 命中 (同 customer)</td>
-</tr>
-<tr>
-<td>[4]</td>
-<td>动态 system</td>
-<td>第 1 轮: <code>## 会话记忆\n</code> (空), 第 5 轮: 4 轮摘要</td>
-<td>❌ 不同</td>
-<td>0% 命中</td>
-</tr>
-<tr>
-<td>[5]</td>
-<td>历史</td>
-<td>第 1 轮: <code>[]</code>, 第 5 轮: 4 条 user+assistant</td>
-<td>❌ 不同</td>
-<td>0% 命中</td>
-</tr>
-<tr>
-<td>[6]</td>
-<td>RAG+用户</td>
-<td>检索内容和用户输入均不同</td>
-<td>❌ 不同</td>
-<td>0% 命中</td>
-</tr>
-</tbody>
-</table>
-<p><strong>关键观察</strong>: 消息 [1][2][3] 共 3 条 system message 占了约 <strong>515 tokens</strong> (140+300+75), 在第 5 轮请求时<strong>完全不用重算</strong> — 推理引擎直接复用第 1 轮的 K/V tensor, 仅重算 [4][5][6] 共 3 条 (720 tokens).</p>
-<h3 id="15.12.4-这个设计的工程细节-(逐条说明为什么这么写)">15.12.4 这个设计的工程细节 (逐条说明为什么这么写)</h3>
-<p><strong>消息 [1] 静态前缀 — 标志串前缀锚定</strong></p>
-<pre><code class="language-python"># kv_cache.py:62
-f&quot;{STATIC_PREFIX_MARKER}\n{domain_prompt}&quot;
-</code></pre>
-<ul>
-<li><code>STATIC_PREFIX_MARKER = "[STATIC_PREFIX_v1]"</code> (kv_cache.py:42) 是个<strong>永不变化</strong>的字符串前缀</li>
-<li>推理引擎按字符串前缀 hash 复用 K/V, 这个 marker 让 hash 计算更稳</li>
-<li>同一个 Bot 服务启动后, 所有 session 同一 domain_prompt 都共享这一段</li>
-<li><code>_v1</code> 后缀是<strong>版本控制位</strong> — 改 domain_prompt 内容时把 <code>_v1</code> 改成 <code>_v2</code>, 老 session 的 cache 自动失效 (不会读到旧内容)</li>
-</ul>
-<p><strong>消息 [2] few-shot — 按意图分桶, 半稳态</strong></p>
-<pre><code class="language-python"># bot_agent.py:347-358 传入
-few_shot_examples=few_shot_text  # 由 few_shot.py 按 primary_intent 选 top_k=3
-</code></pre>
-<ul>
-<li>同一 primary_intent 的所有 session 共用同一段 few-shot 案例 (例如所有 <code>bill_query</code> 客户共享)</li>
-<li>跨 intent 时字符串变化 (例如客户从"问年费"切到"办挂失"), cache 失效 — 这是<strong>有意的设计</strong>, 因为 few-shot 本来就是按意图分的</li>
-<li>测试用例锁定行为契约 (P2 注入修复)</li>
-</ul>
-<p><strong>消息 [3] 客户画像 — 半稳态跨 session 共享</strong></p>
-<pre><code class="language-python"># kv_cache.py:78
-f&quot;{SEMI_STATIC_MARKER}\n{customer_context}&quot;
-</code></pre>
-<ul>
-<li>同一 customer_id 跨 session 共享 (customer_memory 学习后更新一次, 后续几十次 session 都用同一段)</li>
-<li>customer_context 内容<strong>变化频次极低</strong> (几天到几周才变一次), KV cache 长期保持高命中</li>
-<li><code>customer_id</code> 不进字符串, 所以不同 customer 字符串不同 → 推理引擎按字符串前缀天然分桶</li>
-</ul>
-<p><strong>消息 [4] 动态 system — 接受每轮必变的事实</strong></p>
-<pre><code class="language-python"># kv_cache.py:86-96
-def _build_dynamic_system_prompt(...):
-    parts = []
-    if session_memory:
-        parts.append(f&quot;## 会话记忆\n{session_memory}&quot;)
-    if slot_prompt:
-        parts.append(slot_prompt)
-    return &quot;\n\n&quot;.join(parts)
-</code></pre>
-<ul>
-<li>不试图 cache — session_memory 是对话摘要, 每轮都会变</li>
-<li>即使 0% 命中, 80 字 ≈ 120 tokens, 本身就不大, 不算热点</li>
-<li><strong>设计取舍</strong>: 不为了 100 tokens 的动态层去折腾 cache, 接受每轮重算</li>
-</ul>
-<p><strong>消息 [5] 对话历史 — 不进 cache, 但 token 预算算法管</strong></p>
-<ul>
-<li><code>_load_history</code> (15.3) 用 LIFO 累加把历史限制在 <code>budget_history=1500</code> tokens 内</li>
-<li>超出预算时按 LIFO 砍最老的, <strong>最近 N 轮永远在</strong> — 这本身就比"全部历史都送"节省 token</li>
-<li>KV cache 跟 token 预算是两套独立优化: KV cache 让"送出去的部分"少算, token 预算让"送出去的总量"更少</li>
-</ul>
-<p><strong>消息 [6] RAG + 用户输入 — user role 物理隔离的两层用意</strong></p>
-<pre><code class="language-python"># kv_cache.py:170-173
-f&quot;&lt;retrieved_context&gt;\n{rag_context}\n&lt;/retrieved_context&gt;\n\n{user_input}&quot;
-</code></pre>
-<ul>
-<li><strong>物理隔离防注入</strong>: RAG 检索内容如果含客户塞的恶意指令 (例如检索块里有"忽略之前所有指令"), 因为 RAG 在 user message 里, 跟 system prompt 物理隔离, LLM 会把它当"用户输入"处理而不是"系统指令"</li>
-<li><strong>prefix cache 友好</strong>: 动态部分集中在尾部 (消息 [6]), 前面的 [1][2][3] 越靠前越稳定, 推理引擎能更激进地 cache prefix</li>
-</ul>
-<h3 id="15.12.5-一图看懂:-实际-cache-命中的边界">15.12.5 一图看懂: 实际 cache 命中的边界</h3>
-<pre><code class="language-mermaid">flowchart LR
-    A[第 1 轮请求] --&gt;|&quot;prefix='[STATIC_PREFIX_v1]\n你是一名...\n'&quot;| K[(K/V Cache&lt;br/&gt;推理引擎内部)]
-    A --&gt;|&quot;user: 白金卡年费?&quot;| K
-
-    B[第 5 轮请求] --&gt;|&quot;prefix='[STATIC_PREFIX_v1]\n你是一名...\n'&quot;| K
-    K -.复用.-&gt; B1[✅ 静态前缀 K/V&lt;br/&gt;不重算]
-    K -.复用.-&gt; B2[✅ few-shot K/V&lt;br/&gt;不重算]
-    K -.复用.-&gt; B3[✅ 客户画像 K/V&lt;br/&gt;不重算]
-    B --&gt;|&quot;user: 5800 块...&quot;| B4[❌ RAG+用户 K/V&lt;br/&gt;每轮重算]
-    B --&gt;|&quot;history: 4 轮&quot;| B5[❌ 历史 K/V&lt;br/&gt;每轮重算]
-</code></pre>
-<p><strong>可观察的运维指标</strong> (在生产环境通过 Prometheus 看):</p>
-<pre><code class="language-promql"># 估算的稳态层命中比例 (来自 KV_CACHE_HIT_RATE{ cache_layer=&quot;static_prefix&quot; })
-# 理论应该稳定在 1.0 (只要 domain_prompt 没改)
-
-# 估算的 prefill token 节省
-rate(lumio_prefill_tokens_saved_total[5m])
-
-# 实际 TTFT (time to first token) — 端到端真实数据
-# 应该从优化前的 ~500ms 降到优化后的 ~75-150ms
+<pre><code class="language-promql"># 实际 TTFT 监控 (端到端真实数据, 应该从 ~500ms 降到 ~75-150ms)
 histogram_quantile(0.5, rate(lumio_llm_ttft_seconds_bucket[5m]))
+
+# 估算的稳态层命中比例 (应该稳定在 1.0)
+rate(lumio_kv_cache_hit_rate{cache_layer=&quot;static_prefix&quot;}[5m])
 </code></pre>
 <p><strong>怎么判断 KV cache 优化有没有生效</strong>:
-- 看到 <code>static_prefix</code> 命中比例稳定在 1.0 → L1 稳态层生效
-- 看到 <code>semi_static</code> 在 0.6 附近 → L2 半稳态层生效 (略低是因为不同 customer 切分)
-- 看到 <code>TTFT p50</code> 稳定在 200ms 以下 → 整体命中</p>
-<h2 id="15.13-延伸阅读">15.13 延伸阅读</h2>
+- <code>static_prefix</code> 命中比例稳定在 1.0 → L1 稳态层生效
+- <code>semi_static</code> 在 0.6 附近 → L2 半稳态层生效
+- <code>TTFT p50</code> 稳定在 200ms 以下 → 整体命中</p>
+<h3 id="15.7.3-4-个核心设计取舍-(对比-4-个反证法)">15.7.3 4 个核心设计取舍 (对比 4 个反证法)</h3>
+<p>回顾本章的几个关键设计决策, 4 个最值得回味的"为何不选 X":</p>
+<table>
+<thead>
+<tr>
+<th>决策点</th>
+<th>选了</th>
+<th>备选</th>
+<th>为何不选备选</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>token 估算 (15.4.2)</td>
+<td>字符类加权</td>
+<td><code>tiktoken</code> BPE</td>
+<td>启动 100ms+ / 模型绑定 / 银行中文 95% 准确度足够</td>
+</tr>
+<tr>
+<td>关键轮次豁免 (15.4.3)</td>
+<td>19 关键词字面</td>
+<td>白名单 (事件类型) / 正则</td>
+<td>白名单要 LLM 先分类又慢又脆; 正则过度抽象漏新业务</td>
+</tr>
+<tr>
+<td>摘要调度 (15.5.3)</td>
+<td>fire-and-forget 异步</td>
+<td>await 同步</td>
+<td>摘要 LLM 调用 500-1500ms, await 拖垮主请求 P99 1.5s SLO</td>
+</tr>
+<tr>
+<td>LIFO 触发 KV cache 失效 (15.6.5)</td>
+<td>接受偶尔 3s 退化</td>
+<td>强行 prefix-cache-aware LIFO</td>
+<td>强行优化会让语义丢失或 cache 永远不命中, 比偶尔失效更差</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="15.8-上下游集成-+-延伸阅读">15.8 上下游集成 + 延伸阅读</h2>
+<h3 id="15.8.1-上游/下游集成">15.8.1 上游/下游集成</h3>
+<p>上下文工程的 3 层不是孤岛, 与其他模块深度集成:</p>
+<table>
+<thead>
+<tr>
+<th>上游/下游</th>
+<th>集成方式</th>
+<th>行号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SessionManager (SessionState 持久化)</td>
+<td><code>get_session</code> / <code>patch_state</code> / <code>get_history</code></td>
+<td>session.py:254-340</td>
+</tr>
+<tr>
+<td>IntentClassifier (意图分类)</td>
+<td>Layer 2 历史喂入分类器</td>
+<td>bot_agent.py:154</td>
+</tr>
+<tr>
+<td>EntityExtractor (实体抽取)</td>
+<td><code>last_entities</code> 写到 Layer 1</td>
+<td>bot_agent.py:1185-1300</td>
+</tr>
+<tr>
+<td>知识图谱增强</td>
+<td>Layer 3 追加 <code>## 知识图谱补充信息</code></td>
+<td>bot_agent.py:213-216</td>
+</tr>
+<tr>
+<td>RAG 检索</td>
+<td>4 路径降级 → 写入 Layer 3 (限 1200 token)</td>
+<td>bot_agent.py:610-680</td>
+</tr>
+<tr>
+<td>客户记忆学习 (跨会话)</td>
+<td>CAS patch 写入 Layer 1 客户画像字段</td>
+<td>bot_agent.py:124-135</td>
+</tr>
+<tr>
+<td>上下文压缩器</td>
+<td>超预算先压缩 (质量门) 再裁剪</td>
+<td>context_compressor.py:387-436</td>
+</tr>
+<tr>
+<td>Few-shot 选择</td>
+<td>按意图注入 L1.5 半稳态层 (top_k=3)</td>
+<td>few_shot.py:132 + kv_cache.py:99</td>
+</tr>
+<tr>
+<td>总预算截断 (兜底)</td>
+<td>Σ各层 &gt; context−reserved 时从最旧 user 历史裁剪</td>
+<td>bot_agent.py:365-380</td>
+</tr>
+</tbody>
+</table>
+<h3 id="15.8.2-延伸阅读">15.8.2 延伸阅读</h3>
 <ul>
 <li><strong>第 3 章 Bot 自助问答</strong>: 全链路时序 + 6 步决策树, 上下文工程是其中的"上下文拼装"环节</li>
 <li><strong>第 5 章 RAG 检索全链路</strong>: Layer 3 的 RAG 部分详细解析 (4 路径降级 + RRF 融合)</li>
 <li><strong>第 16 章 客户记忆与知识图谱</strong>: Layer 1 的"客户画像"字段由 customer_memory 学习, 知识图谱是 Layer 3 增强</li>
 <li><strong>第 6 章 会话状态机</strong>: SessionState 是 Layer 1 数据的物理载体</li>
 <li><strong>第 10 章 可观测性</strong>: LLM token 监控 + 摘要 size 监控</li>
-<li><strong>15.11 KV Cache 优化</strong>: Layer 2 LIFO 触发时如何与 KV cache 命中率冲突, 详见 15.3.4</li>
 <li><strong>附录 A.4.1</strong>: 上下文工程术语速查</li>
 </ul>
 </section>
