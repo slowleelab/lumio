@@ -7687,7 +7687,7 @@ def _estimate_tokens(text: str) -&gt; int:
     +4 为消息格式开销 (role/content 包装)
     &quot;&quot;&quot;
 </code></pre>
-<p><strong>不选用 <code>tiktoken</code> 的依据</strong>:</p>
+<p>读者可能问: 既然 BPE 准确度更高, 为何不直接用 <code>tiktoken</code>? 4 维对比说明取舍:</p>
 <table>
 <thead>
 <tr>

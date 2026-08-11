@@ -278,7 +278,7 @@ def _estimate_tokens(text: str) -> int:
     """
 ```
 
-**不选用 `tiktoken` 的依据**:
+读者可能问: 既然 BPE 准确度更高, 为何不直接用 `tiktoken`? 4 维对比说明取舍:
 
 | 维度 | 字符类估算 (当前) | tiktoken |
 |---|---|---|
