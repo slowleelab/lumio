@@ -7602,11 +7602,11 @@ async def _build_session_memory(self, session_id: str) -&gt; str:
 </tr>
 </tbody>
 </table>
-<h3 id="15.3.2-默认值不写入的依据">15.3.2 默认值不写入的依据</h3>
+<h3 id="15.3.2-默认值需要写入上下文中吗?">15.3.2 默认值需要写入上下文中吗?</h3>
 <ul>
 <li><code>vip_level != "普通"</code>: 普通是默认值, 写进 prompt 会占用 LLM 注意力的中性词, 属于噪声</li>
 <li><code>risk_tolerance != "R2"</code>: R2 在产品定义里就是中位档, 写出来等同于没写. 只有 R1 (保守) 或 R3 (激进) 这种偏离默认的才值得让 LLM 注意</li>
-<li>实体池<strong>全量写入</strong>: 实体一旦抽出来就是事实, 过滤反而丢真值</li>
+<li><strong>反例</strong> — 实体池<strong>全量写入</strong>: 实体一旦抽出来就是事实, 过滤反而丢真值. 这里没有"默认值", 每个实体都是事实, 都得写</li>
 </ul>
 <h3 id="15.3.3-互补设计">15.3.3 互补设计</h3>
 <p>Layer 1 用中括号标签 + 等号串的 JSON 风格, 不含自然语言冗余 — 500 tokens 可表达 100+ 实体. 跟 Layer 2 (自然语言对话历史) 形成<strong>"结构化 + 非结构化"互补</strong>: 结构化层传递客户"是什么状态", 非结构化层传递客户"具体怎么说的".</p>
