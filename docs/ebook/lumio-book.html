@@ -7558,6 +7558,11 @@ async def _build_session_memory(self, session_id: str) -&gt; str:
     except Exception:
         return &quot;&quot;  # bot_agent.py:1300, 任何异常都静默降级为空字符串
 </code></pre>
+<p><strong>代码里 2 个细节</strong> (默认值过滤 vs 实体全量):</p>
+<ul>
+<li><code>vip_level != "普通"</code> / <code>risk_tolerance != "R2"</code>: 显式过滤默认值. 微优化, 节省 5-10 tokens; 不写是因为"普通"是中性词, 占用 LLM 注意力却没有信号</li>
+<li>实体池<strong>不过滤全量写入</strong>: 实体是平铺事实, 没有"默认值"概念, 过滤反而丢真值</li>
+</ul>
 <h3 id="15.3.1-拼接顺序的依据">15.3.1 拼接顺序的依据</h3>
 <p>5 段的顺序不是按代码里出现的顺序, 而是<strong>按一旦 token 被截断哪段丢失对 LLM 决策伤害最大倒推</strong> — 重要度越高越靠前. LLM 对 prompt 头部内容的关注度高于尾部, 靠前的内容不容易被淹没:</p>
 <table>
@@ -7602,62 +7607,9 @@ async def _build_session_memory(self, session_id: str) -&gt; str:
 </tr>
 </tbody>
 </table>
-<p><strong>过滤规则的 2 个细节</strong> (读代码时的疑问解答):</p>
-<ul>
-<li><code>vip_level != "普通"</code> / <code>risk_tolerance != "R2"</code>: 默认值不写入 — "普通" / "R2" 是默认值, 写进 prompt 是中性词, 占用 LLM 注意力却没信息量. 只有偏离默认的 (VIP / R1 保守 / R3 激进) 才值得让 LLM 注意</li>
-<li>实体池<strong>不过滤全量写入</strong>: 实体一旦抽出来就是事实, 没有"默认值"概念, 过滤反而丢真值. 这跟客户画像不同, 客户画像是分档的, 实体是平铺的</li>
-</ul>
-<h3 id="15.3.2-默认值不写,-实体全量写-—-背后的非均匀编码思路">15.3.2 默认值不写, 实体全量写 — 背后的非均匀编码思路</h3>
-<p>读 <code>_build_session_memory</code> 代码时, 读者大概率会卡在两处:</p>
-<ul>
-<li><code>if state.vip_level and state.vip_level != "普通"</code>: 为何不直接 <code>if state.vip_level</code>? 多写一行过滤为了什么?</li>
-<li><code>if state.last_entities</code>: 为何实体池<strong>没有</strong>像客户画像那样过滤默认值?</li>
-</ul>
-<p>表面上"过滤"是负面动作, 但 Lumio 这两处的设计不是"过滤", 而是<strong>信息论里"非均匀编码"原则在 prompt 拼装上的应用</strong>.</p>
-<p><strong>信息论背景 — 非均匀编码</strong>: Shannon 在 1948 年的《通信的数学理论》里证明: 信源符号概率分布不均匀时, 高概率符号用短编码、低概率符号用长编码, 总编码长度最短. 经典例子: 摩斯码里 <code>E</code> (英文里出现概率 12.7%) 编码 1 个点, <code>Q</code> (0.1%) 编码 4 个字符. 同样的思路在 Huffman 编码、LZW 压缩、LLM 的 BPE 分词里都能看到.</p>
-<p><strong>应用到 Layer 1 的两个具体场景</strong>:</p>
-<table>
-<thead>
-<tr>
-<th>字段类型</th>
-<th>数据形态</th>
-<th>概率分布</th>
-<th>Lumio 的"编码"</th>
-<th>效果</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>客户画像 (vip / risk_tolerance)</td>
-<td>分档枚举 (普通/银/金/白金)</td>
-<td>极不均匀: 银行 80%+ 客户是"普通卡"普通 R2</td>
-<td>把默认值映射为"空" (0 token), 偏离默认才写</td>
-<td>同样写"客户卡种=普通"用 0 token, 写"客户卡种=白金"用 6 tokens, 总 token 数最低</td>
-</tr>
-<tr>
-<td>实体池 (卡号/金额/日期)</td>
-<td>平铺事实</td>
-<td>近似均匀: 每条都是具体值, 概率相当</td>
-<td>不过滤, 全部写入</td>
-<td>每条实体都是有信息量的具体事实, 没有"默认值"可压</td>
-</tr>
-</tbody>
-</table>
-<p><strong>关键判据 — "有没有可压缩的默认值"</strong>:</p>
-<ul>
-<li>客户画像<strong>有默认值</strong> (普通 / R2), 因为它从产品定义上就是分档枚举, 必有多数档. 把"多数档"用 0 token 编码, 少数档正常编码, 总 token 数最优</li>
-<li>实体池<strong>没有默认值</strong>, 因为实体是开放集合 (卡号格式 ≠ 默认卡号), 概率分布近似均匀. 强行类比"过滤"会丢真值, 反而破坏信息的完整性</li>
-</ul>
-<p><strong>经验数据支撑</strong> (银行客服真实场景):</p>
-<ul>
-<li>信用卡客户 80%+ 是"普通卡"用户, "白金卡" &lt; 5%, "钻石卡" &lt; 0.5%. 不写"普通"省下的 token 跟写出来一样多, 但 LLM 注意力 (上下文窗口的注意力是稀缺资源) 不会被"普通"这种中性词占用</li>
-<li>实体抽取的 5 类常见实体 (卡号 / 金额 / 日期 / 卡种 / 投诉编号) 每条出现概率都不超过 30%, 不存在"多数实体". 全量写是正确的</li>
-</ul>
-<p><strong>跟 15.4.1 LIFO 是同一思路</strong>: 15.4.1 的 LIFO 也是非均匀编码 — 近期对话 (出现概率高, 时间局部性) 优先保留, 远期对话 (概率低) 裁掉. 15.3.2 的"默认值不写"和 15.4.1 的"近期优先"是同一理论在不同层级的应用, 读者如果理解了本节, 看 15.4.1 时会感到设计上的连贯性.</p>
-<p><strong>为什么不直接套用 Huffman</strong>: 理论上 Huffman 编码最优, 但它要预先知道符号概率分布, 且要求编码唯一可解. LLM prompt 不需要可解 (人类 + LLM 都看得懂自然语言), 只要总 token 短. 加上银行客户画像档位就 3-5 个, Huffman 收益 &lt; 实现成本, 简单"过滤默认值"够用.</p>
-<h3 id="15.3.3-互补设计">15.3.3 互补设计</h3>
+<h3 id="15.3.2-互补设计">15.3.2 互补设计</h3>
 <p>Layer 1 用中括号标签 + 等号串的 JSON 风格, 不含自然语言冗余 — 500 tokens 可表达 100+ 实体. 跟 Layer 2 (自然语言对话历史) 形成<strong>"结构化 + 非结构化"互补</strong>: 结构化层传递客户"是什么状态", 非结构化层传递客户"具体怎么说的".</p>
-<h3 id="15.3.4-Layer-1-注入-system-而非-messages-的依据">15.3.4 Layer 1 注入 system 而非 messages 的依据</h3>
+<h3 id="15.3.3-Layer-1-注入-system-而非-messages-的依据">15.3.3 Layer 1 注入 system 而非 messages 的依据</h3>
 <p>Layer 1 走 <code>system_prompt</code> 注入, Layer 2/3 走 <code>messages=</code> 形参. 这种设计:</p>
 <ul>
 <li><strong>system_prompt 干净</strong>: 不会被历史污染, 每次回答 system 部分稳定 → LLM 行为更可预测</li>
