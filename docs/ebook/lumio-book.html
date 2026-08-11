@@ -7558,7 +7558,7 @@ async def _build_session_memory(self, session_id: str) -&gt; str:
     except Exception:
         return &quot;&quot;  # bot_agent.py:1300, 任何异常都静默降级为空字符串
 </code></pre>
-<h3 id="15.3.1-拼接顺序的-why">15.3.1 拼接顺序的 why</h3>
+<h3 id="15.3.1-拼接顺序的依据">15.3.1 拼接顺序的依据</h3>
 <p>5 段的顺序不是按代码里出现的顺序, 而是<strong>按一旦 token 被截断哪段丢失对 LLM 决策伤害最大倒推</strong> — 重要度越高越靠前. LLM 对 prompt 头部内容的关注度高于尾部, 靠前的内容不容易被淹没:</p>
 <table>
 <thead>
@@ -7602,7 +7602,7 @@ async def _build_session_memory(self, session_id: str) -&gt; str:
 </tr>
 </tbody>
 </table>
-<h3 id="15.3.2-默认值不写入的-why">15.3.2 默认值不写入的 why</h3>
+<h3 id="15.3.2-默认值不写入的依据">15.3.2 默认值不写入的依据</h3>
 <ul>
 <li><code>vip_level != "普通"</code>: 普通是默认值, 写进 prompt LLM 要花算力去理解这个中性词, 属于噪声</li>
 <li><code>risk_tolerance != "R2"</code>: R2 在产品定义里就是中位档, 写出来等同于没写. 只有 R1 (保守) 或 R3 (激进) 这种偏离默认的才值得让 LLM 注意</li>
@@ -7838,9 +7838,9 @@ async def _ensure_summary(self, session_id: str, trimmed_turns: list) -&gt; None
         ...
 </code></pre>
 <p><strong>用 <code>last_summarized_turn_id</code> 而非计数的原因</strong>: Redis Stream 的 <code>LTRIM</code> 会把最旧的 turn 物理删除, 摘要用"已摘要 N 轮"计数, LTRIM 后 N 会偏移, 导致重复摘要或漏摘要. 用 turn_id (UUID v7, 单调递增) 精确追踪, LTRIM 不影响.</p>
-<p><strong>3s 超时的 why</strong>: 摘要不是用户可见请求, 慢一点无所谓, 但不能慢到拖垮 LLM 服务整体并发. 3s 接近 LLM P99 响应时间, 超时直接放弃 (下轮再试).</p>
+<p><strong>3s 超时的依据</strong>: 摘要不是用户可见请求, 慢一点无所谓, 但不能慢到拖垮 LLM 服务整体并发. 3s 接近 LLM P99 响应时间, 超时直接放弃 (下轮再试).</p>
 <h3 id="15.5.2-per-session-锁">15.5.2 per-session 锁</h3>
-<p>多轮快速对话时每轮裁剪都会 spawn 一个摘要任务, 并发读写同一 <code>last_summarized_turn_id</code> → CAS 重试后到者失败, 摘要滞后. <code>_ensure_summary</code> 外层包 per-session <code>asyncio.Lock</code> (<code>self._summary_locks[session_id]</code>, <code>bot_agent.py:144</code>), 同会话摘要任务<strong>串行执行</strong>:</p>
+<p>多轮快速对话时每轮裁剪都会生成一个摘要任务, 并发读写同一 <code>last_summarized_turn_id</code> → CAS 重试后到者失败, 摘要滞后. <code>_ensure_summary</code> 外层包 per-session <code>asyncio.Lock</code> (<code>self._summary_locks[session_id]</code>, <code>bot_agent.py:144</code>), 同会话摘要任务<strong>串行执行</strong>:</p>
 <pre><code class="language-python"># bot_agent.py:144-151
 self._summary_locks: dict[str, asyncio.Lock] = {}  # 锁字典, 随会话自然增长
 
@@ -7859,7 +7859,7 @@ self._spawn_task(self._ensure_summary(session_id, trimmed_turns))
 </code></pre>
 <p><strong>不 await 主请求的理由</strong>: 主请求 P99 延迟 1.5s 是硬指标 (SLO), 摘要 LLM 调用 500-1500ms, await 摘要会让主请求 2-3s 才返回, 客户感受明显卡顿.</p>
 <p><strong>摘要丢失无影响</strong>: <code>_ensure_summary</code> 内部<strong>幂等</strong> — 下次轮次如果仍需摘要, <code>last_summarized_turn_id</code> 追踪保证只对新增轮次摘要, 旧摘要不丢.</p>
-<p><strong>故障场景</strong>: 主进程崩溃 → <code>asyncio.create_task</code> 的 task 一起死, 摘要未生成 → 下次启动新会话, <code>last_summarized_turn_id</code> 还是旧值, 增量摘要继续. 不影响正确性, 只影响"摘要可能漏一段".</p>
+<p><strong>故障场景</strong>: 主进程异常退出 → <code>asyncio.create_task</code> 创建的后台 task 随之终止, 摘要未生成 → 下次启动新会话时, <code>last_summarized_turn_id</code> 还是旧值, 增量摘要继续. 不影响正确性, 只影响"摘要可能漏一段".</p>
 <p><strong>不阻塞主请求的另一理由</strong>: 摘要是<strong>辅助信息</strong>而非必需数据. 结构化记忆 (Layer 1) 已经有对话摘要 + 客户画像 + 实体池, 摘要缺失只会让 LLM "不知道旧轮次的细节", 不会让对话中断.</p>
 <h3 id="15.5.4-5-路径降级矩阵">15.5.4 5 路径降级矩阵</h3>
 <p>3 层上下文各层都有<strong>独立的失败路径</strong>, 互不阻塞. Lumio 的降级原则是"<strong>有损优先于不可用</strong>" — 银行客服不能因为上下文组件挂了就返回 500, 必须继续服务:</p>
@@ -8147,7 +8147,7 @@ messages = [
 <blockquote>
 <p><strong>本节修正</strong>: 之前版本说"LIFO 触发 → prefix cache 全部失效 → 单轮 prefill 从 75ms 退到 500ms → 5 轮累计 3000ms", 这是基于"prefix cache 是全有全无"的错误假设. 实际 KV cache 按 <strong>message 级别独立命中</strong>, LIFO 触发只影响 history 段, 稳态/半稳态层完全不受影响. <strong>本节给出修正后的精确分析.</strong></p>
 </blockquote>
-<p><strong>长对话场景</strong>: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组<strong>完全相同</strong>, 推理引擎应该能跨这 10 轮命中 100% KV cache. 但如果<strong>第 25 轮到第 28 轮之间</strong>有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息挤爆了预算), 后面 6 轮 messages 数组中<strong>消息 [5] (history) 的字面内容就变了</strong> (少了几条), 推理引擎识别到这点: 消息 [4] 动态 system (因为它包含 history 摘要) + 消息 [5] history 本体 全部失效, 需要重算. <strong>但消息 [1][2][3] 仍然 100% 命中</strong> — 这 3 段 system message 字面跟 history 数组变化无关, 推理引擎按 message 级别独立复用 K/V, 前面所有轮的稳态/半稳态层 K/V 全部保留.</p>
+<p><strong>长对话场景</strong>: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组<strong>完全相同</strong>, 推理引擎应该能跨这 10 轮命中 100% KV cache. 但如果<strong>第 25 轮到第 28 轮之间</strong>有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息超出 token 预算), 后面 6 轮 messages 数组中<strong>消息 [5] (history) 的字面内容就变了</strong> (少了几条), 推理引擎识别到这点: 消息 [4] 动态 system (因为它包含 history 摘要) + 消息 [5] history 本体 全部失效, 需要重算. <strong>但消息 [1][2][3] 仍然 100% 命中</strong> — 这 3 段 system message 字面跟 history 数组变化无关, 推理引擎按 message 级别独立复用 K/V, 前面所有轮的稳态/半稳态层 K/V 全部保留.</p>
 <p><strong>实际影响 (银行场景为何真实发生)</strong>:</p>
 <ul>
 <li>银行客服客户经常在对话中途发<strong>长消息</strong> (粘贴交易明细、上传文件 OCR 结果、贴投诉原文)</li>
@@ -8220,7 +8220,7 @@ messages = [
 <li><strong>turn_id 锚定 (<code>[TURN_25_START]</code>)</strong>: turn_id 跨 session 跨 customer 都不同, 实际等于永远不命中</li>
 <li><strong>prefix-cache-aware LIFO</strong> (宁可爆预算也保留上一轮的全部 history): 爆预算等于超长 prompt 进 LLM, 直接吃 token 限额, 语义丢失更糟</li>
 </ul>
-<p><strong>最终结论</strong>: 既然 LIFO 对 KV cache 命中率的影响是 0%, 强行优化反而引入新问题. Lumio 的 LIFO 设计<strong>自然</strong>就避免了所有这些陷阱. <strong>没有 trade-off, 不需要流式打字机掩盖, 也不需要纠结"何时接受退化"</strong>.</p>
+<p><strong>最终结论</strong>: 既然 LIFO 对 KV cache 命中率的影响是 0%, 强行优化反而引入新问题. Lumio 的 LIFO 设计<strong>自然</strong>就避免了所有这些陷阱. <strong>没有权衡, 不需要流式打字机掩盖, 也不需要纠结"何时接受退化"</strong>.</p>
 <p><strong>未来可能的优化方向</strong> (当前未做):
 1. <strong>history 兜底填充</strong>: 裁剪后用 <code>[EARLIER_TURNS_SUMMARIZED]</code> 占位, 保持 messages 数组长度恒定, 让 prefix 尽量连续
 2. <strong>压缩替代裁剪</strong> (P1-1 修复已部分实现, <code>bot_agent.py:1029-1043</code>): 优先调 <code>compress_history</code> 把超长 turn 压短, 压不短才裁, 减少 LIFO 触发频率
@@ -8395,13 +8395,13 @@ rate(lumio_kv_cache_hit_rate{cache_layer=&quot;static_prefix&quot;}[5m])
 <td>关键轮次豁免 (15.4.3)</td>
 <td>19 关键词字面</td>
 <td>白名单 (事件类型) / 正则</td>
-<td>白名单要 LLM 先分类又慢又脆; 正则过度抽象漏新业务</td>
+<td>白名单要 LLM 先分类, 增加调用次数; 正则过度抽象漏新业务</td>
 </tr>
 <tr>
 <td>摘要调度 (15.5.3)</td>
 <td>fire-and-forget 异步</td>
 <td>await 同步</td>
-<td>摘要 LLM 调用 500-1500ms, await 拖垮主请求 P99 1.5s SLO</td>
+<td>摘要 LLM 调用 500-1500ms, await 会让主请求 P99 突破 1.5s SLO</td>
 </tr>
 <tr>
 <td>LIFO 触发 KV cache 影响 (15.6.5)</td>

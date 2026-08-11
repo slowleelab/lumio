@@ -168,7 +168,7 @@ async def _build_session_memory(self, session_id: str) -> str:
         return ""  # bot_agent.py:1300, 任何异常都静默降级为空字符串
 ```
 
-### 15.3.1 拼接顺序的 why
+### 15.3.1 拼接顺序的依据
 
 5 段的顺序不是按代码里出现的顺序, 而是**按一旦 token 被截断哪段丢失对 LLM 决策伤害最大倒推** — 重要度越高越靠前. LLM 对 prompt 头部内容的关注度高于尾部, 靠前的内容不容易被淹没:
 
@@ -180,7 +180,7 @@ async def _build_session_memory(self, session_id: str) -> str:
 | 4 | 意图历史 | 话题切换轨迹, 丢了 LLM 顶多以为"前后聊两件不相关的事" | ⭐⭐ |
 | 5 | 当前意图 | 业务侧已经把当前意图传到下游路由, 这段更像"提示" | ⭐ |
 
-### 15.3.2 默认值不写入的 why
+### 15.3.2 默认值不写入的依据
 
 - `vip_level != "普通"`: 普通是默认值, 写进 prompt LLM 要花算力去理解这个中性词, 属于噪声
 - `risk_tolerance != "R2"`: R2 在产品定义里就是中位档, 写出来等同于没写. 只有 R1 (保守) 或 R3 (激进) 这种偏离默认的才值得让 LLM 注意
@@ -398,11 +398,11 @@ async def _ensure_summary(self, session_id: str, trimmed_turns: list) -> None:
 
 **用 `last_summarized_turn_id` 而非计数的原因**: Redis Stream 的 `LTRIM` 会把最旧的 turn 物理删除, 摘要用"已摘要 N 轮"计数, LTRIM 后 N 会偏移, 导致重复摘要或漏摘要. 用 turn_id (UUID v7, 单调递增) 精确追踪, LTRIM 不影响.
 
-**3s 超时的 why**: 摘要不是用户可见请求, 慢一点无所谓, 但不能慢到拖垮 LLM 服务整体并发. 3s 接近 LLM P99 响应时间, 超时直接放弃 (下轮再试).
+**3s 超时的依据**: 摘要不是用户可见请求, 慢一点无所谓, 但不能慢到拖垮 LLM 服务整体并发. 3s 接近 LLM P99 响应时间, 超时直接放弃 (下轮再试).
 
 ### 15.5.2 per-session 锁
 
-多轮快速对话时每轮裁剪都会 spawn 一个摘要任务, 并发读写同一 `last_summarized_turn_id` → CAS 重试后到者失败, 摘要滞后. `_ensure_summary` 外层包 per-session `asyncio.Lock` (`self._summary_locks[session_id]`, `bot_agent.py:144`), 同会话摘要任务**串行执行**:
+多轮快速对话时每轮裁剪都会生成一个摘要任务, 并发读写同一 `last_summarized_turn_id` → CAS 重试后到者失败, 摘要滞后. `_ensure_summary` 外层包 per-session `asyncio.Lock` (`self._summary_locks[session_id]`, `bot_agent.py:144`), 同会话摘要任务**串行执行**:
 
 ```python
 # bot_agent.py:144-151
@@ -431,7 +431,7 @@ self._spawn_task(self._ensure_summary(session_id, trimmed_turns))
 
 **摘要丢失无影响**: `_ensure_summary` 内部**幂等** — 下次轮次如果仍需摘要, `last_summarized_turn_id` 追踪保证只对新增轮次摘要, 旧摘要不丢.
 
-**故障场景**: 主进程崩溃 → `asyncio.create_task` 的 task 一起死, 摘要未生成 → 下次启动新会话, `last_summarized_turn_id` 还是旧值, 增量摘要继续. 不影响正确性, 只影响"摘要可能漏一段".
+**故障场景**: 主进程异常退出 → `asyncio.create_task` 创建的后台 task 随之终止, 摘要未生成 → 下次启动新会话时, `last_summarized_turn_id` 还是旧值, 增量摘要继续. 不影响正确性, 只影响"摘要可能漏一段".
 
 **不阻塞主请求的另一理由**: 摘要是**辅助信息**而非必需数据. 结构化记忆 (Layer 1) 已经有对话摘要 + 客户画像 + 实体池, 摘要缺失只会让 LLM "不知道旧轮次的细节", 不会让对话中断.
 
@@ -587,7 +587,7 @@ messages = [
 
 > **本节修正**: 之前版本说"LIFO 触发 → prefix cache 全部失效 → 单轮 prefill 从 75ms 退到 500ms → 5 轮累计 3000ms", 这是基于"prefix cache 是全有全无"的错误假设. 实际 KV cache 按 **message 级别独立命中**, LIFO 触发只影响 history 段, 稳态/半稳态层完全不受影响. **本节给出修正后的精确分析.**
 
-**长对话场景**: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组**完全相同**, 推理引擎应该能跨这 10 轮命中 100% KV cache. 但如果**第 25 轮到第 28 轮之间**有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息挤爆了预算), 后面 6 轮 messages 数组中**消息 [5] (history) 的字面内容就变了** (少了几条), 推理引擎识别到这点: 消息 [4] 动态 system (因为它包含 history 摘要) + 消息 [5] history 本体 全部失效, 需要重算. **但消息 [1][2][3] 仍然 100% 命中** — 这 3 段 system message 字面跟 history 数组变化无关, 推理引擎按 message 级别独立复用 K/V, 前面所有轮的稳态/半稳态层 K/V 全部保留.
+**长对话场景**: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组**完全相同**, 推理引擎应该能跨这 10 轮命中 100% KV cache. 但如果**第 25 轮到第 28 轮之间**有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息超出 token 预算), 后面 6 轮 messages 数组中**消息 [5] (history) 的字面内容就变了** (少了几条), 推理引擎识别到这点: 消息 [4] 动态 system (因为它包含 history 摘要) + 消息 [5] history 本体 全部失效, 需要重算. **但消息 [1][2][3] 仍然 100% 命中** — 这 3 段 system message 字面跟 history 数组变化无关, 推理引擎按 message 级别独立复用 K/V, 前面所有轮的稳态/半稳态层 K/V 全部保留.
 
 **实际影响 (银行场景为何真实发生)**:
 
@@ -620,7 +620,7 @@ messages = [
 - **turn_id 锚定 (`[TURN_25_START]`)**: turn_id 跨 session 跨 customer 都不同, 实际等于永远不命中
 - **prefix-cache-aware LIFO** (宁可爆预算也保留上一轮的全部 history): 爆预算等于超长 prompt 进 LLM, 直接吃 token 限额, 语义丢失更糟
 
-**最终结论**: 既然 LIFO 对 KV cache 命中率的影响是 0%, 强行优化反而引入新问题. Lumio 的 LIFO 设计**自然**就避免了所有这些陷阱. **没有 trade-off, 不需要流式打字机掩盖, 也不需要纠结"何时接受退化"**.
+**最终结论**: 既然 LIFO 对 KV cache 命中率的影响是 0%, 强行优化反而引入新问题. Lumio 的 LIFO 设计**自然**就避免了所有这些陷阱. **没有权衡, 不需要流式打字机掩盖, 也不需要纠结"何时接受退化"**.
 
 **未来可能的优化方向** (当前未做):
 1. **history 兜底填充**: 裁剪后用 `[EARLIER_TURNS_SUMMARIZED]` 占位, 保持 messages 数组长度恒定, 让 prefix 尽量连续
@@ -711,8 +711,8 @@ rate(lumio_kv_cache_hit_rate{cache_layer="static_prefix"}[5m])
 | 决策点 | 选了 | 备选 | 为何不选备选 |
 |---|---|---|---|
 | token 估算 (15.4.2) | 字符类加权 | `tiktoken` BPE | 启动 100ms+ / 模型绑定 / 银行中文 95% 准确度足够 |
-| 关键轮次豁免 (15.4.3) | 19 关键词字面 | 白名单 (事件类型) / 正则 | 白名单要 LLM 先分类又慢又脆; 正则过度抽象漏新业务 |
-| 摘要调度 (15.5.3) | fire-and-forget 异步 | await 同步 | 摘要 LLM 调用 500-1500ms, await 拖垮主请求 P99 1.5s SLO |
+| 关键轮次豁免 (15.4.3) | 19 关键词字面 | 白名单 (事件类型) / 正则 | 白名单要 LLM 先分类, 增加调用次数; 正则过度抽象漏新业务 |
+| 摘要调度 (15.5.3) | fire-and-forget 异步 | await 同步 | 摘要 LLM 调用 500-1500ms, await 会让主请求 P99 突破 1.5s SLO |
 | LIFO 触发 KV cache 影响 (15.6.5) | 无影响 (message 级独立命中) | 强行 prefix-cache-aware LIFO | 强行优化反而引入 truncated/turn_id 锚定等新问题 |
 
 ---
