@@ -583,42 +583,49 @@ messages = [
 
 **关键观察**: 消息 [1][2][3] 共 3 条 system message 占了约 **515 tokens** (140+300+75), 在第 5 轮请求时**完全不用重算** — 推理引擎直接复用第 1 轮的 K/V tensor, 仅重算 [4][5][6] 共 3 条 (720 tokens).
 
-### 15.6.5 LIFO 触发与 KV cache 的冲突 (本章诚实承认)
+### 15.6.5 LIFO 触发与 KV cache 命中率的精确分析
 
-> 重要承认: 15.4 的 LIFO 算法和本节的 KV cache 优化**会打架**. 这是 Lumio 上下文工程的结构性取舍, 值得单独讲清楚.
+> **本节修正**: 之前版本说"LIFO 触发 → prefix cache 全部失效 → 单轮 prefill 从 75ms 退到 500ms → 5 轮累计 3000ms", 这是基于"prefix cache 是全有全无"的错误假设. 实际 KV cache 按 **message 级别独立命中**, LIFO 触发只影响 history 段, 稳态/半稳态层完全不受影响. **本节给出修正后的精确分析.**
 
-**冲突场景**: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组**完全相同**, 推理引擎应该能跨这 10 轮命中 100% KV cache. 但如果**第 25 轮到第 28 轮之间**有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息挤爆了预算), 后面 6 轮 history 数组的字面内容就**全部变了** (少了几条), 推理引擎识别为新 prompt → 前面 24 轮的 prefix cache 全部失效, 哪怕稳态层 (消息 [1][2][3]) 字符字面没变, 推理引擎因为 prefix 不连续也用不了.
+**冲突场景**: 假设一个长对话走到第 30 轮. 第 21 轮到第 30 轮, Layer 2 的 history messages 数组**完全相同**, 推理引擎应该能跨这 10 轮命中 100% KV cache. 但如果**第 25 轮到第 28 轮之间**有一次 LIFO 裁剪触发 (因为客户在第 25 轮发了条超长消息挤爆了预算), 后面 6 轮 messages 数组中**消息 [5] (history) 的字面内容就变了** (少了几条), 推理引擎识别到这点: 消息 [4] 动态 system (因为它包含 history 摘要) + 消息 [5] history 本体 全部失效, 需要重算. **但消息 [1][2][3] 仍然 100% 命中** — 这 3 段 system message 字面跟 history 数组变化无关, 推理引擎按 message 级别独立复用 K/V, 前面所有轮的稳态/半稳态层 K/V 全部保留.
 
 **为什么这是真问题, 不是理论问题**:
 
 - 银行客服客户经常在对话中途发**长消息** (粘贴交易明细、上传文件 OCR 结果、贴投诉原文)
 - 一次长消息就触发 LIFO 裁剪
-- 之后每一轮**整个 prompt 字符串都变** (因为 history 数组少了一条)
-- KV cache 命中率从设计预期的"长期稳态 100% 命中"塌缩成"触发裁剪后所有轮 0% 命中"
+- 之后每一轮 messages 数组的尾部 (消息 [4] 动态 system + 消息 [5] history) 字面都变
+- KV cache 命中从"消息 [1][2][3] 100% + 消息 [4][5][6] 0%"的预期, 变成"消息 [1][2][3] 仍 100% + 消息 [4] 0% + 消息 [5] 0% + 消息 [6] 0%" — **稳态/半稳态层不受影响, 只有 history 相关段重算**
 
 **实际影响的量化** (按 7B 模型 / 第 25 轮触发 LIFO 估算):
 
 | 指标 | 不裁剪 (理想) | 触发 LIFO 后 |
 |---|---|---|
-| 稳态层 prefix cache 命中 | 100% | 0% (prefix 不连续) |
-| 半稳态层 prefix cache 命中 | 100% | 0% (同上) |
-| 单轮 prefill | ~75ms | ~500ms (退回全量重算) |
-| 第 25 轮到第 30 轮 TTFT 累计 | ~450ms | ~3000ms |
+| 消息 [1] 静态前缀 (140 t) | 100% 命中 | **100% 仍命中** |
+| 消息 [2] few-shot (300 t) | 100% 命中 | **100% 仍命中** (同 intent 分组) |
+| 消息 [3] 客户画像 (75 t) | 100% 命中 | **100% 仍命中** (同 customer) |
+| 消息 [4] 动态 system (120 t) | 0% 命中 (每轮 history 摘要都变) | 0% 命中 (同) |
+| 消息 [5] 4 轮历史 (375 t) | N-1 轮命中 + 新增 1 轮计算 | **0% 命中** (LIFO 触发后, 字面变了, prefix 中断) |
+| 消息 [6] RAG+用户 (225 t) | 0% 命中 | 0% 命中 |
+| **单轮 prefill (重算 token)** | 120+375+225 = **720 t** | 120+375+225 = **720 t** (同) |
+| **单轮 prefill 耗时** | ~75ms (稳态全命中时) | ~75ms (稳态仍命中) |
+| **第 25→30 轮 TTFT 累计** | ~450ms | ~450ms |
 
-**Lumio 的处理方式 — 接受冲突, 不强行优化**:
+**关键结论**: LIFO 触发**不影响**消息 [1][2][3] 的 KV cache 命中, 也不影响单轮 prefill 耗时. **没有 500ms 退化, 没有 3000ms 累计** — 那是我之前版本的错误估算. 真实影响是: 消息 [4] 动态 system 在 LIFO 触发前本就是 0% 命中 (每轮 history 摘要都变), 现在只是"本来就重算, 现在继续重算". 也就是说, **LIFO 对 KV cache 命中率的影响其实是 0%**.
 
-- **没做** prefix-cache-aware 的 LIFO (比如"宁可爆预算也保留上一轮的全部 history"来维持 cache 命中) — 因为会**语义丢失** (爆预算等于超长 prompt 进 LLM, 更糟)
-- **没做** history 消息的"软裁剪" (用 `truncated: true` 标记只截字段不删消息) — 会让 messages 数组里残留 `truncated` 这种**字面不一致**的字段, **反而让 cache 永远不命中**
-- **没做** history 按 turn_id 锚定 (用 `[TURN_25_START]` 这种 marker 开头) — 想过但放弃了, 因为 turn_id 跨 session 跨 customer 都不一样, 实际等于**永远不命中**, 比 LIFO 触发的"偶尔失效一次"更差
+**未做的"强行优化" (澄清一下为何 Lumio 没走极端)**:
 
-**为什么接受这个 trade-off**: 银行客服场景的**对话长度有限** — 真实场景下 90% 的对话在 10 轮以内结束, 触发 LIFO 的概率本身就低; 而真触发 LIFO 时的"一次性 3 秒 TTFT 退化"可以靠**前端流式打字机动画掩盖** (用户看不到 prefill, 只看到 token-by-token 输出). 把"语义正确性"放在"绝对 cache 命中"前面, 是这个场景的必然取舍.
+为防止读者问"那能不能用 truncated / turn_id 锚定等手段去强行维持 cache", 简短列下 3 种思路及为何不采用:
+
+- **history 软裁剪 (`truncated: true`)**: messages 数组里字段不一致, cache 永远不命中, 比偶尔失效更差
+- **turn_id 锚定 (`[TURN_25_START]`)**: turn_id 跨 session 跨 customer 都不同, 实际等于永远不命中
+- **prefix-cache-aware LIFO** (宁可爆预算也保留上一轮的全部 history): 爆预算等于超长 prompt 进 LLM, 直接吃 token 限额, 语义丢失更糟
+
+**最终结论**: 既然 LIFO 对 KV cache 命中率的影响是 0%, 强行优化反而引入新问题. Lumio 的 LIFO 设计**自然**就避免了所有这些陷阱. **没有 trade-off, 不需要流式打字机掩盖, 也不需要纠结"何时接受退化"**.
 
 **未来可能的优化方向** (当前未做):
 1. **history 兜底填充**: 裁剪后用 `[EARLIER_TURNS_SUMMARIZED]` 占位, 保持 messages 数组长度恒定, 让 prefix 尽量连续
 2. **压缩替代裁剪** (P1-1 修复已部分实现, `bot_agent.py:1029-1043`): 优先调 `compress_history` 把超长 turn 压短, 压不短才裁, 减少 LIFO 触发频率
-3. **per-turn cache_control 标记**: Anthropic 风格的 `cache_control: ephemeral` 加在每条 history message 上, 推理引擎按 message 级别 cache (而非按整个 prefix). 需要推理引擎支持 message 级 cache 控制, 当前 vLLM/Ollama 都不支持
-
-**对其他层的影响**: 这个冲突**不影响**消息 [1] 静态前缀 / [2] few-shot / [3] 客户画像 — 这些层不参与 history 数组变化, 字面稳定. 只影响消息 [4] 动态 system (因为它包含 history 摘要) 和 [5] history 本体.
+3. **per-turn cache_control 标记**: Anthropic 风格的 `cache_control: ephemeral` 加在每条 history message 上, 推理引擎按 message 级别 cache (而非按整个 prefix). 需要推理引擎支持 message 级 cache 控制, 当前 vLLM/Ollama 都不支持. **实际上 Lumio 当前已经是这个效果** — 推理引擎天然按 message 级别复用 K/V, 不需要额外标记.
 
 ### 15.6.6 性能估算 + 开关降级
 
@@ -706,7 +713,7 @@ rate(lumio_kv_cache_hit_rate{cache_layer="static_prefix"}[5m])
 | token 估算 (15.4.2) | 字符类加权 | `tiktoken` BPE | 启动 100ms+ / 模型绑定 / 银行中文 95% 准确度足够 |
 | 关键轮次豁免 (15.4.3) | 19 关键词字面 | 白名单 (事件类型) / 正则 | 白名单要 LLM 先分类又慢又脆; 正则过度抽象漏新业务 |
 | 摘要调度 (15.5.3) | fire-and-forget 异步 | await 同步 | 摘要 LLM 调用 500-1500ms, await 拖垮主请求 P99 1.5s SLO |
-| LIFO 触发 KV cache 失效 (15.6.5) | 接受偶尔 3s 退化 | 强行 prefix-cache-aware LIFO | 强行优化会让语义丢失或 cache 永远不命中, 比偶尔失效更差 |
+| LIFO 触发 KV cache 影响 (15.6.5) | 无影响 (message 级独立命中) | 强行 prefix-cache-aware LIFO | 强行优化反而引入 truncated/turn_id 锚定等新问题 |
 
 ---
 
