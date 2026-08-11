@@ -41,7 +41,7 @@ tags: ["上下文工程", "token 预算", "LIFO 累加", "对话摘要", "fire-a
 flowchart TB
     User([客户说 user_input]) --> Build[bot_agent._handle_*<br/>3 层上下文拼装]
 
-    subgraph L1["Layer 1: 结构化会话记忆 (永不裁剪)"]
+    subgraph L1["Layer 1: 结构化会话记忆"]
         L1Sum[对话摘要]
         L1Profile[客户画像: VIP/卡种/风险]
         L1Entity[实体池: 卡号/金额/日期]
@@ -127,7 +127,7 @@ flowchart TB
 
 ## 15.3 Layer 1 — 结构化会话记忆
 
-`bot_agent.py:1185-1300` 实现 `_build_session_memory`, 在每次 `_handle_*` 开头调用, **永不抛出** (任何异常都返回空字符串):
+`bot_agent.py:1185-1300` 实现 `_build_session_memory`, 在每次 `_handle_*` 开头调用, 异常时静默降级, 一律返回空字符串:
 
 ```python
 # bot_agent.py:1185
