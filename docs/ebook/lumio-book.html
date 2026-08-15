@@ -84,7 +84,7 @@
 <li><a href="#06-会话状态机">06 会话状态机</a></li>
 <li><a href="#07-MCP-工具集成">07 MCP 工具集成</a></li>
 <li class="part"><a href="#08-错误处理">08 错误处理</a></li>
-<li><a href="#09-搭建知识库">09 搭建知识库</a></li>
+<li><a href="#09-知识库搭建">09 知识库搭建</a></li>
 <li><a href="#10-可观测性">10 可观测性</a></li>
 <li><a href="#11-安全合规">11 安全合规</a></li>
 <li><a href="#12-数据层">12 数据层</a></li>
@@ -279,7 +279,7 @@ async def _session_worker(self, session_id: str) -&gt; None:
 </tr>
 <tr>
 <td><a href="chapters/09-rag-ingestion.md">09</a></td>
-<td>搭建知识库: 摄入管线 + FAQ + 验证</td>
+<td>知识库搭建: 摄入管线 + FAQ + 验证</td>
 <td>中级</td>
 <td>18 分</td>
 </tr>
@@ -5162,9 +5162,9 @@ if result.source in (&quot;template&quot;, &quot;fallback&quot;) and not should_
 - <a href="../06-session-state-machine.md">第 6 章 会话状态机</a> — <code>InvalidTransitionError</code> 3005 详解</p>
 </blockquote>
 </section>
-<section class="chapter" id="09-搭建知识库">
-<h1 class="chapter-title">09 搭建知识库</h1>
-<h1 id="第-9-章:-搭建一个知识库-—-摄入管线-+-FAQ-+-验证">第 9 章: 搭建一个知识库 — 摄入管线 + FAQ + 验证</h1>
+<section class="chapter" id="09-知识库搭建">
+<h1 class="chapter-title">09 知识库搭建</h1>
+<h1 id="第-9-章:-知识库搭建:-摄入管线-+-FAQ-+-验证">第 9 章: 知识库搭建: 摄入管线 + FAQ + 验证</h1>
 <blockquote>
 <p>本章从操作者的视角, 讲清把一份银行文档变成一个可检索知识库的完整路径: 文档怎么组织、怎么传进系统、中间经历了哪些处理、FAQ 怎么建、搭完之后怎么验证能检索. 重点回答: 知识源要不要按目录分? frontmatter 里的元数据有什么用? 5 阶段摄入为什么是这 5 个? FAQ 和文档检索有什么区别? 怎么确认知识库"真的能用"?</p>
 </blockquote>
