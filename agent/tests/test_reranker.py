@@ -123,24 +123,36 @@ def test_tei_rerank_empty():
 
 @patch("lumio.services.common.reranker.httpx.post")
 def test_tei_rerank_ok(mock_post):
-    """TEI 返回排序结果"""
+    """TEI 返回排序结果（字段为 score）"""
     mock_post.return_value = MagicMock(
         json=lambda: [
-            {"index": 1, "relevance_score": 0.9},
-            {"index": 0, "relevance_score": 0.8},
+            {"index": 1, "score": 0.9},
+            {"index": 0, "score": 0.8},
         ]
     )
     r = TEIReranker()
     results = r.rerank("q", ["d0", "d1"])
     assert len(results) == 2
     assert results[0].index == 1
+    assert results[0].relevance_score == 0.9
     assert results[0].text == "d1"  # 按 index 取原文
+
+
+@patch("lumio.services.common.reranker.httpx.post")
+def test_tei_rerank_bare_array(mock_post):
+    """兼容裸数组列表形态 [[index, score, text], ...]"""
+    mock_post.return_value = MagicMock(json=lambda: [[1, 0.85, "d1"], [0, 0.2, "d0"]])
+    r = TEIReranker()
+    results = r.rerank("q", ["d0", "d1"])
+    assert len(results) == 2
+    assert results[0].index == 1
+    assert results[0].relevance_score == 0.85
 
 
 @patch("lumio.services.common.reranker.httpx.post")
 def test_tei_rerank_index_out_of_range(mock_post):
     """index 越界 → 空文本"""
-    mock_post.return_value = MagicMock(json=lambda: [{"index": 5, "relevance_score": 0.9}])
+    mock_post.return_value = MagicMock(json=lambda: [{"index": 5, "score": 0.9}])
     r = TEIReranker()
     results = r.rerank("q", ["d0"])
     assert results[0].text == ""

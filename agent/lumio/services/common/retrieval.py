@@ -593,7 +593,7 @@ async def retrieve(
                 # 退化检测: 评分全为 <= 0 时视为 reranker 不可用/失效
                 # (Ollama/无模型时 _score_document 捕获异常返回 0.0), 回退到 RRF 结果,
                 # 避免 0 分全部命中置信度阈值而被过滤为空。
-                if all(rr.relevance_score <= 0.0 for rr in reranked):
+                if all(rr.score <= 0.0 for rr in reranked):
                     logger.warning("Reranker 评分为全 0，判定为退化，回退到 RRF 结果")
                 else:
                     fused = reranked

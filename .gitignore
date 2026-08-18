@@ -12,6 +12,7 @@ eggs/
 # Virtual environments
 .venv/
 venv/
+.rerank-venv/
 ENV/
 
 # Poetry — 保留 poetry.lock（可复现构建）

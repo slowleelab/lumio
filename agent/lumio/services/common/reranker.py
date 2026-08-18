@@ -149,6 +149,9 @@ class TEIReranker:
         """调用 TEI /rerank 端点进行重排序
 
         请求体包含 query、texts 和 top_n，响应为已排序的索引和分数列表。
+        兼容 TEI / rerank_service 的两种响应形态：
+        - 字典列表：[{"index": 0, "score": 0.9, "text": "..."}]（字段为 score）
+        - 裸数组列表：[[index, score, text], ...]
         """
         if not documents:
             return []
@@ -160,15 +163,17 @@ class TEIReranker:
                 timeout=self.timeout,
             )
             resp.raise_for_status()
-            data: list[dict] = resp.json()
-            return [
-                RerankResult(
-                    index=item["index"],
-                    relevance_score=item["relevance_score"],
-                    text=documents[item["index"]] if item["index"] < len(documents) else "",
-                )
-                for item in data
-            ]
+            data: list = resp.json()
+            results: list[RerankResult] = []
+            for item in data:
+                if isinstance(item, dict):
+                    index = item["index"]
+                    score = item.get("score", item.get("relevance_score", 0.0))
+                else:
+                    index, score = item[0], item[1]
+                text = documents[index] if 0 <= index < len(documents) else ""
+                results.append(RerankResult(index=index, relevance_score=float(score), text=text))
+            return results
         except Exception:
             logger.exception("TEI 重排序请求失败")
             return []
