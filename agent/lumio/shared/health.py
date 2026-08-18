@@ -106,7 +106,7 @@ async def _check_milvus(app: Any) -> dict[str, Any]:
     if collection is None:
         return {"status": "skip", "reason": "not_initialized"}
     try:
-        await asyncio.wait_for(asyncio.to_thread(collection.num_entities), timeout=3.0)
+        await asyncio.wait_for(asyncio.to_thread(lambda: collection.num_entities), timeout=3.0)
         return {"status": "up"}
     except Exception as e:
         return _error_response("milvus", e)

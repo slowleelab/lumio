@@ -71,14 +71,20 @@ def build_es_filters(filters: dict) -> list[dict]:
             if isinstance(value, dict):
                 range_clause: dict[str, Any] = {}
                 if "gte" in value:
-                    range_clause["gte"] = value["gte"]
+                    epoch_ms = _date_to_epoch_ms(value["gte"])
+                    if epoch_ms:
+                        range_clause["gte"] = epoch_ms
                 if "lte" in value:
-                    range_clause["lte"] = value["lte"]
+                    epoch_ms = _date_to_epoch_ms(value["lte"])
+                    if epoch_ms:
+                        range_clause["lte"] = epoch_ms
                 if range_clause:
                     clauses.append({"range": {key: range_clause}})
             elif isinstance(value, str):
-                # 简写: 单个日期值视为 gte
-                clauses.append({"range": {key: {"gte": value}}})
+                # 简写: 单个日期值视为 gte，统一转 epoch 毫秒（ES 数值范围边界按毫秒解释）
+                epoch_ms = _date_to_epoch_ms(value)
+                if epoch_ms:
+                    clauses.append({"range": {key: {"gte": epoch_ms}}})
         elif key == "keywords":
             if isinstance(value, list):
                 clauses.append({"terms": {key: value}})
@@ -155,6 +161,16 @@ def _date_to_epoch(date_str: str) -> int | None:
         return int(dt.timestamp())
     except (ValueError, TypeError):
         return None
+
+
+def _date_to_epoch_ms(date_str: str) -> int | None:
+    """将 yyyy-MM-dd 日期字符串转为 epoch 毫秒
+
+    ES 数值型 range 边界始终按内部毫秒解释（即使 mapping 声明 epoch_second，
+    也仅作用于索引解析时），因此 ES 侧 range 需用毫秒，Milvus 侧仍用秒。
+    """
+    epoch_sec = _date_to_epoch(date_str)
+    return epoch_sec * 1000 if epoch_sec is not None else None
 
 
 async def search_bm25(
@@ -574,8 +590,14 @@ async def retrieve(
                         )
                     )
             if reranked:
-                fused = reranked
-                use_reranker_threshold = True
+                # 退化检测: 评分全为 <= 0 时视为 reranker 不可用/失效
+                # (Ollama/无模型时 _score_document 捕获异常返回 0.0), 回退到 RRF 结果,
+                # 避免 0 分全部命中置信度阈值而被过滤为空。
+                if all(rr.relevance_score <= 0.0 for rr in reranked):
+                    logger.warning("Reranker 评分为全 0，判定为退化，回退到 RRF 结果")
+                else:
+                    fused = reranked
+                    use_reranker_threshold = True
         except Exception:
             logger.warning("Reranker 调用失败，使用 RRF 结果", exc_info=True)
 

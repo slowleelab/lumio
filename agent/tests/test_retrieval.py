@@ -29,8 +29,9 @@ class TestBuildEsFilters:
         filters = {"effective_date": {"gte": "2026-01-01", "lte": "2026-12-31"}}
         clauses = build_es_filters(filters)
         assert len(clauses) == 1
-        assert clauses[0]["range"]["effective_date"]["gte"] == "2026-01-01"
-        assert clauses[0]["range"]["effective_date"]["lte"] == "2026-12-31"
+        # ES 数值型 range 边界按内部毫秒解释（即使 mapping 声明 epoch_second），需转毫秒
+        assert clauses[0]["range"]["effective_date"]["gte"] == 1767196800000  # 2026-01-01 in ms
+        assert clauses[0]["range"]["effective_date"]["lte"] == 1798646400000  # 2026-12-31 in ms
 
     def test_keywords_filter(self):
         filters = {"keywords": ["年费", "积分"]}

@@ -87,6 +87,8 @@ def init_elasticsearch():
                     "customer_tier": {"type": "keyword"},
                     "effective_date": {"type": "date", "format": "epoch_second"},
                     "expiry_date": {"type": "date", "format": "epoch_second"},
+                    "approval_status": {"type": "keyword"},
+                    "is_current_version": {"type": "boolean"},
                     "security_level": {"type": "keyword"},
                     "version": {"type": "keyword"},
                     "chunk_type": {"type": "keyword"},

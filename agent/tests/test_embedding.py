@@ -14,6 +14,8 @@ from lumio.services.common.embedding import (
     EmbeddingProvider,
     OllamaEmbedding,
     TEIEmbedding,
+    _mean_pool,
+    _split_into_segments,
     create_embedding_provider,
 )
 from lumio.shared.exceptions import EmbeddingServiceError, EmbeddingTimeoutError
@@ -90,6 +92,32 @@ async def test_ollama_embed_query_adds_instruction() -> None:
     assert len(captured_input) == 1
     assert captured_input[0].startswith(BGE_QUERY_INSTRUCTION)
     assert "信用卡年费" in captured_input[0]
+
+
+def test_split_into_segments_short_text() -> None:
+    """不超过上限的文本不分段"""
+    text = "信用卡年费减免" * 10
+    segs = _split_into_segments(text)
+    assert len(segs) == 1
+    assert segs[0] == text
+
+
+def test_split_into_segments_long_text() -> None:
+    """超长文本切成多段且每段不超上限，拼接无损"""
+    text = "信用卡消费达标即可减免次年年费。" * 100  # 1600 字符
+    segs = _split_into_segments(text, max_chars=460)
+    assert len(segs) > 1
+    for s in segs:
+        assert len(s) <= 460
+    assert "".join(segs) == text
+
+
+def test_mean_pool() -> None:
+    """均值池化返回与输入同维的逐元素平均"""
+    a = [2.0, 4.0, 6.0]
+    b = [0.0, 2.0, 4.0]
+    pooled = _mean_pool([a, b])
+    assert pooled == [1.0, 3.0, 5.0]
 
 
 @pytest.mark.asyncio
