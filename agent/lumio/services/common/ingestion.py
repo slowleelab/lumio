@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+import uuid_utils
 from markdown_it import MarkdownIt
 
 if TYPE_CHECKING:
@@ -626,7 +627,7 @@ async def ingest_document(
 
         chunk_records: list[dict] = []
         for _idx, (chunk_text_str, embedding) in enumerate(zip(chunks, embeddings, strict=True)):
-            chunk_id = str(KbIngestionLog.id.default.arg())  # 使用 UUID v7 生成
+            chunk_id = str(uuid_utils.uuid7())  # UUID v7
             chunk_records.append(
                 {
                     "chunk_id": chunk_id,
@@ -700,7 +701,7 @@ async def ingest_document(
         # ── 保存 KbChunk 到 DB ──
         for idx, record in enumerate(chunk_records):
             chunk = KbChunk(
-                id=record["chunk_id"],
+                id=uuid_utils.UUID(record["chunk_id"]),
                 document_id=doc_id,
                 chunk_index=idx,
                 content=record["content"],
