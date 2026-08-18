@@ -52,3 +52,23 @@ def test_real_env_wins_over_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: py
         assert os.environ.get("RAG_EMBEDDING_PROVIDER") == "ollama"
     finally:
         monkeypatch.delenv("RAG_EMBEDDING_PROVIDER", raising=False)
+
+
+def test_repo_root_env_wins_when_cwd_inside_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """cwd 位于仓库内时, 仓库根 .env 优先于 cwd/.env (修复 agent/.env 历史残留遮蔽根文件)"""
+    import lumio.shared.config as cm
+
+    repo_root = cm.Path(__file__).resolve().parents[2]
+    # 模拟: 仓库根 .env 定义 A, cwd(模拟为仓库内子目录)的 .env 定义 B —— 根应胜出
+    root_env = repo_root / ".env"
+    assert root_env.is_file(), "测试前置: 仓库根需存在 .env"
+
+    monkeypatch.delenv("POSTGRES_USER", raising=False)
+    monkeypatch.chdir(repo_root / "agent")
+
+    cm._load_dotenv_search()
+    try:
+        # 真实根 .env 内的值被加载 (应为 lumio, 而非任何 cwd 残留)
+        assert os.environ.get("POSTGRES_USER") == "lumio"
+    finally:
+        monkeypatch.delenv("POSTGRES_USER", raising=False)

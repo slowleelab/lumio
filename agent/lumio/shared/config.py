@@ -28,9 +28,18 @@ def _load_dotenv_search() -> None:
         return
 
     # 默认 load_dotenv() 相对进程 CWD 解析, 而服务从 agent/ 启动, 会漏掉仓库根 .env.
-    # 显式探测多个候选位置 (优先仓库根, 与 .env.example 同目录), 找到即加载.
+    # 仓库内以根 .env 为准 (与 .env.example 同目录, 唯一 config 源): 即使 cwd 下
+    # 存在历史残留的 agent/.env 也不允许其遮蔽根文件. 仅当 cwd 位于仓库外
+    # (如自包含的临时测试目录) 才退而使用 cwd/.env.
     repo_root = Path(__file__).resolve().parents[3]
-    for candidate in (Path.cwd() / ".env", repo_root / ".env", repo_root / "agent" / ".env"):
+    cwd_resolved = Path.cwd().resolve()
+    inside_repo = cwd_resolved == repo_root or repo_root in cwd_resolved.parents
+    candidates = (
+        (repo_root / ".env", cwd_resolved / ".env")
+        if inside_repo
+        else (cwd_resolved / ".env", repo_root / ".env")
+    )
+    for candidate in candidates:
         if candidate.is_file():
             load_dotenv(candidate, override=False)
             return
