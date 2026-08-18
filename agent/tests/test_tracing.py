@@ -225,6 +225,70 @@ def test_get_trace_context_otel_missing(monkeypatch: pytest.MonkeyPatch) -> None
     assert tracing.get_trace_context() is None
 
 
+# ── collector 可达性门控 (修复 4318 连接风暴) ──
+
+
+def test_collector_reachable_down() -> None:
+    """不可达端点返回 False"""
+    assert tracing._collector_reachable("http://127.0.0.1:1") is False
+
+
+def test_collector_reachable_invalid_url() -> None:
+    """非法 URL / 无端口返回 False 而非抛异常"""
+    assert tracing._collector_reachable("not-a-url") is False
+
+
+def test_collector_reachable_up() -> None:
+    """可达端点返回 True"""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    port = s.getsockname()[1]
+    try:
+        assert tracing._collector_reachable(f"http://127.0.0.1:{port}") is True
+    finally:
+        s.close()
+
+
+def test_init_tracing_skips_exporter_when_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """collector 不可达时仍初始化 provider 但不挂网络 exporter (免连接风暴)"""
+    monkeypatch.setattr(tracing, "_provider_initialized", False)
+    monkeypatch.setattr(tracing, "_load_tracing_config", lambda: (True, "127.0.0.1", None))
+    monkeypatch.setattr(tracing, "_collector_reachable", lambda endpoint: False)
+    saved = otel_trace.get_tracer_provider()
+    try:
+        tracing._init_tracing("lumio-bot")
+        assert tracing._provider_initialized is True
+    finally:
+        otel_trace._TRACER_PROVIDER = saved
+
+
+# ── _get_tracer 代理/p真实 provider 判定 (防 ProxyTracerProvider 递归) ──
+
+
+def test_get_tracer_returns_none_when_proxy_provider() -> None:
+    """全局 provider 指向 ProxyTracerProvider 时返回 None, 避免 get_tracer 递归爆栈"""
+    saved = otel_trace._TRACER_PROVIDER
+    try:
+        otel_trace._TRACER_PROVIDER = otel_trace._PROXY_TRACER_PROVIDER
+        assert tracing._get_tracer() is None
+    finally:
+        otel_trace._TRACER_PROVIDER = saved
+
+
+def test_get_tracer_returns_tracer_when_real_provider() -> None:
+    """已 mount 真实 provider 时返回 tracer, 正常埋点不受影响"""
+    provider = TracerProvider()
+    saved = otel_trace._TRACER_PROVIDER
+    try:
+        otel_trace._TRACER_PROVIDER = provider
+        assert tracing._get_tracer() is not None
+    finally:
+        otel_trace._TRACER_PROVIDER = saved
+
+
 # ── _read_service_version 兜底分支 ──
 
 

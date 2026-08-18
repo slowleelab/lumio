@@ -7,10 +7,36 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import quote_plus
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# 让 .env 对所有子 Settings 生效 (子类各自只有 env_prefix, 未带 env_file, 若不在此
+# 全局注入, RAG_/LLM_/ES_ 等前缀的值写入 .env 不会生效, 只读进程环境变量).
+# 真实进程环境变量优先级仍高于 .env (load_dotenv 默认 override=False).
+# 让 .env 对所有子 Settings 生效 (子类各自只有 env_prefix, 未带 env_file, 若不在此
+# 全局注入, RAG_/LLM_/ES_ 等前缀的值写入 .env 不会生效, 只读进程环境变量).
+# 真实进程环境变量优先级仍高于 .env (load_dotenv 默认 override=False).
+def _load_dotenv_search() -> None:
+    """探测并加载仓库 .env 到 os.environ (供所有子 Settings 读取)"""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover - python-dotenv 随 pydantic-settings 安装
+        return
+
+    # 默认 load_dotenv() 相对进程 CWD 解析, 而服务从 agent/ 启动, 会漏掉仓库根 .env.
+    # 显式探测多个候选位置 (优先仓库根, 与 .env.example 同目录), 找到即加载.
+    repo_root = Path(__file__).resolve().parents[3]
+    for candidate in (Path.cwd() / ".env", repo_root / ".env", repo_root / "agent" / ".env"):
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            return
+
+
+_load_dotenv_search()
 
 
 class DatabaseSettings(BaseSettings):
