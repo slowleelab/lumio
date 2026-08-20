@@ -1,0 +1,8 @@
+{
+  "settings_version": 1,
+  "purpose": "意图分类『四步自迭代闭环』的唯一版本化开关: 线上 on/off 随此文件入库, 不依赖本机未入库的 .env; 显式进程环境变量(CLS_*)仍可覆盖此文件, 作逃生舱/临时关闭.",
+  "bert_enabled": true,
+  "trap_enabled": true,
+  "trap_sampling_band": 0.15,
+  "trap_ambient_rate": 0.02
+}

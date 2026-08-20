@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -42,7 +44,36 @@ def _load_dotenv_search() -> None:
     for candidate in candidates:
         if candidate.is_file():
             load_dotenv(candidate, override=False)
-            return
+            break
+
+    # 密闭配置文件: 意图分类闭环开关(BERT 快路径 + trap 感知缝)的唯一版本化源.
+    # 线上 on/off 随代码入库, 不依赖本机未入库的 .env. 与 .env 同样的 override=False
+    # 语义 — 显式进程环境变量(CLS_*)仍可覆盖此文件(作逃生舱/临时关闭).
+    _inject_closed_loop_env(repo_root)
+
+
+# 四步闭环开关: 字段 → 对应 CLS_ 环境变量名 (ClassificationSettings env_prefix=CLS_)
+_CLOSED_LOOP_ENV_MAP: dict[str, str] = {
+    "bert_enabled": "CLS_BERT_ENABLED",
+    "trap_enabled": "CLS_TRAP_ENABLED",
+    "trap_sampling_band": "CLS_TRAP_SAMPLING_BAND",
+    "trap_ambient_rate": "CLS_TRAP_AMBIENT_RATE",
+}
+
+
+def _inject_closed_loop_env(repo_root: Path) -> None:
+    """从已提交的 data/intent_classification/closed_loop.json 注入开关到 os.environ."""
+    cfg = repo_root / "agent" / "data" / "intent_classification" / "closed_loop.json"
+    if not cfg.is_file():
+        return
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for field, env_key in _CLOSED_LOOP_ENV_MAP.items():
+        # 保留 None 让 .env/默认值生效; 值统一转字符串注入
+        if data.get(field) is not None:
+            os.environ.setdefault(env_key, str(data[field]))
 
 
 _load_dotenv_search()
