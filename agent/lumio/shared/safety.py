@@ -26,6 +26,24 @@ _RELOAD_CHANNEL = "lumio:safety:reload"
 # 全角→半角转换表（银行场景客户常输入全角字符）
 _FULLWIDTH_OFFSET = 0xFEE0
 
+# 仅"审计触发"的话题词: 输入侧仍需检测/审计, 但**输出不得打码**.
+# 这些是合规/路由话题关键词(投诉监管类/危机干预类), 不是 PII.
+# Bot 自身的转接原因、安抚话术会正常引用这些词(如"转接原因: 投诉处理"),
+# 若一律打码会把结构化消息毁成"**处理", 故从输出过滤中豁免.
+_MASK_EXEMPT_TOPIC = frozenset(
+    {
+        # 投诉监管类
+        "投诉", "银保监会", "律师", "法院", "媒体曝光",
+        # 危机干预类 (P1-9)
+        "自杀", "自残", "轻生", "不想活", "活不下去", "想死", "抑郁", "绝望",
+    }
+)
+
+
+def _is_mask_exempt(word: str) -> bool:
+    """该词在输出打码中豁免 (仅审计, 不遮罩)."""
+    return _normalize(word) in _MASK_EXEMPT_TOPIC
+
 
 def _normalize(text: str) -> str:
     """文本归一化: 全角→半角 + 大小写折叠
@@ -200,6 +218,9 @@ class SafetyFilter:
         # 收集所有命中区间 (start, end)
         intervals: list[tuple[int, int]] = []
         for end_pos, _word in self._automaton.iter(normalized):
+            if _is_mask_exempt(_word):
+                # 话题词(投诉/危机)仅审计, 不打码 — 否则"转接原因: 投诉处理"被毁成"**处理"
+                continue
             word_len = len(_normalize(_word))
             start_pos = end_pos - word_len + 1
             intervals.append((start_pos, end_pos + 1))

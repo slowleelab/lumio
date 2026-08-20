@@ -88,3 +88,6 @@ generated/
 
 # ZCode 会话内部文件
 .zcode/
+
+# 意图分类微调产物 (探针训练权重 99M, 不入库; 保留种子数据与 README)
+agent/data/intent_classification/out_intent_clf/

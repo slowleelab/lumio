@@ -7,7 +7,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from lumio.services.bot.bot_agent import LumioAgent, _is_farewell, _is_greeting
+from lumio.services.bot.bot_agent import (
+    LumioAgent,
+    _has_grounding,
+    _is_farewell,
+    _is_greeting,
+)
+from lumio.services.bot.prompts import CLARIFY_RESPONSE
 from lumio.shared.models import (
     IntentLabel,
     IntentResult,
@@ -43,6 +49,18 @@ class TestGreetingDetection:
 
     def test_is_farewell_no(self) -> None:
         assert _is_farewell("还有问题") is False
+
+    def test_is_farewell_closing_sentence(self) -> None:
+        """收尾句式(谢谢+没有其他问题)应命中告别快速路径, 不再走 LLM"""
+        assert _is_farewell("谢谢，没有其他问题了") is True
+        assert _is_farewell("没有其他问题了") is True
+        assert _is_farewell("暂时没有了") is True
+        assert _is_farewell("不用了谢谢") is True
+
+    def test_is_farewell_does_not_match_followup(self) -> None:
+        """带谢谢但仍有继续提问意图 → 不得误判为告别 (避免提前结束会话)"""
+        assert _is_farewell("谢谢你们，但我还想问下账单怎么查") is False
+        assert _is_farewell("谢谢，那积分呢") is False
 
 
 class TestBotAgent:
@@ -100,6 +118,15 @@ class TestBotAgent:
         assert result["response_source"] == "template"
 
     @pytest.mark.asyncio
+    async def test_run_farewell_closing_fast_path(self, mock_deps: dict) -> None:
+        """收尾语(谢谢+没有其他问题)走告别快速路径 template, 不触发 LLM"""
+        agent = LumioAgent(**mock_deps)
+        result = await agent.run("test-session", "谢谢，没有其他问题了")
+
+        assert result["response_source"] == "template"
+        assert result["response"] != ""
+
+    @pytest.mark.asyncio
     async def test_run_fallback_on_normal_message(self, mock_deps: dict) -> None:
         """正常消息走分类+降级管理器"""
         mock_deps["degradation_mgr"].generate_with_fallback.return_value = MagicMock(
@@ -108,10 +135,92 @@ class TestBotAgent:
         )
 
         agent = LumioAgent(**mock_deps)
+        # 正常问答在真实系统里有检索上下文 → 用非空上下文模拟, 走 generate 路径
+        agent._retrieve = AsyncMock(return_value="信用卡账单查询 知识片段")
         result = await agent.run("test-session", "帮我查一下账单")
 
         assert result["response"] == "这是自动回复"
         assert result["response_source"] == "llm"
+
+    @pytest.mark.asyncio
+    async def test_run_fresh_garbage_returns_clarify(self, mock_deps: dict) -> None:
+        """首句即无意义输入(无检索、无依据、意图不确定) → 确定性澄清, 不调 LLM"""
+        agent = LumioAgent(**mock_deps)
+        result = await agent.run("test-session", "adb")
+
+        assert result["response_source"] == "clarify"
+        assert result["response"] == CLARIFY_RESPONSE
+        mock_deps["degradation_mgr"].generate_with_fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_grounded_followup_not_clarified(self, mock_deps: dict) -> None:
+        """有对话依据的追问(即使检索为空) → 不澄清, 继续走 LLM 用会话记忆续答"""
+        mock_deps["degradation_mgr"].generate_with_fallback = AsyncMock(
+            return_value=MagicMock(content="这是追问续答", source="llm")
+        )
+        agent = LumioAgent(**mock_deps)
+        # 模拟会话记忆里已有实体(追问依据)
+        agent._build_session_memory = AsyncMock(return_value="[已知实体] card_last4=1234")
+
+        result = await agent.run("test-session", "那分期呢")
+
+        assert result["response_source"] == "llm"
+        assert result["response"] == "这是追问续答"
+
+    def test_has_grounding(self) -> None:
+        """依据门控: 记忆含实体/意图/摘要 or 有多轮历史 → 视为有据; 否则无据"""
+        assert _has_grounding("", []) is False
+        assert _has_grounding("[已知实体] card_last4=1234", []) is True
+        assert _has_grounding("", [{"role": "user", "content": "上一轮"}]) is True
+        assert _has_grounding("[当前意图] faq", []) is False  # 仅泛化意图不算有据
+
+    @pytest.mark.asyncio
+    async def test_classify_emits_trace_span(self, mock_deps: dict, monkeypatch) -> None:
+        """意图分类埋入全链路: 生成 Agent: intent_classify span 且带 intent/confidence/source 属性"""
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter
+
+        captured: list = []
+
+        class _MemoryExporter(SpanExporter):
+            def export(self, batch):
+                captured.extend(batch)
+                return self.get_result()
+
+            def get_result(self):
+                return type("R", (), {"message": None})()
+
+            def shutdown(self):
+                pass
+
+            def force_flush(self, timeout_millis=0):
+                return True
+
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(_MemoryExporter()))
+        import lumio.shared.tracing as t
+
+        monkeypatch.setattr(t, "_TRACING_ENABLED", True)
+        monkeypatch.setattr(t, "_get_tracer", lambda: provider.get_tracer("test-classify"))
+
+        mock_deps["classifier"].classify = AsyncMock(
+            return_value=(
+                IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.92),
+                [],
+                MagicMock(),
+                "bert",
+            )
+        )
+        agent = LumioAgent(**mock_deps)
+        await agent._classify("我要查账单")
+
+        names = {s.name for s in captured}
+        assert "Agent: intent_classify" in names
+        span = next(s for s in captured if s.name == "Agent: intent_classify")
+        attrs = span.attributes
+        assert attrs["intent"] == "bill_query"
+        assert attrs["confidence"] == 0.92
+        assert attrs["source"] == "bert"
 
     @pytest.mark.asyncio
     async def test_run_business_transfer(self, mock_deps: dict) -> None:
@@ -157,7 +266,7 @@ class TestBotAgent:
 
     @pytest.mark.asyncio
     async def test_run_classify_failure_graceful(self, mock_deps: dict) -> None:
-        """分类失败时降级为 FAQ 并正常回复（不崩溃）"""
+        """分类失败时优雅降级, 不崩溃: 兜回 FAQ/空置信 → 直接确定性澄清 """
         mock_deps["classifier"].classify = AsyncMock(side_effect=RuntimeError("BOOM"))
         mock_deps["degradation_mgr"].generate_with_fallback.return_value = MagicMock(
             content="请再描述一下",
@@ -167,14 +276,22 @@ class TestBotAgent:
         agent = LumioAgent(**mock_deps)
         result = await agent.run("test-session", "任意消息")
 
-        # 分类失败不应崩溃，走降级回复
-        assert result["response"] == "请再描述一下"
-        assert result["response_source"] == "template"
+        # 分类失败 → FAQ/0 置信被归为"意图不确定", 直接返回澄清话术 (确定性, 不崩溃)
+        assert result["response_source"] == "clarify"
+        assert result["response"] != ""
 
     @pytest.mark.asyncio
     async def test_run_full_exception_triggers_hard_fallback(self, mock_deps: dict) -> None:
         """所有路径都失败时触发硬编码兜底"""
-        mock_deps["classifier"].classify = AsyncMock(side_effect=RuntimeError("BOOM"))
+        # 用高置信具体意图绕过澄清门控, 使走到 LLM 生成阶段才失败 → 触发外层硬兜底
+        mock_deps["classifier"].classify = AsyncMock(
+            return_value=(
+                IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.9),
+                [],
+                MagicMock(),
+                "bert",
+            )
+        )
         mock_deps["degradation_mgr"].generate_with_fallback = AsyncMock(side_effect=RuntimeError("DOUBLE BOOM"))
 
         agent = LumioAgent(**mock_deps)

@@ -1,0 +1,299 @@
+{
+  "meta": {
+    "taxonomy": "IntentLabel (封闭 10 类单标签分类)",
+    "version": "0.1.0",
+    "domain": "银行信用卡客服",
+    "purpose": "BERT 系轻量意图分类器微调的首批种子数据；标签口径与 RuleClassifier(_RULES) 对齐",
+    "source": "rule-aligned seeds + 人工撰写",
+    "counts": {
+      "examples": 129,
+      "confusable_pairs": 12
+    }
+  },
+  "labels": [
+    {
+      "id": "faq",
+      "name_zh": "通用知识问答",
+      "definition": "信用卡通用政策/流程/规则常识咨询（年费、免息期、账单日、汇率、激活、提醒等），不指向单条账单或单笔交易的查询，也不含业务办理动作。",
+      "decision_path": "knowledge (RAG)",
+      "note": "覆盖面最广的类，靠 RAG 检索回答；易与业务意图的\"时效/办理\"问法混淆。"
+    },
+    {
+      "id": "bill_query",
+      "name_zh": "账单查询",
+      "definition": "针对账单整体或还款额的查询（本期/历史账单、应还/最低还款、欠款总额）。",
+      "decision_path": "business",
+      "note": "问\"总额/还款额\"归此；问\"逐笔明细\"归 transaction_query。"
+    },
+    {
+      "id": "transaction_query",
+      "name_zh": "交易明细查询",
+      "definition": "针对具体逐笔消费/扣款/流水的查询（某笔金额、时间、商户、入账状态）。",
+      "decision_path": "business",
+      "note": "与 bill_query 是头号易混淆对，靠\"总额 vs 逐笔\"区分。"
+    },
+    {
+      "id": "limit_query",
+      "name_zh": "额度查询/额度管理",
+      "definition": "额度相关查询或操作诉求（当前/可用/临时额度、提额/降额）。",
+      "decision_path": "business",
+      "note": "仅做意图识别；提额/降额属敏感操作走确认状态机。"
+    },
+    {
+      "id": "installment_inquiry",
+      "name_zh": "分期咨询/办理",
+      "definition": "分期相关咨询或办理（账单/消费分期、期数、手续费率、提前还款）。",
+      "decision_path": "business",
+      "note": "问\"手续费怎么收\"倾向此意图，即便含\"费率\"措辞。"
+    },
+    {
+      "id": "reward_query",
+      "name_zh": "积分/权益查询",
+      "definition": "信用卡积分或权益相关（积分余额/兑换/过期、积分商城、权益到账）。",
+      "decision_path": "business",
+      "note": "涉及积分的时效/兑换均归此，非通用 FAQ。"
+    },
+    {
+      "id": "card_loss",
+      "name_zh": "挂失/补卡",
+      "definition": "卡片丢失/被盗、要求挂失止付、补卡换卡。全站唯一敏感写意图。",
+      "decision_path": "business (敏感, 需确认/转人工)",
+      "note": "命中即高优先级，不可误分流到 faq；需客户确认，必要时转人工核实身份。"
+    },
+    {
+      "id": "complaint",
+      "name_zh": "投诉",
+      "definition": "表达不满/投诉意图（服务态度、乱扣费、处理结果不满意），通常伴随负面情绪。",
+      "decision_path": "business (投诉处理)",
+      "note": "即使抱怨的是某项明细，优先判 complaint 而非 transaction_query。"
+    },
+    {
+      "id": "transfer_agent",
+      "name_zh": "转人工",
+      "definition": "明确要求人工/真人客服介入。",
+      "decision_path": "transfer (转人工会话)",
+      "note": "诉求重点是\"找人工\"→此意图；诉求重点是\"办某事\"（如挂失）则归对应业务意图。"
+    },
+    {
+      "id": "chitchat",
+      "name_zh": "闲聊/非业务",
+      "definition": "问候/寒暄/非业务表达，封闭集内其余内容通常落入此类作为兜底。",
+      "decision_path": "fallback (模板/joke)",
+      "note": "承担封闭集外溢出；但\"你好\"+业务诉求混合时需靠分类器判主诉求。"
+    }
+  ],
+  "examples": [
+    {"text": "信用卡年费怎么减免", "intent": "faq"},
+    {"text": "每年刷卡几次能免年费", "intent": "faq"},
+    {"text": "白金卡的年费是多少", "intent": "faq"},
+    {"text": "信用卡的免息还款期是多长", "intent": "faq"},
+    {"text": "账单日可以修改吗", "intent": "faq"},
+    {"text": "什么是溢缴款", "intent": "faq"},
+    {"text": "怎么激活新到的信用卡", "intent": "faq"},
+    {"text": "境外消费用什么汇率结算", "intent": "faq"},
+    {"text": "还款日和账单日约定是一回事吗", "intent": "faq"},
+    {"text": "信用卡密码和签名有什么不同", "intent": "faq"},
+    {"text": "附属卡怎么办理", "intent": "faq"},
+    {"text": "怎么开通交易短信提醒", "intent": "faq"},
+    {"text": "积分有效期统一是几年", "intent": "faq"},
+    {"text": "信用卡申请有哪些条件", "intent": "faq"},
+    {"text": "什么是最低还款额", "intent": "faq"},
+
+    {"text": "我这个月的账单是多少", "intent": "bill_query"},
+    {"text": "查一下我上个月花了多少钱", "intent": "bill_query"},
+    {"text": "本期账单的应还款额是多少", "intent": "bill_query"},
+    {"text": "我的最低还款额是多少", "intent": "bill_query"},
+    {"text": "信用卡现在还欠多少", "intent": "bill_query"},
+    {"text": "帮我看看这期账单出了没有", "intent": "bill_query"},
+    {"text": "上期的账单款还清了吗", "intent": "bill_query"},
+    {"text": "现在应还总金额是多少", "intent": "bill_query"},
+    {"text": "我这个月总共消费了多少钱", "intent": "bill_query"},
+    {"text": "账单明细在哪里看", "intent": "bill_query"},
+    {"text": "这个月的还款额够了吗", "intent": "bill_query"},
+    {"text": "我的账单到现在还差多少没还", "intent": "bill_query"},
+    {"text": "账单总额是多少", "intent": "bill_query"},
+    {"text": "这个季度我欠了多少钱", "intent": "bill_query"},
+    {"text": "显示一下我的历史账单", "intent": "bill_query"},
+
+    {"text": "查一下我最近的消费记录", "intent": "transaction_query"},
+    {"text": "这笔158元的扣款是什么", "intent": "transaction_query"},
+    {"text": "帮我看看上周的交易流水", "intent": "transaction_query"},
+    {"text": "这个月有哪些交易明细", "intent": "transaction_query"},
+    {"text": "上笔刷卡是在哪个商户消费的", "intent": "transaction_query"},
+    {"text": "那天我消费的一笔入账了吗", "intent": "transaction_query"},
+    {"text": "查一下账号里最近一笔交易", "intent": "transaction_query"},
+    {"text": "为什么我有一笔扣款失败了", "intent": "transaction_query"},
+    {"text": "帮我核对一下这笔消费记录", "intent": "transaction_query"},
+    {"text": "昨天的刷卡流水还没显示", "intent": "transaction_query"},
+    {"text": "查一下最近在地铁站的扣款", "intent": "transaction_query"},
+    {"text": "这笔境外消费划走了多少", "intent": "transaction_query"},
+    {"text": "订房那笔预授权入账了吗", "intent": "transaction_query"},
+
+    {"text": "我的信用卡额度是多少", "intent": "limit_query"},
+    {"text": "现在有多少可用额度", "intent": "limit_query"},
+    {"text": "可以帮我提额吗", "intent": "limit_query"},
+    {"text": "临时额度怎么申请", "intent": "limit_query"},
+    {"text": "信用额度不够用怎么办", "intent": "limit_query"},
+    {"text": "我想调高一点额度", "intent": "limit_query"},
+    {"text": "为什么我的额度被降了", "intent": "limit_query"},
+    {"text": "额度什么时候能恢复", "intent": "limit_query"},
+    {"text": "我这个月额度用完了", "intent": "limit_query"},
+    {"text": "能申请永久提额吗", "intent": "limit_query"},
+    {"text": "把临时额度提到五万", "intent": "limit_query"},
+    {"text": "自动提额多久评估一次", "intent": "limit_query"},
+
+    {"text": "账单可以分期吗", "intent": "installment_inquiry"},
+    {"text": "我分12期的手续费要多少", "intent": "installment_inquiry"},
+    {"text": "怎么办理消费分期", "intent": "installment_inquiry"},
+    {"text": "信用卡分期费率是多少", "intent": "installment_inquiry"},
+    {"text": "这笔大额消费能分期还吗", "intent": "installment_inquiry"},
+    {"text": "账单分期和消费分期区别在哪", "intent": "installment_inquiry"},
+    {"text": "分期的手续费怎么收取", "intent": "installment_inquiry"},
+    {"text": "分期提前还款还有手续费吗", "intent": "installment_inquiry"},
+    {"text": "分几期比较划算", "intent": "installment_inquiry"},
+    {"text": "我这张卡能申请分期吗", "intent": "installment_inquiry"},
+    {"text": "买手机那笔能做分期吗", "intent": "installment_inquiry"},
+    {"text": "分期首期还款怎么算", "intent": "installment_inquiry"},
+
+    {"text": "我的积分有多少", "intent": "reward_query"},
+    {"text": "积分怎么兑换礼品", "intent": "reward_query"},
+    {"text": "积分快过期了怎么办", "intent": "reward_query"},
+    {"text": "积分商城入口在哪", "intent": "reward_query"},
+    {"text": "这些积分都能换什么", "intent": "reward_query"},
+    {"text": "这月积分到账了吗", "intent": "reward_query"},
+    {"text": "兑换的礼品多久能到", "intent": "reward_query"},
+    {"text": "积分兑换要手续费吗", "intent": "reward_query"},
+    {"text": "积分能充话费吗", "intent": "reward_query"},
+    {"text": "积分和里程能互转吗", "intent": "reward_query"},
+    {"text": "新户礼怎么还没到账", "intent": "reward_query"},
+    {"text": "当月的积分发到哪了", "intent": "reward_query"},
+
+    {"text": "我的卡丢了要挂失", "intent": "card_loss"},
+    {"text": "帮我紧急挂失信用卡", "intent": "card_loss"},
+    {"text": "卡被偷了怎么处理", "intent": "card_loss"},
+    {"text": "我要补办一张新卡", "intent": "card_loss"},
+    {"text": "申请换卡需要多久", "intent": "card_loss"},
+    {"text": "卡片丢失了能立刻止付吗", "intent": "card_loss"},
+    {"text": "挂失后怎么重新发卡", "intent": "card_loss"},
+    {"text": "我的卡找不到了怎么办", "intent": "card_loss"},
+    {"text": "挂失会收手续费吗", "intent": "card_loss"},
+    {"text": "我卡在国外丢了怎么处理", "intent": "card_loss"},
+    {"text": "紧急挂失之后还能撤销吗", "intent": "card_loss"},
+    {"text": "新卡寄到后要重新设密码吗", "intent": "card_loss"},
+    {"text": "挂失后卡片还能再使用吗", "intent": "card_loss"},
+
+    {"text": "我要投诉你们客服", "intent": "complaint"},
+    {"text": "客服态度实在太差了", "intent": "complaint"},
+    {"text": "对这笔处理结果很不满意", "intent": "complaint"},
+    {"text": "我要举报你们", "intent": "complaint"},
+    {"text": "你们这样处理太过分了", "intent": "complaint"},
+    {"text": "我要投诉到监管部门", "intent": "complaint"},
+    {"text": "连个道歉都没有真让人恼火", "intent": "complaint"},
+    {"text": "这件事必须给我个说法", "intent": "complaint"},
+    {"text": "你们乱发短信骚扰我", "intent": "complaint"},
+    {"text": "等了两小时没人接我要投诉", "intent": "complaint"},
+    {"text": "报销单据一直没处理很不满", "intent": "complaint"},
+    {"text": "客服承诺的返现一直没兑现", "intent": "complaint"},
+
+    {"text": "转人工客服", "intent": "transfer_agent"},
+    {"text": "帮我找个人工", "intent": "transfer_agent"},
+    {"text": "我要和真人客服说话", "intent": "transfer_agent"},
+    {"text": "请帮我转给人工处理", "intent": "transfer_agent"},
+    {"text": "人工服务在哪里", "intent": "transfer_agent"},
+    {"text": "机器人答不了我要人工", "intent": "transfer_agent"},
+    {"text": "别再让机器人回复了转人工", "intent": "transfer_agent"},
+    {"text": "给我接人工客服", "intent": "transfer_agent"},
+    {"text": "让你上级来跟我说", "intent": "transfer_agent"},
+    {"text": "我是VIP给接人工好吗", "intent": "transfer_agent"},
+    {"text": "转人工专席处理", "intent": "transfer_agent"},
+    {"text": "让主管来跟我沟通", "intent": "transfer_agent"},
+    {"text": "请转接人工坐席", "intent": "transfer_agent"},
+
+    {"text": "你好", "intent": "chitchat"},
+    {"text": "在吗", "intent": "chitchat"},
+    {"text": "你是谁呀", "intent": "chitchat"},
+    {"text": "谢谢你的回答", "intent": "chitchat"},
+    {"text": "再见", "intent": "chitchat"},
+    {"text": "你真厉害", "intent": "chitchat"},
+    {"text": "哈哈没什么", "intent": "chitchat"},
+    {"text": "没事随便聊聊", "intent": "chitchat"},
+    {"text": "早", "intent": "chitchat"},
+    {"text": "你真贴心", "intent": "chitchat"},
+    {"text": "你们最近忙不忙", "intent": "chitchat"},
+    {"text": "今天天气不错啊", "intent": "chitchat"}
+  ],
+  "confusable_pairs": [
+    {
+      "text": "我查一下这个月总共消费了多少",
+      "correct": "bill_query",
+      "trap": "transaction_query",
+      "note": "问\"总额\"归 bill_query；问\"逐笔明细\"才归 transaction_query"
+    },
+    {
+      "text": "帮我看看最近有哪些消费记录",
+      "correct": "transaction_query",
+      "trap": "bill_query",
+      "note": "有\"记录/明细\"倾向逐笔，归 transaction_query"
+    },
+    {
+      "text": "这笔108元的扣款是哪里来的",
+      "correct": "transaction_query",
+      "trap": "bill_query",
+      "note": "单笔金额定位 → transaction_query"
+    },
+    {
+      "text": "分期还款的手续费怎么收",
+      "correct": "installment_inquiry",
+      "trap": "faq",
+      "note": "即便以\"怎么\"问流程，涉及分期费率仍归 installment"
+    },
+    {
+      "text": "我这张卡的年费能分期交吗",
+      "correct": "installment_inquiry",
+      "trap": "faq",
+      "note": "年费是话题，但诉求是\"分期\"→ installment"
+    },
+    {
+      "text": "积分兑换的礼品要多久到账",
+      "correct": "reward_query",
+      "trap": "faq",
+      "note": "涉及积分兑换时效归 reward，不归通用 FAQ"
+    },
+    {
+      "text": "补办的卡要几天能寄到",
+      "correct": "card_loss",
+      "trap": "faq",
+      "note": "涉及补卡流程归 card_loss；纯通用流程咨询才归 faq"
+    },
+    {
+      "text": "我卡丢了能不能先冻结一下",
+      "correct": "card_loss",
+      "trap": "limit_query",
+      "note": "丢卡止付归 card_loss，不归额度类"
+    },
+    {
+      "text": "我要投诉你们乱扣费",
+      "correct": "complaint",
+      "trap": "transaction_query",
+      "note": "即便涉及扣费明细，表达投诉意图优先归 complaint"
+    },
+    {
+      "text": "帮我转人工办挂失",
+      "correct": "transfer_agent",
+      "trap": "card_loss",
+      "note": "诉求重点是\"找人工\"→transfer_agent；重点是办挂失→card_loss；短回复含两者需按主诉求判"
+    },
+    {
+      "text": "我的当前额度还够刷卡吗",
+      "correct": "limit_query",
+      "trap": "faq",
+      "note": "自报账户状态的额度判断归 limit_query"
+    },
+    {
+      "text": "账单和消费流水是不是一回事",
+      "correct": "faq",
+      "trap": "bill_query",
+      "note": "出现\"账单/流水\"但本质问概念区别 → 归 FAQ"
+    }
+  ]
+}

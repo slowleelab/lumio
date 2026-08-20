@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import uuid as uuid_module
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,7 @@ from lumio.services.bot.prompts import (
     _SUMMARIZE_SYSTEM_PROMPT,
     BUSINESS_SYSTEM_PROMPT,
     BUSINESS_TRANSFER_TEMPLATE,
+    CLARIFY_RESPONSE,
     CRISIS_RESPONSE,
     FALLBACK_SYSTEM_PROMPT,
     FAREWELL_RESPONSE,
@@ -285,10 +287,25 @@ class LumioAgent:
     # ── 路径处理 ──
 
     async def _classify(self, user_input: str) -> tuple[IntentResult, list[Entity], SentimentLabel]:
-        """意图分类 + 实体抽取 + 情感分析"""
+        """意图分类 + 实体抽取 + 情感分析 (接入全链路: Agent: intent_classify)"""
         try:
-            intent_result, entities, sentiment, _ = await self._classifier.classify(user_input)
-            return intent_result, entities, sentiment
+            from lumio.shared.tracing import _TRACING_ENABLED, _get_tracer
+
+            tracer = _get_tracer() if _TRACING_ENABLED else None
+            if tracer is None:
+                intent_result, entities, sentiment, _ = await self._classifier.classify(user_input)
+                return intent_result, entities, sentiment
+
+            with tracer.start_as_current_span("Agent: intent_classify") as span:
+                try:
+                    intent_result, entities, sentiment, source = await self._classifier.classify(user_input)
+                except Exception:
+                    span.set_attribute("error", True)
+                    raise
+                span.set_attribute("intent", intent_result.primary_intent.value)
+                span.set_attribute("confidence", float(intent_result.primary_confidence))
+                span.set_attribute("source", str(source))  # bert / rule / llm / fallback
+                return intent_result, entities, sentiment
         except Exception:
             return IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0), [], SentimentLabel.NEUTRAL
 
@@ -331,6 +348,24 @@ class LumioAgent:
 
         slot_prompt = await self._load_slot_prompt(session_id, intent.primary_intent, entities or [])
         session_memory = await self._build_session_memory(session_id)
+
+        # 无检索上下文时的"依据门控": 防 LLM 空想编造(如把 "adb" 误认成某银行),
+        # 同时保住追问场景。
+        # - 无检索 且 无对话依据(首句即无意义输入) → 绕开 LLM, 返回固定澄清话术
+        #    (确定性、零幻觉、秒回)。
+        # - 无检索 但 有对话依据(追问答) → 放行, 让 LLM 依托下方注入的会话记忆续答。
+        if not context and not _has_grounding(session_memory, history) and _is_uncertain_intent(intent):
+            logger.info("无检索且无对话依据且意图不确定, 直接澄清: session=%s input=%r", session_id, user_input)
+            return self._build_result(
+                session_id,
+                user_input,
+                CLARIFY_RESPONSE,
+                "clarify",
+                intent.primary_intent.value,
+                intent.primary_confidence,
+                entities=entities,
+                sentiment=sentiment,
+            )
 
         # P2 上下文工程: few-shot 动态选择注入生产路径 (此前 select_few_shot 零生产调用)
         few_shot_text = ""
@@ -1339,9 +1374,53 @@ class LumioAgent:
 # ── 快速路径判断 ──
 
 
+def _normalize_text(text: str) -> str:
+    """归一化: 去首尾空白 + 去常见全半角标点 + 小写 (判定问候/告别用)."""
+    return re.sub(r"[\s，。！？；、—…,.!?;:：~～]+", "", text).lower()
+
+
 def _is_greeting(text: str) -> bool:
-    return text.strip().lower() in {"你好", "您好", "嗨", "hi", "hello", "在吗", "在不在"}
+    return _normalize_text(text) in {"你好", "您好", "嗨", "hi", "hello", "在吗", "在不在"}
+
+
+# 收尾对话句式: 命中即视为告别 (快速路径), 避免"谢谢，没有其他问题了"这类
+# 无害收尾语被判成 faq 白白走一次 LLM (实测 13s + 一次模型调用).
+_FAREWELL_WORDS = {"再见", "拜拜", "bye", "谢谢", "感谢", "没了", "没有了"}
+_FAREWELL_CLOSERS = (
+    "没有其他问题了", "没有别的问题了", "没有其它问题了",
+    "没有问题了", "没别的事了", "没什么事了", "就这些",
+    "就这些问题", "暂时没有了", "不用了谢谢",
+)
 
 
 def _is_farewell(text: str) -> bool:
-    return text.strip().lower() in {"再见", "拜拜", "bye", "谢谢", "感谢", "没了", "没有了"}
+    norm = _normalize_text(text)
+    return bool(norm) and (norm in _FAREWELL_WORDS or any(c in norm for c in _FAREWELL_CLOSERS))
+
+
+def _has_grounding(session_memory: str, history: list | None) -> bool:
+    """是否有可依托的对话依据(判断是否"追问"而非全新乱码).
+
+    追问能答的前提是存在真实对话脉络(上一轮的意图/实体/摘要)或已发生多轮对话;
+    否则会话记忆为空/仅兜底, 属于"首句即无意义输入", 不应对其编造。
+    """
+    if not session_memory and not history:
+        return False
+    markers = ("[对话摘要]", "[已知实体]", "[意图历史]")
+    if any(m in session_memory for m in markers):
+        return True
+    return bool(history)
+
+
+def _is_uncertain_intent(intent: Any) -> bool:
+    """意图是否"没有明确可作答方向": 泛化意图(FAQ/闲聊)或置信度过低.
+
+    用于无检索上下文时的澄清门控: 只有连意图都不确定(如 "adb"/"889" 被归为
+    faq/空置信)才澄清; 已有明确具体意图(如账单/积分查询)即使检索为空也不该被
+    当成乱码拒答, 而应继续走生成/追问流程。
+    """
+    primary = getattr(intent, "primary_intent", None)
+    confidence = getattr(intent, "primary_confidence", 0.0) or 0.0
+    if primary in (IntentLabel.FAQ, IntentLabel.CHITCHAT):
+        return True
+    return confidence < 0.5

@@ -46,6 +46,16 @@ def session_meta_key(session_id: str) -> str:
     return f"{_META_PREFIX}:{session_id}:meta"
 
 
+def session_alias_key(alias: str) -> str:
+    """会话别名映射 key: lumio:session:alias:{chat_svc_id} → bot_session_id
+
+    转人工后 chat-svc 生成 `session-xxxx` 作为自己的会话 id, 而其回调(/api/session/update、
+    /api/analyze)携带的是这个 id。本映射把 chat-svc id 反解回 Lumio 的 uuid4-hex,
+    让两套命名空间对齐, 回调才能命中真正的会话。
+    """
+    return f"{_META_PREFIX}:alias:{alias}"
+
+
 def session_history_key(session_id: str) -> str:
     """会话历史 Redis key: lumio:session:{session_id}:history"""
     return f"{_HISTORY_PREFIX}:{session_id}:history"
@@ -198,18 +208,28 @@ class SessionManager:
     async def get_session(self, session_id: str) -> SessionState | None:
         """加载会话状态
 
+        入口统一解析别名：chat-svc 回调携带的 `session-xxxx` 会先经
+        :meth:`resolve_session_id` 反解回 Lumio 的 uuid4-hex，再按原 id 加载。
+
         Args:
-            session_id: 会话 ID
+            session_id: 会话 ID（可能为 chat-svc 别名）
 
         Returns:
             SessionState 或 None（会话不存在）
         """
+        session_id = await self.resolve_session_id(session_id)
         meta_json = await self._redis.get(self._meta_key(session_id))
         if meta_json is None:
             return None
 
         meta = json.loads(meta_json)
         turns = await self._load_history(session_id)
+
+        # 防御: patch_state 的 Lua (cjson) 会把空数组字段(如 card_types=[])在
+        # decode→encode 时错写成 {} (空表→对象). 这里把已知列表字段统一收敛为 []，
+        # 避免污染数据导致解析崩溃; 下次 _save_meta 会以正确 [] 重写 `修复` 干净。
+        def _as_list(v: Any) -> list[Any]:
+            return [] if isinstance(v, dict) else (v or [])
 
         return SessionState(
             session_id=meta["session_id"],
@@ -219,7 +239,7 @@ class SessionManager:
             sub_phase=SessionSubPhase(meta["sub_phase"]) if meta.get("sub_phase") else None,
             end_reason=meta.get("end_reason"),
             vip_level=meta.get("vip_level", "普通"),
-            card_types=meta.get("card_types", []),
+            card_types=_as_list(meta.get("card_types")),
             risk_tolerance=meta.get("risk_tolerance", "R2"),
             vip_level_updated_at=meta.get("vip_level_updated_at", 0.0),
             risk_tolerance_updated_at=meta.get("risk_tolerance_updated_at", 0.0),
@@ -227,16 +247,16 @@ class SessionManager:
             turns=turns,
             turn_count=len(turns),
             last_intent=IntentLabel(meta["last_intent"]) if meta.get("last_intent") else None,
-            last_entities=[Entity(**e) for e in meta.get("last_entities", [])],
-            confidence_history=meta.get("confidence_history", []),
+            last_entities=[Entity(**e) for e in _as_list(meta.get("last_entities"))],
+            confidence_history=[float(x) for x in _as_list(meta.get("confidence_history"))],
             low_confidence_streak=meta.get("low_confidence_streak", 0),
             human_request_score=meta.get("human_request_score", 0),
             conversation_summary=meta.get("conversation_summary", ""),
             summary_turn_count=meta.get("summary_turn_count", 0),
             last_summarized_turn_id=meta.get("last_summarized_turn_id", ""),
             # 坐席辅助引擎层字段（从 Redis 原始 JSON 读取，patch_state 写入的值不会丢失）
-            intent_stack=[IntentLabel(i) if isinstance(i, str) else i for i in meta.get("intent_stack", [])],
-            entity_pool=[Entity(**e) for e in meta.get("entity_pool", [])],
+            intent_stack=[IntentLabel(i) if isinstance(i, str) else i for i in _as_list(meta.get("intent_stack"))],
+            entity_pool=[Entity(**e) for e in _as_list(meta.get("entity_pool"))],
             emotion_vector=meta.get("emotion_vector"),
             suppress_flag=meta.get("suppress_flag", False),
             node_position=meta.get("node_position", ""),
@@ -244,8 +264,10 @@ class SessionManager:
             agent_id=meta.get("agent_id"),
             transfer_reason=meta.get("transfer_reason"),
             transfer_summary=meta.get("transfer_summary"),
-            created_at=datetime.fromisoformat(meta["created_at"]) if meta.get("created_at") else datetime.now(),
-            last_active_at=datetime.fromisoformat(meta["last_active_at"])
+            created_at=datetime.fromisoformat(meta["created_at"]).replace(tzinfo=None)
+            if meta.get("created_at")
+            else datetime.now(),
+            last_active_at=datetime.fromisoformat(meta["last_active_at"]).replace(tzinfo=None)
             if meta.get("last_active_at")
             else datetime.now(),
             version=meta.get("version", 1),
@@ -537,6 +559,33 @@ class SessionManager:
         except Exception:
             logger.exception("对话记录持久化失败: session=%s", session_id)
             return 0
+
+    # ── 会话别名映射 (chat-svc id ↔ Lumio id) ──
+
+    async def bind_session_alias(self, session_id: str, alias: str) -> None:
+        """把 chat-svc 会话 id(`session-xxxx`) 映射到本会话 id(uuid4-hex)。
+
+        转人工 chat-svc 创建会话后, bot 拿到 `transfer_sid` 时写入, 使 chat-svc 的
+        回调(/api/session/update、/api/analyze)可以反解命中本会话。
+        """
+        if not alias:
+            return
+        # suppress: 映射失败不应阻断主流程
+        try:
+            await self._redis.set(session_alias_key(alias), session_id, ex=self._ttl)
+        except Exception:
+            logger.exception("绑定会话别名失败: session=%s alias=%s", session_id, alias)
+
+    async def resolve_session_id(self, session_id: str) -> str:
+        """把 chat-svc 会话 id 反解回 Lumio 会话 id；非别名原样返回。"""
+        if isinstance(session_id, str) and session_id.startswith("session-"):
+            try:
+                mapped = await self._redis.get(session_alias_key(session_id))
+                if mapped:
+                    return mapped
+            except Exception:
+                logger.exception("解析会话别名失败: alias=%s", session_id)
+        return session_id
 
     # ── 内部方法 ──
 

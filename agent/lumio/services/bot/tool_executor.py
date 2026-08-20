@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -100,6 +101,10 @@ def detect_confirmation(text: str) -> ConfirmDecision:
         if core == kw or (core.startswith(kw) and len(core) <= len(kw) + 2):
             return "confirm"
     return "unclear"
+
+
+class ToolLoopTimeoutError(RuntimeError):
+    """工具编排循环整体预算耗尽（tool_loop_timeout_ms）。由调用方回落降级链。"""
 
 
 @dataclass
@@ -251,79 +256,99 @@ class ToolCallingExecutor:
         trace_id: str = "",
         initial_executed: list[str] | None = None,
     ) -> ToolExecutionResult:
-        executed: list[str] = list(initial_executed or [])
+        # P0 超时修复: 每次 LLM 调用显式短超时 + 整个循环的整体预算,
+        # 否则单次 chat_with_tools 回落 OpenAI 默认 60s, 一轮慢调用即拖垮外层 20s 编排预算.
+        loop_timeout = self._settings.tool_loop_timeout_ms / 1000.0
+        call_timeout = self._settings.tool_loop_llm_timeout_seconds
 
-        for _ in range(self._settings.max_tool_iterations):
-            result = await self._llm.chat_with_tools(messages, tools)
+        async def _inner() -> ToolExecutionResult:
+            executed: list[str] = list(initial_executed or [])
 
-            if not result.has_tool_calls:
-                return ToolExecutionResult(
-                    content=result.content,
-                    source="llm",
-                    executed_tools=executed,
-                )
+            for _ in range(self._settings.max_tool_iterations):
+                result = await self._llm.chat_with_tools(messages, tools, timeout=call_timeout)
 
-            # 记录 assistant 的 tool_calls（回喂 API 需原样带上）
-            messages.append(result.raw_message)
-
-            for tool_call in result.tool_calls:
-                # P1-4 第三轮修复: 执行侧白名单校验 — 渐进式暴露只过滤"给 LLM 看"的一侧,
-                # 执行侧此前对幻觉工具名直接透传后端 (未知工具 is_sensitive 还返回 False → 免确认).
-                # 现强制: 工具名必须存在于注册缓存, 否则拒绝执行并回喂错误.
-                if self._mcp.get_tool(tool_call.name) is None:
-                    logger.warning(
-                        "拒绝未注册工具调用 (幻觉): name=%s session=%s",
-                        tool_call.name,
-                        session_id,
+                if not result.has_tool_calls:
+                    return ToolExecutionResult(
+                        content=result.content,
+                        source="llm",
+                        executed_tools=executed,
                     )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": f"工具 {tool_call.name!r} 不存在, 请勿调用",
-                        }
+
+                # 记录 assistant 的 tool_calls（回喂 API 需原样带上）
+                messages.append(result.raw_message)
+
+                for tool_call in result.tool_calls:
+                    # P1-4 第三轮修复: 执行侧白名单校验 — 渐进式暴露只过滤"给 LLM 看"的一侧,
+                    # 执行侧此前对幻觉工具名直接透传后端 (未知工具 is_sensitive 还返回 False → 免确认).
+                    # 现强制: 工具名必须存在于注册缓存, 否则拒绝执行并回喂错误.
+                    if self._mcp.get_tool(tool_call.name) is None:
+                        logger.warning(
+                            "拒绝未注册工具调用 (幻觉): name=%s session=%s",
+                            tool_call.name,
+                            session_id,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"工具 {tool_call.name!r} 不存在, 请勿调用",
+                            }
+                        )
+                        executed.append(tool_call.name)
+                        continue
+
+                    # 护栏（授权 + 额度）→ 拒绝则短路，不执行、不进入确认
+                    guard_decision = await self._enforce_guard(
+                        tool_call, session_id=session_id, actor_id=actor_id, actor_role=actor_role
                     )
+                    if not guard_decision.allowed:
+                        # P2-19: 护栏拒绝 → 真实转人工 (文案 _GUARD_REFUSAL 已引导, 但此前
+                        # should_transfer 恒 False, 客户看到"可以转接"还得再发一条消息)
+                        return ToolExecutionResult(
+                            content=_GUARD_REFUSAL,
+                            source="guard",
+                            executed_tools=executed,
+                            should_transfer=True,
+                            transfer_reason=f"tool_guard_refused: {tool_call.name} ({guard_decision.reason})",
+                        )
+
+                    # 敏感工具 → 短路，写待确认（不执行）
+                    if self._mcp.is_sensitive(tool_call.name):
+                        pending = self._build_pending_action(tool_call, trace_id=trace_id)
+                        TOOL_CONFIRMATIONS.labels(decision="pending").inc()
+                        return ToolExecutionResult(
+                            content=pending.confirm_prompt,
+                            source="tool",
+                            pending_action=pending,
+                            executed_tools=executed,
+                        )
+
+                    # 非敏感工具 → 执行 + 脱敏 + 审计 + 回喂
+                    tool_message = await self._execute_and_audit(
+                        tool_call,
+                        session_id=session_id,
+                        actor_id=actor_id,
+                        actor_role=actor_role,
+                    )
+                    messages.append(tool_message)
                     executed.append(tool_call.name)
-                    continue
 
-                # 护栏（授权 + 额度）→ 拒绝则短路，不执行、不进入确认
-                guard_decision = await self._enforce_guard(
-                    tool_call, session_id=session_id, actor_id=actor_id, actor_role=actor_role
-                )
-                if not guard_decision.allowed:
-                    # P2-19: 护栏拒绝 → 真实转人工 (文案 _GUARD_REFUSAL 已引导, 但此前
-                    # should_transfer 恒 False, 客户看到"可以转接"还得再发一条消息)
-                    return ToolExecutionResult(
-                        content=_GUARD_REFUSAL,
-                        source="guard",
-                        executed_tools=executed,
-                        should_transfer=True,
-                        transfer_reason=f"tool_guard_refused: {tool_call.name} ({guard_decision.reason})",
-                    )
+            # 循环上限保护
+            raise RuntimeError(f"工具调用超过最大轮数 {self._settings.max_tool_iterations}")
 
-                # 敏感工具 → 短路，写待确认（不执行）
-                if self._mcp.is_sensitive(tool_call.name):
-                    pending = self._build_pending_action(tool_call, trace_id=trace_id)
-                    TOOL_CONFIRMATIONS.labels(decision="pending").inc()
-                    return ToolExecutionResult(
-                        content=pending.confirm_prompt,
-                        source="tool",
-                        pending_action=pending,
-                        executed_tools=executed,
-                    )
-
-                # 非敏感工具 → 执行 + 脱敏 + 审计 + 回喂
-                tool_message = await self._execute_and_audit(
-                    tool_call,
-                    session_id=session_id,
-                    actor_id=actor_id,
-                    actor_role=actor_role,
-                )
-                messages.append(tool_message)
-                executed.append(tool_call.name)
-
-        # 循环上限保护
-        raise RuntimeError(f"工具调用超过最大轮数 {self._settings.max_tool_iterations}")
+        try:
+            return await asyncio.wait_for(_inner(), timeout=loop_timeout)
+        except TimeoutError:
+            # 工具循环整体预算耗尽：由调用方回落降级链（如 _handle_tool → RAG），
+            # 不让请求继续占用外层 20s 预算。
+            logger.warning(
+                "工具编排循环超时: session=%s (>%dms)",
+                session_id,
+                int(self._settings.tool_loop_timeout_ms),
+            )
+            raise ToolLoopTimeoutError(
+                f"工具编排循环超时 (> {int(self._settings.tool_loop_timeout_ms)}ms): session={session_id}"
+            ) from None
 
     async def _execute_and_audit(
         self,

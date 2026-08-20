@@ -92,6 +92,20 @@ BOT_AGENT_RESPONSES = Counter(
     ["source"],  # source: llm/template/fallback/tool_* 等
 )
 
+# 超时/降级回复按来源计数: queue_backlog(队列积压过期) / orchestration(编排预算耗尽)
+BOT_AGENT_TIMEOUTS = Counter(
+    "lumio_agent_timeouts_total",
+    "Bot 回复超时次数（按来源区分，用于归因）",
+    ["source"],
+)
+
+# Bot 单条消息从入队到产出答复的处理耗时分布（秒）
+BOT_ANSWER_LATENCY = Histogram(
+    "lumio_bot_answer_duration_seconds",
+    "Bot 单条消息处理耗时（processing_start → _finish_message 完成）",
+    buckets=(0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 20.0, 30.0, float("inf")),
+)
+
 # P0-5: 死信队列指标 — 消息进入死信 (处理失败/重试超限) 与人工重放
 DEAD_LETTER_WRITES = Counter(
     "lumio_dead_letter_writes_total",

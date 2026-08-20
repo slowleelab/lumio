@@ -404,10 +404,20 @@ async def init_classifier(app: FastAPI) -> None:
     rule_classifier = RuleClassifier()
     llm_classifier = LLMClassifier(llm_client)
     settings = get_settings()
+
+    bert_classifier = None
+    if settings.classification.bert_enabled:
+        # 懒加载: 仅开启时引入 (模块本身不 import torch, torch 在首次 classify 才加载)
+        from lumio.services.common.bert_classifier import BertIntentClassifier
+
+        bert_classifier = BertIntentClassifier(model_path=settings.classification.bert_model_path)
+        _logger.info("启用小 BERT 意图分类快路径 model=%s", settings.classification.bert_model_path)
+
     classifier = IntentClassifier(
         rule_classifier=rule_classifier,
         llm_classifier=llm_classifier,
         fast_threshold=settings.classification.intent_threshold + 0.1,
+        bert_classifier=bert_classifier,
     )
     app.state.classifier = classifier
 
@@ -521,7 +531,10 @@ async def init_agent(app: FastAPI) -> None:
     except Exception as exc:
         _logger.warning("Agent DB session factory 注入失败 (画像学习降级): %s", exc)
     app.state.agent = agent
-    _logger.info("对话 Agent 初始化完成")
+    # 修复: 注入 chat-svc 客户端到 agent._chat_client — bot 转人工桥接依赖它,
+    # 此前从未赋值导致 _run_agent 里 getattr(agent,"_chat_client") 恒为 None, 桥接从不执行.
+    agent._chat_client = getattr(app.state, "chat_svc_client", None)
+    _logger.info("对话 Agent 初始化完成 (chat_client=%s)", agent._chat_client is not None)
 
 
 async def close_agent(app: FastAPI) -> None:

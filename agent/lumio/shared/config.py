@@ -145,7 +145,10 @@ class LLMSettings(BaseSettings):
     health_probe_success_threshold: int = 2  # 连续成功恢复阈值
     # 各类独立超时
     classify_timeout: float = 1.5  # 分类独立超时
-    generate_timeout: float = 2.0  # 生成独立超时
+    # 生成独立超时: 2s 对本地 qwen2.5:7b 过紧(实测 ~64ms/token, 一次答案 6-13s), 导致
+    # 每次生成必超时→重试→LLMTimeoutError→"回复超时"。抬到 15s, 与编排总时限 20s 匹配,
+    # 典型问答仍 ~10s 内返回, 仍在客户页 25s 长轮询窗口内。
+    generate_timeout: float = 15.0
 
     # ── A0: KV Cache 优化配置 ──
     # 三层 cache 控制
@@ -285,6 +288,10 @@ class ClassificationSettings(BaseSettings):
     intent_threshold: float = 0.6
     # 实体抽取
     min_entity_confidence: float = 0.7
+    # 轻量 BERT 意图分类器 (torch 推理快路径): 开启后取代规则快路径, 置信度不足仍回退 LLM
+    bert_enabled: bool = False
+    # 已微调 BERT 模型目录 (相对路径以 agent/ 为基准; 权重不入 git, 部署需随服携带)
+    bert_model_path: str = "data/intent_classification/out_intent_clf"
 
 
 class RAGSettings(BaseSettings):
@@ -365,6 +372,9 @@ class BotSettings(BaseSettings):
     message_ttl_seconds: int = 8
     # fast_reply 冷却时间（秒），同一会话两次 fast_reply 的最小间隔
     fast_reply_cooldown: int = 5
+    # 单会话在途消息队列深度上限。防止单会话短时灌入大量消息 → 无界内存队列;
+    # 队列满时消息留在 Redis Stream(PEL), 由 XAUTOCLAIM/TTL 后续重投或超时兜底.
+    max_session_queue: int = 20
     # P2-16: 同一客户同时进行的活跃会话数上限 (多设备/多标签页防资源耗尽)
     max_sessions_per_customer: int = 3
 
@@ -413,7 +423,9 @@ class OrchestrationSettings(BaseSettings):
     d2_emotion_score_threshold: float = 0.3
 
     # 全局超时（对应文档 §3.5 仲裁超时兜底）
-    global_timeout_ms: int = 5000
+    # 5s 对 RAG 自问答过紧: 仅 ES/Milvus 检索 + embed + rerank 就约 4s, 加 LLM 生成必超标导致"回复超时"。
+    # 抬到 20s, 介于前端 25s 长轮询超时之内留有余量, 典型问答仍数秒返回, 该值仅作最坏情况兜底。
+    global_timeout_ms: int = 20000
 
     # 执行器 SLA（对应文档 §3.4 执行器 SLA 表）
     e1_sla_ms: int = 3000  # AI 服务
@@ -549,6 +561,12 @@ class MCPSettings(BaseSettings):
     sensitive_tools: list[str] = Field(default_factory=list)
     # 工具调用循环最大轮数（防死循环）
     max_tool_iterations: int = 5
+    # 工具循环内每次 LLM 调用的超时（秒）。chat_with_tools 未显式传 timeout 时
+    # 会回落 OpenAI 客户端默认 60s，一次慢调用即能吃掉外层 20s 编排预算 → 强制短超时。
+    tool_loop_llm_timeout_seconds: float = 15.0
+    # 整个工具循环的整体预算（毫秒）。多轮工具调用串联时必须有一个总上限，
+    # 防止第 2/3/4 轮调用把请求拖过外层全局超时。默认小于 global_timeout_ms(20s)。
+    tool_loop_timeout_ms: int = 15000
     # 待确认操作（pending_action）过期时间（秒）
     confirmation_ttl_seconds: int = 300
     # 确认窗口内无法判定（unclear）连续次数上限, 达到后自动取消 pending 并放行新消息

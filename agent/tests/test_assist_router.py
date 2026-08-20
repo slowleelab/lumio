@@ -49,6 +49,7 @@ def setup_state(app: FastAPI) -> tuple[MagicMock, dict]:
     sm.transition_phase = AsyncMock(return_value=_make_state())
     sm.get_session = AsyncMock(return_value=_make_state())
     sm.patch_state = AsyncMock(return_value={"ok": True, "new_version": 2})
+    sm.resolve_session_id = AsyncMock(side_effect=lambda sid: sid)
     app.state.session_manager = sm
     app.state.redis_client = AsyncMock()
     app.state.llm_client = None

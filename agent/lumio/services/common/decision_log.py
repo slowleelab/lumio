@@ -178,33 +178,40 @@ class DecisionLogger:
     async def _write_pg(self, record: DecisionRecord) -> None:
         """落 PG decision_log 表 (E2 可解释性 / D2 GDPR 链路)
 
-        失败软处理: 不影响主流程, 决策本身已落 Redis.
+        失败不阻断主流程 (决策已落 Redis), 但显式 warn 并做一次简单重试
+        (瞬断/连接抖动场景下避免审计记录丢失)。
         """
         factory = await self._get_db_session_factory()
         if not factory:
             return
-        try:
-            import uuid_utils
+        for attempt in range(2):
+            try:
+                import uuid_utils
 
-            from lumio.shared.orm_models import DecisionLog
+                from lumio.shared.orm_models import DecisionLog
 
-            async with factory() as session:  # type: ignore[no-untyped-call]
-                row = DecisionLog(
-                    id=uuid_utils.uuid7(),
-                    decision_id=record.decision_id,
-                    session_id=record.session_id,
-                    turn_id=record.turn_id,
-                    customer_id=record.customer_id,
-                    agent_name=record.agent_name,
-                    action=record.action.value,
-                    reasoning=record.reasoning,
-                    evidence_json=record.evidence or None,
-                    latency_ms=record.latency_ms,
-                )
-                session.add(row)
-                await session.commit()
-        except Exception as exc:
-            logger.debug("PG 决策日志写入失败: %s", exc)
+                async with factory() as session:  # type: ignore[no-untyped-call]
+                    row = DecisionLog(
+                        id=uuid_utils.uuid7(),
+                        decision_id=record.decision_id,
+                        session_id=record.session_id,
+                        turn_id=record.turn_id,
+                        customer_id=record.customer_id,
+                        agent_name=record.agent_name,
+                        action=record.action.value,
+                        reasoning=record.reasoning,
+                        evidence_json=record.evidence or None,
+                        latency_ms=record.latency_ms,
+                    )
+                    session.add(row)
+                    await session.commit()
+                return
+            except Exception as exc:
+                if attempt == 0:
+                    logger.warning("PG 决策日志写入失败, 重试一次: session=%s, err=%s", record.session_id, exc)
+                    await asyncio.sleep(0.1)
+                else:
+                    logger.warning("PG 决策日志写入失败(重试后): session=%s, err=%s", record.session_id, exc)
 
     async def _get_db_session_factory(self) -> Any:
         if self._db_session_factory is None:
@@ -230,6 +237,61 @@ class DecisionLogger:
         except Exception as exc:
             logger.warning("决策查询失败: %s", exc)
             return []
+
+    async def query_session_pg(self, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """从 PG decision_log 表查询会话决策 (持久化审计源, 监管可用).
+
+        PG 不可用时回退 Redis(最近 100 条)。按 created_at 降序返回。
+        """
+        factory = await self._get_db_session_factory()
+        if factory:
+            try:
+                from lumio.shared.orm_models import DecisionLog
+
+                async with factory() as session:  # type: ignore[no-untyped-call]
+                    from sqlalchemy import select
+
+                    # 只选业务列, 跳过 `id` UUID 主键列: 该列在 asyncpg 下由
+                    # Uuid(native_uuid=False) 反解 pgproto.UUID 时抛
+                    # 'UUID' object has no attribute 'replace' (ORM 潜在缺陷,
+                    # 查询侧规避).
+                    stmt = (
+                        select(
+                            DecisionLog.decision_id,
+                            DecisionLog.session_id,
+                            DecisionLog.turn_id,
+                            DecisionLog.customer_id,
+                            DecisionLog.agent_name,
+                            DecisionLog.action,
+                            DecisionLog.reasoning,
+                            DecisionLog.evidence_json,
+                            DecisionLog.latency_ms,
+                            DecisionLog.created_at,
+                        )
+                        .where(DecisionLog.session_id == session_id)
+                        .order_by(DecisionLog.created_at.desc())
+                        .limit(limit)
+                    )
+                    result = await session.execute(stmt)
+                    rows = result.all()
+                    return [
+                        {
+                            "decision_id": r.decision_id,
+                            "session_id": r.session_id,
+                            "turn_id": r.turn_id,
+                            "customer_id": r.customer_id,
+                            "agent_name": r.agent_name,
+                            "action": r.action,
+                            "reasoning": r.reasoning,
+                            "evidence": r.evidence_json or {},
+                            "latency_ms": r.latency_ms,
+                            "created_at": r.created_at.isoformat() if r.created_at else None,
+                        }
+                        for r in rows
+                    ]
+            except Exception as exc:
+                logger.warning("PG 决策查询失败, 回退 Redis: session=%s, err=%s", session_id, exc)
+        return await self.query_session(session_id, limit=limit)
 
     async def _get_redis(self) -> Any:
         if self._redis is None:

@@ -20,6 +20,7 @@ class ChatSvcClient:
         self,
         session_id: str,
         customer_id: str | None = None,
+        customer_name: str | None = None,
         transfer_reason: str = "",
         transfer_summary: str = "",
         history: list[dict[str, str]] | None = None,
@@ -30,6 +31,7 @@ class ChatSvcClient:
         return {
             "session_id": session_id,
             "customer_id": customer_id or "",
+            "customer_name": customer_name or "",
             "transfer_reason": transfer_reason,
             "transfer_summary": transfer_summary,
             "history": history or [],

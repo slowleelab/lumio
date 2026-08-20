@@ -268,6 +268,49 @@ async def test_init_classifier():
     assert app.state.classifier is None
 
 
+async def test_init_classifier_bert_enabled():
+    """bert_enabled=True 时应构造并注入 BERT 分类器 (需实际构造, 因 deps 内是局部 import)"""
+    from lumio.services.common import deps
+
+    app = FastAPI()
+    app.state.llm_client = MagicMock()
+    fake_settings = MagicMock()
+    fake_settings.classification.bert_enabled = True
+    fake_settings.classification.bert_model_path = "foo/bar"
+    fake_settings.classification.intent_threshold = 0.6
+    with (
+        patch.object(deps, "RuleClassifier"),
+        patch.object(deps, "LLMClassifier"),
+        patch.object(deps, "IntentClassifier") as mock_intent,
+        patch.object(deps, "get_settings", return_value=fake_settings),
+    ):
+        await deps.init_classifier(app)
+    _, kwargs = mock_intent.call_args
+    bert = kwargs["bert_classifier"]
+    assert bert is not None
+    assert bert._model_path.endswith("/foo/bar")
+
+
+async def test_init_classifier_bert_disabled():
+    """bert_enabled=False 时不应注入 BERT 分类器"""
+    from lumio.services.common import deps
+
+    app = FastAPI()
+    app.state.llm_client = MagicMock()
+    fake_settings = MagicMock()
+    fake_settings.classification.bert_enabled = False
+    fake_settings.classification.intent_threshold = 0.6
+    with (
+        patch.object(deps, "RuleClassifier"),
+        patch.object(deps, "LLMClassifier"),
+        patch.object(deps, "IntentClassifier") as mock_intent,
+        patch.object(deps, "get_settings", return_value=fake_settings),
+    ):
+        await deps.init_classifier(app)
+    _, kwargs = mock_intent.call_args
+    assert kwargs["bert_classifier"] is None
+
+
 async def test_init_transfer_checker():
     """转人工检查器初始化"""
     from lumio.services.common import deps

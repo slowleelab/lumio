@@ -12,6 +12,7 @@ from lumio.services.bot.prompt_registry import (
     get_prompt,
     get_prompt_registry,
 )
+from lumio.services.bot.prompts import FALLBACK_SYSTEM_PROMPT, KNOWLEDGE_SYSTEM_PROMPT
 
 
 def test_prompt_version_rollout_clamp():
@@ -41,6 +42,32 @@ def test_get_prompt_missing():
     """不存在的 prompt 返回占位符"""
     reg = PromptRegistry()
     assert reg.get_prompt("no_such_prompt") == "[PROMPT_MISSING:no_such_prompt]"
+
+
+# 回归: 客户随便发句无意义输入, 兜底话术不得谎称"系统故障" (见 S6 诊断)
+def test_fallback_prompt_does_not_claim_system_outage():
+    """兜底系统提示词不得诱导模型说系统故障/服务不可用, 应引导客户换说法"""
+    banned = ["系统故障", "系统遇到", "技术问题", "服务暂时不可用", "服务受限", "系统不可用"]
+    for w in banned:
+        assert w not in FALLBACK_SYSTEM_PROMPT, f"兜底提示词仍含敏感/误导措辞: {w}"
+    # 引导重新表述
+    assert "换个说法" in FALLBACK_SYSTEM_PROMPT
+    # 明确: 检索无结果也不得暗示平台异常
+    assert "运行异常" in FALLBACK_SYSTEM_PROMPT
+    assert "未能理解" in FALLBACK_SYSTEM_PROMPT
+    # 要求简短, 不得罗列问题清单 (回归: 兜底回复不得一长段举例)
+    assert "简短" in FALLBACK_SYSTEM_PROMPT
+    assert "罗列问题清单" in FALLBACK_SYSTEM_PROMPT
+
+
+def test_knowledge_prompt_brief_when_no_context():
+    """知识路径在未检索到上下文(如客户发"889")时, 引导简短澄清而非冗长列举"""
+    banned = ["系统故障", "系统遇到", "技术问题", "服务暂时不可用"]
+    for w in banned:
+        assert w not in KNOWLEDGE_SYSTEM_PROMPT
+    assert "未检索到相关知识" in KNOWLEDGE_SYSTEM_PROMPT
+    assert "简短" in KNOWLEDGE_SYSTEM_PROMPT
+    assert "不要罗列问题清单" in KNOWLEDGE_SYSTEM_PROMPT
 
 
 def test_get_prompt_from_redis_cache(monkeypatch):

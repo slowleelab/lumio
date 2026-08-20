@@ -43,6 +43,8 @@ from lumio.shared.exceptions import DocumentFormatError
 from lumio.shared.metrics import (
     BOT_ACTIVE_WORKERS,
     BOT_AGENT_RESPONSES,
+    BOT_AGENT_TIMEOUTS,
+    BOT_ANSWER_LATENCY,
     BOT_FAST_REPLY,
     BOT_SEMAPHORE_UTILIZATION,
     BOT_STREAM_LENGTH,
@@ -199,6 +201,7 @@ async def _finish_message(
     intent: str | None = None,
     confidence: float = 0.0,
     source: str = "fallback",
+    extra: dict | None = None,
 ) -> None:
     """写入 response key + 发布 Pub/Sub 通知"""
     # 安全过滤：对 Bot 回复进行敏感词过滤
@@ -213,6 +216,10 @@ async def _finish_message(
         confidence=confidence,
         source=source,
     )
+    # 扩展字段 (如 is_transfer/transfer_sid) 必须与回复在同一 key 一次写入,
+    # 否则 Publish 唤醒轮询读删 key 后, 后补写会因 key 已删而丢失 (竞态).
+    if extra:
+        payload.update(extra)
     response_key = f"{RESPONSE_KEY_PREFIX}:{session_id}"
     notify_channel = f"{NOTIFY_CHANNEL_PREFIX}:{session_id}"
 
@@ -334,14 +341,24 @@ async def _dispatch_message(redis_client, agent, msg_id: str, fields: dict) -> N
         await redis_client.xack(CHAT_STREAM_KEY, CONSUMER_GROUP, msg_id)
         return
 
-    q = _session_queues.setdefault(session_id, asyncio.Queue())
+    q = _session_queues.setdefault(session_id, asyncio.Queue(get_settings().bot.max_session_queue))
 
     # Worker 注册必须在 await 之前完成，防止竞态创建多个 Worker
     if session_id not in _session_active:
         _session_active[session_id] = True
         asyncio.create_task(_session_worker(session_id, q, redis_client, agent))
 
-    await q.put((msg_id, fields))
+    # 有界准入: 队列满则本消息留在 Stream(PEL), 不进入内存队列, 避免无界积压.
+    # 不 XACK → 由 XAUTOCLAIM 重投或 enqueue 超过 message_ttl 后超时兜底.
+    try:
+        q.put_nowait((msg_id, fields))
+    except asyncio.QueueFull:
+        logger.warning(
+            "会话消息队列已满, 消息留在 stream: session=%s depth=%d",
+            session_id,
+            q.qsize(),
+        )
+        return
 
 
 async def _session_worker(
@@ -372,6 +389,7 @@ async def _session_worker(
             enqueue_time = fields.get("_enqueue_time", 0.0)
             client_message_id = fields.get("message_id", "")
             customer_id = fields.get("customer_id", "")
+            customer_name = fields.get("customer_name", "")
             channel = fields.get("channel", "web")
             trace_raw = fields.get("_trace_context", "")
             trace_id = trace_raw.split(":")[0] if trace_raw else None
@@ -417,6 +435,7 @@ async def _session_worker(
                 if enqueue_time and (now - enqueue_time > message_ttl):
                     logger.debug("消息过期跳过: session=%s msg_id=%s", session_id, msg_id)
                     _metrics["to"] += 1
+                    BOT_AGENT_TIMEOUTS.labels(source="queue_backlog").inc()
                     await _finish_message(
                         redis_client,
                         session_id,
@@ -576,8 +595,11 @@ async def _session_worker(
                             msg_id,
                             fields.get("message_id", ""),
                             customer_id=customer_id,
+                            customer_name=customer_name,
                             merged_message_ids=merged_message_ids,
                         )
+                        # 处理耗时（含 RAG/LLM/工具/超时降级）分布
+                        BOT_ANSWER_LATENCY.observe(asyncio.get_event_loop().time() - processing_start)
                     except Exception:
                         logger.exception("Agent 异常: session=%s msg_id=%s", session_id, msg_id)
                         await _finish_message(
@@ -642,6 +664,7 @@ async def _run_agent(
     msg_id: str,
     orig_message_id: str,
     customer_id: str = "",  # P1-6 第三轮修复: 透传 customer_id (画像学习依赖)
+    customer_name: str = "",  # 透传客户名称, 供转人工后坐席端展示
     merged_message_ids: list[str] | None = None,
 ) -> None:
     """标准 Agent 处理路径 (Semaphore 内)
@@ -706,11 +729,13 @@ async def _run_agent(
         )
     except TimeoutError:
         logger.warning("Agent 编排超时: session=%s (>%dms)", session_id, get_settings().orchestration.global_timeout_ms)
+        BOT_AGENT_TIMEOUTS.labels(source="orchestration").inc()
+        # 编排预算耗尽（单个上游慢）: 用独立 source 与文案, 不再误导归因为"咨询量较大"
         await _finish_message(
             redis_client,
             session_id,
-            "当前咨询量较大，回复超时，请重新发送或输入'转人工'。",
-            source="timeout",
+            "回复超时，请重新发送或输入'转人工'。",
+            source="llm_timeout",
         )
         await redis_client.xack(CHAT_STREAM_KEY, CONSUMER_GROUP, msg_id)
         await _mark_processed(redis_client, orig_message_id)  # P1-2
@@ -757,6 +782,9 @@ async def _run_agent(
     # 转人工处理
     if is_transfer:
         transfer_url = ""
+        transfer_sid = ""
+        # 修复: 之前 agent._chat_client 在 init_agent 未赋值, 转人工桥接是死代码.
+        # _run_agent 无 request 变量, 故读 agent._chat_client; 由 init_agent 注入 app.state.chat_svc_client.
         chat_client = getattr(agent, "_chat_client", None)
         if chat_client:
             try:
@@ -781,6 +809,8 @@ async def _run_agent(
 
                 transfer_req = chat_client.build_transfer_request(
                     session_id=session_id,
+                    customer_id=customer_id or "",
+                    customer_name=customer_name or "",
                     transfer_reason=transfer_reason,
                     transfer_summary=transfer_summary,
                     history=history,
@@ -795,7 +825,17 @@ async def _run_agent(
                     state.transfer_summary = transfer_summary
                     state.transfer_reason = transfer_reason
                     await session_manager._save_meta(state)
+# transfer_sid = chat-svc 生成的会话 id (session-xxxx), 客户页据此轮询坐席消息.
+                # 此前仅回传 transfer_url (带 token 的 URL), 前端无真实 sid 可用.
+                transfer_sid = transfer_resp.get("sessionId") or transfer_resp.get("session_id") or ""
                 transfer_url = transfer_resp.get("pollUrl", "") or transfer_resp.get("poll_url", "")
+
+                # 记录 chat-svc id ↔ Lumio id 映射, 让 chat-svc 回调(/api/session/update 等)
+                # 能反解命中本题 Lumio 会话 (否则状态机在转人工后永远停在 queued)
+                if transfer_sid and session_manager:
+                    with contextlib.suppress(Exception):
+                        await session_manager.bind_session_alias(session_id, transfer_sid)
+
                 if transfer_url:
                     logger.info(
                         "转人工已创建: bot=%s star=%s",
@@ -815,6 +855,12 @@ async def _run_agent(
             intent=str(primary_intent.value) if primary_intent else None,
             confidence=primary_confidence,
             source=source,
+            extra={
+                "is_transfer": True,
+                "transfer_sid": transfer_sid,
+                "transfer_url": transfer_url,
+                "transfer_reason": transfer_reason,
+            },
         )
         # 审计更新：转人工完成
         if _db_session_factory and orig_message_id:
@@ -835,15 +881,7 @@ async def _run_agent(
                         intent=str(primary_intent.value) if primary_intent else None,
                         source="merged",
                     )
-        # 额外写 transfer 信息到 response key 的扩展字段
-        response_key = f"{RESPONSE_KEY_PREFIX}:{session_id}"
-        existing = await redis_client.get(response_key)
-        if existing:
-            data = json.loads(existing)
-            data["is_transfer"] = True
-            data["transfer_url"] = transfer_url
-            data["transfer_reason"] = transfer_reason
-            await redis_client.setex(response_key, RESPONSE_TTL, json.dumps(data, ensure_ascii=False))
+        # 转接字段已通过 _finish_message 的 extra 一次写入, 不再事后补写 (避免轮询读删 key 的竞态)
         await redis_client.xack(CHAT_STREAM_KEY, CONSUMER_GROUP, msg_id)
         await _mark_processed(redis_client, orig_message_id)  # P1-2
         return
@@ -902,13 +940,19 @@ async def _consumer_loop(redis_client, agent) -> None:
     try:
         while True:
             try:
-                result = await redis_client.xreadgroup(
-                    groupname=CONSUMER_GROUP,
-                    consumername=consumer_name,
-                    streams={CHAT_STREAM_KEY: ">"},
-                    count=10,
-                    block=1000,
-                )
+                # 阻塞式空轮询每 1s 一次: 抑制 redis 自动埋点, 避免每秒生成一条
+                # ~1000ms 的 XREADGROUP span 淹没 Jaeger (真实消息耗时另由 _dispatch_message
+                # 从 stream 恢复 trace context 单独成链, BOT_ANSWER_LATENCY 计量).
+                from opentelemetry.instrumentation.utils import suppress_instrumentation
+
+                with suppress_instrumentation():
+                    result = await redis_client.xreadgroup(
+                        groupname=CONSUMER_GROUP,
+                        consumername=consumer_name,
+                        streams={CHAT_STREAM_KEY: ">"},
+                        count=10,
+                        block=1000,
+                    )
             except Exception:
                 logger.exception("XREADGROUP 异常, 1s 后重试")
                 await asyncio.sleep(1)
@@ -1244,11 +1288,17 @@ async def chat_send(body: ChatSendRequest, request: Request, user: CurrentUser):
             "message": body.message,
             "_trace_context": trace_ctx,
             "customer_id": body.customer_id or "",
+            "customer_name": body.customer_name or "",
             "channel": body.channel.value if body.channel else "web",
         },
         maxlen=STREAM_MAXLEN,
         approximate=True,
     )
+
+    # 排队可见性: 立刻 ping 一次队列通知, 让前端首轮 poll 快速返回 queued + 排队位置,
+    # 避免盲目长等一整轮 (此时结果未就绪, worker 完成后再 publish "ready").
+    with contextlib.suppress(Exception):
+        await redis_client.publish(f"{NOTIFY_CHANNEL_PREFIX}:{session_id}", "queued")
 
     return ChatSendResponse(
         accepted=True,
@@ -1291,7 +1341,7 @@ async def chat_poll(
     # 2. 订阅 Pub/Sub 等待通知 (带超时保护)
     try:
         result = await asyncio.wait_for(
-            _wait_for_response(redis_client, response_key, notify_channel, timeout),
+            _wait_for_response(redis_client, session_id, response_key, notify_channel, timeout),
             timeout=timeout + 2,  # 硬超时 = 用户超时 + 2s 缓冲
         )
         return result
@@ -1306,6 +1356,7 @@ async def chat_poll(
 
 async def _wait_for_response(
     redis_client,
+    session_id: str,
     response_key: str,
     notify_channel: str,
     timeout: int,
@@ -1335,6 +1386,20 @@ async def _wait_for_response(
                             content=json.dumps(data, ensure_ascii=False).encode("utf-8"),
                             media_type="application/json",
                         )
+                    # 窗口耗尽仍无结果: 若该会话仍在排队/处理中 → 返回 queued + 位置
+                    # (前端据此显示"排队中"并续轮询); 否则判定为超时.
+                    session_q = _session_queues.get(session_id)
+                    q_pending = session_q is not None and not session_q.empty()
+                    if session_id in _session_active or q_pending:
+                        position = session_q.qsize() if session_q is not None else 0
+                        return JSONResponse(
+                            content=_build_poll_json(
+                                status="queued",
+                                position=position,
+                                est_wait=f"{min(position * 5, 30)}s" if position else "稍后",
+                                suggestion="正在排队处理, 请稍候",
+                            )
+                        )
                     return JSONResponse(
                         content=_build_poll_json(
                             status="timeout",
@@ -1362,7 +1427,8 @@ async def _wait_for_response(
                             content=json.dumps(data, ensure_ascii=False).encode("utf-8"),
                             media_type="application/json",
                         )
-                    # 短暂等待 response key 就绪
+                    # 短暂等待 response key 就绪; 仍为空则不提前返回 — 继续监听,
+                    # 让单次 poll 的调用方也能等到同窗口内随后到达的 done 结果.
                     await asyncio.sleep(0.05)
                     raw = await redis_client.get(response_key)
                     if raw:
@@ -1616,16 +1682,33 @@ async def chat_transfer(body: ChatTransferRequest, req: Request, user: CurrentUs
             )
 
     # 通知 chat-svc 创建转人工会话
-    chat_client = getattr(req.app.state, "chat_client", None)
+    chat_client = getattr(req.app.state, "chat_svc_client", None)
     transfer_url = ""
+    transfer_sid = ""
     if chat_client:
         try:
-            result = await chat_client.create_session(body.session_id)
-            transfer_url = result.get("transfer_url", "")
+            transfer_req = chat_client.build_transfer_request(
+                session_id=body.session_id,
+                transfer_reason=body.reason or "",
+            )
+            result = await chat_client.create_session(transfer_req)
+            transfer_sid = result.get("sessionId") or result.get("session_id") or ""
+            transfer_url = result.get("pollUrl", "") or result.get("poll_url", "")
+            # 记录 chat-svc id ↔ Lumio id 映射, 让 chat-svc 回调能反解命中本题会话
+            if transfer_sid and session_manager:
+                with contextlib.suppress(Exception):
+                    await session_manager.bind_session_alias(
+                        body.session_id, transfer_sid
+                    )
         except Exception:
             logger.warning("chat-svc 转人工通知失败: session=%s", body.session_id)
 
-    return {"status": "transferring", "session_id": body.session_id, "transfer_url": transfer_url}
+    return {
+        "status": "transferring",
+        "session_id": body.session_id,
+        "transfer_sid": transfer_sid,
+        "transfer_url": transfer_url,
+    }
 
 
 # ── 客户反馈 ──

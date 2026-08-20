@@ -118,6 +118,21 @@ def test_filter_output_no_hit():
     assert sf.filter_output("信用卡年费政策") == "信用卡年费政策"
 
 
+def test_filter_output_exempts_topic_words():
+    """话题词(投诉/危机)只审计不打码: '转接原因: 投诉处理' 不得被毁成 '**处理'"""
+    sf = SafetyFilter(mask_char="*")
+    sf.load_from_set({"密码", "投诉", "自杀", "保本保息"})
+
+    # PII 仍打码
+    assert sf.filter_output("您的密码是123456") == "您的**是123456"
+    # 投诉监管类/危机类话题词不打码
+    assert "投诉" in sf.filter_output("已为您转接人工，转接原因: 投诉处理")
+    assert "自杀" in sf.filter_output("客户提到自杀话题")
+    # 输入审计仍命中话题词 (不影响 check_input)
+    is_safe, hits = sf.check_input("这不好好，我投诉你们")
+    assert not is_safe and "投诉" in hits
+
+
 def test_filter_output_mask_length():
     """掩码长度与敏感词长度一致"""
     sf = SafetyFilter(mask_char="*")

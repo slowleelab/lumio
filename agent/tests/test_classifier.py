@@ -157,6 +157,68 @@ async def test_dual_path_no_llm_uses_fallback() -> None:
     assert source == "fallback"
 
 
+# ── IntentClassifier (小 BERT 快路径) ──
+
+
+def _fake_bert(return_intent: IntentLabel = IntentLabel.FAQ, conf: float = 0.95, *, exc: Exception | None = None) -> MagicMock:
+    """构造一个假的 BERT 分类器 (async classify), 不加载真 torch。"""
+    fake = MagicMock()
+    if exc is not None:
+        fake.classify = AsyncMock(side_effect=exc)
+    else:
+        fake.classify = AsyncMock(return_value=IntentResult(primary_intent=return_intent, primary_confidence=conf))
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_bert_fast_path_hit() -> None:
+    """BERT 高置信度应直接命中, source == bert, 不触发 LLM"""
+    fake = _fake_bert(IntentLabel.REWARD_QUERY, 0.95)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, entities, sentiment, source = await classifier.classify("积分商城在哪")
+
+    assert source == "bert"
+    assert intent.primary_intent == IntentLabel.REWARD_QUERY
+    fake.classify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bert_low_confidence_fallthrough_to_llm() -> None:
+    """BERT 低置信度 (< 阈值) 应 fallthrough 到 LLM 慢路径"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.4)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.6), [], SentimentLabel.NEUTRAL)
+    )
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier,
+                                  fast_threshold=0.7, bert_classifier=fake)
+    _intent, _entities, _sentiment, source = await classifier.classify("这个怎么弄")
+
+    assert source == "llm"
+    mock_llm_classifier.classify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_bert_low_confidence_no_llm_uses_fallback() -> None:
+    """BERT 低置信度且无 LLM → fallback"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.4)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    _intent, _entities, _sentiment, source = await classifier.classify("这个怎么弄")
+
+    assert source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_bert_error_falls_back_to_rule() -> None:
+    """BERT 推理异常 → 回退规则快路径 (规则命中则以 rule 返回), 不抛异常"""
+    fake = _fake_bert(exc=RuntimeError("模型加载失败"))
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, entities, sentiment, source = await classifier.classify("我要查账单")
+
+    assert source == "rule"
+    assert intent.primary_intent == IntentLabel.BILL_QUERY
+
+
 # ── get_domain ──
 
 

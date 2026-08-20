@@ -12,6 +12,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from lumio.services.common.bert_classifier import BertIntentClassifier
 from lumio.shared.models import Entity, IntentLabel, IntentResult, SentimentLabel
 
 if TYPE_CHECKING:
@@ -276,8 +277,8 @@ class LLMClassifier:
 class IntentClassifier:
     """双通道意图分类编排器
 
-    Fast Path（规则） → 置信度 >= 阈值 → 直接使用
-                       → 置信度 < 阈值 → Slow Path（LLM）
+    Fast Path（规则｜小 BERT） → 置信度 >= 阈值 → 直接使用
+                              → 置信度 < 阈值 → Slow Path（LLM）
     """
 
     def __init__(
@@ -285,10 +286,12 @@ class IntentClassifier:
         rule_classifier: RuleClassifier | None = None,
         llm_classifier: LLMClassifier | None = None,
         fast_threshold: float = _FAST_PATH_THRESHOLD,
+        bert_classifier: BertIntentClassifier | None = None,
     ) -> None:
         self._rule = rule_classifier or RuleClassifier()
         self._llm = llm_classifier
         self._threshold = fast_threshold
+        self._bert = bert_classifier
 
     # P2-17: 规则路径情绪关键词 (愤怒/负面), 支撑情绪转人工
     _ANGRY_KEYWORDS: frozenset[str] = frozenset(
@@ -318,41 +321,52 @@ class IntentClassifier:
             text: 用户输入文本
 
         Returns:
-            (IntentResult, 实体列表, 情感标签, 分类来源 "rule"|"llm"|"fallback")
+            (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback")
         """
-        # Fast Path
-        rule_result = self._rule.classify(text)
-        if rule_result.primary_confidence >= self._threshold:
+        # Fast Path: 优先小 BERT, 否则规则; BERT 异常时回退规则 (打不挂线上)
+        fast_source = "rule"
+        if self._bert is not None:
+            try:
+                fast_result = await self._bert.classify(text)
+                fast_source = "bert"
+            except Exception:
+                logger.warning("BERT 分类失败, 回退规则快路径")
+                fast_result = self._rule.classify(text)
+        else:
+            fast_result = self._rule.classify(text)
+
+        if fast_result.primary_confidence >= self._threshold:
             logger.debug(
-                "Fast Path 命中: intent=%s, confidence=%.2f",
-                rule_result.primary_intent.value,
-                rule_result.primary_confidence,
+                "Fast Path 命中: intent=%s, confidence=%.2f, source=%s",
+                fast_result.primary_intent.value,
+                fast_result.primary_confidence,
+                fast_source,
             )
             # P2-17: Fast Path 情绪检测 — 此前规则通道恒 NEUTRAL, 情绪只在 LLM 慢路径
             # 生效 (覆盖面窄). 规则命中时用关键词快速判定愤怒/负面, 支撑情绪转人工.
-            return rule_result, [], self._rule_sentiment(text), "rule"
+            return fast_result, [], self._rule_sentiment(text), fast_source
 
         # Slow Path
         if self._llm is None:
             logger.debug("Slow Path 不可用，使用 Fast Path 低置信度结果")
-            return rule_result, [], SentimentLabel.NEUTRAL, "fallback"
+            return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
 
         # 熔断器打开 → 跳过 LLM
         if not self._llm._llm._breaker.is_available:
             logger.debug("LLM 熔断器打开，跳过 Slow Path")
-            return rule_result, [], SentimentLabel.NEUTRAL, "fallback"
+            return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
 
         logger.debug(
             "Fast Path 置信度不足 (%.2f < %.2f)，进入 Slow Path",
-            rule_result.primary_confidence,
+            fast_result.primary_confidence,
             self._threshold,
         )
 
         try:
             llm_result, entities, sentiment = await self._llm.classify(text)
         except Exception:
-            logger.warning("LLM 分类调用失败，使用规则结果兜底")
-            return rule_result, [], SentimentLabel.NEUTRAL, "fallback"
+            logger.warning("LLM 分类调用失败，使用 Fast Path 结果兜底")
+            return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
 
         # LLM 结果置信度也很低时，标记来源为 fallback
         source = "llm" if llm_result.primary_confidence >= 0.3 else "fallback"
