@@ -825,7 +825,7 @@ async def _run_agent(
                     state.transfer_summary = transfer_summary
                     state.transfer_reason = transfer_reason
                     await session_manager._save_meta(state)
-# transfer_sid = chat-svc 生成的会话 id (session-xxxx), 客户页据此轮询坐席消息.
+                # transfer_sid = chat-svc 生成的会话 id (session-xxxx), 客户页据此轮询坐席消息.
                 # 此前仅回传 transfer_url (带 token 的 URL), 前端无真实 sid 可用.
                 transfer_sid = transfer_resp.get("sessionId") or transfer_resp.get("session_id") or ""
                 transfer_url = transfer_resp.get("pollUrl", "") or transfer_resp.get("poll_url", "")
@@ -1697,9 +1697,7 @@ async def chat_transfer(body: ChatTransferRequest, req: Request, user: CurrentUs
             # 记录 chat-svc id ↔ Lumio id 映射, 让 chat-svc 回调能反解命中本题会话
             if transfer_sid and session_manager:
                 with contextlib.suppress(Exception):
-                    await session_manager.bind_session_alias(
-                        body.session_id, transfer_sid
-                    )
+                    await session_manager.bind_session_alias(body.session_id, transfer_sid)
         except Exception:
             logger.warning("chat-svc 转人工通知失败: session=%s", body.session_id)
 
@@ -2010,3 +2008,246 @@ async def get_document_status(doc_id: str, db: DbSession, user: CurrentUser):
             for log in logs
         ],
     }
+
+
+# ── 闭环 P1 感知缝: 漂移聚合 / 有界留存 (管理面) ────────────────────────────
+
+
+@router.get("/admin/classifier-sample/aggregate")
+async def classifier_sample_aggregate(req: Request, user: CurrentUser):
+    """闭环漂移观测: 汇总近 window_days 天各意图的采样数 + 平均置信度.
+
+    仅 admin/agent 可见. 未启用感知缝时返回空列表.
+    """
+    if user.role not in ("admin", "agent"):
+        from lumio.shared.auth import AuthorizationError
+
+        raise AuthorizationError("仅管理员/坐席可查看分类样本统计")
+    collector = getattr(req.app.state, "trap_collector", None)
+    if collector is None:
+        return {"enabled": False, "samples": []}
+    window_days = int(req.query_params.get("window_days", 7))
+    rows = await collector.aggregate(window_days=window_days, min_samples=1)
+    return {"enabled": True, "window_days": window_days, "samples": rows}
+
+
+@router.post("/admin/classifier-sample/purge")
+async def classifier_sample_purge(req: Request, user: CurrentUser):
+    """有界留存: 手动清理超过 days 天的感知样本. 仅 admin.
+
+    正常运行下由后台调度周期性调用; 此端点用于运维手动清档/演示.
+    """
+    if user.role != "admin":
+        from lumio.shared.auth import AuthorizationError
+
+        raise AuthorizationError("仅管理员可清理分类样本")
+    collector = getattr(req.app.state, "trap_collector", None)
+    if collector is None:
+        return {"enabled": False, "deleted": 0}
+    days = int(req.query_params.get("days", 90))
+    deleted = await collector.purge_older_than(days=days)
+    return {"enabled": True, "days": days, "deleted": deleted}
+
+
+# ── 闭环 P2 评估/归因: 四层根因 (管理面) ────────────────────────────────────
+
+
+@router.get("/admin/closed-loop/root-causes")
+async def closed_loop_root_causes(req: Request, user: CurrentUser):
+    """闭环归因: 对最近 window_days 天的感知样本做多头一致性 + 结果弱标签 +
+    四层根因聚合. 仅 admin/agent 可见.
+
+    返回: 总样本数、按层/按 verdict 分布、可操作的失败样本 top (按重排权降序).
+    """
+    if user.role not in ("admin", "agent"):
+        from lumio.shared.auth import AuthorizationError
+
+        raise AuthorizationError("仅管理员/坐席可查看闭环归因")
+    db_sf = getattr(req.app.state, "db_session_factory", None)
+    if db_sf is None:
+        from lumio.services.common.database import get_async_session_factory
+
+        db_sf = get_async_session_factory()
+    redis_client = getattr(req.app.state, "redis_client", None)
+    window_days = int(req.query_params.get("window_days", 7))
+    limit = int(req.query_params.get("limit", 200))
+    from lumio.services.common.trap_eval import attribute_recent
+
+    summary = await attribute_recent(
+        db_session_factory=db_sf,
+        redis=redis_client,
+        window_days=window_days,
+        limit=limit,
+    )
+    return {"enabled": True, "window_days": window_days, **summary}
+
+
+# ── 闭环 P3 版本化优化: 模型注册表 + canary + 样本回流 (管理面) ────────────────
+
+
+def _require_admin(user: CurrentUser) -> None:
+    if user.role != "admin":
+        from lumio.shared.auth import AuthorizationError
+
+        raise AuthorizationError("仅管理员可操作")
+
+
+def _get_registry(req: Request):
+    from lumio.services.common.model_registry import ModelRegistry
+
+    reg = getattr(req.app.state, "model_registry", None)
+    if reg is None:
+        from lumio.shared.config import get_settings
+
+        reg = ModelRegistry(
+            state_path=get_settings().classification.model_registry_path,
+            allow_ungated=False,
+        )
+        req.app.state.model_registry = reg
+    return reg
+
+
+def _gates_runner_for(repo_path: str):
+    """为候选版本构造 **异步** 评估门 runner (供事件循环内 promote 使用)."""
+    from lumio.services.common.eval_gates import EvalGates
+
+    try:
+        from lumio.services.common.bert_classifier import BertIntentClassifier
+
+        clf = BertIntentClassifier(model_path=repo_path)
+
+        async def _predict(text: str) -> tuple[str, float]:
+            try:
+                res = await clf.classify(text)
+                return res.primary_intent.value, float(res.primary_confidence)
+            except Exception:  # 模型加载/推理失败 → 视为该点未命中 (门会判 FAIL)
+                return "", 0.0
+
+    except Exception as exc:  # 依赖不可用
+        detail = f"候选模型不可加载: {exc}"
+
+        async def _gates_unavailable(detail: str = detail) -> list[dict]:
+            return [{"name": "golden", "passed": False, "detail": detail, "failures": []}]
+
+        return _gates_unavailable
+
+    async def _gates() -> list[dict]:
+        results = await EvalGates().arun(_predict)
+        return [r.to_dict() for r in results]
+
+    return _gates
+
+
+@router.get("/admin/model-registry")
+async def model_registry_view(req: Request, user: CurrentUser):
+    """查看模型注册表 (版本指针 + canary 状态). admin/agent 可见."""
+    if user.role not in ("admin", "agent"):
+        from lumio.shared.auth import AuthorizationError
+
+        raise AuthorizationError("仅管理员/坐席可查看")
+    return _get_registry(req).to_dict()
+
+
+@router.post("/admin/model-registry/register")
+async def model_registry_register(req: Request, user: CurrentUser):
+    """登记新版本 (staging). body: {version, path, notes?}. 仅 admin."""
+    _require_admin(user)
+    body = await req.json()
+    registry = _get_registry(req)
+    v = registry.register(
+        version_id=body["version"],
+        path=body["path"],
+        notes=body.get("notes", ""),
+    )
+    return {"ok": True, "version": v.to_dict()}
+
+
+@router.post("/admin/model-registry/canary")
+async def model_registry_canary(req: Request, user: CurrentUser):
+    """设 canary + 灰度占比. body: {version, traffic?}. 仅 admin."""
+    _require_admin(user)
+    body = await req.json()
+    registry = _get_registry(req)
+    v = registry.set_canary(version_id=body["version"], traffic=float(body.get("traffic", 1.0)))
+    return {"ok": True, "canary": v.to_dict(), "traffic": registry._canary_traffic}
+
+
+@router.post("/admin/model-registry/promote")
+async def model_registry_promote(req: Request, user: CurrentUser):
+    """canary 过四门评估后升 active. 仅 admin. 不传 force 且门未全 PASS 则拒绝."""
+    _require_admin(user)
+    registry = _get_registry(req)
+    if not registry._canary:
+        return {"ok": False, "reason": "无 canary 版本", "report": []}
+    canary_path = registry._versions[registry._canary].path
+    runner = _gates_runner_for(canary_path)
+    report = await runner()  # 事件循环内 await, 避免嵌套 asyncio.run
+    ok, report = registry.promote(gate_runner=lambda: report)
+    return {"ok": ok, "report": report, "active": registry._active}
+
+
+@router.post("/admin/model-registry/rollback")
+async def model_registry_rollback(req: Request, user: CurrentUser):
+    """回退到上一 active. 仅 admin."""
+    _require_admin(user)
+    registry = _get_registry(req)
+    prev = registry.rollback()
+    return {"ok": prev is not None, "active": prev}
+
+
+@router.get("/admin/closed-loop/backflow/candidates")
+async def closed_loop_backflow_candidates(req: Request, user: CurrentUser):
+    """精选失败样本写人审 staging. admin/agent 可见; 写文件仅 admin 可触发."""
+    _require_admin(user)
+    db_sf = getattr(req.app.state, "db_session_factory", None)
+    if db_sf is None:
+        from lumio.services.common.database import get_async_session_factory
+
+        db_sf = get_async_session_factory()
+    limit = int(req.query_params.get("limit", 100))
+    max_n = int(req.query_params.get("max_n", 50))
+
+    from sqlalchemy import select
+
+    from lumio.services.common.sample_backflow import select_candidates, write_staging
+    from lumio.services.common.trap_eval import AttribSample, AttributeEngine
+    from lumio.shared.config import get_settings
+    from lumio.shared.orm_models import ClassifierSample
+
+    engine = AttributeEngine()
+    pairs = []
+    async with db_sf() as session:
+        stmt = select(ClassifierSample).order_by(ClassifierSample.created_at.desc()).limit(limit)
+        rows = (await session.execute(stmt)).scalars().all()
+    for r in rows:
+        s = AttribSample(
+            sample_id=str(r.id),
+            text=r.text,
+            fast_source=r.fast_source,
+            fast_intent=r.fast_intent,
+            fast_confidence=r.fast_confidence,
+            rule_intent=r.rule_intent,
+            final_source=r.final_source,
+            final_intent=r.final_intent,
+            final_confidence=r.final_confidence,
+            margin=r.margin,
+            divergence=r.divergence,
+            reasons=list(r.reasons or []),
+        )
+        pairs.append((s, engine.attribute(s)))
+    candidates = select_candidates(pairs, max_n=max_n)
+    cfg = get_settings().classification
+    staged = write_staging(candidates, cfg.backflow_review_path)
+    return {"ok": True, "staged": staged, "review_path": cfg.backflow_review_path}
+
+
+@router.post("/admin/closed-loop/backflow/finalize")
+async def closed_loop_backflow_finalize(req: Request, user: CurrentUser):
+    """把 review 中人工批准的条目并入种子训练集 (human-in-loop). 仅 admin."""
+    _require_admin(user)
+    from lumio.services.common.sample_backflow import finalize_confirmed
+    from lumio.shared.config import get_settings
+
+    cfg = get_settings().classification
+    added, version = finalize_confirmed(cfg.backflow_review_path, cfg.seed_dataset_path)
+    return {"ok": True, "added": added, "version": version}

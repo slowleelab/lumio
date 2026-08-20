@@ -213,6 +213,24 @@ class LumioAgent:
         except Exception:
             pass  # 危机检测失败时放行 (不阻断正常对话)
 
+        # ── 输入层护栏（生产级硬拦截）：身份/角色覆盖 + 第三方信息查询 ──
+        # 在进入路由/LLM 之前由确定性规则直接拦截，返回固定话术，零 LLM 参与。
+        # 优先级仅低于危机干预；正常金融提问不命中，零回归。
+        try:
+            from lumio.services.bot.input_guard import check_input_guard
+
+            guard_hit = check_input_guard(user_input)
+            if guard_hit is not None:
+                logger.info(
+                    "输入护栏拦截: category=%s session=%s input=%r",
+                    guard_hit.category,
+                    session_id,
+                    user_input[:50],
+                )
+                return self._build_result(session_id, user_input, guard_hit.response, "guard", "faq")
+        except Exception:
+            pass  # 护栏异常时放行 (不阻断正常对话)
+
         # 快速路径：问候/告别不调 LLM
         if _is_greeting(user_input):
             return self._build_result(session_id, user_input, GREETING_RESPONSE, "template", "chitchat")
@@ -237,8 +255,15 @@ class LumioAgent:
             return self._build_result(session_id, user_input, FAREWELL_RESPONSE, "template", "chitchat")
 
         try:
-            # 1. 意图分类 + 实体抽取 + 情感分析
-            intent_result, entities, sentiment = await self._classify(user_input)
+            # 闭环 P1 感知缝: 提供会话/客户归属 (采样器被动读取, 业务不感知采样逻辑)
+            from lumio.services.common.trap_collector import reset_trap_context, set_trap_context
+
+            ctx = set_trap_context(session_id, customer_id)
+            try:
+                # 1. 意图分类 + 实体抽取 + 情感分析
+                intent_result, entities, sentiment = await self._classify(user_input)
+            finally:
+                reset_trap_context(ctx)
 
             # 2. 规则路由
             domain = get_domain(intent_result.primary_intent)

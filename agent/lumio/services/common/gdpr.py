@@ -274,7 +274,7 @@ class GDPRService:
         try:
             from sqlalchemy import delete
 
-            from lumio.shared.orm_models import ChatMessage, DecisionLog, DialogueLog
+            from lumio.shared.orm_models import ChatMessage, ClassifierSample, DecisionLog, DialogueLog
 
             db_sf = getattr(self, "_db_session_factory", None)
             if db_sf is None:
@@ -298,6 +298,11 @@ class GDPRService:
                 stmt3 = delete(ChatMessage).where(ChatMessage.customer_id == customer_id)
                 result3 = await session.execute(stmt3)
                 deleted += result3.rowcount or 0
+                # 4) classifier_sample (闭环 P1 感知样本: 客户要求删除时一并硬删,
+                # 采样文本虽已打码, 但 customer_id/会话归属仍属个人数据)
+                stmt4 = delete(ClassifierSample).where(ClassifierSample.customer_id == customer_id)
+                result4 = await session.execute(stmt4)
+                deleted += result4.rowcount or 0
                 await session.commit()
             logger.info("GDPR PostgreSQL 删除: customer=%s, rows=%d", customer_id, deleted)
             return deleted

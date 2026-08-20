@@ -22,7 +22,7 @@ class TestOrchestrationSettings:
         assert s.d1_intent_confidence_threshold == 0.5
         assert s.d2_emotion_score_threshold == 0.3
         # 全局超时
-        assert s.global_timeout_ms == 5000
+        assert s.global_timeout_ms == 20000
         # 执行器 SLA
         assert s.e1_sla_ms == 3000
         assert s.e2_sla_ms == 500

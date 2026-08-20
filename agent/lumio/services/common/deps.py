@@ -409,22 +409,53 @@ async def init_classifier(app: FastAPI) -> None:
     if settings.classification.bert_enabled:
         # 懒加载: 仅开启时引入 (模块本身不 import torch, torch 在首次 classify 才加载)
         from lumio.services.common.bert_classifier import BertIntentClassifier
+        from lumio.services.common.model_registry import ModelRegistry
 
-        bert_classifier = BertIntentClassifier(model_path=settings.classification.bert_model_path)
-        _logger.info("启用小 BERT 意图分类快路径 model=%s", settings.classification.bert_model_path)
+        # P3: 从模型注册表取 active 版本路径 (无注册表/无 active 时回退配置默认)
+        registry = ModelRegistry(state_path=settings.classification.model_registry_path)
+        model_path = registry.compose_classifier_path(settings.classification.bert_model_path)
+        bert_classifier = BertIntentClassifier(model_path=model_path)
+        app.state.model_registry = registry
+        _logger.info("启用小 BERT 意图分类快路径 model=%s", model_path)
+
+    trap = None
+    if settings.classification.trap_enabled:
+        from lumio.services.common.database import get_async_session_factory
+        from lumio.services.common.trap_collector import TrapCollector
+
+        trap = TrapCollector(
+            session_factory=get_async_session_factory(),
+            threshold=settings.classification.intent_threshold,
+            band=settings.classification.trap_sampling_band,
+            ambient_rate=settings.classification.trap_ambient_rate,
+        )
+        app.state.trap_collector = trap
+        _logger.info(
+            "启用闭环感知缝 TrapCollector band=%.2f ambient=%.3f",
+            settings.classification.trap_sampling_band,
+            settings.classification.trap_ambient_rate,
+        )
 
     classifier = IntentClassifier(
         rule_classifier=rule_classifier,
         llm_classifier=llm_classifier,
         fast_threshold=settings.classification.intent_threshold + 0.1,
         bert_classifier=bert_classifier,
+        trap=trap,
     )
     app.state.classifier = classifier
 
 
 async def close_classifier(app: FastAPI) -> None:
     """关闭分类器（无需特殊清理）"""
+    # 等待飞行中的采样落库 task 落盘 (避免关闭时丢失尚未提交的样本)
+    collector = getattr(app.state, "trap_collector", None)
+    if collector is not None and getattr(collector, "_pending_tasks", None):
+        _, pending = await asyncio.wait(list(collector._pending_tasks), timeout=3)
+        for task in pending:
+            task.cancel()
     app.state.classifier = None
+    app.state.trap_collector = None
 
 
 def get_classifier(request: Request) -> IntentClassifier:

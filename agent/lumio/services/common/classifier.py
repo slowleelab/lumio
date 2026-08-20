@@ -13,6 +13,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from lumio.services.common.bert_classifier import BertIntentClassifier
+from lumio.services.common.trap_collector import TrapCollector, TrapRecord
 from lumio.shared.models import Entity, IntentLabel, IntentResult, SentimentLabel
 
 if TYPE_CHECKING:
@@ -287,11 +288,13 @@ class IntentClassifier:
         llm_classifier: LLMClassifier | None = None,
         fast_threshold: float = _FAST_PATH_THRESHOLD,
         bert_classifier: BertIntentClassifier | None = None,
+        trap: TrapCollector | None = None,
     ) -> None:
         self._rule = rule_classifier or RuleClassifier()
         self._llm = llm_classifier
         self._threshold = fast_threshold
         self._bert = bert_classifier
+        self._trap = trap  # P1 感知缝: 被动采样失败/不确定/分歧样本
 
     # P2-17: 规则路径情绪关键词 (愤怒/负面), 支撑情绪转人工
     _ANGRY_KEYWORDS: frozenset[str] = frozenset(
@@ -344,16 +347,19 @@ class IntentClassifier:
             )
             # P2-17: Fast Path 情绪检测 — 此前规则通道恒 NEUTRAL, 情绪只在 LLM 慢路径
             # 生效 (覆盖面窄). 规则命中时用关键词快速判定愤怒/负面, 支撑情绪转人工.
+            await self._emit_sample(text, fast_source, fast_result, fast_result, fast_source)
             return fast_result, [], self._rule_sentiment(text), fast_source
 
         # Slow Path
         if self._llm is None:
             logger.debug("Slow Path 不可用，使用 Fast Path 低置信度结果")
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
             return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
 
         # 熔断器打开 → 跳过 LLM
         if not self._llm._llm._breaker.is_available:
             logger.debug("LLM 熔断器打开，跳过 Slow Path")
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
             return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
 
         logger.debug(
@@ -366,11 +372,48 @@ class IntentClassifier:
             llm_result, entities, sentiment = await self._llm.classify(text)
         except Exception:
             logger.warning("LLM 分类调用失败，使用 Fast Path 结果兜底")
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
             return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
 
         # LLM 结果置信度也很低时，标记来源为 fallback
         source = "llm" if llm_result.primary_confidence >= 0.3 else "fallback"
+        await self._emit_sample(text, fast_source, fast_result, llm_result, source)
         return llm_result, entities, sentiment, source
+
+    async def _emit_sample(
+        self,
+        text: str,
+        fast_source: str,
+        fast_result: IntentResult,
+        final_result: IntentResult,
+        final_source: str,
+    ) -> None:
+        """P1 感知缝: 把一次分类结果快照交给 TrapCollector 判定是否采样.
+
+        规则通道是廉价正则 (<1ms), 仅在 BERT 为快路径时顺带跑一次用于分歧检测,
+        避免重复跑昂贵的 BERT. 采样判定在同步阶段完成, 落库由后台 task 承担.
+        """
+        trap = self._trap
+        if trap is None:
+            return
+        rule_intent: str | None = None
+        divergence = False
+        if fast_source == "bert":
+            rule_intent = self._rule.classify(text).primary_intent.value
+            divergence = rule_intent != fast_result.primary_intent.value
+        rec = TrapRecord(
+            text=text,
+            fast_source=fast_source,
+            fast_intent=fast_result.primary_intent.value,
+            fast_confidence=fast_result.primary_confidence,
+            rule_intent=rule_intent,
+            final_source=final_source,
+            final_intent=final_result.primary_intent.value,
+            final_confidence=final_result.primary_confidence,
+            margin=abs(final_result.primary_confidence - self._threshold),
+            divergence=divergence,
+        )
+        await trap.capture(rec)
 
 
 def get_domain(intent: IntentLabel) -> str:

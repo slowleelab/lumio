@@ -293,6 +293,24 @@ class ClassificationSettings(BaseSettings):
     # 已微调 BERT 模型目录 (相对路径以 agent/ 为基准; 权重不入 git, 部署需随服携带)
     bert_model_path: str = "data/intent_classification/out_intent_clf"
 
+    # ── 闭环 P1 感知缝 (TrapCollector) ──
+    # 采样: 走慢路径/兜底、贴近决策边界、规则-BERT 分歧 + 固定小概率随机的样本落库
+    trap_enabled: bool = False
+    # 有界留存: 超过该天数自动清档
+    trap_retention_days: int = 90
+    # 贴近决策边界的带宽 (abs(final_confidence - threshold) < band 即采样)
+    trap_sampling_band: float = 0.15
+    # 环境随机采样率 (打破"只采异常"的选择偏差, 支撑漂移检测)
+    trap_ambient_rate: float = 0.02
+
+    # ── 闭环 P3 版本化优化 ──
+    # 模型注册表状态文件 (相对 agent/ 解析; 仅存版本指针, 不存权重)
+    model_registry_path: str = "data/intent_classification/model_registry.json"
+    # 样本回流人审 staging 文件
+    backflow_review_path: str = "data/intent_classification/backflow_review.jsonl"
+    # 回流并入的种子数据集
+    seed_dataset_path: str = "data/intent_classification/seed_dataset.json"
+
 
 class RAGSettings(BaseSettings):
     """RAG 检索配置"""

@@ -346,11 +346,11 @@ class _FakePgSession:
 
 
 async def test_delete_postgres_injected_factory():
-    """已注入 db factory 时正常删除三张表"""
+    """已注入 db factory 时正常删除四张表"""
     service = GDPRService()
     service._db_session_factory = lambda: _FakePgSession()
     deleted = await service._delete_postgres("c1")
-    assert deleted == 6  # 3 张表 × rowcount 2
+    assert deleted == 8  # 4 张表 × rowcount 2 (dialogue/decision/chat_message/classifier_sample)
 
 
 async def test_delete_postgres_no_factory(monkeypatch):
