@@ -25,6 +25,24 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 5173,
     proxy: {
+      // 顺序: 越具体的路径越靠前, 避免 /api/chat 前缀吞掉 /api/chat-svc
+      "/api/assist/ws": {
+        target: "http://localhost:8001",
+        changeOrigin: true,
+        ws: true,
+        rewrite: (path) => path.replace(/^\/api\/assist\/ws/, "/api/ws"),
+      },
+      "/api/bot/chat": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/bot\/chat/, "/api/chat"),
+      },
+      "/api/chat-svc": {
+        target: "http://localhost:8092",
+        changeOrigin: true,
+        ws: true,
+        rewrite: (path) => path.replace(/^\/api\/chat-svc/, "/api"),
+      },
       "/api/chat": {
         target: "http://localhost:8000",
         changeOrigin: true,
@@ -34,6 +52,10 @@ export default defineConfig({
         changeOrigin: true,
       },
       "/api/health": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+      "/api/auth": {
         target: "http://localhost:8000",
         changeOrigin: true,
       },
@@ -69,11 +91,6 @@ export default defineConfig({
         target: "http://localhost:8001",
         changeOrigin: true,
         ws: true,
-      },
-      "/api/chat-svc": {
-        target: "http://localhost:8080",
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/chat-svc/, "/api"),
       },
     },
   },

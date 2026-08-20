@@ -273,7 +273,7 @@ services:
 
   # ── Jaeger（全链路追踪后端：OTLP 采集 + UI） ──────────
   jaeger:
-    image: jaegertracing/all-in-one:1.57
+    image: jaegertracing/all-in-one:latest
     container_name: lumio-jaeger
     restart: unless-stopped
     environment:

@@ -16,23 +16,23 @@ export interface UseChatSvcPollOptions {
 
 /** 坐席侧 HTTP 长轮询 chat-svc 获取新消息 (B2: 走 axios 包装, 自动 Bearer)
  *
- *  - 时间戳游标: 只拉取 lastTimestamp 之后的消息, 切换 session 时重置
+ *  - seq 游标: 只拉取 lastSeq 之后的消息 (单调有序, 消除同毫秒丢/重/乱), 切换 session 时重置
  *  - sessionId 变化: 立即停旧的, 启动新的
  *  - 组件卸载: 自动停止
  *  - 错误: 1s 后重试 (silently)
  */
 export function useChatSvcPoll(opts: UseChatSvcPollOptions) {
   const isPolling = ref(false)
-  let lastTimestamp = 0
+  let lastSeq = 0
   let stopFlag = false
 
   async function loop(sid: string) {
     isPolling.value = true
     while (!stopFlag) {
       try {
-        const msgs = await pollChatSvcMessages(sid, lastTimestamp, opts.timeoutMs ?? 25000)
+        const msgs = await pollChatSvcMessages(sid, lastSeq, opts.timeoutMs ?? 25000)
         for (const m of msgs || []) {
-          if (m.timestamp > lastTimestamp) lastTimestamp = m.timestamp
+          if (m.seq > lastSeq) lastSeq = m.seq
           opts.onMessage(m)
         }
       } catch {
@@ -44,7 +44,7 @@ export function useChatSvcPoll(opts: UseChatSvcPollOptions) {
 
   function start(sid: string) {
     stopFlag = false
-    lastTimestamp = 0  // 新会话从 0 开始
+    lastSeq = 0  // 新会话从 0 开始
     loop(sid)
   }
 

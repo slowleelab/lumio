@@ -2,17 +2,45 @@ import { defineStore } from "pinia"
 import { ref } from "vue"
 import { sendMessage, pollReply } from "@/api/bot"
 import { sendChatSvcMessage, pollChatSvcMessages } from "@/api/chat-svc"
-import type { ChatMessage, ChatRequest } from "@/api/types"
+import type { ChatMessage, ChatRequest, PollResponse } from "@/api/types"
+
+// 长轮询参数：单次 poll 25s；总时限 40s（覆盖 worker 20s 编排预算 + 排队的余量）
+const POLL_PER_POLL_MS = 25
+const POLL_TOTAL_MS = 40000
 
 export const useChatStore = defineStore("chat", () => {
   const messages = ref<ChatMessage[]>([])
   const sessionId = ref<string | null>(null)
   const isLoading = ref(false)
+  const replyStatus = ref<string>("")  // bot 轮询期间的进度提示：排队中/处理中/超时重试
   const transferUrl = ref<string | null>(null)  // chat-svc 轮询地址
   const agentConnected = ref(false)
 
   let msgCounter = 0
   const seenMessageIds = new Set<string>()
+
+  // 续轮询：queued/processing 保持等待不判死；首个 timeout 继续轮询，总时限到仍未 done
+  // 才落一条占位气泡（避免静默丢回复）。只有 done 返回真实 result。
+  async function pollUntilDone(sid: string, deadline: number): Promise<PollResponse | null> {
+    for (;;) {
+      const remaining = Math.min(
+        POLL_PER_POLL_MS,
+        Math.max(1, Math.ceil((deadline - Date.now()) / 1000)),
+      )
+      const resp = await pollReply(sid, remaining)
+      if (resp.status === "done") return resp
+      replyStatus.value =
+        resp.status === "queued"
+          ? `排队中${resp.position ? `，前方 ${resp.position} 位` : ""}`
+          : resp.status === "processing"
+            ? "处理中…"
+            : "回复超时，重试中…"
+      if (Date.now() >= deadline) {
+        replyStatus.value = "服务繁忙，请稍后重试"
+        return { status: "timeout", has_message: false } as PollResponse
+      }
+    }
+  }
 
   async function send(text: string) {
     const userMsg: ChatMessage = {
@@ -23,6 +51,7 @@ export const useChatStore = defineStore("chat", () => {
     }
     messages.value.push(userMsg)
     isLoading.value = true
+    replyStatus.value = ""
 
     try {
       // 如果已转人工，发消息到 chat-svc (走 axios 包装, 自动 Bearer + 错误拦截)
@@ -32,14 +61,12 @@ export const useChatStore = defineStore("chat", () => {
           try {
             await sendChatSvcMessage(sid, { sender: "customer", content: text })
           } catch { /* 错误已 toast */ }
-          // 更新游标：避免轮询拉回自己刚发的消息
-          lastAgentTimestamp = Date.now()
         }
         isLoading.value = false
         return
       }
 
-      // Bot 阶段：发送 + 轮询
+      // Bot 阶段：发送 + 续轮询（queued/processing 保持等待，don't 判死在首个 timeout）
       const request: ChatRequest = {
         message: text,
         session_id: sessionId.value ?? undefined,
@@ -47,8 +74,9 @@ export const useChatStore = defineStore("chat", () => {
       const sendResp = await sendMessage(request)
       sessionId.value = sendResp.session_id
 
-      const pollResp = await pollReply(sendResp.session_id, 30)
-      if (pollResp.status === "done") {
+      const pollDeadline = Date.now() + POLL_TOTAL_MS
+      const pollResp = await pollUntilDone(sendResp.session_id, pollDeadline)
+      if (pollResp && pollResp.status === "done") {
         const botMsg: ChatMessage = {
           id: `msg-${++msgCounter}`,
           role: "bot",
@@ -75,7 +103,7 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   let agentPollActive = false
-  let lastAgentTimestamp = 0  // 游标：只拉取该时间戳之后的消息
+  let lastSeq = 0  // seq 游标：只拉取该序号之后的消息（单调有序）
 
   async function startAgentPolling() {
     if (agentPollActive) return
@@ -84,10 +112,10 @@ export const useChatStore = defineStore("chat", () => {
       try {
         const sid = transferUrl.value.match(/session_id=([^&]+)/)?.[1]
         if (!sid) break
-        const msgs = await pollChatSvcMessages(sid, lastAgentTimestamp, 25000)
+        const msgs = await pollChatSvcMessages(sid, lastSeq, 25000)
         for (const m of msgs) {
-          if (m.timestamp > lastAgentTimestamp) {
-            lastAgentTimestamp = m.timestamp
+          if (m.seq > lastSeq) {
+            lastSeq = m.seq
           }
           if (m.sender === "agent" && !seenMessageIds.has(m.messageId)) {
             seenMessageIds.add(m.messageId)
@@ -110,9 +138,9 @@ export const useChatStore = defineStore("chat", () => {
     transferUrl.value = null
     agentConnected.value = false
     agentPollActive = false
-    lastAgentTimestamp = 0
+    replyStatus.value = ""
     seenMessageIds.clear()
   }
 
-  return { messages, sessionId, isLoading, transferUrl, agentConnected, send, clearSession }
+  return { messages, sessionId, isLoading, replyStatus, transferUrl, agentConnected, send, clearSession }
 })
