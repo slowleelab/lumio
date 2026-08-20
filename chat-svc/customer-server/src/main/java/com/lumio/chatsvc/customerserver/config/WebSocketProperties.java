@@ -12,12 +12,22 @@ public class WebSocketProperties {
 
     private Customer customer = new Customer();
 
+    private Agent agent = new Agent();
+
     public Customer getCustomer() {
         return customer;
     }
 
     public void setCustomer(Customer customer) {
         this.customer = customer;
+    }
+
+    public Agent getAgent() {
+        return agent;
+    }
+
+    public void setAgent(Agent agent) {
+        this.agent = agent;
     }
 
     public static class Customer {
@@ -65,6 +75,19 @@ public class WebSocketProperties {
 
         public void setHeartbeatIntervalSeconds(int heartbeatIntervalSeconds) {
             this.heartbeatIntervalSeconds = heartbeatIntervalSeconds;
+        }
+    }
+
+    /** 坐席实时通道配置 */
+    public static class Agent {
+        private boolean authEnabled = true;
+
+        public boolean isAuthEnabled() {
+            return authEnabled;
+        }
+
+        public void setAuthEnabled(boolean authEnabled) {
+            this.authEnabled = authEnabled;
         }
     }
 }

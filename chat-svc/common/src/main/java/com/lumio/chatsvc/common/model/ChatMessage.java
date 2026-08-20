@@ -48,6 +48,12 @@ public class ChatMessage implements Serializable {
      */
     private long timestamp;
 
+    /**
+     * 会话内单调递增序号（由 CustomerMessageStore 写入时分配）。
+     * 用于消息游标/离线补发，避免同毫秒多条消息丢失、重复或乱序。
+     */
+    private long seq;
+
     public ChatMessage() {
         this.timestamp = System.currentTimeMillis();
         this.contentType = "text";
@@ -124,6 +130,14 @@ public class ChatMessage implements Serializable {
 
     public void setTimestamp(long timestamp) {
         this.timestamp = timestamp;
+    }
+
+    public long getSeq() {
+        return seq;
+    }
+
+    public void setSeq(long seq) {
+        this.seq = seq;
     }
 
     /**

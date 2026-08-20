@@ -115,6 +115,12 @@ public class Session implements Serializable {
     private String routerId;
 
     /**
+     * 来源会话 ID（Lumio 侧 bot 会话的 uuid4-hex）
+     * <p>转人工时由 Lumio 传入, 用于追溯两套会话 id 的对应关系。</p>
+     */
+    private String sourceSessionId;
+
+    /**
      * 会话创建时间（毫秒时间戳）
      */
     private long createTime;
@@ -234,6 +240,14 @@ public class Session implements Serializable {
 
     public void setUpdateTime(long updateTime) {
         this.updateTime = updateTime;
+    }
+
+    public String getSourceSessionId() {
+        return sourceSessionId;
+    }
+
+    public void setSourceSessionId(String sourceSessionId) {
+        this.sourceSessionId = sourceSessionId;
     }
 
     /**

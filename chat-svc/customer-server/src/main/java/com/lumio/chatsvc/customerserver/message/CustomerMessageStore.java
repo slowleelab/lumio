@@ -9,6 +9,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -27,12 +29,38 @@ public class CustomerMessageStore {
     private final Map<String, List<ChatMessage>> sessionMessages = new ConcurrentHashMap<>();
 
     /**
+     * 每个已分配序号的会话的当前最大 seq（单调递增，供消息游标/离线补发）
+     */
+    private final Map<String, AtomicLong> sessionLastSeq = new ConcurrentHashMap<>();
+
+    /**
      * 每个会话的锁 + 条件变量，用于长轮询阻塞/唤醒
      */
     private final Map<String, SessionLock> sessionLocks = new ConcurrentHashMap<>();
 
+    /**
+     * 消息写入监听器（实时推送通道订阅新消息）
+     */
+    private final List<MessageListener> messageListeners = new CopyOnWriteArrayList<>();
+
     private static final int MAX_MESSAGES_PER_SESSION = 200;
     private static final long DEFAULT_POLL_TIMEOUT_MS = 30000;
+
+    /**
+     * 注册消息写入监听器
+     */
+    public void addMessageListener(MessageListener listener) {
+        if (listener != null && !messageListeners.contains(listener)) {
+            messageListeners.add(listener);
+        }
+    }
+
+    /**
+     * 移除消息写入监听器
+     */
+    public void removeMessageListener(MessageListener listener) {
+        messageListeners.remove(listener);
+    }
 
     private static class SessionLock {
         final ReentrantLock lock = new ReentrantLock();
@@ -44,11 +72,27 @@ public class CustomerMessageStore {
     }
 
     /**
-     * 添加消息到会话
+     * 添加消息到会话。按 messageId 幂等去重；为消息分配会话内单调 seq。
      */
     public void addMessage(String sessionId, ChatMessage message) {
         List<ChatMessage> messages = sessionMessages.computeIfAbsent(
                 sessionId, k -> new ArrayList<>());
+        AtomicLong seqCounter = sessionLastSeq.computeIfAbsent(sessionId, k -> new AtomicLong());
+
+        // 幂等：已存在的 messageId 直接跳过（WS + 长轮询双通道去重）
+        if (message.getMessageId() != null && !message.getMessageId().isEmpty()) {
+            synchronized (messages) {
+                for (ChatMessage existing : messages) {
+                    if (message.getMessageId().equals(existing.getMessageId())) {
+                        LOGGER.debug("重复消息已跳过: sessionId={}, messageId={}",
+                                sessionId, message.getMessageId());
+                        return;
+                    }
+                }
+            }
+        }
+
+        message.setSeq(seqCounter.incrementAndGet());
 
         synchronized (messages) {
             // 超过上限时移除最旧的一半
@@ -70,18 +114,27 @@ public class CustomerMessageStore {
             }
         }
 
+        // 通知实时推送监听器（坐席 WS 通道等）
+        for (MessageListener listener : messageListeners) {
+            try {
+                listener.onMessage(sessionId, message);
+            } catch (Exception e) {
+                LOGGER.error("消息监听器处理失败: sessionId={}", sessionId, e);
+            }
+        }
+
         LOGGER.debug("消息已存储: sessionId={}, messageId={}", sessionId, message.getMessageId());
     }
 
     /**
-     * 长轮询获取消息（非消费性，基于游标 since）
+     * 长轮询获取消息（非消费性，基于 seq 游标）
      *
      * @param sessionId 会话 ID
-     * @param since     游标：只返回 timestamp > since 的消息（毫秒）
+     * @param lastSeq   seq 游标：只返回 seq &gt; lastSeq 的消息
      * @param timeoutMs 长轮询超时（毫秒），0 表示不阻塞
-     * @return since 之后的新消息列表，超时返回空列表
+     * @return lastSeq 之后的新消息列表，超时返回空列表
      */
-    public List<ChatMessage> pollMessages(String sessionId, long since, long timeoutMs) {
+    public List<ChatMessage> pollMessages(String sessionId, long lastSeq, long timeoutMs) {
         sessionMessages.computeIfAbsent(sessionId, k -> new ArrayList<>());
 
         long deadline = System.currentTimeMillis() + (timeoutMs > 0 ? timeoutMs : DEFAULT_POLL_TIMEOUT_MS);
@@ -90,7 +143,7 @@ public class CustomerMessageStore {
         sl.lock.lock();
         try {
             while (true) {
-                List<ChatMessage> newMessages = getMessagesSince(sessionId, since);
+                List<ChatMessage> newMessages = getMessagesSince(sessionId, lastSeq);
                 if (!newMessages.isEmpty()) {
                     return newMessages;
                 }
@@ -113,9 +166,10 @@ public class CustomerMessageStore {
     }
 
     /**
-     * 获取 since 之后的消息（非阻塞，非消费）
+     * 获取 seq 大于 lastSeq 的消息（非阻塞，非消费）。
+     * seq 由 addMessage 单调分配，会话内有序且可为任意消息提供精确游标。
      */
-    public List<ChatMessage> getMessagesSince(String sessionId, long since) {
+    public List<ChatMessage> getMessagesSince(String sessionId, long lastSeq) {
         List<ChatMessage> messages = sessionMessages.get(sessionId);
         if (messages == null) {
             return new ArrayList<>();
@@ -123,12 +177,20 @@ public class CustomerMessageStore {
         synchronized (messages) {
             List<ChatMessage> result = new ArrayList<>();
             for (ChatMessage msg : messages) {
-                if (msg.getTimestamp() > since) {
+                if (msg.getSeq() > lastSeq) {
                     result.add(msg);
                 }
             }
             return result;
         }
+    }
+
+    /**
+     * 会话当前最大 seq（供快照/离线补发游标）。无消息时返回 0。
+     */
+    public long getLastSeq(String sessionId) {
+        AtomicLong seqCounter = sessionLastSeq.get(sessionId);
+        return seqCounter == null ? 0 : seqCounter.get();
     }
 
     /**
@@ -173,6 +235,7 @@ public class CustomerMessageStore {
      */
     public void clearSession(String sessionId) {
         sessionMessages.remove(sessionId);
+        sessionLastSeq.remove(sessionId);
         sessionLocks.remove(sessionId);
         LOGGER.debug("已清除会话消息: sessionId={}", sessionId);
     }
