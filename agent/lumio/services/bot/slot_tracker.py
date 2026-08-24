@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from lumio.shared.models import IntentLabel
+from lumio.shared.models import IntentLabel, SlotValue
 
 # ── 槽位定义 ──
 
@@ -45,6 +45,7 @@ _INTENT_SLOTS: dict[IntentLabel, list[SlotDef]] = {
     IntentLabel.CARD_LOSS: [
         SlotDef("card_tail", "卡号后四位", True, "请提供您信用卡的后四位以便验证身份"),
         SlotDef("phone_number", "预留手机号", False, "请确认您的预留手机号"),
+        SlotDef("card_number", "卡号全号", False, "请提供完整卡号"),
     ],
     IntentLabel.COMPLAINT: [
         SlotDef("issue_detail", "问题详情", True, "请详细描述您遇到的问题"),
@@ -127,6 +128,25 @@ class SlotTracker:
     def fill_from_message(self, key: str, value: str) -> None:
         """手动标记槽位已填充"""
         self._mark_filled(key, value)
+
+    def apply_fills(self, fills: dict) -> None:
+        """把会话级已填值批注到本意图槽位定义上（跨意图继承）
+
+        fills: {槽名: SlotValue 或 {name,value,...}}。仅填充双方都认识的槽名；
+        某槽在历史轮次已收集到值, 即使本意图是新的也直接复用, 不再追问。
+        """
+        for s in self.slots:
+            if s.filled:
+                continue
+            entry = fills.get(s.name)
+            value = ""
+            if isinstance(entry, dict):
+                value = entry.get("value", "")
+            elif isinstance(entry, SlotValue):
+                value = entry.value
+            if value:
+                s.filled = True
+                s.value = value
 
     def _mark_filled(self, slot_name: str, value: str) -> None:
         for s in self.slots:

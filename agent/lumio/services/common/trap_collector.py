@@ -16,19 +16,38 @@
 - 有界留存: purge_older_than() 按 retention 清档; aggregate() 提供漂移聚合
 - 后台落库: asyncio.create_task 持有引用防 GC; 写失败仅告警不打断主链路
 """
+
 from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import random
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from lumio.shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ── P3 误杀回流: 样本追加到人审 staging (atomic append, 不依赖 DB) ──
+
+
+def _backflow_path() -> Path:
+    """取配置的误杀回流 staging 文件绝对路径 (agent/ 基准解析)."""
+    from lumio.shared.config import get_settings
+
+    raw = get_settings().classification.backflow_review_path
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    # 本文件位于 lumio/services/common/ 下, 上溯 3 级即 agent/ 根
+    return Path(__file__).resolve().parents[3] / p
+
 
 # ── PII 打码 ────────────────────────────────────────────────────────────────
 # 单次匹配最大数字段 (手机11 / 身份证15·18 / 卡号13-19), 再按类型识别.
@@ -59,15 +78,13 @@ def mask_pii(text: str) -> str:
 
 # ── 归属上下文 (业务代码通过 contextvar 提供, 采样器被动读取) ───────────────
 _TrapCtx = tuple[str | None, str | None]  # (session_id, customer_id)
-_trap_context: contextvars.ContextVar[_TrapCtx] = contextvars.ContextVar(
-    "trap_context", default=(None, None)
-)
+_trap_context: contextvars.ContextVar[_TrapCtx] = contextvars.ContextVar("trap_context", default=(None, None))
 
 
 @dataclass
 class TrapContextToken:
     """上下文 set/reset 令牌, 便于业务代码 with 语句对齐释放. 此处取名为 token 以贴合
-    contextvars.Token 语义, 但不依赖其类型. """
+    contextvars.Token 语义, 但不依赖其类型."""
 
     token: contextvars.Token[_TrapCtx]
 
@@ -141,6 +158,8 @@ class TrapCollector:
         self._enabled = enabled
         # 持有后台 task 引用, 防 asyncio GC 在 await 期间回收 task (项目规范)
         self._pending_tasks: set[asyncio.Task[Any]] = set()
+        # 误杀回流单文件写锁 (多请求并发 append 到同一 staging 文件时串行化; 写入为同步块, 无 await 死锁)
+        self._backflow_lock = threading.Lock()
 
     # 供测试注入
     def bind_session_factory(self, session_factory: Any) -> None:
@@ -214,9 +233,7 @@ class TrapCollector:
             await session.commit()
             return int(result.rowcount or 0)
 
-    async def aggregate(
-        self, *, window_days: int = 7, min_samples: int = 10
-    ) -> list[dict[str, Any]]:
+    async def aggregate(self, *, window_days: int = 7, min_samples: int = 10) -> list[dict[str, Any]]:
         """漂移/分布聚合: 按 final_intent 统计窗口内样本数 + 平均置信度.
 
         供漂移监控侧消费 (dev 可 crontab 周期调用; 后续接 Grafana/告警).
@@ -252,6 +269,32 @@ class TrapCollector:
                         }
                     )
         return rows
+
+    # ── P3 误杀回流: 一条判断嫌疑样本 → staging JSONL (人审/回流种子) ──
+    def record_backflow(self, *, text: str, session_id: str, reason: str, extra: dict[str, Any] | None = None) -> bool:
+        """把"疑似误杀"(放行后用户又澄清/重问/打断)样本追加到人审 staging 文件.
+
+        与人审打通闭环的"感知"侧: 判定在同步段完成, 落盘失败仅告警不阻断。
+        返回是否落盘。文本写入前做 PII 打码。
+        """
+        try:
+            with self._backflow_lock:
+                path = _backflow_path()
+                if path.parent and not path.parent.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                row = {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "session_id": session_id or "",
+                    "text": mask_pii(text),
+                    "reason": reason,
+                    **(extra or {}),
+                }
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            return True
+        except Exception:
+            logger.warning("误杀回流落盘失败: reason=%s", reason, exc_info=True)
+            return False
 
 
 # 模块级单例 (供依赖注入装配时复用; 测试注入独立实例)

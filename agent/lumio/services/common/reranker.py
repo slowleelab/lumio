@@ -7,8 +7,6 @@
 from __future__ import annotations
 
 import logging
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Protocol, runtime_checkable
 
 import httpx
@@ -43,10 +41,15 @@ class RerankerProvider(Protocol):
 
 
 class OllamaReranker:
-    """基于 Ollama /api/generate 的重排序实现
+    """基于 Ollama 原生 /api/rerank 的重排序实现
 
-    使用 Ollama 的 generate 接口逐一对文档评分，
+    使用 Ollama 的 rerank 接口对整批文档一次性打分 (路由端批量),
     按得分降序排列后返回 top_k 结果。
+
+    bge-reranker 一类 BERT 重排模型不支持生成, 旧实现误用 /api/generate
+    逐文档让模型"吐出分数", 恒返回全 0 (退化回落 RRF), 却仍付出了并发生成调用
+    的耗时与 GPU 争用。现改用 /api/rerank (Ollama>=0.5.4); 若该模型/服务无
+    rerank 能力则尽快返回空列表, 由检索端回退 RRF, 不再空耗。
     """
 
     def __init__(
@@ -64,53 +67,35 @@ class OllamaReranker:
         return f"ollama:{self.model}"
 
     def rerank(self, query: str, documents: list[str], top_k: int = 5) -> list[RerankResult]:
-        """使用 Ollama /api/generate 对每篇文档并发评分并排序
-
-        所有文档并发评分，而非逐文档串行调用。
-        """
+        """调用 Ollama /api/rerank 一次性批量打分并排序."""
         if not documents:
             return []
-
-        scored: list[tuple[int, float, str]] = []
-        with ThreadPoolExecutor(max_workers=min(len(documents), 10)) as executor:
-            futures = {executor.submit(self._score_document, query, doc): idx for idx, doc in enumerate(documents)}
-            for future in as_completed(futures):
-                idx = futures[future]
-                score = future.result()
-                scored.append((idx, score, documents[idx]))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [RerankResult(index=idx, relevance_score=score, text=text) for idx, score, text in scored[:top_k]]
-
-    def _score_document(self, query: str, document: str) -> float:
-        """调用 Ollama 对单篇文档评分"""
-        prompt = (
-            f"请对以下查询和文档的相关性进行评分，仅返回0到1之间的浮点数，不要返回其他内容。\n"
-            f"查询：{query}\n"
-            f"文档：{document}\n"
-            f"相关性分数："
-        )
         try:
             resp = httpx.post(
-                f"{self.base_url}/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False},
+                f"{self.base_url}/api/rerank",
+                json={
+                    "model": self.model,
+                    "query": query,
+                    "documents": documents,
+                },
                 timeout=self.timeout,
             )
             resp.raise_for_status()
-            response_text: str = resp.json().get("response", "")
-            return self._parse_score(response_text)
+            payload = resp.json()
         except Exception:
-            logger.exception("Ollama 评分请求失败")
-            return 0.0
+            # 模型/服务无 rerank 能力 (404) 或调用失败 → 返回空, 检索端回退 RRF.
+            # 不再走逐文档 /api/generate (BERT 重排模型无法生成, 白耗 GPU).
+            logger.warning("Ollama rerank 不可用 (%s), 回退 RRF: %s", self.model, self.base_url)
+            return []
 
-    @staticmethod
-    def _parse_score(response: str) -> float:
-        """从模型响应中提取浮点数分数"""
-        match = re.search(r"(\d+\.?\d*)", response.strip())
-        if match:
-            score = float(match.group(1))
-            return max(0.0, min(1.0, score))
-        return 0.0
+        results = payload.get("results") or []
+        ranked: list[RerankResult] = []
+        for item in sorted(results, key=lambda r: r.get("relevance_score", 0.0), reverse=True):
+            idx = int(item.get("index", -1))
+            score = float(item.get("relevance_score", 0.0))
+            text = item.get("document", "") or (documents[idx] if 0 <= idx < len(documents) else "")
+            ranked.append(RerankResult(index=idx, relevance_score=score, text=text))
+        return ranked[:top_k]
 
     def health_check(self) -> bool:
         """检查 Ollama 服务是否可用"""

@@ -233,7 +233,7 @@ class GDPRService:
         旧实现用 pattern `lumio:session:*customer:{id}*` — 但 session key 实际是
         `lumio:session:{uuid}:meta` (customer_id 只存在于 JSON value), 模式永不匹配。
         现改为 SCAN `lumio:session:*:meta` 解析 value 匹配 customer_id,
-        一并删除 meta + history + slot key。
+        一并删除 meta + history (槽位已填值随会话 meta 一并删除)。
         """
         redis = await self._get_redis()
         if not redis:
@@ -260,7 +260,6 @@ class GDPRService:
             to_delete = [key if isinstance(key, str) else key.decode()]
             if session_id:
                 to_delete.append(session_history_key(session_id))
-                to_delete.append(f"lumio:slot:{session_id}")  # slot_tracker key
             await redis.delete(*to_delete)
             deleted += 1
         return deleted

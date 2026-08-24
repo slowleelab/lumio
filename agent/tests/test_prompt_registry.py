@@ -12,7 +12,12 @@ from lumio.services.bot.prompt_registry import (
     get_prompt,
     get_prompt_registry,
 )
-from lumio.services.bot.prompts import FALLBACK_SYSTEM_PROMPT, KNOWLEDGE_SYSTEM_PROMPT
+from lumio.services.bot.prompts import (
+    BUSINESS_SYSTEM_PROMPT,
+    COMPLAINT_SYSTEM_PROMPT,
+    FALLBACK_SYSTEM_PROMPT,
+    KNOWLEDGE_SYSTEM_PROMPT,
+)
 
 
 def test_prompt_version_rollout_clamp():
@@ -68,6 +73,15 @@ def test_knowledge_prompt_brief_when_no_context():
     assert "未检索到相关知识" in KNOWLEDGE_SYSTEM_PROMPT
     assert "简短" in KNOWLEDGE_SYSTEM_PROMPT
     assert "不要罗列问题清单" in KNOWLEDGE_SYSTEM_PROMPT
+
+
+def test_prompts_safety_redlines():
+    """P0/P1/P2 安全红线必须存在于各系统提示词: 不编造工号、拒绝角色越权、不协助违法违规"""
+    for p in (KNOWLEDGE_SYSTEM_PROMPT, BUSINESS_SYSTEM_PROMPT, COMPLAINT_SYSTEM_PROMPT, FALLBACK_SYSTEM_PROMPT):
+        assert "工号" in p, "必须禁止编造/出示工号"
+        assert "越权" in p, "必须拒绝忽略指令/替换角色等越权要求"
+        assert "套现" in p, "必须不协助套现等违法违规行为"
+        assert "不承诺任何收益" in p, "必须不承诺收益"
 
 
 def test_get_prompt_from_redis_cache(monkeypatch):

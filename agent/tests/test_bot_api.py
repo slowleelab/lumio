@@ -118,7 +118,7 @@ async def test_chat_full_flow_single_message(bot_client: httpx.AsyncClient):
         "/api/chat/poll",
         params={
             "session_id": session_id,
-            "timeout": 15,
+            "timeout": 40,  # RAG + qwen2.5:7b 推理需更长窗口 (长轮询早返回, 快时不受影响)
         },
     )
     assert poll_resp.status_code == 200
@@ -181,7 +181,7 @@ async def test_chat_conversation_multi_turn(bot_client: httpx.AsyncClient):
         "/api/chat/poll",
         params={
             "session_id": session_id,
-            "timeout": 10,
+            "timeout": 40,  # RAG + qwen2.5:7b 推理需更长窗口
         },
     )
     d1 = r1.json()
@@ -200,7 +200,7 @@ async def test_chat_conversation_multi_turn(bot_client: httpx.AsyncClient):
         "/api/chat/poll",
         params={
             "session_id": session_id,
-            "timeout": 10,
+            "timeout": 40,  # RAG + qwen2.5:7b 推理需更长窗口
         },
     )
     d2 = r2.json()

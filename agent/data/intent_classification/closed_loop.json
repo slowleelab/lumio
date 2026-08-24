@@ -1,8 +1,24 @@
 {
-  "settings_version": 1,
+  "settings_version": 2,
   "purpose": "意图分类『四步自迭代闭环』的唯一版本化开关: 线上 on/off 随此文件入库, 不依赖本机未入库的 .env; 显式进程环境变量(CLS_*)仍可覆盖此文件, 作逃生舱/临时关闭.",
+  "switch_rationale": {
+    "rephrase_guard_enabled": "开: 噪声门(乱答防上线/快慢分歧门/形状噪声)的回话豁免配套 -- 关着会误拦'上轮问卡号本轮答4444'的真实多轮回话; golden eval TestRephraseReply 已冻结真值",
+    "llm_arbiter_enabled": "开: 二线噪声网. 实测真实问题 0 误伤(9/9+191 真值), 乱码 10 例中 6 例判 noise; 触发频带已重接到 fast_conf<0.5(2026-08-21 P2), 通胀置信逃不过",
+    "ood_enabled": "关: energy 无区分度 -- 乱码'额佛呢份' energy=-2.55 > 阈值-3.4 被判'认得', 开了也拦不住",
+    "noise_gate_enabled": "关: 惊讶度无区分度 -- 乱码 7.2-8.3 vs 真实 6.9-8.3 区间重叠, 只作观测不拦截",
+    "anaphora_resolver_enabled": "关: 指代消解是独立增益特性, 与本轮噪声治理无关, 维持灰度关闭"
+  },
   "bert_enabled": true,
   "trap_enabled": true,
   "trap_sampling_band": 0.15,
-  "trap_ambient_rate": 0.02
+  "trap_ambient_rate": 0.02,
+  "rephrase_guard_enabled": true,
+  "ood_enabled": false,
+  "ood_energy_threshold": -3.4,
+  "ood_ambiguous_band": 0.5,
+  "ood_temperature": 1.0,
+  "llm_arbiter_enabled": true,
+  "noise_gate_enabled": false,
+  "anaphora_resolver_enabled": false,
+  "anaphora_llm_fallback_enabled": false
 }

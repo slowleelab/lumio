@@ -13,26 +13,6 @@ from lumio.services.common.reranker import (
 )
 from lumio.shared.models import RerankResult
 
-# ── _parse_score ──
-
-
-def test_parse_score_normal():
-    """正常浮点分数"""
-    assert OllamaReranker._parse_score("0.85") == 0.85
-    assert OllamaReranker._parse_score("相关性: 0.7") == 0.7
-
-
-def test_parse_score_clamp():
-    """超出 0~1 范围被钳制 (负号被正则丢弃, 取绝对值)"""
-    assert OllamaReranker._parse_score("2.5") == 1.0
-    assert OllamaReranker._parse_score("-0.3") == 0.3
-
-
-def test_parse_score_no_number():
-    """无数字 → 0"""
-    assert OllamaReranker._parse_score("无法评分") == 0.0
-
-
 # ── OllamaReranker ──
 
 
@@ -50,15 +30,20 @@ def test_ollama_rerank_empty():
 
 @patch("lumio.services.common.reranker.httpx.post")
 def test_ollama_rerank_scores_and_sorts(mock_post):
-    """并发评分后按分数降序取 top_k"""
+    """批量 /api/rerank 返回 results, 按分数降序取 top_k"""
 
     def side_effect(url, json=None, timeout=None):
+        # 断言走原生 /api/rerank, 传 query+documents 批量
+        assert url == "http://localhost:11434/api/rerank"
+        assert json["query"] == "查询"
+        assert json["documents"] == ["文档A", "文档B"]
         resp = MagicMock()
-        text = json["prompt"]
-        if "文档A" in text:
-            resp.json.return_value = {"response": "0.9"}
-        else:
-            resp.json.return_value = {"response": "0.5"}
+        resp.json.return_value = {
+            "results": [
+                {"index": 0, "relevance_score": 0.9, "document": "文档A"},
+                {"index": 1, "relevance_score": 0.5, "document": "文档B"},
+            ]
+        }
         return resp
 
     mock_post.side_effect = side_effect
@@ -67,31 +52,43 @@ def test_ollama_rerank_scores_and_sorts(mock_post):
     assert len(results) == 2
     assert results[0].index == 0  # 文档A 得分高排前
     assert results[0].relevance_score == 0.9
+    assert results[0].text == "文档A"
     assert isinstance(results[0], RerankResult)
 
 
 @patch("lumio.services.common.reranker.httpx.post")
 def test_ollama_rerank_topk_truncates(mock_post):
-    """top_k 截断"""
-
-    def side_effect(url, json=None, timeout=None):
-        resp = MagicMock()
-        resp.json.return_value = {"response": "0.5"}
-        return resp
-
-    mock_post.side_effect = side_effect
+    """top_k 截断 (results 无序也需按分排序后截断)"""
+    mock_post.return_value = MagicMock(
+        json=lambda: {
+            "results": [
+                {"index": 2, "relevance_score": 0.3, "document": "d2"},
+                {"index": 0, "relevance_score": 0.9, "document": "d0"},
+                {"index": 1, "relevance_score": 0.6, "document": "d1"},
+            ]
+        }
+    )
     r = OllamaReranker()
-    results = r.rerank("q", ["d1", "d2", "d3"], top_k=2)
+    results = r.rerank("q", ["d0", "d1", "d2"], top_k=2)
     assert len(results) == 2
+    assert [x.index for x in results] == [0, 1]
 
 
 @patch("lumio.services.common.reranker.httpx.post")
-def test_ollama_rerank_error_returns_zero(mock_post):
-    """评分请求异常 → 该文档 0 分"""
+def test_ollama_rerank_error_returns_empty(mock_post):
+    """rerank 调用异常/模型无 rerank 能力 (404) → 返回空, 由检索端回退 RRF"""
     mock_post.side_effect = RuntimeError("network down")
     r = OllamaReranker()
-    results = r.rerank("q", ["d1"])
-    assert results[0].relevance_score == 0.0
+    assert r.rerank("q", ["d1"]) == []
+
+
+@patch("lumio.services.common.reranker.httpx.post")
+def test_ollama_rerank_http_404_returns_empty(mock_post):
+    """HTTP 非 2xx (无 rerank 能力的模型/旧版服务) → 空结果快速回落"""
+    resp = MagicMock()
+    resp.raise_for_status.side_effect = RuntimeError("404 page not found")
+    mock_post.return_value = resp
+    assert OllamaReranker().rerank("q", ["d1"]) == []
 
 
 @patch("lumio.services.common.reranker.httpx.get")

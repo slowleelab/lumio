@@ -15,6 +15,7 @@
   (knowledge 意图→retrieval, 其余→generation), 并在 summary 里标注需 P3 补捕获
   RAG/生成下游信号才能定罪. 不伪造断层置信.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -50,7 +51,7 @@ class VerdictType(StrEnum):
 
 
 def _safe_domain(intent_str: str) -> str:
-    """把意图字符串安全转为 IntentLabel 后取所属域; 未知 → fallback. """
+    """把意图字符串安全转为 IntentLabel 后取所属域; 未知 → fallback."""
     try:
         return get_domain(IntentLabel(intent_str))
     except ValueError:
@@ -59,7 +60,7 @@ def _safe_domain(intent_str: str) -> str:
 
 @dataclass
 class AttribSample:
-    """一次感知样本 + 结果弱标签. 字段对齐 classifier_sample 行 + 会话推导. """
+    """一次感知样本 + 结果弱标签. 字段对齐 classifier_sample 行 + 会话推导."""
 
     sample_id: str = ""
     text: str = ""
@@ -105,13 +106,13 @@ class AttributionVerdict:
 
 
 class AttributeEngine:
-    """归因引擎. attribute() 为纯判定, 供单测直接调用; 汇总/落库在 admin 侧. """
+    """归因引擎. attribute() 为纯判定, 供单测直接调用; 汇总/落库在 admin 侧."""
 
     def __init__(self, margin_band: float = 0.15) -> None:
         self._margin_band = margin_band
 
     def attribute(self, s: AttribSample) -> AttributionVerdict:
-        """对单个样本做四层归因. 纯逻辑, 无 IO. """
+        """对单个样本做四层归因. 纯逻辑, 无 IO."""
         evidences: list[str] = []
 
         # ── 守卫: 护栏层 ──
@@ -139,9 +140,7 @@ class AttributeEngine:
             if outcome_negative:
                 rank += 5
                 evidences.append("结果未解决 (转人工/求助/重复)")
-            return AttributionVerdict(
-                s.sample_id, layer, verdict, s.final_intent, evidences, rank
-            )
+            return AttributionVerdict(s.sample_id, layer, verdict, s.final_intent, evidences, rank)
 
         if s.final_source == "fast" and outcome_negative:
             # 分类自信 → 结果未解决 → retrieval/generation 候选
@@ -164,7 +163,7 @@ class AttributeEngine:
         return AttributionVerdict(s.sample_id, EvalLayer.UNASSIGNED, verdict, s.final_intent, evidences, rank)
 
     def root_cause_summary(self, verdicts: list[AttributionVerdict]) -> dict[str, Any]:
-        """聚合: 分层失败数 + 需人工复核的 top 样本 (按 re_rank 降序). """
+        """聚合: 分层失败数 + 需人工复核的 top 样本 (按 re_rank 降序)."""
         by_layer: dict[str, int] = {}
         verdict_counts: dict[str, int] = {}
         for v in verdicts:
@@ -182,9 +181,7 @@ class AttributeEngine:
         }
 
 
-async def enrich_sessions(
-    redis: Any, sample_ids: list[str], session_ids: list[str]
-) -> dict[str, dict[str, Any]]:
+async def enrich_sessions(redis: Any, sample_ids: list[str], session_ids: list[str]) -> dict[str, dict[str, Any]]:
     """从 Redis 加载会话, 推导结果弱标签, 按 session_id 返回.
 
     best-effort: 会话已过期/Redis 不可用 → 返回空标签集 (归因退化为纯分类层判定).
@@ -214,7 +211,7 @@ async def enrich_sessions(
 
 
 def _has_repeated_intent(st: Any) -> bool:
-    """同意图在 intent_stack 中重复出现 (≥2) → 用户绕圈提问. """
+    """同意图在 intent_stack 中重复出现 (≥2) → 用户绕圈提问."""
     stack = getattr(st, "intent_stack", []) or []
     from collections import Counter
 
@@ -229,7 +226,7 @@ async def attribute_recent(
     limit: int = 200,
     margin_band: float = 0.15,
 ) -> dict[str, Any]:
-    """查询最近采样并归因: 结果柱状 + 可操作的失败样本 top. """
+    """查询最近采样并归因: 结果柱状 + 可操作的失败样本 top."""
     from sqlalchemy import select
 
     from lumio.shared.orm_models import ClassifierSample

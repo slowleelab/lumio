@@ -37,9 +37,7 @@ def _load_dotenv_search() -> None:
     cwd_resolved = Path.cwd().resolve()
     inside_repo = cwd_resolved == repo_root or repo_root in cwd_resolved.parents
     candidates = (
-        (repo_root / ".env", cwd_resolved / ".env")
-        if inside_repo
-        else (cwd_resolved / ".env", repo_root / ".env")
+        (repo_root / ".env", cwd_resolved / ".env") if inside_repo else (cwd_resolved / ".env", repo_root / ".env")
     )
     for candidate in candidates:
         if candidate.is_file():
@@ -58,6 +56,15 @@ _CLOSED_LOOP_ENV_MAP: dict[str, str] = {
     "trap_enabled": "CLS_TRAP_ENABLED",
     "trap_sampling_band": "CLS_TRAP_SAMPLING_BAND",
     "trap_ambient_rate": "CLS_TRAP_AMBIENT_RATE",
+    "rephrase_guard_enabled": "CLS_REPHRASE_GUARD_ENABLED",
+    "ood_enabled": "CLS_OOD_ENABLED",
+    "ood_energy_threshold": "CLS_OOD_ENERGY_THRESHOLD",
+    "ood_ambiguous_band": "CLS_OOD_AMBIGUOUS_BAND",
+    "ood_temperature": "CLS_OOD_TEMPERATURE",
+    "llm_arbiter_enabled": "CLS_LLM_ARBITER_ENABLED",
+    "noise_gate_enabled": "CLS_NOISE_GATE_ENABLED",
+    "anaphora_resolver_enabled": "CLS_ANAPHORA_RESOLVER_ENABLED",
+    "anaphora_llm_fallback_enabled": "CLS_ANAPHORA_LLM_FALLBACK_ENABLED",
 }
 
 
@@ -140,6 +147,10 @@ class MilvusSettings(BaseSettings):
     port: int = 19530
     collection_name: str = "lumio_knowledge"
     vector_dim: int = 1024  # bge-large-zh-v1.5 输出维度
+    # 向量检索硬超时(秒): Milvus gRPC 通道死亡(容器重启/网络断)时 collection.search
+    # 无超时会永久挂起, 且挂在 to_thread 线程里事件循环无法自救 -- 必须客户端兜底,
+    # 超时降级为 BM25-only (实测: 死通道连噪声输入也拖到 60s 编排超时, 回复全瘫).
+    search_timeout: float = 5.0
 
 
 class MinIOSettings(BaseSettings):
@@ -165,7 +176,9 @@ class LLMSettings(BaseSettings):
     primary_model: str = "qwen2.5:7b"
     fallback_model: str = "qwen2.5:7b"
     temperature: float = 0.2
-    max_tokens: int = 2048
+    # 生成输出上限: 实测本地 qwen2.5:7b RAG 答复多为 60~90 token, 2048 上限
+    # 不收益且给解码预留过大解码预算; 512 有 6x 余量, 并限制异常长解码拖慢一轮。
+    max_tokens: int = 512
     timeout_seconds: float = 60.0
 
     # 健康探测
@@ -175,11 +188,15 @@ class LLMSettings(BaseSettings):
     health_probe_fail_threshold: int = 2  # 连续失败降级阈值
     health_probe_success_threshold: int = 2  # 连续成功恢复阈值
     # 各类独立超时
-    classify_timeout: float = 1.5  # 分类独立超时
-    # 生成独立超时: 2s 对本地 qwen2.5:7b 过紧(实测 ~64ms/token, 一次答案 6-13s), 导致
-    # 每次生成必超时→重试→LLMTimeoutError→"回复超时"。抬到 15s, 与编排总时限 20s 匹配,
-    # 典型问答仍 ~10s 内返回, 仍在客户页 25s 长轮询窗口内。
-    generate_timeout: float = 15.0
+    # 分类独立超时 (LLM 慢路径硬总时长): 既约束慢路径 LLM 分类最坏等待, 又留足正常
+    # 分类余量. 此前 1.5s 只是透传 SDK per-read 超时(对流式永不触发), 实为死配置;
+    # 现由 classifier 的 asyncio.wait_for 强制总 deadline, 故设 3s: 拖慢的 8s+ 分类被
+    # 封顶, 正常分类(热机 ~1-2s)不受影响. 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清.
+    classify_timeout: float = 3.0
+    # 生成独立超时: 15s 对热机 qwen2.5:7b 足够, 但在健康探测或其他渲染抢占 GPU 时,
+    # 慢而成功的调用可能顶破 15s → 触发"超时→重试"把一轮翻倍 (实测 24.5s 尖峰)。
+    # 抬到 20s: 让慢一点但能成功的单次调用一次走完(20s<25s 长轮询窗口), 避免重试翻倍。
+    generate_timeout: float = 20.0
 
     # ── A0: KV Cache 优化配置 ──
     # 三层 cache 控制
@@ -194,7 +211,10 @@ class LLMSettings(BaseSettings):
     # 分层 token 预算 (A2)
     budget_static: int = 800  # 稳态层
     budget_customer: int = 400  # 半稳态层 (客户画像)
-    budget_rag: int = 1200  # 动态层 (RAG 检索)
+    # 动态层 (RAG 检索): 1200→600. 实测此类问答 prompt 中 RAG 检索内容占 ~1067/1506
+    # token, 是 prefill (~220tok/s) 的头号贡献者; 单轮只需保留 top 1-2 相关 chunk,
+    # 600 预算即够, prefill 显著下降. 检索端已按此预算截断, 不会多取。
+    budget_rag: int = 600  # 动态层 (RAG 检索)
     budget_history: int = 1500  # 动态层 (历史)
     budget_current: int = 200  # 动态层 (当前轮)
 
@@ -334,6 +354,41 @@ class ClassificationSettings(BaseSettings):
     # 环境随机采样率 (打破"只采异常"的选择偏差, 支撑漂移检测)
     trap_ambient_rate: float = 0.02
 
+    # ── 多轮噪声/闲聊治理 (P0) ──
+    # 噪声门先判"是否在回上文话"(填上缺的必填槽/纯数字/确认词)再判噪声的开关.
+    # 关闭 = 旧行为(只看当前句); 开启 = 回话放行, 防"上轮问卡号/金额, 本句答数字"被误判噪声.
+    # 灰度: 先在 staging 开 + 用 decision_log 的 NOISE_BLOCKED 对账真实误伤, 再上生产.
+    # 由 closed_loop.json 同源注入(见 _CLOSED_LOOP_ENV_MAP)。
+    rephrase_guard_enabled: bool = False
+
+    # ── 闭环 P1 提纯"认不认": energy-OOD + 温度校准 + LLM 模糊仲裁 ──
+    # energy ("不认"通道): -logsumexp(logits) —— 封闭意图集外输入该值显著更"负"(分散).
+    # BERT 快路径产生该分数; LLM 慢路径/无 torch 环境不产生, 由上层走置信度 + 更多信号.
+    ood_enabled: bool = False  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
+    # energy 阈值: energy 高于此 → 认为"认识"可用(信任 BERT); 低于 → "不认"倾向 OOD/噪声.
+    # energy 数值尺度取决于 logits 绝对值, 需在部署环境用验证集标定, 这里给保守初值.
+    ood_energy_threshold: float = 0.0
+    # 温度缩放: logits / temperature 后再 softmax. 1.0 = 不缩放. 用验证集一维标定,
+    # 把置信度校准到与准确率匹配(>1 更保守、压低过拟合 BERT 的虚高置信).
+    ood_temperature: float = 1.0
+    # 模糊带宽仲裁: 多信号落在"模糊带"(energy/BERT 置信中段、无铁证)时, 把原文交 LLM
+    # 判 {business|chitchat|noise} 与证据链投票. LLM 结果不单独作通过依据(弱信号).
+    llm_arbiter_enabled: bool = False
+    # LLM 仲裁输入也走 BERT 快路径时的 energy 模糊带宽 (|energy - 阈值| 内即模糊)
+    ood_ambiguous_band: float = 1.0
+
+    # ── 闭环 P2 中英多信号噪声闸 (InputGate) ──
+    # 打开后由 InputGate 在噪声门内额外做惊讶度(中/英)多信号投票; 默认关(观测/需标定).
+    noise_gate_enabled: bool = False
+
+    # ── 多轮指代消解 (回指落实体) ──
+    # 规则预扫层: 当前句命中回指(这/那张卡/那笔)时, 从历史实体池取"唯一候选"解析进实体.
+    # 唯一性约束保证安全性: 候选 0 个或多于 1 个时规则层绝不乱猜. 由 closed_loop.json 同源注入.
+    anaphora_resolver_enabled: bool = False
+    # LLM 兜底层: 仅当规则层判定"存在回指但候选不唯一/无法确定"时按此开关触发, 供多候选难例.
+    # 默认关; 与规则层独立, 需单独灰度.
+    anaphora_llm_fallback_enabled: bool = False
+
     # ── 闭环 P3 版本化优化 ──
     # 模型注册表状态文件 (相对 agent/ 解析; 仅存版本指针, 不存权重)
     model_registry_path: str = "data/intent_classification/model_registry.json"
@@ -357,6 +412,12 @@ class RAGSettings(BaseSettings):
     rrf_confidence_threshold: float = 0.0
     # Reranker 置信度阈值（Reranker 分数范围 0-1）
     confidence_threshold: float = 0.5
+    # 词法证据门 (P1): ES 已应答但 BM25 零命中(没有任何 token 匹配) -> 判定无相关知识,
+    # 不把向量召回(实测无区分度: 乱码 0.55-0.63 / 真实 0.52-0.79 重叠)的文档喂 LLM.
+    # 注意: 绝对分数下限被实测证伪不可用 -- 真实短查询'年费'@0.92 与乱码'额佛呢份'@2.77
+    # 区间重叠, BM25 分数混合了查询词特异度与相关性, 无一刀切阈值; 零命中是唯一无歧义信号.
+    # reranker 分数生效时(生产 TEI)由 confidence_threshold 主导, 本门不拦.
+    require_lexical_evidence: bool = True
     # Embedding 模型
     embedding_provider: str = "ollama"  # ollama / tei
     embedding_model: str = "mxbai-embed-large"  # Ollama 开发环境模型

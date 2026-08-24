@@ -360,6 +360,18 @@ class EmbeddingCircuitBreaker:
         """底层嵌入提供者"""
         return self._provider
 
+    def confirm_available(self) -> None:
+        """启动期已确证服务可用时调用, 立即闭合熔断.
+
+        背景: 熔断需 连续 recovery_threshold 次周期探测 才闭合; 默认 recovery=2 + 间隔 30s,
+        全新健康实例头 30s+ 恒报 unavailable, 导致 /health degraded、就绪探针误判。
+        仅当启动维度自检已执行一次真实 embed 成功后可调, 消除该冷启动锁存。
+        后台周期探测继续守护后续健康, 不受影响。
+        """
+        self._is_open = False
+        self._consecutive_failures = 0
+        self._consecutive_successes = max(self._consecutive_successes, self._recovery_threshold)
+
     async def start_probe(self) -> None:
         """启动周期性探测任务"""
         if self._probe_task is None or self._probe_task.done():

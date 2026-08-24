@@ -96,18 +96,23 @@ def build_es_filters(filters: dict) -> list[dict]:
 def build_milvus_expr(filters: dict) -> str:
     """将 RetrieveRequest.filters 转换为 Milvus 过滤表达式字符串
 
-    - keyword 字段 → field == "value"
-    - date 字段 → field >= epoch_sec (整型比较)
-    - keywords → keywords like "%value%" (VARCHAR 字段)
+    - keyword 字段 -> field == "value"
+    - date 字段 -> field >= epoch_sec (整型比较)
+    - keywords -> keywords like "%value%" (VARCHAR 字段)
     - 多条件用 " and " 连接
     - 空 filters 返回 ""
+
+    布尔值必须转小写字符串: ingestion 写入 Milvus 的是 VARCHAR "true"/"false",
+    Python f-string 直转 True 会得到 "True" -> 恒不匹配 -> 向量检索静默 0 命中
+    (修复前合规过滤让向量通道在真实环境整体失效, RAG 实际只有 BM25 单通道).
     """
     conditions: list[str] = []
     for key, value in filters.items():
         if value is None:
             continue
         if key in _MILVUS_SCALAR_FIELDS:
-            conditions.append(f'{key} == "{value}"')
+            value_str = str(value).lower() if isinstance(value, bool) else str(value)
+            conditions.append(f'{key} == "{value_str}"')
         elif key in _ES_DATE_FIELDS:
             # 将日期字符串转为 epoch 秒（与 ES mapping epoch_second 格式对齐）
             if isinstance(value, dict):
@@ -178,7 +183,7 @@ async def search_bm25(
     query: str,
     top_k: int = 5,
     filters: dict | None = None,
-) -> list[RetrievedChunk]:
+) -> tuple[list[RetrievedChunk], float | None]:
     """BM25 全文检索（Elasticsearch + IK 分词）
 
     Args:
@@ -188,10 +193,14 @@ async def search_bm25(
         filters: 过滤条件
 
     Returns:
-        RetrievedChunk 列表；异常时返回空列表
+        (chunks, best_score) 元组:
+        - chunks: RetrievedChunk 列表；异常时返回空列表
+        - best_score: ES 本次应答的最高原始 BM25 分（0 命中时为 0.0）;
+          ES 未查询/查询失败（None 客户端或异常）为 None —— 两者必须可区分,
+          供 retrieve() 的相关性下限门判断"ES 说没有相关内容"与"ES 挂了".
     """
     if es_client is None:
-        return []
+        return [], None
 
     settings = get_settings()
     index_name = f"{settings.elasticsearch.index_prefix}_kb_chunks"
@@ -207,17 +216,19 @@ async def search_bm25(
 
     try:
         resp = await es_client.search(index=index_name, body=body, size=top_k)
+        hits = resp["hits"]["hits"]
+        best_score = max((h["_score"] for h in hits if h.get("_score") is not None), default=0.0)
         results: list[RetrievedChunk] = []
 
         # 收集所有 parent_chunk_id，批量获取 parent 内容
         parent_ids = set()
-        for hit in resp["hits"]["hits"]:
+        for hit in hits:
             pid = hit["_source"].get("parent_chunk_id")
             if pid:
                 parent_ids.add(pid)
         parent_contents = await _batch_fetch_parents_es(es_client, index_name, list(parent_ids))
 
-        for hit in resp["hits"]["hits"]:
+        for hit in hits:
             source = hit["_source"]
             chunk_id = source.get("chunk_id", hit["_id"])
             parent_chunk_id = source.get("parent_chunk_id")
@@ -235,10 +246,10 @@ async def search_bm25(
                     metadata=metadata,
                 )
             )
-        return results
+        return results, best_score
     except Exception:
         logger.exception("BM25 检索异常: query=%s", query)
-        return []
+        return [], None
 
 
 async def _batch_fetch_parents_es(
@@ -304,15 +315,19 @@ async def search_vector(
         "is_current_version",  # S4: 版本过滤
     ]
 
+    milvus_timeout = get_settings().milvus.search_timeout
     try:
-        results_raw = await asyncio.to_thread(
-            milvus_collection.search,
-            data=[query_embedding],
-            anns_field="embedding",
-            param=search_params,
-            limit=top_k,
-            expr=base_expr if base_expr else None,
-            output_fields=output_fields,
+        results_raw = await asyncio.wait_for(
+            asyncio.to_thread(
+                milvus_collection.search,
+                data=[query_embedding],
+                anns_field="embedding",
+                param=search_params,
+                limit=top_k,
+                expr=base_expr if base_expr else None,
+                output_fields=output_fields,
+            ),
+            timeout=milvus_timeout,
         )
 
         results: list[RetrievedChunk] = []
@@ -323,7 +338,10 @@ async def search_vector(
                 pid = hit.entity.get("parent_chunk_id")
                 if pid:
                     parent_ids.add(pid)
-            parent_contents = await _batch_fetch_parents_milvus(milvus_collection, list(parent_ids))
+            parent_contents = await asyncio.wait_for(
+                _batch_fetch_parents_milvus(milvus_collection, list(parent_ids)),
+                timeout=milvus_timeout,
+            )
 
             for hit in results_raw[0]:
                 entity = hit.entity
@@ -347,6 +365,13 @@ async def search_vector(
                     )
                 )
         return results
+    except TimeoutError:
+        logger.warning(
+            "Milvus 向量检索超时(%.1fs), 降级 BM25-only: top_k=%d",
+            milvus_timeout,
+            top_k,
+        )
+        return []
     except Exception:
         logger.exception("向量检索异常: top_k=%d", top_k)
         return []
@@ -513,9 +538,11 @@ async def retrieve(
 
     bm25_results: list[RetrievedChunk] = []
     vector_results: list[RetrievedChunk] = []
+    # ES 本次应答的最高原始 BM25 分; None = ES 未查询/查询失败 (与"ES 说没有相关内容"区分)
+    bm25_best_score: float | None = None
 
     if request.search_type == "hybrid":
-        # 并行: ES BM25 ∥ (embed → Milvus vector)
+        # 并行: ES BM25 ∥ (embed -> Milvus vector)
         bm25_task = asyncio.create_task(search_bm25(es_client, request.query, expanded_k, compliance_filters))
 
         if embedding_provider and milvus_collection:
@@ -526,16 +553,16 @@ async def retrieve(
                 vector_task = asyncio.create_task(
                     search_vector(milvus_collection, query_embedding, expanded_k, compliance_filters)
                 )
-                bm25_results, vector_results = await asyncio.gather(bm25_task, vector_task)
+                (bm25_results, bm25_best_score), vector_results = await asyncio.gather(bm25_task, vector_task)
             except Exception:
                 logger.warning("向量检索嵌入失败，降级到 BM25 only")
                 # 只取消 vector_task (embed 阶段已失败, 向量检索必然拿不到 embedding)
                 # bm25_task 不取消, 让其自然完成, 结果可降级使用
                 if vector_task is not None and not vector_task.done():
                     vector_task.cancel()
-                bm25_results = await bm25_task
+                bm25_results, bm25_best_score = await bm25_task
         else:
-            bm25_results = await bm25_task
+            bm25_results, bm25_best_score = await bm25_task
 
         # 融合
         if bm25_results and vector_results:
@@ -550,7 +577,7 @@ async def retrieve(
             fused = []
 
     elif request.search_type == "bm25_only":
-        bm25_results = await search_bm25(es_client, request.query, expanded_k, compliance_filters)
+        bm25_results, bm25_best_score = await search_bm25(es_client, request.query, expanded_k, compliance_filters)
         fused = bm25_results
 
     elif request.search_type == "vector_only":
@@ -608,6 +635,29 @@ async def retrieve(
         if not fused:
             logger.warning("置信度过滤后无结果: threshold=%.3f", threshold)
 
+    # ── 词法证据门 (P1): reranker 退化时的兜底门 ──
+    # 背景: Ollama /api/rerank 404 (reranker 静默失效) -> 回退 RRF 阈值 0.0 = 零过滤,
+    # 乱码输入也能拿到知识文档喂 LLM (会话 e33d1fa8 "额佛呢份" 拿 556 字符相关内容流畅胡答).
+    # 门语义: ES 已应答(best 非 None)但 BM25 零命中(best==0, 没有任何 token 匹配) ->
+    # 知识库没有能对上这句话的内容, 返回空 (调用方走无知识降级话术).
+    # 为什么不是绝对分数下限: 实测真实短查询与乱码的 BM25 原始分区间重叠('年费'@0.92
+    # vs '额佛呢份'@2.77), 分数混合了查询词特异度与相关性, 无一刀切阈值; 零命中是
+    # 唯一无歧义的"没有词法证据"信号, 向量余弦又无区分度(乱码 0.55-0.63/真实 0.52-0.79).
+    # 不拦: ES 挂了(best=None, 保留 vector-only 降级)和 reranker 分数生效时
+    # (confidence_threshold 主导 -- reranker 对 query+doc 联合打分, 是比词法更强的证据).
+    if (
+        settings.rag.require_lexical_evidence
+        and not use_reranker_threshold
+        and bm25_best_score is not None
+        and bm25_best_score <= 0.0
+    ):
+        logger.warning(
+            "BM25 零命中, 判定无相关知识(词法证据门): query=%r candidates=%d",
+            request.query,
+            len(fused),
+        )
+        fused = []
+
     # ── Milvus 合规后过滤 (S4 第五轮修复) ──
     # 旧实现: Milvus schema 无 approval_status/is_current_version, metadata 取默认值
     # "PUBLISHED"/True → 过滤形同虚设, 未审批/非当前版本文档经向量检索泄露.
@@ -651,7 +701,7 @@ async def retrieve(
 
     # 6b: dashboard 缺口补齐 — observe 直方图 (search_type 取 request.search_type.value)
     try:
-        st = request.search_type.value if hasattr(request.search_type, "value") else str(request.search_type)
+        st = str(getattr(request.search_type, "value", request.search_type))
         RETRIEVE_DURATION.labels(search_type=st).observe(time.monotonic() - start_time)
     except Exception:
         # 指标失败不影响主流程

@@ -4,6 +4,7 @@
 结果弱标签叠加、汇总聚合、会话弱标签富化.
 纯逻辑单测, 无 DB / 无 Redis.
 """
+
 from __future__ import annotations
 
 from lumio.services.common.trap_eval import (
@@ -95,9 +96,7 @@ class TestOutcomeDrivenLayers:
 
 class TestHealthy:
     def test_high_confidence_no_issue_healthy(self) -> None:
-        v = AttributeEngine().attribute(
-            _sample(final_source="fast", final_confidence=0.95, margin=0.4)
-        )
+        v = AttributeEngine().attribute(_sample(final_source="fast", final_confidence=0.95, margin=0.4))
         assert v.layer == EvalLayer.UNASSIGNED
         assert v.verdict == VerdictType.HEALTHY
         assert v.re_rank == 0
@@ -109,7 +108,14 @@ class TestSummary:
         verdicts = [
             engine.attribute(_sample(final_source="llm", sample_id="a", fast_confidence=0.2)),
             engine.attribute(
-                _sample(final_source="fast", final_intent="faq", final_confidence=0.95, margin=0.4, transferred=True, sample_id="b")
+                _sample(
+                    final_source="fast",
+                    final_intent="faq",
+                    final_confidence=0.95,
+                    margin=0.4,
+                    transferred=True,
+                    sample_id="b",
+                )
             ),
             engine.attribute(_sample(sample_id="c", final_confidence=0.95, margin=0.4)),
         ]
@@ -125,8 +131,6 @@ class TestSummary:
     def test_actionable_sorted_by_rerank_desc(self) -> None:
         engine = AttributeEngine()
         low = engine.attribute(_sample(final_source="llm", sample_id="low", fast_confidence=0.2))
-        high = engine.attribute(
-            _sample(final_source="llm", sample_id="high", fast_confidence=0.2, transferred=True)
-        )
+        high = engine.attribute(_sample(final_source="llm", sample_id="high", fast_confidence=0.2, transferred=True))
         summary = engine.root_cause_summary([low, high])
         assert summary["actionable"][0]["sample_id"] == "high"

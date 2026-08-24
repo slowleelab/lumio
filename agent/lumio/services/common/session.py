@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -18,20 +17,22 @@ from redis.asyncio import Redis
 
 from lumio.shared.config import get_settings
 from lumio.shared.exceptions import InvalidTransitionError, SessionNotFoundError
+from lumio.shared.logger import setup_logger
 from lumio.shared.metrics import SESSION_PHASE_DURATION, SESSION_TRANSITIONS
 from lumio.shared.models import (
     ChannelType,
     DialogueTurn,
     Entity,
-    IntentLabel,
     IntentResult,
     SessionPhase,
     SessionState,
     SessionSubPhase,
+    SlotValue,
+    normalize_intent,
     validate_transition,
 )
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 # Redis Key 前缀
 _META_PREFIX = "lumio:session"
@@ -178,16 +179,17 @@ class SessionManager:
         customer_id: str | None = None,
         channel_type: ChannelType = ChannelType.WEB,
     ) -> SessionState:
-        """创建新会话
+        """创建新会话"""
+        return await self._create_session_with(uuid4().hex, customer_id=customer_id, channel_type=channel_type)
 
-        Args:
-            customer_id: 客户 ID
-            channel_type: 渠道类型
-
-        Returns:
-            新创建的 SessionState
-        """
-        session_id = uuid4().hex
+    async def _create_session_with(
+        self,
+        session_id: str,
+        *,
+        customer_id: str | None = None,
+        channel_type: ChannelType = ChannelType.WEB,
+    ) -> SessionState:
+        """按指定 session_id 创建会话并落 meta(供 get_or_create 复用, 也用于端到端固定 id)."""
         now = datetime.now()
         state = SessionState(
             session_id=session_id,
@@ -231,6 +233,19 @@ class SessionManager:
         def _as_list(v: Any) -> list[Any]:
             return [] if isinstance(v, dict) else (v or [])
 
+        # 槽位已填值防御解析: cjson 会把空表错写成 {}, 缺省回空 dict; 值须为 dict 结构
+        def _load_slot_values(v: Any) -> dict[str, SlotValue]:
+            if not isinstance(v, dict):
+                return {}
+            out: dict[str, SlotValue] = {}
+            for name, item in v.items():
+                if isinstance(item, dict) and item.get("value"):
+                    try:
+                        out[name] = SlotValue(**item)
+                    except Exception:
+                        continue
+            return out
+
         return SessionState(
             session_id=meta["session_id"],
             customer_id=meta.get("customer_id"),
@@ -246,8 +261,9 @@ class SessionManager:
             card_types_updated_at=meta.get("card_types_updated_at", 0.0),
             turns=turns,
             turn_count=len(turns),
-            last_intent=IntentLabel(meta["last_intent"]) if meta.get("last_intent") else None,
+            last_intent=normalize_intent(meta["last_intent"]) if meta.get("last_intent") else None,
             last_entities=[Entity(**e) for e in _as_list(meta.get("last_entities"))],
+            slot_values=_load_slot_values(meta.get("slot_values")),
             confidence_history=[float(x) for x in _as_list(meta.get("confidence_history"))],
             low_confidence_streak=meta.get("low_confidence_streak", 0),
             human_request_score=meta.get("human_request_score", 0),
@@ -255,7 +271,7 @@ class SessionManager:
             summary_turn_count=meta.get("summary_turn_count", 0),
             last_summarized_turn_id=meta.get("last_summarized_turn_id", ""),
             # 坐席辅助引擎层字段（从 Redis 原始 JSON 读取，patch_state 写入的值不会丢失）
-            intent_stack=[IntentLabel(i) if isinstance(i, str) else i for i in _as_list(meta.get("intent_stack"))],
+            intent_stack=[normalize_intent(i) if isinstance(i, str) else i for i in _as_list(meta.get("intent_stack"))],
             entity_pool=[Entity(**e) for e in _as_list(meta.get("entity_pool"))],
             emotion_vector=meta.get("emotion_vector"),
             suppress_flag=meta.get("suppress_flag", False),
@@ -347,7 +363,34 @@ class SessionManager:
         if self._timeout_manager and state.current_phase == SessionPhase.BOT:
             with contextlib.suppress(Exception):
                 await self._timeout_manager.start_guard(session_id, SessionSubPhase.BOT_ACTIVE)
+
+        # 对话轮次实时落库(合规审计): 非阻塞后台任务, 失败不阻断主链路.
+        # 不再依赖"会话必须走到 ENDED 才落库" — 弥补超时/用户中途离开导致
+        # persist_dialogue 不触发的审计缺口. 会话结束的 persist_dialogue(幂等)兜底.
+        if self._resolve_factory() is not None:
+            task = asyncio.create_task(self._persist_turn_async(session_id, turn))
+            self._pending_persist_tasks.add(task)
+            task.add_done_callback(self._pending_persist_tasks.discard)
         return state
+
+    def _resolve_factory(self) -> Any | None:
+        """解析对话落库用的 session factory.
+
+        优先用注入的厂; 未注入时回退全局厂 (与 DecisionLogger / audit 一致,
+        保证 dialogue_log 实时落库不因注入缺失而静默跳过). 半构造的测试桩
+        (绕过 __init__, 无 _pending_persist_tasks)视为不持久化, 避免误连真实库.
+        """
+        factory = getattr(self, "_db_session_factory", None)
+        if factory is not None:
+            return factory
+        if not hasattr(self, "_pending_persist_tasks"):
+            return None
+        try:
+            from lumio.services.common.database import get_async_session_factory
+
+            return get_async_session_factory()
+        except Exception:
+            return None
 
     async def get_history(self, session_id: str, limit: int | None = None) -> list[DialogueTurn]:
         """获取最近的对话历史
@@ -495,11 +538,71 @@ class SessionManager:
             state = await self.get_session(session_id)
             if state:
                 return state
+            # 修复: 入参 session_id 在 Redis 无 meta(新会话) 时按该 id 直接落库,
+            # 而非 create_session() 新造随机 id 返回 — 前者会让调用方/_run_agent 继续用
+            # 原 id, add_turn 查不到 meta 而把整轮对话历史(Redis history + dialogue_log)静默丢弃.
+            return await self._create_session_with(session_id, customer_id=customer_id, channel_type=channel_type)
         return await self.create_session(customer_id=customer_id, channel_type=channel_type)
 
     async def delete_session(self, session_id: str) -> None:
         """删除会话"""
         await self._redis.delete(self._meta_key(session_id), self._history_key(session_id))
+
+    def _build_dialogue_log(
+        self,
+        session_id: str,
+        turn: DialogueTurn,
+        customer_id: str | None,
+        channel_type: str | None,
+    ) -> Any:
+        """把一轮对话(DialogueTurn)映射为 dialogue_log 持久化行(供实时落库 & 会话结束兜底共用)."""
+        from lumio.shared.orm_models import DialogueLog
+
+        return DialogueLog(
+            session_id=session_id,
+            turn_id=turn.turn_id,
+            speaker=turn.speaker,
+            content=turn.content,
+            intent=turn.intent.value if turn.intent else None,
+            confidence=turn.confidence,
+            entities=[e.model_dump() for e in turn.entities] if turn.entities else [],
+            response_source=turn.response_source or None,
+            retrieval_context=turn.retrieval_context or None,
+            emotion_label=turn.emotion_label.value if turn.emotion_label else None,
+            emotion_score=turn.emotion_score,
+            timestamp=turn.timestamp,
+            customer_id=customer_id,
+            channel_type=channel_type,
+        )
+
+    async def _persist_turn_async(self, session_id: str, turn: DialogueTurn) -> None:
+        """把一轮对话实时写入 dialogue_log(非阻塞后台任务).
+
+        add_turn 每追加一轮即触发, 从会话元信息补充 customer_id/channel_type.
+        失败仅告警, 不阻断 Redis 记录主链路; 会话结束的 persist_dialogue
+        (幂等) 会兜底补齐失败/遗漏的轮次.
+        """
+        factory = self._resolve_factory()
+        if factory is None:
+            return
+
+        customer_id = None
+        channel_type = "web"
+        meta_json = None
+        with contextlib.suppress(Exception):
+            meta_json = await self._redis.get(self._meta_key(session_id))
+        if meta_json:
+            with contextlib.suppress(Exception):
+                meta = json.loads(meta_json)
+                customer_id = meta.get("customer_id")
+                channel_type = meta.get("channel_type", "web")
+
+        try:
+            async with factory() as db:
+                db.add(self._build_dialogue_log(session_id, turn, customer_id, channel_type))
+                await db.commit()
+        except Exception:
+            logger.warning("对话轮次实时落库失败(会话结束将幂等兜底): session=%s turn=%s", session_id, turn.turn_id)
 
     async def persist_dialogue(self, session_id: str, db_session_factory: Any = None) -> int:
         """会话结束时异步落库对话记录到 PostgreSQL
@@ -531,27 +634,19 @@ class SessionManager:
             channel_type = meta.get("channel_type", "web")
 
         try:
+            from sqlalchemy import select
+
             from lumio.shared.orm_models import DialogueLog
 
             async with db_session_factory() as db:
+                # 幂等: 轮次在 add_turn 时已实时落库, 会话结束兜底时跳过已持久化的,
+                # 避免与实时落库重复写入(每次轮次一对 customer/bot 记录).
+                res = await db.execute(select(DialogueLog.turn_id).where(DialogueLog.session_id == session_id))
+                existing = {row[0] for row in res.all()}
                 for turn in turns:
-                    log_entry = DialogueLog(
-                        session_id=session_id,
-                        turn_id=turn.turn_id,
-                        speaker=turn.speaker,
-                        content=turn.content,
-                        intent=turn.intent.value if turn.intent else None,
-                        confidence=turn.confidence,
-                        entities=[e.model_dump() for e in turn.entities] if turn.entities else [],
-                        response_source=turn.response_source or None,
-                        retrieval_context=turn.retrieval_context or None,
-                        emotion_label=turn.emotion_label.value if turn.emotion_label else None,
-                        emotion_score=turn.emotion_score,
-                        timestamp=turn.timestamp,
-                        customer_id=customer_id,
-                        channel_type=channel_type,
-                    )
-                    db.add(log_entry)
+                    if turn.turn_id in existing:
+                        continue
+                    db.add(self._build_dialogue_log(session_id, turn, customer_id, channel_type))
                 await db.commit()
 
             logger.info("对话记录已持久化: session=%s turns=%d", session_id, len(turns))
@@ -617,6 +712,7 @@ class SessionManager:
             "turn_count": state.turn_count,
             "last_intent": state.last_intent.value if state.last_intent else None,
             "last_entities": [e.model_dump() for e in state.last_entities],
+            "slot_values": {k: v.model_dump() for k, v in state.slot_values.items()},
             "confidence_history": state.confidence_history,
             "low_confidence_streak": state.low_confidence_streak,
             "human_request_score": state.human_request_score,
@@ -843,6 +939,19 @@ class SessionManager:
                             key = f"{entity.get('entity_type', '')}:{entity.get('value', '')}"
                             entity_index[key] = entity
                     adjusted[field] = list(entity_index.values())
+                else:
+                    adjusted[field] = value
+
+            elif field == "slot_values":
+                # 槽名级 last-write-wins union: 并发两轮各自填不同槽, 互不覆盖整体.
+                # 上限 20 防长会话下槽位值无界膨胀 (与 _INTENT_SLOTS 槽种数量级一致).
+                current_slots: dict = current.get(field, {}) or {}
+                if isinstance(value, dict):
+                    merged = dict(current_slots)
+                    merged.update(value)
+                    if len(merged) > 20:
+                        merged = {k: v for k, v in list(merged.items())[-20:]}
+                    adjusted[field] = merged
                 else:
                     adjusted[field] = value
 

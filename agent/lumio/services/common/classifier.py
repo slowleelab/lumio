@@ -8,12 +8,15 @@ Fast Path 置信度 < 阈值时自动 fallthrough 到 Slow Path。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import TYPE_CHECKING, Any
 
+from lumio.services.bot.entity_extractor import extract_entities, normalize_entity_type
 from lumio.services.common.bert_classifier import BertIntentClassifier
 from lumio.services.common.trap_collector import TrapCollector, TrapRecord
+from lumio.shared.config import get_settings
 from lumio.shared.models import Entity, IntentLabel, IntentResult, SentimentLabel
 
 if TYPE_CHECKING:
@@ -26,6 +29,36 @@ logger = logging.getLogger(__name__)
 
 # 规则分类器阈值：Fast Path 置信度 >= 此值直接使用
 _FAST_PATH_THRESHOLD = 0.7
+
+# 低置信噪声闸下限: BERT 快路径置信度低于此值时视为"没认出来", 直接不花一次 LLM 慢路径分类.
+# 实测 LLM 慢路径会把噪声置信抬到恰 ≥ 此下限 (如 0.219→0.30), 既浪费一次 6s+ 调用,
+# 又掩盖噪声信号让下游 low_conf 噪声闸漏放. 仅 BERT 为快路径时激进兜底; 与
+# bot_agent 的 CLARIFY_CONFIDENCE_FLOOR (0.3) 对齐, 低于它本来就该回确定性澄清.
+_LOW_CONF_FLOOR = 0.3
+
+
+def _collect_alternatives(
+    hits: list[tuple[IntentLabel, float]], primary: IntentLabel, limit: int = 3
+) -> list[IntentLabel]:
+    """从规则命中列表收集次意图 (多意图).
+
+    - 去重、剔除主意图
+    - 按置信度降序
+    - 低置信 (< 0.5) 的不算作有意义的次意图
+    """
+    seen: set[IntentLabel] = set()
+    out: list[IntentLabel] = []
+    for intent, conf in sorted(hits, key=lambda x: x[1], reverse=True):
+        if intent == primary or intent in seen:
+            continue
+        if conf < 0.5:
+            continue
+        seen.add(intent)
+        out.append(intent)
+        if len(out) >= limit - 1:  # include primary, so return at most limit-1
+            break
+    return out
+
 
 # 意图域映射：用于 supervisor 路由
 INTENT_DOMAINS: dict[IntentLabel, str] = {
@@ -194,6 +227,8 @@ class RuleClassifier:
         Returns:
             IntentResult（primary_confidence 低于阈值时触发 Slow Path）
         """
+        # 多意图: 收集所有命中的规则, 置信度最高的为主, 其余去重后进 alternatives.
+        hits: list[tuple[IntentLabel, float]] = []
         best_intent = IntentLabel.FAQ
         best_confidence = 0.0
 
@@ -217,13 +252,16 @@ class RuleClassifier:
                         rule_confidence -= 0.1
                         break
 
-            if matched and rule_confidence > best_confidence:
-                best_intent = rule["intent"]
-                best_confidence = rule_confidence
+            if matched:
+                hits.append((rule["intent"], rule_confidence))
+                if rule_confidence > best_confidence:
+                    best_intent = rule["intent"]
+                    best_confidence = rule_confidence
 
         return IntentResult(
             primary_intent=best_intent,
             primary_confidence=best_confidence,
+            alternatives=_collect_alternatives(hits, best_intent),
         )
 
 
@@ -247,16 +285,21 @@ class LLMClassifier:
             (IntentResult, 实体列表, 情感标签)
         """
         try:
-            # P1-3 第三轮修复: 显式传 classify_timeout (此前配置从未生效, 走默认 60s)
-            from lumio.shared.config import get_settings
-
-            result = await self._llm.classify(
-                system_prompt=_CLASSIFY_SYSTEM_PROMPT,
-                user_input=text,
-                timeout=get_settings().llm.classify_timeout,
+            # 强制总时长上限: 此前 timeout 只透传给 OpenAI SDK 作 per-read 超时, 对
+            # 流式输出(小 token 持续到达)永不触发 → LLM 分类可跑 8s+ (拖垮整轮应答).
+            # asyncio.wait_for 给硬总 deadline; 超时走下方兜底 FAQ@0.0 → 下游 low_conf
+            # 噪声闸拦回确定性澄清, 不再叠加第二次 LLM 生成.
+            timeout = get_settings().llm.classify_timeout
+            result = await asyncio.wait_for(
+                self._llm.classify(
+                    system_prompt=_CLASSIFY_SYSTEM_PROMPT,
+                    user_input=text,
+                    timeout=timeout,
+                ),
+                timeout=timeout,
             )
         except Exception:
-            logger.warning("LLM 分类调用失败，返回兜底结果")
+            logger.warning("LLM 分类调用失败/超时(≤%.1fs)，返回兜底结果", get_settings().llm.classify_timeout)
             return (
                 IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0),
                 [],
@@ -273,6 +316,57 @@ class LLMClassifier:
             entities,
             sentiment,
         )
+
+    async def arbitrate(self, text: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        """P1 模糊带宽仲裁: 让 LLM 判 {business|chitchat|noise} 作为弱信号。
+
+        只作为"决策仲裁"(非分类慢路径): 语义落在模糊带宽(energy/BERT 中段、无铁证)时,
+        把原文(可拼 history)交 LLM 判定它到底是业务、闲聊还是噪声, 与证据链投票。
+        LLM 结果不单独作通过依据 — 调用方需结合置信/energy/缺槽; 自评置信视为弱信号。
+
+        Returns:
+            {"domain": "business"|"chitchat"|"noise"|"unknown",
+             "confidence": float, "structured": bool}
+            调用失败/LLM 不可用时返回 {"domain": "unknown", "confidence": 0.0, "structured": False}.
+        """
+        try:
+            history_txt = ""
+            if history:
+                turns = [f"{t.get('speaker')}:{t.get('content')}" for t in history if t.get("content")]
+                history_txt = ("\n".join(turns[-6:]) + "\n") if turns else ""
+            timeout = get_settings().llm.classify_timeout
+            result = await asyncio.wait_for(
+                self._llm.classify(
+                    system_prompt=_ARBITRATE_SYSTEM_PROMPT,
+                    user_input=f"{history_txt}用户: {text}",
+                    timeout=timeout,
+                ),
+                timeout=timeout,
+            )
+        except Exception:
+            logger.warning("LLM 仲裁调用失败，返回 unknown 弱信号")
+            return {"domain": "unknown", "confidence": 0.0, "structured": False}
+
+        raw = (result.get("domain") or "").strip().lower()
+        if raw not in ("business", "chitchat", "noise"):
+            return {"domain": "unknown", "confidence": 0.0, "structured": False}
+        conf = float(result.get("confidence", 0.0))
+        return {"domain": raw, "confidence": conf, "structured": True}
+
+
+# P1 LLM 仲裁 prompt: 只判"这到底属于哪一类", 用于模糊带的保守兜底裁决.
+_ARBITRATE_SYSTEM_PROMPT = """你是银行信用卡客服的"输入仲裁"。判断一句话到底属于哪类，输出 JSON。
+只允许三种类别（严格小写）：
+- business: 与银行业务相关的真实诉求（查账/分期/挂失/投诉/额度/积分/转人工等）
+- chitchat: 闲聊/寒暄/玩笑，不涉及具体业务
+- noise: 乱码/按键误触/无意义输入/与对话无关的噪音
+
+规则：
+- 拿不准、或像是在接上文的数字/金额/卡号回话但语义不明 → 归 {business}（保守，宁放过不误拦）
+- 明确的乱码（如 hjfw、纯键盘乱敲）→ noise
+- 输出格式：{"domain": "business|chitchat|noise", "confidence": 0-1}
+只输出 JSON，不要其他文字。
+"""
 
 
 class IntentClassifier:
@@ -295,6 +389,9 @@ class IntentClassifier:
         self._threshold = fast_threshold
         self._bert = bert_classifier
         self._trap = trap  # P1 感知缝: 被动采样失败/不确定/分歧样本
+        # P1: 最近一次 BERT 快路径的 energy-OOD 分 (无 BERT/未启用时为 None).
+        # 供上层噪声闸读取, 与 classify 主结果解耦, 不改变返回签名。
+        self._last_energy: float | None = None
 
     # P2-17: 规则路径情绪关键词 (愤怒/负面), 支撑情绪转人工
     _ANGRY_KEYWORDS: frozenset[str] = frozenset(
@@ -317,26 +414,42 @@ class IntentClassifier:
                 return SentimentLabel.NEGATIVE
         return SentimentLabel.NEUTRAL
 
-    async def classify(self, text: str) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
+    async def classify(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
         """执行双通道分类
 
         Args:
             text: 用户输入文本
+            history: 可选多轮上下文 (speaker/content), 透传给 BERT 快路径做对话级意图判定
 
         Returns:
-            (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback")
+            (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback"|"bert:lowconf")
         """
         # Fast Path: 优先小 BERT, 否则规则; BERT 异常时回退规则 (打不挂线上)
         fast_source = "rule"
         if self._bert is not None:
             try:
-                fast_result = await self._bert.classify(text)
+                fast_result = await self._bert.classify(text, history=history)
                 fast_source = "bert"
+                # P1: 同次前向顺带算 energy-OOD 分, 供上层噪声闸作"认不认"信号.
+                # 开启时丢给线程池再跑一次前向; 失败仅清空, 不阻断 (energy 是辅助信号).
+                if get_settings().classification.ood_enabled:
+                    try:
+                        self._last_energy = await self._bert.ood_score(text, history=history)
+                        # 随本次分类结果对象透传 (而非共享属性), 避免并发会话读时串线.
+                        fast_result.energy = self._last_energy
+                    except Exception:
+                        self._last_energy = None
             except Exception:
                 logger.warning("BERT 分类失败, 回退规则快路径")
                 fast_result = self._rule.classify(text)
+                self._last_energy = None
         else:
             fast_result = self._rule.classify(text)
+            self._last_energy = None
 
         if fast_result.primary_confidence >= self._threshold:
             logger.debug(
@@ -348,19 +461,35 @@ class IntentClassifier:
             # P2-17: Fast Path 情绪检测 — 此前规则通道恒 NEUTRAL, 情绪只在 LLM 慢路径
             # 生效 (覆盖面窄). 规则命中时用关键词快速判定愤怒/负面, 支撑情绪转人工.
             await self._emit_sample(text, fast_source, fast_result, fast_result, fast_source)
-            return fast_result, [], self._rule_sentiment(text), fast_source
+            return fast_result, extract_entities(text), self._rule_sentiment(text), fast_source
+
+        # P-低置信短路: BERT 快路径强"不认"(置信 < 噪声下限)时, 不跑 LLM 慢路径分类.
+        # 慢路径不仅贵 (一次 LLM 分类 ~6s), 还把置信抬到恰 ≥ 下限掩盖噪声, 让下游
+        # low_conf 噪声闸失效 → 噪声被漏放到第二次 LLM 生成. 直接返回 fast_result,
+        # 交给 _evaluate_noise_gate 的 low_conf 拦回确定性澄清, 零 LLM 开销.
+        # 仅在 BERT 快路径命中 (<0.7 才会走到这) 且 BERT 置信 < 下限时触发; 真实业务
+        # 样本实测均 ≥0.35, 不受影响; is_replying 豁免由下游闸先行断言。
+        if fast_source == "bert" and fast_result.primary_confidence < _LOW_CONF_FLOOR:
+            logger.debug(
+                "BERT 低置信短路慢路径 (conf=%.3f < %s): skip LLM classify, intent=%s",
+                fast_result.primary_confidence,
+                _LOW_CONF_FLOOR,
+                fast_result.primary_intent.value,
+            )
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "bert:lowconf")
+            return fast_result, extract_entities(text), self._rule_sentiment(text), "bert:lowconf"
 
         # Slow Path
         if self._llm is None:
             logger.debug("Slow Path 不可用，使用 Fast Path 低置信度结果")
             await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
-            return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
+            return fast_result, extract_entities(text), SentimentLabel.NEUTRAL, "fallback"
 
         # 熔断器打开 → 跳过 LLM
         if not self._llm._llm._breaker.is_available:
             logger.debug("LLM 熔断器打开，跳过 Slow Path")
             await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
-            return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
+            return fast_result, extract_entities(text), SentimentLabel.NEUTRAL, "fallback"
 
         logger.debug(
             "Fast Path 置信度不足 (%.2f < %.2f)，进入 Slow Path",
@@ -373,12 +502,19 @@ class IntentClassifier:
         except Exception:
             logger.warning("LLM 分类调用失败，使用 Fast Path 结果兜底")
             await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
-            return fast_result, [], SentimentLabel.NEUTRAL, "fallback"
+            return fast_result, extract_entities(text), SentimentLabel.NEUTRAL, "fallback"
 
         # LLM 结果置信度也很低时，标记来源为 fallback
         source = "llm" if llm_result.primary_confidence >= 0.3 else "fallback"
         await self._emit_sample(text, fast_source, fast_result, llm_result, source)
-        return llm_result, entities, sentiment, source
+        llm_result.energy = self._last_energy  # 快路径 energy 随慢路径结果一起透传
+        # P0 快慢分歧信号: 慢路径覆盖快路径时保留快路径意图/置信, 供下游噪声闸与
+        # 转人工派发门判"两路分歧" -- 慢路径对乱码的自评置信会稳定通胀(会话 e33d1fa8:
+        # BERT limit_query@0.39 -> LLM bill_query@0.7), 最终置信单项不可信.
+        llm_result.fast_conf = fast_result.primary_confidence
+        llm_result.fast_intent = fast_result.primary_intent
+        # 快照实体亦并入规则层抽取结果 (规则层在 LLM 抽漏时兜底), 只去重不覆盖
+        return llm_result, _merge_entities(entities, extract_entities(text)), sentiment, source
 
     async def _emit_sample(
         self,
@@ -434,13 +570,20 @@ def _parse_intent(raw: str) -> IntentLabel:
 
 
 def _parse_entities(raw_entities: list[dict[str, Any]]) -> list[Entity]:
-    """将 LLM 输出的实体列表转为 Entity 模型"""
+    """将 LLM 输出的实体列表转为 Entity 模型。
+
+    实体类型经 normalize_entity_type 映射到规范 key (与 slot_tracker 词汇表对齐),
+    未知/乱造的类型名被丢弃, 避免污染 slot 填充与指代消解候选。
+    """
     entities: list[Entity] = []
     for e in raw_entities:
         try:
+            etype = normalize_entity_type(e.get("entity_type", ""))
+            if etype is None:
+                continue
             entities.append(
                 Entity(
-                    entity_type=e.get("entity_type", "unknown"),
+                    entity_type=etype,
                     value=e.get("value", ""),
                     confidence=e.get("confidence", 0.7),
                 )
@@ -448,6 +591,23 @@ def _parse_entities(raw_entities: list[dict[str, Any]]) -> list[Entity]:
         except Exception:
             logger.debug("实体解析失败: %s", e)
     return entities
+
+
+def _merge_entities(primary: list[Entity], secondary: list[Entity]) -> list[Entity]:
+    """合并实体列表, 保序去重 (同类同值). primary 优先, secondary 兜底补漏。"""
+    if not secondary:
+        return primary
+    if not primary:
+        return secondary
+    seen = {(e.entity_type, e.value) for e in primary}
+    out = list(primary)
+    for e in secondary:
+        key = (e.entity_type, e.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
 
 
 def _parse_sentiment(raw: str) -> SentimentLabel:

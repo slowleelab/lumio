@@ -139,8 +139,20 @@ def detect_scene(message: str, intent: str | None = None) -> Scene:
     text = message.strip().lower()
 
     # 1. intent 直接判定 URGENT（挂失/投诉不可被关键词覆盖）
-    if intent in ("card_loss", "complaint"):
-        return Scene.URGENT
+    # 使用共享敏感集合 (而非硬编码字符串精确比较), 拆细后也不漏判。
+    try:
+        from lumio.shared.models import SENSITIVE_INTENTS, IntentLabel
+
+        if intent:
+            try:
+                _lbl = IntentLabel(intent)
+                if _lbl in SENSITIVE_INTENTS:
+                    return Scene.URGENT
+            except ValueError:
+                pass
+    except ImportError:
+        if intent in ("card_loss", "complaint"):
+            return Scene.URGENT
 
     # 2. 关键词检测（带否定过滤）
     if _keyword_hit_not_negated(text, _URGENT_KEYWORDS):

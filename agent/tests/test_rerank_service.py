@@ -63,9 +63,7 @@ async def test_rerank_empty_texts(client):
 
 
 async def test_rerank_orders_and_normalizes(client):
-    r = await client.post(
-        "/rerank", json={"query": "q", "texts": ["aa", "bbbbbbbbb"]}
-    )  # 后文分数高, 应排第一
+    r = await client.post("/rerank", json={"query": "q", "texts": ["aa", "bbbbbbbbb"]})  # 后文分数高, 应排第一
     assert r.status_code == 200
     data = r.json()
     assert data[0]["index"] == 1  # 高分排前
@@ -77,9 +75,7 @@ async def test_rerank_orders_and_normalizes(client):
 
 
 async def test_rerank_raw_scores_passthrough(client):
-    r = await client.post(
-        "/rerank", json={"query": "q", "texts": ["aa", "bbbbbbbbb"], "raw_scores": True}
-    )
+    r = await client.post("/rerank", json={"query": "q", "texts": ["aa", "bbbbbbbbb"], "raw_scores": True})
     data = r.json()
     # raw 模式直接返回原始分 (非 0~1 归一), 仍按分数降序
     assert data[0]["index"] == 1
@@ -87,15 +83,11 @@ async def test_rerank_raw_scores_passthrough(client):
 
 
 async def test_rerank_topn_truncates(client):
-    r = await client.post(
-        "/rerank", json={"query": "q", "texts": ["a", "bb", "ccc", "dddd"], "top_n": 2}
-    )
+    r = await client.post("/rerank", json={"query": "q", "texts": ["a", "bb", "ccc", "dddd"], "top_n": 2})
     data = r.json()
     assert len(data) == 2
     # top_n 超出输入长度时钳制
-    r2 = await client.post(
-        "/rerank", json={"query": "q", "texts": ["a"], "top_n": 10}
-    )
+    r2 = await client.post("/rerank", json={"query": "q", "texts": ["a"], "top_n": 10})
     assert len(r2.json()) == 1
 
 

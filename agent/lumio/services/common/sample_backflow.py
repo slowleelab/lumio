@@ -12,6 +12,7 @@
 
 P1 落库文本已打码, 回流样本保留打码文本 (隐私前置, 恶意样本安全).
 """
+
 from __future__ import annotations
 
 import json
@@ -64,7 +65,7 @@ def select_candidates(
     max_n: int = 50,
     seen: set[str] | None = None,
 ) -> list[BackflowCandidate]:
-    """从 (sample, verdict) 对中选出分类层失败样本, 做 {text|intent} 去重. """
+    """从 (sample, verdict) 对中选出分类层失败样本, 做 {text|intent} 去重."""
     from lumio.services.common.trap_eval import EvalLayer, VerdictType
 
     seen = set() if seen is None else set(seen)
@@ -97,7 +98,7 @@ def select_candidates(
 
 
 def write_staging(candidates: Sequence[BackflowCandidate], path: str) -> int:
-    """写入人审 review JSONL (逐行一条候选, approved 待批). """
+    """写入人审 review JSONL (逐行一条候选, approved 待批)."""
     target = _agent_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     n = 0
@@ -114,7 +115,7 @@ def finalize_confirmed(
     seed_path: str,
 ) -> tuple[int, str]:
     """读取 review JSONL 中 approved==true 的条目, 去重后并入 seed_dataset.json.
-    返回 (新增条数, 新版本号). 未批准自动跳过 → 不写训练集. """
+    返回 (新增条数, 新版本号). 未批准自动跳过 → 不写训练集."""
     review = _agent_path(review_path)
     if not review.exists():
         logger.warning("回流 review 文件不存在: %s", review)

@@ -80,18 +80,23 @@ async def init_embedding(app: FastAPI) -> None:
         timeout=settings.rag.embedding_timeout,
         max_retries=settings.rag.embedding_max_retries,
     )
-    # 启动时维度自检
+    breaker = EmbeddingCircuitBreaker(provider)
+    # 启动时维度自检: 一次真实 embed 成功即确证服务可用, 立即闭合熔断。
+    # 否则熔断需连续 recovery_threshold 次周期探测(30s+ 间隔)才闭合, 全新健康实例
+    # 头 30s 恒报 degraded, 导致 /health 与就绪探针误判不可用。
+    self_check_ok = False
     try:
         test_vec = await provider.embed(["维度校验"])
         actual_dim = len(test_vec[0])
         if actual_dim != settings.milvus.vector_dim:
             raise RuntimeError(f"嵌入维度不匹配: 模型输出 {actual_dim} 维, Milvus 配置 {settings.milvus.vector_dim} 维")
+        self_check_ok = True
     except Exception as e:
         _logger.warning("嵌入服务维度自检失败: %s", e)
         if settings.environment != "development":
             raise
-
-    breaker = EmbeddingCircuitBreaker(provider)
+    if self_check_ok:
+        breaker.confirm_available()
     await breaker.start_probe()
     app.state.embedding_breaker = breaker
     app.state.embedding_provider = provider
@@ -414,9 +419,16 @@ async def init_classifier(app: FastAPI) -> None:
         # P3: 从模型注册表取 active 版本路径 (无注册表/无 active 时回退配置默认)
         registry = ModelRegistry(state_path=settings.classification.model_registry_path)
         model_path = registry.compose_classifier_path(settings.classification.bert_model_path)
-        bert_classifier = BertIntentClassifier(model_path=model_path)
+        # P1: 温度校准从配置注入 BERT 快路径 (1.0=不缩放), 与 closed_loop 同源可灰度
+        bert_classifier = BertIntentClassifier(
+            model_path=model_path,
+            temperature=settings.classification.ood_temperature,
+        )
         app.state.model_registry = registry
         _logger.info("启用小 BERT 意图分类快路径 model=%s", model_path)
+        # 启动期预加载: 在 lifespan 内等待模型就绪, 使首个需 BERT 的请求不再经历冷加载
+        # (冷加载 + 慢分类在 Ollama 高并发下可达 9s+, 见延迟治理). 失败不阻断启动.
+        await bert_classifier.preload()
 
     trap = None
     if settings.classification.trap_enabled:

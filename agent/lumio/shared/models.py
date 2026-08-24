@@ -58,6 +58,46 @@ class IntentLabel(StrEnum):
     CHITCHAT = "chitchat"
 
 
+# 旧 flat 意图值 -> 归一化后的主意图。阶段 B 将现有宽泛类拆成 300+ 子意图时,
+# 存量 Redis/PG/回流样本里的旧字符串会在此归一化 (identity 即不拆分时的默认)。
+# 未在映射内的未知字符串由 normalize_intent 兜底为 FAQ, 反序列化不抛异常。
+_INTENT_NORMALIZATION: dict[str, IntentLabel] = {
+    "faq": IntentLabel.FAQ,
+    "bill_query": IntentLabel.BILL_QUERY,
+    "transaction_query": IntentLabel.TRANSACTION_QUERY,
+    "limit_query": IntentLabel.LIMIT_QUERY,
+    "installment_inquiry": IntentLabel.INSTALLMENT_INQUIRY,
+    "reward_query": IntentLabel.REWARD_QUERY,
+    "card_loss": IntentLabel.CARD_LOSS,
+    "complaint": IntentLabel.COMPLAINT,
+    "transfer_agent": IntentLabel.TRANSFER_AGENT,
+    "chitchat": IntentLabel.CHITCHAT,
+}
+
+
+def normalize_intent(value: str) -> IntentLabel:
+    """把 (旧/新) 意图字符串归一化为受支持的 IntentLabel。
+
+    - 已是合法 IntentLabel 值 → 直接返回
+    - 旧 flat 值 → 归一化到主意图 (兼容存量数据)
+    - 未知字符串 → 兜底 FAQ, 不抛异常
+    """
+    try:
+        return IntentLabel(value)
+    except ValueError:
+        pass
+    return _INTENT_NORMALIZATION.get(value, IntentLabel.FAQ)
+
+
+# 敏感写意图: 命中必须紧急转人工 / assist URGENT, 不允许走工具或 RAG 兜底 (合规底线)。
+# 阶段 B 拆分为 300+ 子意图时, 把 fraud/争议/冻结/反欺诈等风险子意图并入此集合。
+# 使用 in {集合} 而非点对点精确比较, 保证拆细后不漏判。
+SENSITIVE_INTENTS: frozenset[IntentLabel] = frozenset({IntentLabel.CARD_LOSS, IntentLabel.COMPLAINT})
+
+# 主动转人工意图: 用户明确要求转人工。
+TRANSFER_INTENTS: frozenset[IntentLabel] = frozenset({IntentLabel.TRANSFER_AGENT})
+
+
 class SentimentLabel(StrEnum):
     POSITIVE = "positive"
     NEUTRAL = "neutral"
@@ -158,9 +198,18 @@ class Entity(BaseModel):
 class IntentResult(BaseModel):
     """意图分类结果"""
 
+    # exclude: 内部透传字段, 不随 model_dump 进决策日志/对外响应.
     primary_intent: IntentLabel
     primary_confidence: float
     alternatives: list[IntentLabel] = Field(default_factory=list)
+    # P1: 本次分类的 energy-OOD 分 (-logsumexp). 随本对象按次透传给上层噪声闸,
+    # 避免各 session 并发时共享 classifier._last_energy 造成跨会话串线.
+    energy: float | None = Field(default=None, exclude=True)
+    # P0 快慢分歧信号: LLM 慢路径覆盖快路径时, 透传 BERT 快路径的意图与置信,
+    # 供噪声门/转人工派发门判"两路分歧"(乱码被慢路径高置信幻觉成 bill_query@0.7
+    # 而快路径只给 limit_query@0.39, 见会话 e33d1fa8). None = 无慢路径覆盖.
+    fast_conf: float | None = Field(default=None, exclude=True)
+    fast_intent: IntentLabel | None = Field(default=None, exclude=True)
 
 
 class SentimentResult(BaseModel):
@@ -232,6 +281,20 @@ class PendingAction(BaseModel):
     unclear_count: int = 0  # 确认窗口内无法判定的次数, ≥3 自动取消并放行新消息
 
 
+class SlotValue(BaseModel):
+    """槽位已填值（随会话 meta 持久化，跨意图保留）
+
+    name 为规范槽名（amount/period/card_tail/phone_number/card_number/card_type/issue_detail）。
+    与静态 per-intent 槽位定义（SlotTracker._INTENT_SLOTS）分离：此处只存"已收集到的值"，
+    是否必填、追问话术由当前意图的静态定义计算，两者互不耦合。
+    """
+
+    name: str
+    value: str
+    source: str = "entity"  # entity | derived | message
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class SessionState(BaseModel):
     """会话状态对象
 
@@ -265,6 +328,9 @@ class SessionState(BaseModel):
     confidence_history: list[float] = Field(default_factory=list)
     low_confidence_streak: int = 0
     human_request_score: int = 0
+
+    # 槽位已填值（生产级: 随会话 meta 持久化, 单一真相源, 跨意图保留）
+    slot_values: dict[str, SlotValue] = Field(default_factory=dict)
 
     # 对话摘要压缩（长对话场景）
     conversation_summary: str = ""  # 被裁剪轮次的摘要

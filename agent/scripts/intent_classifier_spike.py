@@ -113,7 +113,11 @@ _TPL: dict[str, list[str]] = {
     "complaint": ["我要{投诉}", "对服务很{不满}", "{举报}这个扣费", "我要{投诉你们}", "客服态度让我{不满}"],
     "transfer_agent": ["帮我{转人工}", "转{人工客服}", "我想找{真人}", "{人工}在吗", "帮我接{人工}"],
     "chitchat": ["{你好}", "{嗨}", "{在吗}", "你是{谁}", "{谢谢}", "{再见}"],
-    "faq": ["什么是{年费}", "怎么{办理}信用卡", "激活{如何操作}", "免息期{流程是什么}", "汇率{什么是}"],
+    "faq": ["什么是{年费}", "怎么{办理}信用卡", "激活{如何操作}", "免息期{流程是什么}", "汇率{什么是}",
+            "是不是所有卡都能免年费", "你们有没有新出的联名卡", "我的卡是不是支持境外免费",
+            "白金卡有哪些专属权益", "信用卡刷满几笔能免年费吗", "听说你们有张隐藏黑金卡是真的吗",
+            "卡片赠送的接送机权益怎么用", "这张卡是不是免息期最长", "这款卡真的送礼品吗",
+            "我的卡是不是终身免年费还带接送机", "你们是不是有海洋主题的联名卡"],
 }
 # {总额} 槽位 -> 若干可选填词, 增加多样性
 _SLOTS = {
@@ -276,7 +280,13 @@ def evaluate(model, tokenizer, device, rows: list[dict]) -> tuple[float, float, 
     try:
         from sklearn.metrics import accuracy_score, f1_score
     except Exception:
-        accuracy_score, f1_score = _vanilla_metrics
+
+        def accuracy_score(g, p):
+            return _vanilla_metrics(g, p)[0]
+
+        def f1_score(g, p, average="macro", zero_division=0):
+            return _vanilla_metrics(g, p, average, zero_division)[1]
+
     texts = [r["text"] for r in rows]
     preds = [predict_model(model, tokenizer, device, t) for t in texts]
     gts = [r["intent"] for r in rows]

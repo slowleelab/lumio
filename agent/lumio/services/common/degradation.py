@@ -101,9 +101,10 @@ class HealthMonitor:
         """指数退避更新探测间隔"""
         n = self._consecutive_failures
         if n == 0:
-            # P2 第三轮修复: 健康时探测间隔至少 10s — 旧代码恒 1s/次,
-            # 每天 ~86400 次真实 LLM 调用 (计费成本) 且 5-token ping 污染业务 P99 指标
-            self._current_interval = max(self._probe_interval, 10.0)
+            # 健康时探测间隔至少 30s — 旧代码恒 10s/次, 每 10s 一次真实 LLM 探测
+            # 会与业务生成抢占同一 GPU 槽位, 把本可成功的慢请求顶过 generate_timeout
+            # 触发"超时→重试→翻倍". 抬到 30s, 碰撞概率降 2/3; 降级检测仍靠索引退避活着。
+            self._current_interval = max(self._probe_interval, 30.0)
         else:
             self._current_interval = min(2.0**n, self._max_interval)
 

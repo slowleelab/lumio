@@ -240,18 +240,23 @@ async def test_websocket_customer_message(assist_server: str):
         }
         await ws.send(json.dumps(customer_msg, ensure_ascii=False))
 
-        # 接收推送（最多等 15s，因为可能调用 LLM）
-        raw = await ws.recv()
+        # 接收推送（LLM/RAG 可能较慢，显式放宽超时）
+        raw = await asyncio.wait_for(ws.recv(), timeout=30)
         push_data = json.loads(raw)
 
         assert push_data["type"] == "assist_push", f"Expected assist_push, got {push_data.get('type')}: {push_data}"
         assert push_data["session_id"] == session_id
 
+        # 当前引擎输出为仲裁结构: 话术/知识/告警内嵌于主卡片 content,
+        # 产品推荐对应营销位 marketing_slot (可为 null)。
         payload = push_data.get("payload", {})
-        assert "scripts" in payload
-        assert "knowledge" in payload
-        assert "alerts" in payload
-        assert "recommendations" in payload
+        primary_card = payload.get("primary_card", {})
+        content = primary_card.get("content", {})
+        assert primary_card.get("type") == "service_answer"
+        assert isinstance(content.get("scripts"), list)  # 话术匹配
+        assert isinstance(content.get("knowledge"), list)  # 知识检索
+        assert isinstance(content.get("alerts"), list)  # 合规告警
+        assert "marketing_slot" in payload  # 产品推荐位
 
 
 async def test_websocket_invalid_json(assist_server: str):
@@ -304,7 +309,7 @@ async def test_concurrent_chat_sessions(bot_client: httpx.AsyncClient):
             "/api/chat/poll",
             params={
                 "session_id": session_id,
-                "timeout": 10,
+                "timeout": 40,  # 并发下串行处理 + qwen2.5:7b 推理需更长窗口
             },
         )
         return poll_resp.json()

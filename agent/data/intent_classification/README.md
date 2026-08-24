@@ -47,4 +47,26 @@ BERT 系轻量意图分类器微调的首批训练输入。标签口径与 `lumi
 
 ## 版本
 
+- 0.3.1 — 造数扩充 + 重训。手工补 ~55 条真实变体问法(每类+填槽分支/易混淆边界),
+  新增 2 条 bill↔transaction 易混淆对, 补 4 条"转人工+挂失/补卡"同现样本(修 transfer 被 card_loss 吞)。
+  新增独立 OOD/噪声评估池 `ood_pool.json`(29 条, 只评测不训练), 用于 energy-OOD 阈值标定。
+  训练用 `scripts/intent_train_pipeline.py`(确定性 paraphrase 扩充 + 规则弱标签扩量,
+  微调 24M 中文 RoBERTa)。产出模型 `out_intent_clf_v030/` 并轮换进 `out_intent_clf`:
+  留出集 acc 0.973 / macroF1 0.979, 易混淆 15 对全对, 域内误伤≤1% 档位下 OOD 命中 20.7%→58.6%。
+  标定阈值 ood_energy_threshold=-3.4 / band=0.5 写入 `closed_loop.json`(开关仍默认关, 供灰度启用)。
+- 0.2.0 — 补 15 条卡权益/产品真伪校验类 FAQ 正样本 + 1 条 faq↔card_loss 易混淆对，
+  faq 类种子 15→30。修复微调 BERT 将「卡权益/功能真伪问题」误判为 card_loss 的偏置
+  （如「我的卡是不是终身免年费还带接送机」，重训后 → faq 0.905；留出集 acc 0.929 / 易混淆对 acc 0.923）。
 - 0.1.0 — 首版：rule-aligned 种子句 + 易混淆对。
+
+## 重训 / 标定
+
+```bash
+# 造数 + 微调 + 评测 + energy 标定(落盘到 out_intent_clf_v030/, 含 ood_calibration.json)
+python3 scripts/intent_train_pipeline.py --out data/intent_classification/out_intent_clf_v030
+# 只看已存模型在留出集/易混淆对/OOD 池上的表现
+python3 scripts/intent_train_pipeline.py --out data/intent_classification/out_intent_clf_v030 --val-only
+```
+
+模型目录 `out_intent_clf_v030/` 保留版本化权重; 确认达标后把其权重轮换进 `out_intent_clf`(生产读取路径,
+现配置 `bert_model_path`)。`ood_calibration.json` 记录 in vs OOD 能量分布与推荐阈值。

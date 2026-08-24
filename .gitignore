@@ -91,3 +91,7 @@ generated/
 
 # 意图分类微调产物 (探针训练权重 99M, 不入库; 保留种子数据与 README)
 agent/data/intent_classification/out_intent_clf/
+agent/data/intent_classification/out_intent_clf_v*/
+agent/data/intent_classification/out_intent_clf.bak.*/
+# 意图分类数据文件的手工备份 (内容已在 git 历史, 不入库)
+agent/data/intent_classification/*.bak.*

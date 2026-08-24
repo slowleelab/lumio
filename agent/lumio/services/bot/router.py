@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import hashlib
 import json
-import logging
 import os
 import re
 import time
@@ -39,7 +38,8 @@ from lumio.services.common.retrieval import retrieve
 from lumio.services.common.rule_loader import RuleLoader
 from lumio.shared.auth import CurrentUser
 from lumio.shared.config import get_settings
-from lumio.shared.exceptions import DocumentFormatError
+from lumio.shared.exceptions import DocumentFormatError, SessionNotFoundError
+from lumio.shared.logger import setup_logger
 from lumio.shared.metrics import (
     BOT_ACTIVE_WORKERS,
     BOT_AGENT_RESPONSES,
@@ -65,7 +65,7 @@ from lumio.shared.rate_limit import get_limiter
 if TYPE_CHECKING:
     pass
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 router = APIRouter(tags=["bot"])
 
@@ -775,9 +775,19 @@ async def _run_agent(
         response_source=source,
         retrieval_context=result.get("retrieval_context", ""),
     )
-    with contextlib.suppress(Exception):
+    # 对话记录落库(Redis 历史 + PG 合规审计). 失败绝不可静默 — 银行审计数据不得无声丢失.
+    # 历史坑: 此处曾用 contextlib.suppress(Exception) 整体吞掉异常, 一旦会话状态取不到
+    # (SessionNotFoundError), 整轮 Redis 历史 + dialogue_log 同时丢失且无任何日志.
+    try:
         await session_manager.add_turn(session_id, customer_turn, intent=intent)
-        await session_manager.add_turn(session_id, bot_turn, intent=intent)
+        # P0 修复: bot 轮不传 intent -- 此前两轮都带同一 intent, add_turn 会把
+        # low_confidence_streak 与 confidence_history 各记两遍 (一轮对话翻倍,
+        # 会话 178351b41: 15 轮对话 streak=30). 计数只按客户轮算, 每次交换 +1.
+        await session_manager.add_turn(session_id, bot_turn)
+    except SessionNotFoundError:
+        logger.warning("会话状态未取到, 本轮对话历史未落库(Redis 历史+PG 审计丢失): session=%s", session_id)
+    except Exception as exc:
+        logger.warning("对话历史落库失败: session=%s err=%s", session_id, exc)
 
     # 转人工处理
     if is_transfer:
@@ -884,6 +894,13 @@ async def _run_agent(
         # 转接字段已通过 _finish_message 的 extra 一次写入, 不再事后补写 (避免轮询读删 key 的竞态)
         await redis_client.xack(CHAT_STREAM_KEY, CONSUMER_GROUP, msg_id)
         await _mark_processed(redis_client, orig_message_id)  # P1-2
+        logger.info(
+            "消息处理完成: session=%s intent=%s source=%s merged=%d",
+            session_id,
+            primary_intent.value if primary_intent and hasattr(primary_intent, "value") else "unknown",
+            source,
+            len(merged_message_ids) if merged_message_ids else 0,
+        )
         return
 
     # 非转人工: 写 response + 通知
@@ -1848,6 +1865,38 @@ async def get_session_messages(session_id: str, req: Request, user: CurrentUser,
                 raise
             except Exception:
                 pass
+
+    # 优先读 PG 持久化的对话记录(dialogue_log): 轮次实时落库后即存在, 跨 TTL/重启仍可查,
+    # 不再只依赖易失的 Redis 历史. 持久化为空(尚未触发/全被裁剪)时回退下方 Redis 路径.
+    if _db_session_factory:
+        try:
+            from sqlalchemy import select
+
+            from lumio.services.common.session import session_history_key
+            from lumio.shared.orm_models import DialogueLog
+
+            async with _db_session_factory() as db:
+                res = await db.execute(
+                    select(DialogueLog).where(DialogueLog.session_id == session_id).order_by(DialogueLog.timestamp)
+                )
+                rows = res.scalars().all()
+            if rows:
+                messages = [
+                    {
+                        "speaker": r.speaker,
+                        "content": r.content,
+                        "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                        "intent": r.intent,
+                        "response_source": r.response_source,
+                        "confidence": r.confidence,
+                        "turn_id": r.turn_id,
+                    }
+                    for r in rows
+                ]
+                return {"session_id": session_id, "messages": messages, "count": len(messages)}
+        except Exception:
+            logger.exception("读取 PG 对话历史失败, 回退 Redis: session=%s", session_id)
+
     if not redis_client:
         # P3-9 整改: 不再静默返回空列表 (会误导客户端 polling loop 空转)
         # 显式 503 走统一错误体, 客户端能识别"系统故障"vs"无消息"

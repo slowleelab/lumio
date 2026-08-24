@@ -14,10 +14,13 @@ import asyncio
 import contextlib
 import logging
 import re
+import time
 import uuid as uuid_module
-from datetime import UTC, datetime
+from collections import OrderedDict
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from lumio.services.bot.input_gate import InputGate
 from lumio.services.bot.prompts import (
     _SUMMARIZE_SYSTEM_PROMPT,
     BUSINESS_SYSTEM_PROMPT,
@@ -29,22 +32,28 @@ from lumio.services.bot.prompts import (
     GREETING_RESPONSE,
     KNOWLEDGE_SYSTEM_PROMPT,
 )
-from lumio.services.bot.tool_executor import detect_confirmation
+from lumio.services.bot.slot_tracker import _ENTITY_TO_SLOT, SlotTracker
+from lumio.services.bot.tool_executor import ConfirmDecision, detect_confirmation
 from lumio.services.bot.tool_selection import TOOL_INTENTS, select_tools_for_intent
+from lumio.services.common.bert_classifier import ood_verdict
 from lumio.services.common.classifier import IntentClassifier, get_domain
+from lumio.services.common.decision_log import DecisionAction, log_decision
 from lumio.services.common.degradation import DegradationManager
-from lumio.services.common.transfer import TransferChecker
+from lumio.services.common.transfer import TRANSFER_CONFIDENT_CONF, TransferChecker
 from lumio.shared.config import get_settings
 from lumio.shared.metrics import TOOL_CONFIRMATIONS
 from lumio.shared.models import (
+    SENSITIVE_INTENTS,
     DegradationLevel,
     Entity,
     IntentLabel,
     IntentResult,
+    PendingAction,
     RetrieveRequest,
     RetrieveResponse,
     SentimentLabel,
     SessionPhase,
+    TransferTriggerLevel,
 )
 from lumio.shared.token_utils import estimate_tokens as _token_estimate  # P1-8 统一入口
 from lumio.shared.tracing import traced
@@ -78,6 +87,32 @@ logger = logging.getLogger(__name__)
 
 
 # ── 重要性标记 ──
+
+# 摘要触发的最小裁剪 token 量 (P2-28): 低于此省下的上下文预算不值一次 LLM 往返
+# (且 LLM 摘要与业务生成在同一串行 GPU 槽抢占, 见 _load_history 注释)。
+_SUMMARY_MIN_TRIMMED_TOKENS = 512
+
+# 无检索上下文时的澄清门槛: 泛化意图(faq/闲聊)且置信低于此值才澄清。
+# 高于此值视为"置信足够", 放行让 LLM 依托会话记忆续答/追问 (如 faq@0.6"那分期呢")。
+_NO_CONTEXT_GATE_CONF = 0.5
+
+# 把"transfer_agent"当真·客户主动转人工所需的最低置信 (与 transfer._check_l2 同源阈值):
+# 低置信的 transfer_agent 多为乱码/连续低置信被 LLM 误判(把握通常 <0.5), 不能据此拉真人坐席;
+# 真"转人工/按按钮"把握高(常 ≥0.7), 不受影响。敏感意图(挂失/投诉)走主意图即时转, 合规底线优先。
+
+# L3『先确认再转』: 连续低置信/兜底累计触发转人工时, 不再直接派真人坐席, 改为挂一个待确认.
+# 下一轮客户明确确认才真正转 —— 既防『灌乱码刷真人』滥用, 也不再把这类升级谎标成『客户主动请求』.
+# 真·转人工(L1 关键词 / L2 高置信 transfer_agent / 敏感意图)不走此确认, 仍即时转。
+_TRANSFER_OFFER_PROMPT = "这几次似乎还没能帮您解决问题，需要为您转接人工客服吗？（回复“是”或“需要”即可）"
+_TRANSFER_OFFER_TIMEOUT = timedelta(seconds=120)
+
+# 转人工邀请的确认词独立于通用 detect_confirmation: 邀请话术明确引导客户回"是/需要",
+# 而通用的 confirm 关键词表不含这两个词 —— 客户按话术回复会被误判成 unclear → 邀请被无辜清除.
+# 取消词需覆盖"不用/不需要"等否定表述 (取消优先判定, 规避"不..."被当作确认).
+_TRANSFER_OFFER_CANCEL_KEYWORDS = frozenset({"不用", "不需要", "不要", "不了", "算了", "取消", "不转", "不用吧"})
+_TRANSFER_OFFER_CONFIRM_KEYWORDS = frozenset(
+    {"是", "需要", "要", "好的", "是的", "确认", "确定", "可以", "行", "转人工", "嗯"}
+)
 
 _IMPORTANT_KEYWORDS = [
     "投诉",
@@ -144,6 +179,11 @@ class LumioAgent:
         self._pending_tasks: set[asyncio.Task[Any]] = set()
         # P1-10: 摘要任务 per-session 锁 (多轮快速对话时串行化增量摘要)
         self._summary_locks: dict[str, asyncio.Lock] = {}
+        # P2: 多信号噪声闸 (默认关, 由 config noise_gate_enabled 控制)
+        self._gate = InputGate()
+        # P3: 疑似误杀探针 — 上轮判"回话放行"的会话, 若紧接着又被噪声门拦, 标记回流.
+        # 用定长 OrderedDict(按访问序)记录最近放行, 防长运行后无界增长; freshness 见常量.
+        self._recent_reply_pass: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     def _spawn_task(self, coro: Any) -> asyncio.Task[Any]:
         """创建并持有后台 task 引用, 完成后自动从集合移除."""
@@ -182,6 +222,7 @@ class LumioAgent:
                 logger.warning("apply_learned_profile 调度失败: %s", exc)
 
         # ── 工具确认状态机拦截：存在未过期 pending_action 时，本轮解读为确认/取消 ──
+        result: dict[str, Any] | None = None
         if self._tool_executor is not None and self._session_manager is not None:
             try:
                 state = await self._session_manager.get_session(session_id)
@@ -261,7 +302,12 @@ class LumioAgent:
             ctx = set_trap_context(session_id, customer_id)
             try:
                 # 1. 意图分类 + 实体抽取 + 情感分析
-                intent_result, entities, sentiment = await self._classify(user_input)
+                _t_intent = time.monotonic()
+                intent_result, entities, sentiment = await self._classify(user_input, session_id)
+                _intent_ms = (time.monotonic() - _t_intent) * 1000
+                # 指代消解: 当前句回指历史实体时解析回具体所指(默认关 closed_loop 灰度).
+                # 位于 _classify 之后、槽位填充/噪声门/路由之前, 使消解实体与各处共用同一份.
+                entities = await self._resolve_anaphora(session_id, user_input, entities, intent_result.primary_intent)
             finally:
                 reset_trap_context(ctx)
 
@@ -269,26 +315,96 @@ class LumioAgent:
             domain = get_domain(intent_result.primary_intent)
             history = await self._load_history(session_id)
 
+            # E2 决策可解释: 记录意图分类决策 (涵盖每轮实际路由, 供监管/客户审计)
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.INTENT_CLASSIFY,
+                    reasoning=f"意图={intent_result.primary_intent.value} 置信={intent_result.primary_confidence:.2f} 域={domain}",
+                    evidence={
+                        "intent": intent_result.primary_intent.value,
+                        "confidence": intent_result.primary_confidence,
+                        "domain": domain,
+                        # P: 记录候补意图 - 敏感/转人工穿透分析此前因缺失候补而无据可查,
+                        # 本次会话 4d22 靠复现才定位, 现补进决策日志供事后审计直接锁定.
+                        "alternatives": [a.value for a in (intent_result.alternatives or [])],
+                        # P0 快慢分歧: 记录两路各自的意图/置信, 事后审计可直接定位
+                        # "哪一路在幻觉" (会话 e33d1fa8 审核期间靠手工复现才拼出证据链).
+                        "fast_conf": intent_result.fast_conf,
+                        "fast_intent": intent_result.fast_intent.value if intent_result.fast_intent else None,
+                    },
+                    latency_ms=_intent_ms,
+                    turn_id=uuid_module.uuid4().hex[:16],
+                    customer_id=customer_id,
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+
             # 2.5 渐进式工具暴露：仅当开关开启 + 有可用工具 + 命中查询类工具意图时，
             #     打通 MCP 工具编排路径（在 domain 分派之前）。开关关闭时整段不进入，路由 100% 同现状。
+            # P-指代修复: 统一出口 —— 所有 handler 的 result 在此补入真实 entities.
+            # 此前各 handler 调 _build_result 时不传 entities, 落库实体恒空,
+            # 历史实体池(last_entities)从不累积, 指代消解与"[已知实体]"内存全部空转.
+            result = None
             if (
                 get_settings().mcp.progressive_disclosure_enabled
                 and self._tool_executor is not None
                 and self._tool_executor.has_tools()
                 and intent_result.primary_intent in TOOL_INTENTS
             ):
-                return await self._handle_tool(
+                result = await self._handle_tool(
                     session_id, user_input, intent_result, history, entities, sentiment, customer_id
                 )
 
-            if domain == "knowledge":
-                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
-            elif domain == "business":
-                return await self._handle_business(
-                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
+            # P0 多轮治理: 噪声门回话豁免所需"上文缺槽快照", 提前到 domain 分派前读取,
+            # 避免各 handler 内 _load_slot_prompt 因意图切换重置 tracker 而清掉"上文在等什么"。
+            if result is None:
+                gate_missing_slots: list[tuple[str, str]] = []
+                if get_settings().classification.rephrase_guard_enabled:
+                    gate_missing_slots = await self._missing_required_slots(session_id, intent_result.primary_intent)
+
+                if domain == "knowledge":
+                    result = await self._handle_knowledge(
+                        session_id,
+                        user_input,
+                        intent_result,
+                        history,
+                        entities,
+                        sentiment,
+                        missing_slots=gate_missing_slots,
+                    )
+                elif domain == "business":
+                    result = await self._handle_business(
+                        session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                    )
+                else:
+                    result = await self._handle_fallback(
+                        session_id,
+                        user_input,
+                        intent_result,
+                        history,
+                        entities,
+                        sentiment,
+                        missing_slots=gate_missing_slots,
+                    )
+
+            # 统一把增强后的实体写回 result, 保证 slot 填充/噪声门/持久化共用同一份数据
+            if result and entities:
+                result["entities"] = entities
+
+            # P0 修复: 澄清轮的 L3 补判 (run() 统一出口). 噪声门/低置信分支在 handler 内
+            # 提前 return clarify, 永远到不了各路径末尾的 _check_transfer -- 连续低置信的
+            # 客户只会在澄清话术里无限打转 (会话 178351b41: streak=30, 零次转人工邀请).
+            # 越线那一轮 (streak == 阈值) 把澄清换成邀请; 客户明确确认才派真人.
+            if result is not None and result.get("response_source") == "clarify" and not result.get("should_transfer"):
+                offer = await self._maybe_offer_transfer_after_clarify(
+                    session_id, user_input, intent_result, entities, sentiment
                 )
-            else:
-                return await self._handle_fallback(session_id, user_input, intent_result, history, entities, sentiment)
+                if offer is not None:
+                    result = offer
+
+            return result
 
         except Exception as e:
             logger.warning("Bot Agent 执行失败: %s", e)
@@ -296,9 +412,13 @@ class LumioAgent:
             should_transfer = False
             transfer_reason = ""
             with contextlib.suppress(Exception):
-                should_transfer, transfer_reason = await self._check_transfer(
+                should_transfer, transfer_reason, transfer_level = await self._check_transfer(
                     user_input, None, SentimentLabel.NEUTRAL, session_id=session_id
                 )
+                # L3『先确认再转』: 累计低置信/兜底不派真人 (此降级路径仅返回兜底稿, 不挂确认).
+                if transfer_level == TransferTriggerLevel.L3:
+                    should_transfer = False
+                    transfer_reason = ""
             return self._build_result(
                 session_id,
                 user_input,
@@ -311,19 +431,70 @@ class LumioAgent:
 
     # ── 路径处理 ──
 
-    async def _classify(self, user_input: str) -> tuple[IntentResult, list[Entity], SentimentLabel]:
-        """意图分类 + 实体抽取 + 情感分析 (接入全链路: Agent: intent_classify)"""
+    async def _resolve_anaphora(
+        self, session_id: str, user_input: str, entities: list[Entity], intent: IntentLabel | None = None
+    ) -> list[Entity]:
+        """指代消解: 当前句回指历史实体时, 解析回某条具体所指并并入本轮实体。
+
+        由 anaphora_resolver_enabled 控制(默认关)。从 领域 state.last_entities 读取历史
+        实体池 —— 该池此前因 _build_result 不传 entities 而恒空, 由 A 阶段修复后真正累积。
+        另读取"上轮缺槽"(missing_slots)喂给零主回指补槽。返回不变(未开启/无历史实体)。
+        LLM 兜底层仅当 anaphora_llm_fallback_enabled 开启时联动。
+        """
+        from lumio.services.bot.anaphora_resolver import AnaphoraResolver
+        from lumio.shared.config import get_settings
+
+        if not get_settings().classification.anaphora_resolver_enabled or self._session_manager is None:
+            return entities
         try:
+            state = await self._session_manager.get_session(session_id)
+        except Exception:
+            state = None
+        if state is None or not state.last_entities:
+            return entities
+        intent = intent or IntentLabel.FAQ
+        # 上轮仍在等的必填槽(零主回指据此从历史补该槽唯一候选值)
+        try:
+            missing_slots = await self._missing_required_slots(session_id, intent)
+        except Exception:
+            missing_slots = []
+        llm = getattr(self._degradation_mgr, "_llm", None)
+        resolver = AnaphoraResolver(llm_client=llm or None)
+        enriched, meta = await resolver.resolve(user_input, state.last_entities, entities, missing_slots=missing_slots)
+        source = meta.get("source")
+        if source not in (None, "none"):
+            logger.info(
+                "指代消解 %s: session=%s source=%s candidates=%s resolved=%s",
+                user_input[:30],
+                session_id,
+                source,
+                meta.get("candidates"),
+                meta.get("resolved"),
+            )
+        return enriched
+
+    async def _classify(
+        self, user_input: str, session_id: str | None = None
+    ) -> tuple[IntentResult, list[Entity], SentimentLabel]:
+        """意图分类 + 实体抽取 + 情感分析 (接入全链路: Agent: intent_classify)
+
+        session_id 存在时加载最近对话轮次作为多轮上下文给 BERT 快路径,
+        让"上轮说分期, 这轮问费率"等追问能借上下文落在正确意图而非当全新单句。
+        """
+        try:
+            history = await self._classify_context(session_id)
             from lumio.shared.tracing import _TRACING_ENABLED, _get_tracer
 
             tracer = _get_tracer() if _TRACING_ENABLED else None
             if tracer is None:
-                intent_result, entities, sentiment, _ = await self._classifier.classify(user_input)
+                intent_result, entities, sentiment, _ = await self._classifier.classify(user_input, history=history)
                 return intent_result, entities, sentiment
 
             with tracer.start_as_current_span("Agent: intent_classify") as span:
                 try:
-                    intent_result, entities, sentiment, source = await self._classifier.classify(user_input)
+                    intent_result, entities, sentiment, source = await self._classifier.classify(
+                        user_input, history=history
+                    )
                 except Exception:
                     span.set_attribute("error", True)
                     raise
@@ -334,6 +505,24 @@ class LumioAgent:
         except Exception:
             return IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0), [], SentimentLabel.NEUTRAL
 
+    async def _classify_context(self, session_id: str | None) -> list[dict[str, str]] | None:
+        """拉取最近对话轮次, 拼成 BERT 多轮上下文 (speaker/content, 时间升序)。
+
+        轻量取近几轮 (不触发 _load_history 的 LLM 摘要/压缩), 失败静默返回 None,
+        退化为单句分类, 不阻断主线。
+        """
+        if not session_id or self._session_manager is None:
+            return None
+        try:
+            turns = await self._session_manager.get_history(session_id, limit=6)
+        except Exception:
+            return None
+        return [
+            {"speaker": t.speaker, "content": t.content}
+            for t in turns
+            if t.speaker in ("customer", "bot") and t.content
+        ][-6:]
+
     async def _handle_knowledge(
         self,
         session_id: str,
@@ -342,6 +531,7 @@ class LumioAgent:
         history: list[dict[str, str]],
         entities: list[Entity] | None = None,
         sentiment: SentimentLabel = SentimentLabel.NEUTRAL,
+        missing_slots: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         """知识问答: RAG 检索 + LLM 生成.
 
@@ -357,7 +547,21 @@ class LumioAgent:
             logger.info("重复提问命中, 复用上次回答: session=%s", session_id)
             return self._build_result(session_id, user_input, repeat_reply, "repeat", "knowledge")
 
+        _rag_t0 = time.monotonic()
         context = await self._retrieve(user_input)
+        # E2 决策可解释: 记录 RAG 检索决策 (命中与否)
+        try:
+            log_decision(
+                session_id=session_id,
+                agent_name="bot_agent",
+                action=DecisionAction.RAG_RETRIEVE,
+                reasoning=f"RAG 检索{'命中' if context else '未命中'}",
+                evidence={"hit": bool(context), "context_len": len(context or "")},
+                turn_id=uuid_module.uuid4().hex[:16],
+                latency_ms=(time.monotonic() - _rag_t0) * 1000,
+            )
+        except Exception:
+            logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
         if context:
             from lumio.services.bot.knowledge_graph import enrich_retrieval_context
 
@@ -371,16 +575,84 @@ class LumioAgent:
             if verdict.is_blocked:
                 logger.info("RAG 内容已净化: pattern=%s", verdict.pattern)
 
-        slot_prompt = await self._load_slot_prompt(session_id, intent.primary_intent, entities or [])
+        slot_prompt = await self._load_slot_prompt(session_id, intent.primary_intent, entities or [], user_input)
         session_memory = await self._build_session_memory(session_id)
+
+        # 乱答防上线(CRITICAL): 分类器判定"不识别"(conf < 下限)或内容级噪声的输入,
+        # 无论有无会话记忆/检索上下文都绝不编造作答 — 直接确定性澄清。典型: 乱码/按键误触。
+        # P0 多轮治理: 噪声门统一走 _evaluate_noise_gate —— 先判"本句是否在回上文话"
+        # (填了缺的必填槽/纯数字)。回话一律放行(防"上轮问金额/卡号, 本句答 4444"被误判成
+        # 噪声), 不因低置信/像噪声而澄清; 真实乱码(hjfw/22)不填任何槽, 仍被拦截,
+        # 保住"乱答防上线"与"先问候再乱打"两处漏点都在。
+        gate_reason, gate_evidence = await self._evaluate_noise_gate(
+            session_id, user_input, intent, entities, missing_slots
+        )
+        if gate_reason is not None:
+            logger.info(
+                "乱答防拦截: action=%s session=%s input=%r conf=%.2f",
+                gate_reason,
+                session_id,
+                user_input,
+                intent.primary_confidence,
+            )
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.NOISE_BLOCKED,
+                    reasoning=f"噪声门拦截({gate_reason})",
+                    evidence=gate_evidence,
+                    turn_id=uuid_module.uuid4().hex[:16],
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+            # P3 误杀探针: 上轮"回话放行"后本轮被拦 → 疑似误杀, 回流人审
+            await self._maybe_flag_mis_kill(session_id, user_input, gate_reason)
+            return self._build_result(
+                session_id,
+                user_input,
+                CLARIFY_RESPONSE,
+                "clarify",
+                intent.primary_intent.value,
+                intent.primary_confidence,
+                entities=entities,
+                sentiment=sentiment,
+            )
+        if gate_evidence.get("is_replying"):
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.CONTEXT_REPLY_PASS,
+                    reasoning="多轮回话判定放行",
+                    evidence=gate_evidence,
+                    turn_id=uuid_module.uuid4().hex[:16],
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+            # P3 误杀探针: 记录本会话刚"回话放行", 供下一轮被拦时标记疑似误杀
+            self._mark_reply_pass(session_id, user_input)
 
         # 无检索上下文时的"依据门控": 防 LLM 空想编造(如把 "adb" 误认成某银行),
         # 同时保住追问场景。
-        # - 无检索 且 无对话依据(首句即无意义输入) → 绕开 LLM, 返回固定澄清话术
-        #    (确定性、零幻觉、秒回)。
-        # - 无检索 但 有对话依据(追问答) → 放行, 让 LLM 依托下方注入的会话记忆续答。
-        if not context and not _has_grounding(session_memory, history) and _is_uncertain_intent(intent):
-            logger.info("无检索且无对话依据且意图不确定, 直接澄清: session=%s input=%r", session_id, user_input)
+        # - 无检索 且 意图不确定(faq/泛化) → 评估依据.
+        #   无对话依据(首句即无意义输入, 如 "adb")或置信不足(faq@<0.5, 如"阿萨法上课呢"@0.30,
+        #   即便因前文有历史被算作"有依据")一律返回固定澄清话术 —— 确定性、零幻觉、秒回。
+        #   纠正是唯一诚实回复, 且省掉一次在 Ollama 高并发下 4-9s 的 LLM 生成。
+        # - 无检索 但 有对话依据且置信足够(faq@≥0.5) 或 意图明确(账单/积分等具体查询)
+        #   → 放行, 让 LLM 依托会话记忆续答/追问 (保住 "那分期呢"@0.6 这类真追问)。
+        if (
+            not context
+            and _is_uncertain_intent(intent)
+            and (not _has_grounding(session_memory, history) or intent.primary_confidence < _NO_CONTEXT_GATE_CONF)
+        ):
+            logger.info(
+                "无检索且意图不确定且(无依据或低置信), 直接澄清: session=%s input=%r intent=%s conf=%.2f",
+                session_id,
+                user_input,
+                intent.primary_intent.value,
+                intent.primary_confidence,
+            )
             return self._build_result(
                 session_id,
                 user_input,
@@ -454,6 +726,7 @@ class LumioAgent:
         # P0-1 上下文工程修复: 分层消息直传 LLM (不再压平成单一 system prompt).
         # 保留 L1 静态锚点 / L2 半稳态 / L3 动态 / RAG user-role 物理隔离结构,
         # 最大化前缀缓存命中; 失败时由 generate_with_fallback 走既有降级链.
+        _t_llm = time.monotonic()
         result = await self._degradation_mgr.generate_with_fallback(
             system_prompt=KNOWLEDGE_SYSTEM_PROMPT,
             user_input=user_input,
@@ -462,9 +735,26 @@ class LumioAgent:
             history=history,
             messages=messages,
         )
-        should_transfer, transfer_reason = await self._check_transfer(
+        _llm_ms = (time.monotonic() - _t_llm) * 1000
+        # E2 决策可解释: 记录 LLM 生成决策 (含降级来源)
+        try:
+            log_decision(
+                session_id=session_id,
+                agent_name="bot_agent",
+                action=DecisionAction.LLM_GENERATE,
+                reasoning=f"knowledge 生成, 来源={getattr(result, 'source', '')}",
+                evidence={"source": getattr(result, "source", "")},
+                latency_ms=_llm_ms,
+                turn_id=uuid_module.uuid4().hex[:16],
+            )
+        except Exception:
+            logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+        should_transfer, transfer_reason, transfer_level = await self._check_transfer(
             user_input, intent, sentiment, session_id=session_id
         )
+        # L3『先确认再转』: 连续低置信/兜底累计不派真人, 先挂确认回话 (真·明确转人工 L1/L2 仍即时转)。
+        if transfer_level == TransferTriggerLevel.L3:
+            return await self._offer_transfer(session_id, user_input, intent, entities or [], sentiment, transfer_reason)
         # P1-8 修复: 降级回复 (模板/兜底) 不只是文案说"转人工" — 真正触发转人工.
         # 此前 should_transfer 恒 False, 客户看到"请输入转人工"还要再发一条消息.
         if result.source in ("template", "fallback") and not should_transfer:
@@ -494,16 +784,45 @@ class LumioAgent:
         customer_id: str | None = None,
     ) -> dict[str, Any]:
         """业务办理: 挂失/投诉直接转，否则（有工具）走工具编排 / （无工具）LLM 生成"""
-        if intent.primary_intent in (IntentLabel.CARD_LOSS, IntentLabel.COMPLAINT, IntentLabel.TRANSFER_AGENT):
+        # ── 统一"是否即时派真人"判定 (与 transfer._check_l2 同源阈值, 堵低置信/幻觉拉真人) ──
+        # 仅在主意图给出确定性信号时才即时转人工, 且敏感写主意图同样受置信门槛:
+        #   * 敏感写(挂失/投诉) 主意图 且 置信 ≥ TRANSFER_CONFIDENT_CONF → 合规即时转 (+投诉建工单)
+        #   * transfer_agent 主意图 且 置信 ≥ TRANSFER_CONFIDENT_CONF → 客户主动要求人工
+        # 低置信的敏感写主意图被分类器幻觉出来 (见会话 fdf8: 乱码"gbfgbf"→complaint@0.21) 不得据此
+        # 即时派真人/误建工单 —— 显式的真实诉求("投诉"/"卡丢了")要么命中 L1 关键词要么高置信, 不受影响。
+        primary = intent.primary_intent
+        alts = set(intent.alternatives or [])
+        conf = intent.primary_confidence
+        confident = conf >= TRANSFER_CONFIDENT_CONF
+        sensitive_primary = primary in SENSITIVE_INTENTS
+        transfer_primary_confident = primary == IntentLabel.TRANSFER_AGENT and confident
+        # P0 快慢分歧: 慢路径覆盖快路径且两路意图不同(乱码/极含糊输入的典型特征,
+        # 见会话 e33d1fa8 与架构审核 R1) -- business 路径没有噪声门, 分歧信号在此
+        # 自行拦截: 不派真人、不建工单、不进工具编排, 回确定性澄清. 防"慢路径置信
+        # 通胀 -> 幻觉 transfer_agent@0.7 越过统一置信门拉真人"的换通道滥用.
+        disagreement = _fast_slow_disagreement(intent)
+        transfer_needed = ((sensitive_primary and confident) or transfer_primary_confident) and not disagreement
+
+        # 低置信的敏感写/转人工 -- 无论是作主意图还是仅作候补, 一律不即时派真人、不建工单。
+        # (主意图低置信敏感 = 乱码被幻觉成 complaint/挂失; 候补低置信敏感 = 会话 4d22 同款穿透路径)
+        low_conf_transfer_primary = primary == IntentLabel.TRANSFER_AGENT and not confident
+        low_conf_sensitive_primary = sensitive_primary and not confident
+        low_conf_alt_only = (
+            not transfer_needed and not confident and bool(alts & (SENSITIVE_INTENTS | {IntentLabel.TRANSFER_AGENT}))
+        )
+        low_conf_signal = low_conf_transfer_primary or low_conf_sensitive_primary or low_conf_alt_only or disagreement
+
+        if transfer_needed:
             reason_map = {
                 IntentLabel.CARD_LOSS: "挂失业务",
                 IntentLabel.COMPLAINT: "投诉处理",
                 IntentLabel.TRANSFER_AGENT: "客户主动请求",
             }
-            reason = reason_map.get(intent.primary_intent, "业务办理")
+            reason = reason_map.get(primary, "业务办理")
             # P2-15: 投诉工单创建 — 投诉不是"转人工就完事", 需要可跟踪的闭环状态
-            # (open → resolved, 由 admin 端点关闭; Redis hash 轻量实现, 不引新表)
-            if intent.primary_intent == IntentLabel.COMPLAINT:
+            # (open → resolved, 由 admin 端点关闭; Redis hash 轻量实现, 不引新表)。
+            # 仅在置信充分的 complaints 上建工单, 低置信幻觉不作数 (见 fdf8 误建投诉工单)。
+            if primary == IntentLabel.COMPLAINT:
                 try:
                     await self._create_complaint_ticket(session_id, user_input, customer_id)
                 except Exception as exc:
@@ -513,10 +832,34 @@ class LumioAgent:
                 user_input,
                 BUSINESS_TRANSFER_TEMPLATE.format(reason=reason),
                 "template",
-                intent.primary_intent.value,
-                intent.primary_confidence,
+                primary.value,
+                conf,
                 should_transfer=True,
                 transfer_reason=reason,
+            )
+
+        if low_conf_signal:
+            # 把握不足的"转人工/敏感"判定或快慢分歧: 不擅自拉真人坐席、不误建工单, 回确定性澄清。
+            logger.info(
+                "低置信敏感/转人工或快慢分歧信号不回执真人, 回澄清: session=%s input=%r intent=%s conf=%.2f "
+                "alts=%s fast=%s disagreement=%s",
+                session_id,
+                user_input,
+                primary.value,
+                conf,
+                sorted(a.value for a in alts),
+                f"{intent.fast_intent.value if intent.fast_intent else None}@{intent.fast_conf}",
+                disagreement,
+            )
+            return self._build_result(
+                session_id,
+                user_input,
+                CLARIFY_RESPONSE,
+                "clarify",
+                primary.value,
+                conf,
+                entities=entities,
+                sentiment=sentiment,
             )
 
         # 结构化会话记忆注入 system prompt
@@ -524,6 +867,10 @@ class LumioAgent:
         system_prompt = BUSINESS_SYSTEM_PROMPT
         if session_memory:
             system_prompt = f"{BUSINESS_SYSTEM_PROMPT}\n\n## 会话记忆\n{session_memory}"
+        # 槽位状态注入(与 knowledge 路径同一真相源, 引导 Bot 知道自己已收集/还缺哪些信息)
+        slot_prompt = await self._load_slot_prompt(session_id, intent.primary_intent, entities or [], user_input)
+        if slot_prompt:
+            system_prompt = f"{system_prompt}\n\n{slot_prompt}"
 
         # 工具编排路径：MCP 启用且有可用工具时，尝试 tool-calling；任何异常回落降级链
         if self._tool_executor is not None and self._tool_executor.has_tools():
@@ -563,6 +910,7 @@ class LumioAgent:
             except Exception as exc:
                 logger.warning("工具编排失败，回落降级链: %s", exc)
 
+        _t_llm = time.monotonic()
         result = await self._degradation_mgr.generate_with_fallback(
             system_prompt=system_prompt,
             user_input=user_input,
@@ -570,9 +918,26 @@ class LumioAgent:
             intent_label=intent.primary_intent,
             history=history,
         )
-        should_transfer, transfer_reason = await self._check_transfer(
+        _llm_ms = (time.monotonic() - _t_llm) * 1000
+        # E2 决策可解释: 记录业务路径 LLM 生成决策
+        try:
+            log_decision(
+                session_id=session_id,
+                agent_name="bot_agent",
+                action=DecisionAction.LLM_GENERATE,
+                reasoning=f"business 生成, 来源={getattr(result, 'source', '')}",
+                evidence={"source": getattr(result, "source", ""), "domain": "business"},
+                latency_ms=_llm_ms,
+                turn_id=uuid_module.uuid4().hex[:16],
+            )
+        except Exception:
+            logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+        should_transfer, transfer_reason, transfer_level = await self._check_transfer(
             user_input, intent, sentiment, session_id=session_id
         )
+        # L3『先确认再转』(同上)
+        if transfer_level == TransferTriggerLevel.L3:
+            return await self._offer_transfer(session_id, user_input, intent, entities or [], sentiment, transfer_reason)
         # P1-8: 降级回复真正触发转人工 (同上)
         if result.source in ("template", "fallback") and not should_transfer:
             should_transfer = True
@@ -663,6 +1028,9 @@ class LumioAgent:
     ) -> dict[str, Any]:
         """处理待确认的敏感工具操作（confirm/cancel/unclear/expired）"""
         pending: PendingAction = state.pending_action
+        # L3『先确认再转』的转人工邀请: 独立于敏感工具确认, 走专用状态机。
+        if pending.tool_name == "TRANSFER_OFFER":
+            return await self._handle_transfer_offer(session_id, user_input, state)
         actor_id = customer_id or state.customer_id or session_id
 
         # 过期：清除并提示重新发起
@@ -800,6 +1168,62 @@ class LumioAgent:
             "faq",
         )
 
+    async def _handle_transfer_offer(self, session_id: str, user_input: str, state: Any) -> dict[str, Any]:
+        """L3『先确认再转』的确认态处理: 客户明确回复"是/需要"才真正派真人坐席。
+
+        任何真人派发都必须来自客户明确确认 —— 绝不因连续低置信轮次自动派坐席。
+        取消/超时/未明确回复即清除邀请, 避免把客户困在确认对话里。
+        """
+        pending: PendingAction = state.pending_action
+        if pending.expires_at is not None and datetime.now(UTC) > pending.expires_at:
+            await self._clear_pending_action(session_id, state.version)
+            return self._build_result(
+                session_id, user_input, "转人工邀请已超时。如需人工客服，请直接回复“转人工”。", "template", "faq"
+            )
+        decision = self._detect_transfer_offer(user_input)
+        if decision == "confirm":
+            await self._clear_pending_action(session_id, state.version)
+            reason = (pending.arguments or {}).get("transfer_reason") or "连续多轮未理解后客户确认转人工"
+            logger.info("L3 转人工已确认, 派真人: session=%s reason=%s", session_id, reason)
+            return self._build_result(
+                session_id,
+                user_input,
+                BUSINESS_TRANSFER_TEMPLATE.format(reason="客户确认转人工"),
+                "template",
+                "faq",
+                should_transfer=True,
+                transfer_reason=f"confirm:{reason}",
+            )
+        if decision == "cancel":
+            await self._clear_pending_action(session_id, state.version)
+            return self._build_result(
+                session_id, user_input, "好的，继续为您服务。如需人工客服，随时说“转人工”即可。", "template", "faq"
+            )
+        # unclear: 未明确回复 —— 清除邀请并提示如何转, 避免把客户困在确认对话里。
+        await self._clear_pending_action(session_id, state.version)
+        return self._build_result(session_id, user_input, "如需转接人工客服，请回复“转人工”。", "template", "faq")
+
+    @staticmethod
+    def _detect_transfer_offer(text: str) -> ConfirmDecision:
+        """转人工邀请的确认判定 (独立于通用 detect_confirmation).
+
+        邀请话术明确引导客户回"是/需要", 但通用 confirm 关键词表不含这两个词,
+        客户按话术回复会被误判成 unclear → 邀请被无辜清除, 功能形同虚设.
+        这里对邀请话术引导的回复词单独识别, 其余交给通用检测.
+        """
+        if not text:
+            return "unclear"
+        core = re.sub(r"[\s，。！？,.!?、～~嗯哦啊呀呢吧]", "", text.strip())
+        # 取消优先 (否定表述优先): 明确的"不用/不需要/算了...
+        if core in _TRANSFER_OFFER_CANCEL_KEYWORDS or any(
+            core.startswith(kw) for kw in ("不用", "不需要", "不要", "不了")
+        ):
+            return "cancel"
+        for kw in _TRANSFER_OFFER_CONFIRM_KEYWORDS:
+            if core == kw or core.startswith(kw):
+                return "confirm"
+        return detect_confirmation(text)
+
     async def _save_pending_action(self, session_id: str, pending: PendingAction) -> None:
         """将待确认操作写入会话状态（CAS）"""
         if self._session_manager is None:
@@ -844,13 +1268,79 @@ class LumioAgent:
         history: list[dict[str, str]],
         entities: list[Entity] | None = None,
         sentiment: SentimentLabel = SentimentLabel.NEUTRAL,
+        missing_slots: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
         """闲聊/兜底: 快速匹配 或 LLM 生成"""
         # 结构化会话记忆注入 system prompt
         session_memory = await self._build_session_memory(session_id)
+
+        # 乱答防上线(CRITICAL): 兜底是最后一档"能答就答"的路径, 但**分类器判定不识别**
+        # (conf < 下限, 即 source=fallback)的输入(典型如乱码/按键误触 "sncjao"、"889")
+        # 绝不能交给 LLM 硬编一个答复——那正是"乱答"来源(conf≈0 还被当普通闲聊生成)。
+        # 与 knowledge 路径同一判定标准: 低于下限 → 直接回确定性澄清话术(零幻觉、秒回)。
+        # 另有**内容级噪声门**(纯数字/纯符号, 如 "22")即使高置信被快路径认成闲聊
+        # 也一并澄清, 堵住 BERT 快路径把纯数字噪音高置信误判为闲聊而漏走的漏点。
+        # 乱答防上线(CRITICAL): 兜底是最后一档"能答就答"的路径, 分类器判定不识别
+        # (conf < 下限)或内容级噪声的输入绝不能交给 LLM 硬编答复 — 直接确定性澄清。
+        # P0 多轮治理: 与 knowledge 路径同一噪声门(_evaluate_noise_gate); 本句在回上文话
+        # (填缺的必填槽/纯数字)时放行, 防"上轮问金额/卡号, 本句答 4444"被误判成噪声。
+        gate_reason, gate_evidence = await self._evaluate_noise_gate(
+            session_id, user_input, intent, entities, missing_slots
+        )
+        if gate_reason is not None:
+            logger.info(
+                "兜底路径噪声门拦截: action=%s session=%s input=%r conf=%.2f",
+                gate_reason,
+                session_id,
+                user_input,
+                intent.primary_confidence,
+            )
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.NOISE_BLOCKED,
+                    reasoning=f"噪声门拦截({gate_reason})",
+                    evidence=gate_evidence,
+                    turn_id=uuid_module.uuid4().hex[:16],
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+            # P3 误杀探针: 上轮"回话放行"后本轮被拦 → 疑似误杀, 回流人审
+            await self._maybe_flag_mis_kill(session_id, user_input, gate_reason)
+            return self._build_result(
+                session_id,
+                user_input,
+                CLARIFY_RESPONSE,
+                "clarify",
+                intent.primary_intent.value,
+                intent.primary_confidence,
+                entities=entities,
+                sentiment=sentiment,
+            )
+        if gate_evidence.get("is_replying"):
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.CONTEXT_REPLY_PASS,
+                    reasoning="多轮回话判定放行",
+                    evidence=gate_evidence,
+                    turn_id=uuid_module.uuid4().hex[:16],
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+            # P3 误杀探针: 记录本会话刚"回话放行", 供下一轮被拦时标记疑似误杀
+            self._mark_reply_pass(session_id, user_input)
+
         system_prompt = FALLBACK_SYSTEM_PROMPT
         if session_memory:
             system_prompt = f"{FALLBACK_SYSTEM_PROMPT}\n\n## 会话记忆\n{session_memory}"
+        # 槽位状态注入(若上轮在等必填信息, 本句可能是在回话)
+        slot_prompt = await self._load_slot_prompt(session_id, intent.primary_intent, entities or [], user_input)
+        if slot_prompt:
+            system_prompt = f"{system_prompt}\n\n{slot_prompt}"
+        _t_llm = time.monotonic()
         result = await self._degradation_mgr.generate_with_fallback(
             system_prompt=system_prompt,
             user_input=user_input,
@@ -858,14 +1348,31 @@ class LumioAgent:
             intent_label=IntentLabel.CHITCHAT,
             history=history,
         )
+        _llm_ms = (time.monotonic() - _t_llm) * 1000
+        # E2 决策可解释: 记录兜底 LLM 生成决策 (含降级来源)
+        try:
+            log_decision(
+                session_id=session_id,
+                agent_name="bot_agent",
+                action=DecisionAction.LLM_GENERATE,
+                reasoning=f"fallback 生成, 来源={getattr(result, 'source', '')}",
+                evidence={"source": getattr(result, "source", ""), "domain": "chitchat"},
+                latency_ms=_llm_ms,
+                turn_id=uuid_module.uuid4().hex[:16],
+            )
+        except Exception:
+            logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
         # P0-4 修复: 兜底路径也做转人工检查 — 此前 _handle_fallback 完全跳过,
         # 客户被敷衍 N 轮也不会转人工 (只能靠下一轮主动说"转人工"被分类)
         should_transfer = False
         transfer_reason = ""
         if result.source in ("template", "fallback"):
-            should_transfer, transfer_reason = await self._check_transfer(
+            should_transfer, transfer_reason, transfer_level = await self._check_transfer(
                 user_input, None, sentiment, session_id=session_id
             )
+            # L3『先确认再转』: 兜底路径同样不自动派真人, 改为挂确认回话。
+            if transfer_level == TransferTriggerLevel.L3:
+                return await self._offer_transfer(session_id, user_input, intent, entities or [], sentiment, transfer_reason)
         return self._build_result(
             session_id,
             user_input,
@@ -1033,14 +1540,14 @@ class LumioAgent:
         intent: IntentResult | None = None,
         sentiment: SentimentLabel = SentimentLabel.NEUTRAL,
         session_id: str = "",
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, TransferTriggerLevel | None]:
         """判断是否需要转人工
 
         P0-3 修复: 此前恒传 session=None 导致 L3 累计触发 (连续低置信/多次兜底)
         是死代码 — 客户被 Bot 敷衍多轮也永远不会自动转人工. 现加载会话状态传入.
         """
         if self._transfer_checker is None:
-            return False, ""
+            return False, "", None
         try:
             session = None
             if session_id and self._session_manager is not None:
@@ -1050,15 +1557,97 @@ class LumioAgent:
                         session = state
                 except Exception:
                     pass
-            should, _, reason = self._transfer_checker.check(
+            should, level, reason = self._transfer_checker.check(
                 text=text,
-                intent=intent or IntentResult(primary_intent=IntentLabel.FAQ),
+                intent=intent or IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0),
                 sentiment=sentiment,
                 session=session,
             )
-            return should, reason
+            return should, reason, level
         except Exception:
-            return False, ""
+            return False, "", None
+
+    async def _offer_transfer(
+        self,
+        session_id: str,
+        user_input: str,
+        intent: IntentResult,
+        entities: list[Entity],
+        sentiment: SentimentLabel,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """L3『先确认再转』: 连续低置信/兜底累计触发的转人工不直接派真人坐席,
+        而是挂一个待确认 (pending_action) 并返回固定确认话术 —— 下一轮客户明确回复"是/需要"
+        才真正转人工。
+
+        防『灌乱码刷真人』: 不能仅凭"连续 N 轮低置信"就自动把真人坐席派给输入; 也避免把
+        这类自动升级谎标成『客户主动请求』。真·明确转人工 (L1 关键词 / L2 高置信 transfer_agent /
+        敏感意图) 不走此确认, 仍即时转。
+        """
+        if self._session_manager is not None:
+            try:
+                pending = PendingAction(
+                    tool_name="TRANSFER_OFFER",
+                    confirm_prompt=_TRANSFER_OFFER_PROMPT,
+                    expires_at=datetime.now(UTC) + _TRANSFER_OFFER_TIMEOUT,
+                    arguments={"transfer_reason": reason},
+                )
+                await self._save_pending_action(session_id, pending)
+                logger.info("L3 转人工改为先确认: session=%s input=%r", session_id, user_input)
+            except Exception:
+                logger.debug("挂转人工待确认失败, 本轮仅澄清不转: session=%s", session_id)
+        return self._build_result(
+            session_id,
+            user_input,
+            _TRANSFER_OFFER_PROMPT,
+            "clarify",
+            intent.primary_intent.value,
+            intent.primary_confidence,
+            entities=entities,
+            sentiment=sentiment,
+        )
+
+    async def _maybe_offer_transfer_after_clarify(
+        self,
+        session_id: str,
+        user_input: str,
+        intent: IntentResult,
+        entities: list[Entity],
+        sentiment: SentimentLabel,
+    ) -> dict[str, Any] | None:
+        """澄清轮的 L3『先确认再转』补判 (run() 统一出口调用).
+
+        噪声门/低置信分支在 handler 内提前 return, 原本永远到不了路径末尾的
+        _check_transfer, 导致 streak 涨到几十也没有任何升级出口 (会话 178351b41:
+        streak=30 零邀请, 真被困客户只能在澄清话术里打转). 这里按"越线轮"
+        (streak == 阈值) 补挂邀请: 每个连续低置信周期只邀请一次不刷屏;
+        客户明确回复"是/需要"才真派真人, 与 L3 防"灌乱码刷人工"的语义一致.
+        """
+        if self._session_manager is None:
+            return None
+        try:
+            state = await self._session_manager.get_session(session_id)
+        except Exception:
+            return None
+        if state is None:
+            return None
+        threshold = get_settings().session.low_confidence_threshold
+        if state.low_confidence_streak != threshold:
+            return None
+        logger.info(
+            "澄清轮 L3 越线补判: session=%s streak=%d input=%r",
+            session_id,
+            state.low_confidence_streak,
+            user_input[:50],
+        )
+        return await self._offer_transfer(
+            session_id,
+            user_input,
+            intent,
+            entities,
+            sentiment,
+            f"L3_LOW_CONFIDENCE_STREAK: 连续 {state.low_confidence_streak} 轮低置信度",
+        )
 
     async def _load_history(self, session_id: str) -> list[dict[str, str]]:
         """加载对话历史作为 LLM 上下文
@@ -1119,9 +1708,14 @@ class LumioAgent:
                 kept_turns.insert(0, t)
                 used += est
 
-            # 如果有轮次被裁剪，异步触发摘要压缩（不阻塞用户请求）
+            # 如果有轮次被裁剪，异步触发摘要压缩（不阻塞用户请求）.
+            # P2-28 修复: 仅当裁剪量确实省下预算时才摘要 — 过去每轮小裁剪(2-4 轮,
+            # ~300 token)都触发 LLM 摘要, 与当前轮业务生成在同一串行 Ollama GPU 槽抢占,
+            # 且两种不同 prompt 的切换击穿 KV 前缀缓存, 把单轮从 4s 顶到 11s. 阈值以下
+            # 直接丢弃旧轮(等价"无摘要降级"), 长会话大裁剪时仍正常压缩, 短会话不再每轮付 GPU 代价。
             trimmed_turns = turns[:split_idx]
-            if trimmed_turns:
+            trimmed_est = sum(_estimate_tokens(t.content) for t in trimmed_turns)
+            if trimmed_turns and trimmed_est >= _SUMMARY_MIN_TRIMMED_TOKENS:
                 self._spawn_task(self._ensure_summary(session_id, trimmed_turns))
 
             return [
@@ -1200,7 +1794,11 @@ class LumioAgent:
                         {"role": "system", "content": summary_prompt},
                         {"role": "user", "content": user_content},
                     ],
-                    timeout=3.0,
+                    # P2-28 修复: 3s 对本地 qwen2.5:7b 会话摘要过紧 — 孤立调用即需 2-3s,
+                    # 与上一轮业务生成在同一串行 Ollama GPU 槽发生时被顶到 10s+,
+                    # 3s 下必超时→重试→占用 GPU 21s, 反串行阻塞下一轮业务生成 (实测 20s 尖峰)。
+                    # 抬到与生成同源 generate_timeout, 让慢但能成功的单次调用一次走完, 不重试翻倍。
+                    timeout=max(20.0, get_settings().llm.generate_timeout),
                 )
             except Exception:
                 logger.debug("对话摘要生成失败: session=%s", session_id)
@@ -1317,49 +1915,260 @@ class LumioAgent:
             return memory
         except Exception:
             logger.debug("构建会话记忆失败: session=%s", session_id)
+            return ""
 
-    async def _load_slot_prompt(self, session_id: str, intent: IntentLabel, entities: list[Entity]) -> str:
-        """加载/创建槽位追踪器，从实体池填充，返回槽位 prompt 段
+    async def _load_slot_prompt(
+        self, session_id: str, intent: IntentLabel, entities: list[Entity], user_input: str = ""
+    ) -> str:
+        """加载/更新槽位状态并持久化到会话状态(SessionState.slot_values), 返回槽位 prompt 段
 
-        槽位状态持久化在 Redis key lumio:slot:{session_id}，跨轮次保留。
-        仅当意图有定义的必填槽位时才返回非空 prompt。
+        生产级语义(替代旧独立 key lumio:slot:* 裸读写):
+        - 单一真相源: 槽位已填值随会话 meta 持久化, 经 patch_state 版本 CAS + 槽名级 union 写入,
+          并发两轮各自填不同槽互不覆盖; TTL 随会话, 消除硬编码 3600 与生命周期不一致。
+        - 历史反填: 本轮实体 ∪ last_entities ∪ entity_pool 共同补槽(不再只填本轮)。
+        - 跨意图继承: 意图切换不再重建 tracker 清空已填槽, 同名槽直接复用(如 挂失→补卡)。
+        - 派生: 满卡号 CARD_NUMBER 已填而卡尾缺失 → 派生后四位, 避免"有满卡仍追问尾号"。
+        - COMPLAINT: issue_detail 无法由实体抽取命中, 原文回填, 解除必填食位对噪声门的互锁。
+        - 值归一: 号码类去分隔符 + 长度上限 64, 防 prompt 膨胀。
+        仅当当前意图有已定义槽位时才返回非空 prompt。
         """
-        import json
+        from lumio.services.bot.entity_extractor import normalize_entity_type
+        from lumio.services.bot.slot_tracker import _ENTITY_TO_SLOT
+        from lumio.shared.models import SlotValue
 
-        from lumio.services.bot.slot_tracker import SlotTracker
-
-        redis = self._session_manager._redis if self._session_manager else None
-
-        # 读取已有 tracker
-        tracker: SlotTracker | None = None
-        if redis:
+        state = None
+        if self._session_manager is not None:
             try:
-                raw = await redis.get(f"lumio:slot:{session_id}")
-                if raw:
-                    data = json.loads(raw)
-                    # 意图切换时重置 tracker
-                    if data.get("intent") == intent.value:
-                        tracker = SlotTracker.from_dict(data)
+                state = await self._session_manager.get_session(session_id)
             except Exception:
-                pass
+                state = None
+        fills: dict[str, SlotValue] = dict(state.slot_values) if state else {}
 
-        # 创建新 tracker
-        if tracker is None:
-            tracker = SlotTracker.for_intent(intent)
+        # 候选实体: 本轮 ∪ 历史 last_entities ∪ entity_pool (跨轮反填)
+        candidates: list[Entity] = list(entities or [])
+        if state is not None:
+            candidates += list(state.last_entities or [])
+            candidates += list(state.entity_pool or [])
 
-        # 从实体池填充槽位
-        if entities:
-            entity_dicts = [
-                {"entity_type": e.entity_type, "value": e.value} for e in entities if e.entity_type and e.value
-            ]
-            tracker.fill_from_entities(entity_dicts)
+        def _clean(kind: str, raw: str) -> str:
+            text = (raw or "").strip()
+            if kind in ("card_number", "card_tail", "phone_number"):
+                text = re.sub(r"[\s\- ]", "", text)
+            return text[:64]
 
-        # 持久化
-        if redis:
-            with contextlib.suppress(Exception):
-                await redis.setex(f"lumio:slot:{session_id}", 3600, json.dumps(tracker.to_dict(), ensure_ascii=False))
+        # 实体 → 槽位 (首值优先, 已填不覆盖)
+        for e in candidates:
+            etype = normalize_entity_type(e.entity_type)
+            if not etype or not e.value:
+                continue
+            slot_name = _ENTITY_TO_SLOT.get(etype)
+            if not slot_name or slot_name in fills:
+                continue
+            fills[slot_name] = SlotValue(name=slot_name, value=_clean(slot_name, e.value), source="entity")
 
+        # 派生: 满卡号 → 卡尾
+        card_full = fills.get("card_number")
+        if card_full and card_full.value and "card_tail" not in fills:
+            tail = card_full.value[-4:] if len(card_full.value) >= 4 else card_full.value
+            if tail:
+                fills["card_tail"] = SlotValue(name="card_tail", value=tail, source="derived")
+
+        # COMPLAINT: 必填食位 issue_detail 原文回填
+        if intent == IntentLabel.COMPLAINT and "issue_detail" not in fills:
+            text = (user_input or "").strip()
+            if len(text) >= 4:
+                fills["issue_detail"] = SlotValue(name="issue_detail", value=text[:256], source="message")
+
+        # CAS 持久化(改经 patch_state, 继承版本 CAS + 槽名级 union)
+        if state is not None and self._session_manager is not None and fills:
+            try:
+                patch = {"slot_values": {k: v.model_dump() for k, v in fills.items()}}
+                await self._session_manager.patch_state(session_id, state.version, patch, writer="bot_slot")
+            except Exception as exc:
+                logger.debug("槽位状态写入失败(不阻断): session=%s err=%s", session_id, exc)
+
+        tracker = SlotTracker.for_intent(intent)
+        tracker.apply_fills(fills)
         return tracker.build_prompt() if tracker.has_slots else ""
+
+    async def _missing_required_slots(self, session_id: str, intent: IntentLabel) -> list[tuple[str, str]]:
+        """读会话状态 slot_values + 当前意图静态必填定义, 返回尚未填充的必填槽 [(name, label), ...].
+
+        用于噪声门先判"本句是否在回上文话"+ 指代零主回指补槽: 存在缺的必填槽说明 bot 刚在等
+        这类信息, 本句把它填上即视为回话, 避免"上轮问卡号/金额, 本句答数字"被误判成噪声澄清。
+        只读不写, 与 _load_slot_prompt 共用同一真相源(SessionState.slot_values)。
+        无会话/异常时返回空(等于不启用回话豁免)。
+        """
+        if not session_id or self._session_manager is None:
+            return []
+        try:
+            state = await self._session_manager.get_session(session_id)
+        except Exception:
+            state = None
+        if state is None:
+            return []
+        fills = state.slot_values or {}
+        tracker = SlotTracker.for_intent(intent)
+        tracker.apply_fills(fills)
+        return [(s.name, s.label) for s in tracker.missing_required]
+
+    async def _evaluate_noise_gate(
+        self,
+        session_id: str,
+        user_input: str,
+        intent: IntentResult,
+        entities: list[Entity] | None,
+        missing_slots: list[tuple[str, str]] | None = None,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """噪声门统一判定(多轮治理 P0): 返回 (block_reason|None, evidence)。
+
+        block_reason:
+          - "low_confidence"  分类器不识别(conf < 下限)
+          - "noise"           内容级噪声(纯数字/零元音乱码)且非回话
+          - None              放行
+        回话豁免: missing_slots 由 run() 在 domain 分派前预取(见 run 注释), 避免各 handler 的
+        _load_slot_prompt 因意图切换重置 tracker 而清掉"上文在等什么"; 本句填上缺的必填槽/
+        纯数字 → 放行, 即便形状像噪声或低置信。开关关时 run() 传 [] → 行为等同旧版。
+        """
+        guard_on = get_settings().classification.rephrase_guard_enabled
+        missing: list[tuple[str, str]] = list(missing_slots or [])
+        is_replying = _is_replying_to_context(user_input, entities, missing)
+        low_conf = intent.primary_confidence < CLARIFY_CONFIDENCE_FLOOR
+        is_noise = _is_noise_input(user_input)
+        # P1: energy-OOD "认不认"信号 (仅 ood_enabled 且 BERT 快路径有 energy 时启用).
+        # energy "unknown" → 倾向 OOD/噪声; "ambiguous" → 落在模糊带, 交 LLM 仲裁.
+        cls_settings = get_settings().classification
+        energy = None
+        verdict = None
+        if cls_settings.ood_enabled:
+            # P1 并发修复: energy 随本次分类的 IntentResult 透传(intent.energy),
+            # 关闭对共享 classifier._last_energy 的跨 await 读取, 避免多会话串线.
+            # 只要判定算过 energy 就必然挂在本次结果上; None 即本次确实没算到, 不兜底旧值.
+            energy = getattr(intent, "energy", None)
+            if energy is not None:
+                verdict = ood_verdict(energy, cls_settings.ood_energy_threshold, cls_settings.ood_ambiguous_band)
+        evidence: dict[str, Any] = {
+            "rephrase_guard_enabled": guard_on,
+            "is_replying": is_replying,
+            "missing_slots": missing,
+            "is_noise_shape": is_noise,
+            "low_confidence": low_conf,
+            "confidence": intent.primary_confidence,
+            "energy": energy,
+            "ood_verdict": verdict,
+            # P0 快慢分歧证据: 事后审计可直接从决策日志定位"哪一路在幻觉".
+            "fast_conf": intent.fast_conf,
+            "fast_intent": intent.fast_intent.value if intent.fast_intent else None,
+            "fast_slow_disagreement": _fast_slow_disagreement(intent),
+        }
+        if is_replying:
+            return None, evidence
+        # P1: energy 强"不认" -> 直接当噪声拦截 (非回话), 高于低置信的澄清强度
+        if verdict == "unknown":
+            return "ood_unknown", evidence
+        if low_conf:
+            return "low_confidence", evidence
+        if is_noise:
+            return "noise", evidence
+        # P0 快慢分歧: 慢路径把乱码/含糊输入幻觉成另一意图且置信通胀(最终置信
+        # 越过上面所有以它为触发条件的门) -> 拦回确定性澄清 (会话 e33d1fa8).
+        if _fast_slow_disagreement(intent):
+            return "fast_slow_disagreement", evidence
+        # P1: 模糊带宽仲裁 — 语义吃不准(BERT 中段 energy / 低置信但非噪声)时交 LLM 裁决.
+        # LLM 结果作为弱信号投票, 不单独放行: 仅当 LLM 明确判 business 时结合实体/槽位放行,
+        # 判 noise 则拦截; chitchat/unknown 交由下方既有语义路径(不硬拦, 也不硬答).
+        # P2 重接线: 触发频带从"最终置信<0.5"扩到"快路径证据弱(fast_conf<0.5)". 慢路径置信
+        # 在乱码上会通胀(e33d1fa8: 0.39 被覆盖成 0.7), 以最终置信为触发条件的仲裁器永远等不到
+        # 通胀结果进来; 快路径分数是独立信号, "弱快证据 + 高慢置信"(两路同意图的弱输入,
+        # 分歧门因意图一致不覆盖)正是该让 LLM 看一眼是不是噪声的形态.
+        fast_weak = intent.fast_conf is not None and intent.fast_conf < _DISAGREEMENT_FAST_FLOOR
+        if (
+            cls_settings.llm_arbiter_enabled
+            and (verdict == "ambiguous" or (verdict is None and (intent.primary_confidence < 0.5 or fast_weak)))
+            and self._classifier is not None
+            and getattr(self._classifier, "_llm", None) is not None
+        ):
+            verdict_domain = await self._arbitrate_domain(user_input, getattr(self._classifier, "_llm", None))
+            evidence["arbiter_domain"] = verdict_domain["domain"]
+            if verdict_domain["domain"] == "noise":
+                return "arbiter_noise", evidence
+        # P2: 多信号噪声闸 (InputGate) 额外投票 — 惊讶度异常 + 不认/吃不准信号佐证才拦.
+        # 回话/实体填槽由 InputGate 内部硬否决, 不因惊讶度误杀; 开关默认关(观测).
+        if cls_settings.noise_gate_enabled:
+            ig = self._gate
+            ig_verdict = await asyncio.to_thread(
+                ig.evaluate,
+                text=user_input,
+                is_replying=is_replying,
+                low_conf=low_conf,
+                noise_shape=is_noise,
+                energy_verdict=verdict,
+            )
+            evidence["input_gate"] = ig_verdict.signals
+            if ig_verdict.decision == "block":
+                return f"input_gate_{ig_verdict.reason}", evidence
+        return None, evidence
+
+    async def _arbitrate_domain(self, user_input: str, llm: Any) -> dict[str, Any]:
+        """P1: 把 LLM 仲裁调用薄封装, 失败返回 unknown(不阻断)."""
+        try:
+            if hasattr(llm, "arbitrate"):
+                arbitrated = await llm.arbitrate(user_input)
+                if isinstance(arbitrated, dict):
+                    return arbitrated
+                logger.debug("LLM 仲裁返回非结构化结果(视为 unknown): %r", user_input)
+            return {"domain": "unknown", "confidence": 0.0, "structured": False}
+        except Exception:
+            logger.debug("LLM 仲裁异常(视为 unknown 弱信号): %r", user_input)
+            return {"domain": "unknown", "confidence": 0.0, "structured": False}
+
+    # ── P3 误杀回流 (感知缝): 探针式标记 + staging 落盘 ──
+    def _mark_reply_pass(self, session_id: str, user_input: str) -> None:
+        """记录某会话刚被"回话放行"(CONTEXT_REPLY_PASS).
+
+        定长 LRU: 超过上限时淘汰最早未被访问者; 每次访问把该会话移到队尾。
+        """
+        if not session_id:
+            return
+        entry = self._recent_reply_pass.pop(session_id, None) or {}
+        entry.update({"input": user_input or "", "ts": time.monotonic()})
+        self._recent_reply_pass[session_id] = entry
+        while len(self._recent_reply_pass) > _REPLY_PASS_MAX_SESSIONS:
+            self._recent_reply_pass.popitem(last=False)
+
+    async def _maybe_flag_mis_kill(self, session_id: str, user_input: str, gate_reason: str) -> None:
+        """上轮判"回话放行"、本轮又被噪声门拦 → 疑似误杀, 探针式回流 + 决策留痕.
+
+        感知→归因: 把样本写进 backflow staging (人审/回灌种子), 并打 MIS_KILL_CANDIDATE。
+        只认新鲜窗口内的放行 (过久未触发说明非"紧接着回话被拦", 不误归因); 失败不阻断主链路。
+        """
+        if not session_id:
+            return
+        prev = self._recent_reply_pass.pop(session_id, None)
+        if not prev:
+            return
+        # 放行距本次拦截太久 → 不算"误杀", 避免把无关的历史回话错归因到这个样本
+        if time.monotonic() - prev.get("ts", 0.0) > _REPLY_PASS_FRESH_SECONDS:
+            return
+        try:
+            from lumio.services.common.trap_collector import default_trap_collector
+
+            default_trap_collector().record_backflow(
+                text=user_input,
+                session_id=session_id,
+                reason=f"reply_pass_then_blocked:{gate_reason}",
+                extra={"prev_reply_input": prev["input"]},
+            )
+            log_decision(
+                session_id=session_id,
+                agent_name="bot_agent",
+                action=DecisionAction.MIS_KILL_CANDIDATE,
+                reasoning=f"疑似误杀: 上轮回话放行后本轮被噪声门拦({gate_reason})",
+                evidence={"prev_reply_input": prev["input"], "reblocked_reason": gate_reason},
+                turn_id=uuid_module.uuid4().hex[:16],
+            )
+        except Exception:
+            logger.debug("疑似误杀标记失败(不阻断): session=%s", session_id)
 
     def _build_result(
         self,
@@ -1412,15 +2221,33 @@ def _is_greeting(text: str) -> bool:
 # 无害收尾语被判成 faq 白白走一次 LLM (实测 13s + 一次模型调用).
 _FAREWELL_WORDS = {"再见", "拜拜", "bye", "谢谢", "感谢", "没了", "没有了"}
 _FAREWELL_CLOSERS = (
-    "没有其他问题了", "没有别的问题了", "没有其它问题了",
-    "没有问题了", "没别的事了", "没什么事了", "就这些",
-    "就这些问题", "暂时没有了", "不用了谢谢",
+    "没有其他问题了",
+    "没有别的问题了",
+    "没有其它问题了",
+    "没有问题了",
+    "没别的事了",
+    "没什么事了",
+    "就这些",
+    "就这些问题",
+    "暂时没有了",
+    "不用了谢谢",
 )
 
 
 def _is_farewell(text: str) -> bool:
     norm = _normalize_text(text)
     return bool(norm) and (norm in _FAREWELL_WORDS or any(c in norm for c in _FAREWELL_CLOSERS))
+
+
+# 乱答防上线判决阈值: 意图分类置信低于此即视为"分类未识别"(与 classifier 的
+# fallback 判定阈值一致)。knowledge 与 fallback 两条生成路径共同遵守——低于此
+# 时不交给 LLM 编造作答, 一律回确定性澄清话术(零幻觉、秒回)。
+CLARIFY_CONFIDENCE_FLOOR = 0.3
+
+# P3 误杀探针生命周期: 放行记录定长上限 + "紧接着被拦"的新鲜度窗口。
+# 长运行服务内存有界; 只有窗口内(紧接上一轮)被拦才算疑似误杀, 过久不归因。
+_REPLY_PASS_MAX_SESSIONS = 5000
+_REPLY_PASS_FRESH_SECONDS = 180.0
 
 
 def _has_grounding(session_memory: str, history: list | None) -> bool:
@@ -1435,6 +2262,109 @@ def _has_grounding(session_memory: str, history: list | None) -> bool:
     if any(m in session_memory for m in markers):
         return True
     return bool(history)
+
+
+def _is_noise_input(text: str) -> bool:
+    """内容级噪声判定: 去掉数字与标点后没有可表义字符(纯数字/纯符号/仅空白),
+    或余下为纯拉丁字母且无任何元音的乱码串(如 "YRNN"/"HTY"/"HWS46"/"jdfkl"),
+    或余下为超短重复结构(同字≥4连/ABAB/AABB, 如 "卡卡卡卡"/"看快看快"/"嗯嗯啊啊")。
+
+    用于堵住快路径乱答漏点: BERT 快路径可能把这类噪音高置信(≥0.7)判成闲聊/FAQ
+    直接返回, 置信度门(conf<0.3)盖不住, 若放行会给 LLM 硬编答复。这类输入无法被
+    LLM 正确作答, 必须确定性澄清。带真实语义的内容("22元"、"卡号后四位 4444")因
+    中文回落; 真实英文词("refund"/"bill"/"transfer"/"happy")恒含元音, 不被误伤;
+    三字内口语("哈哈哈")与真实短句不命中重复结构, 不被误伤。
+    """
+    stripped = re.sub(r"[\d０-９\s，。、；：！？!?,.;:·…─~～#@*&%$()（）\"'\-]+", "", text)
+    if not stripped:
+        return True
+    # 纯拉丁字母且零元音的乱码串(≥3 位)-> 噪音. 用 fullmatch 限定"余下全是字母",
+    # 避免把含中文的串(如 "HWS46元")误伤; 只判零元音(而非元音≤1), 避免误伤 bill/happy.
+    if re.fullmatch(r"[A-Za-z]{3,}", stripped) and not any(ch in "aeiouAEIOU" for ch in stripped):
+        return True
+    # P0 中文乱码形状: 整串(≥4位)为同一字连排/两字交替/两字各连排 -- 键盘乱打或
+    # 输入法误触的典型形态. fullmatch 限定"整串只有该结构", 真实句子里局部重复
+    # ("好的好的我知道了")不受影响; 真实叠词口语(哈哈哈=3字)因长度门槛不拦.
+    return bool(
+        len(stripped) >= 4
+        and (
+            re.fullmatch(r"(.)\1{3,}", stripped)  # AAAA: 卡卡卡卡
+            or re.fullmatch(r"(.)\1+(.)\2+", stripped)  # AABB: 嗯嗯啊啊
+            or re.fullmatch(r"(..)\1+", stripped)  # ABAB: 看快看快
+        )
+    )
+
+
+# P0 快慢分歧门: BERT 快路径与 LLM 慢路径对同一输入给出不同意图, 且快路径置信偏低
+# (< 0.5)或慢路径置信也不高(< 0.4)时, 判为"两路分歧" -- 乱码/极含糊输入的典型特征
+# (会话 e33d1fa8: 乱码 BERT limit_query@0.39 / LLM bill_query@0.7, 慢路径置信通胀
+# 越过一切以"最终置信"为触发条件的闸门, 架构审核根因 R1). 实测 seed_dataset 191
+# 真值误伤 1 条(0.5%, 代价一轮澄清); 16 条手工乱码拦 12 条.
+_DISAGREEMENT_FAST_FLOOR = 0.5
+_DISAGREEMENT_SLOW_FLOOR = 0.4
+
+
+def _fast_slow_disagreement(intent: IntentResult) -> bool:
+    """快慢路径是否在低把握下分歧(仅慢路径覆盖快路径时有定义, 否则恒 False)."""
+    if intent.fast_conf is None or intent.fast_intent is None:
+        return False
+    if intent.fast_intent == intent.primary_intent:
+        return False
+    return intent.fast_conf < _DISAGREEMENT_FAST_FLOOR or intent.primary_confidence < _DISAGREEMENT_SLOW_FLOOR
+
+
+def _is_replying_to_context(
+    user_input: str, entities: list[Entity] | None, missing_slots: list[tuple[str, str]]
+) -> bool:
+    """本句是否在"回上文的话"(而非瞎按键盘)。
+
+    当且仅当【上文在等一个必填槽】(missing_slots 非空)且本句把它回应上了才算回话:
+    - 抽到实体命中缺的槽(_ENTITY_TO_SLOT), 或
+    - 是纯数字短串(金额/卡号/卡尾/期数等短填充), 或
+    - 是确认词(嗯对/是的/确认等)——bot 刚在等卡号/金额, 用户"嗯对/好的"即回话背书。
+
+    判定刻意保守: 宁可放过一条[上文漏网的]真噪声(顶多多一句澄清), 也不误杀一句真实回话。
+    非回话(含"先问候再乱打 hjfw"——不填任何槽、也不是确认词)仍由调用方按噪声处理。
+    """
+    if not missing_slots:
+        return False
+    missing_names = {name for name, _ in missing_slots}
+    for e in entities or []:
+        if _ENTITY_TO_SLOT.get(e.entity_type) in missing_names:
+            return True
+    if _is_confirmation(user_input):
+        return True
+    # 纯数字回复: 放宽到 1-19 位兜住金额/卡号/卡尾等真实回话。此分支仅在"上文在等
+    # 必填槽"(missing_slots 非空)时才会触达, 故不必担心把独立乱数字误当回话; 卡号
+    # 16 位/身份证 18 位都落在范围内, 避免真实回话被当噪声拦。
+    return bool(re.fullmatch(r"\d{1,19}", _normalize_text(user_input)))
+
+
+# 确认词: 上一轮 bot 要求提供某必填信息(卡号/金额/期数)后, 用户用这些短词确认/背书
+# 即视为回话放行, 避免"要卡号 → 用户回 嗯对"被误判成噪声澄清。整串归一化后命中才认,
+# 避免把 "对, 那再帮我查个额度" 这种带继续提问的正常话误判成回话。
+_CONFIRMATION_WORDS = {
+    "嗯",
+    "嗯嗯",
+    "嗯对",
+    "嗯好的",
+    "嗯好",
+    "好的",
+    "好",
+    "对",
+    "对的",
+    "是的",
+    "是",
+    "没错",
+    "确认",
+    "可以",
+    "好的对",
+    "就这个",
+}
+
+
+def _is_confirmation(text: str) -> bool:
+    return _normalize_text(text) in _CONFIRMATION_WORDS
 
 
 def _is_uncertain_intent(intent: Any) -> bool:

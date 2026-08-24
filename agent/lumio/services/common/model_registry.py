@@ -11,6 +11,7 @@
 持久化: 一个 JSON 状态文件 (默认 data/intent_classification/model_registry.json),
 仅存版本指针与裁决记录, 不搬运权重 (权重目录由各版本 path 指向, 不入 git).
 """
+
 from __future__ import annotations
 
 import json
@@ -67,7 +68,7 @@ GatesRunner = Callable[[], list[dict[str, Any]]]  # 返回 gate 结果 dict 列�
 
 
 class ModelRegistry:
-    """版本状态机 (本地 JSON 持久化). """
+    """版本状态机 (本地 JSON 持久化)."""
 
     def __init__(self, state_path: str = "", allow_ungated: bool = False) -> None:
         self._state_path = _resolve_agent_path(state_path) if state_path else ""
@@ -87,9 +88,7 @@ class ModelRegistry:
         except (OSError, ValueError):
             logger.warning("模型注册表状态文件损坏, 以空状态启动: %s", self._state_path)
             return
-        self._versions = {
-            k: ModelVersion.from_dict(v) for k, v in data.get("versions", {}).items()
-        }
+        self._versions = {k: ModelVersion.from_dict(v) for k, v in data.get("versions", {}).items()}
         self._active = data.get("active")
         self._previous_active = data.get("previous_active")
         self._canary = data.get("canary")
@@ -106,9 +105,7 @@ class ModelRegistry:
             "canary_traffic": self._canary_traffic,
         }
         Path(self._state_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(self._state_path).write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        Path(self._state_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # ── 版本管理 ──
     def register(self, version_id: str, path: str, notes: str = "") -> ModelVersion:
@@ -145,7 +142,7 @@ class ModelRegistry:
         *,
         force: bool = False,
     ) -> tuple[bool, list[dict[str, Any]]]:
-        """canary → active. 必须 gate 全 PASS (force=True 除外, 慎用). """
+        """canary → active. 必须 gate 全 PASS (force=True 除外, 慎用)."""
         report: list[dict[str, Any]] = []
         if gate_runner is not None:
             report = list(gate_runner())
@@ -177,7 +174,7 @@ class ModelRegistry:
         return True, report
 
     def rollback(self) -> str | None:
-        """回退到 previous_active (若存在). """
+        """回退到 previous_active (若存在)."""
         if self._previous_active and self._previous_active in self._versions:
             prev = self._versions[self._previous_active]
             prev.status = "active"
@@ -191,7 +188,7 @@ class ModelRegistry:
         return None
 
     def compose_classifier_path(self, fallback: str) -> str:
-        """当前应使用的 BERT 模型路径: active > fallback. """
+        """当前应使用的 BERT 模型路径: active > fallback."""
         if self._active and self._active in self._versions:
             return self._versions[self._active].path
         return _resolve_agent_path(fallback)

@@ -17,6 +17,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -39,6 +40,10 @@ class DecisionAction(str, Enum):
     REFLECTION = "reflection"
     CACHE_HIT = "cache_hit"
     USER_CONFIRM = "user_confirm"
+    MIS_KILL_CANDIDATE = "mis_kill_candidate"  # P3 疑似误杀(放行后又澄清/重问)回流探针
+    # 多轮噪声/闲聊治理 (P0): 噪声被拦截 / 上下文回应放行
+    NOISE_BLOCKED = "noise_blocked"
+    CONTEXT_REPLY_PASS = "context_reply_pass"
 
 
 @dataclass
@@ -303,6 +308,41 @@ class DecisionLogger:
                 logger.debug("Redis 客户端初始化失败: %s", exc)
                 self._redis = False
         return self._redis if self._redis else None
+
+    # ── P3 定期评审: 噪声闸动作分组统计 (误杀率趋势) ──
+    async def query_noise_gate_stats(
+        self, *, window_days: int = 7, actions: tuple[str, ...] | None = None
+    ) -> dict[str, int]:
+        """按决策动作统计窗口内噪声闸事件次数.
+
+        用于评审: 把 NOISE_BLOCKED / CONTEXT_REPLY_PASS / MIS_KILL_CANDIDATE 分组出报表,
+        观察"回话放行占比"与"疑似误杀"趋势。PG 不可用时返回空 dict(不阻断)。
+        """
+        actions = actions or ("noise_blocked", "context_reply_pass", "mis_kill_candidate")
+        factory = await self._get_db_session_factory()
+        out: dict[str, int] = {}
+        if not factory:
+            return out
+        try:
+            from sqlalchemy import func, select
+
+            from lumio.shared.orm_models import DecisionLog
+
+            cutoff = datetime.now(UTC) - timedelta(days=window_days)
+            stmt = (
+                select(DecisionLog.action, func.count(DecisionLog.id).label("cnt"))
+                .where(
+                    DecisionLog.action.in_(actions),
+                    DecisionLog.created_at >= cutoff,
+                )
+                .group_by(DecisionLog.action)
+            )
+            async with factory() as session:  # type: ignore[no-untyped-call]
+                result = await session.execute(stmt)
+                out = {str(row.action): int(row.cnt) for row in result.all()}
+        except Exception as exc:
+            logger.warning("噪声闸统计失败: %s", exc)
+        return out
 
 
 # 全局单例

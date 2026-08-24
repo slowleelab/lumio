@@ -284,20 +284,27 @@ async def test_get_status_no_redis(monkeypatch):
 
 
 async def test_delete_redis_by_customer_match():
-    """SCAN 匹配 customer_id 的 session 删除 (meta+history+slot)"""
+    """SCAN 匹配 customer_id 的 session 删除 (meta+history; 槽位已填值随 meta 一并删除)"""
     service = GDPRService()
     fake = _FakeRedis()
-    fake._set_raw("lumio:session:s1:meta", json.dumps({"customer_id": "c1", "session_id": "s1"}))
+    fake._set_raw(
+        "lumio:session:s1:meta",
+        json.dumps(
+            {
+                "customer_id": "c1",
+                "session_id": "s1",
+                "slot_values": {"card_tail": {"name": "card_tail", "value": "1234", "source": "entity"}},
+            }
+        ),
+    )
     fake._set_raw("lumio:session:s2:meta", json.dumps({"customer_id": "c2", "session_id": "s2"}))
     fake._set_raw("lumio:session:s1:history", json.dumps(["msg"]))
-    fake._set_raw("lumio:slot:s1", "{}")
     service._redis = fake
 
     deleted = await service._delete_redis_by_customer("c1")
     assert deleted == 1
     assert "lumio:session:s1:meta" not in fake.data
     assert "lumio:session:s1:history" not in fake.data
-    assert "lumio:slot:s1" not in fake.data
     assert "lumio:session:s2:meta" in fake.data  # 其他客户保留
 
 

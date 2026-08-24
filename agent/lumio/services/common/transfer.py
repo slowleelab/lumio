@@ -13,7 +13,8 @@ from pathlib import Path
 
 from lumio.shared.config import get_settings
 from lumio.shared.models import (
-    IntentLabel,
+    SENSITIVE_INTENTS,
+    TRANSFER_INTENTS,
     IntentResult,
     SentimentLabel,
     SessionState,
@@ -21,6 +22,13 @@ from lumio.shared.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 语义级(L2)认定"转人工/敏感写"所需的最低置信。
+# 乱码/连续低置信被判成 transfer_agent 或幻觉出敏感候补时把握通常远低于 0.5(已线上复现),
+# 据此拉真人既误伤事实又给"灌乱码刷人工坐席"留口子。真·明确转人工靠 L1 关键词或高置信主意图。
+# 此常量同时被 bot_agent 的 business 路径引用, 作为"低置信不即时派真人"的统一阈值。
+TRANSFER_CONFIDENT_CONF = 0.5
+
 
 # 默认转人工关键词
 _DEFAULT_TRANSFER_KEYWORDS = [
@@ -132,19 +140,31 @@ class TransferChecker:
     ) -> tuple[bool, str]:
         """L2 语义触发
 
-        条件：
-        - 情感为 negative/angry 且分类置信度 > 0.8
-        - 或意图为 complaint
-        - 或意图为 transfer_agent
+        条件（已加置信度门槛，堵低置信/幻觉候补拉真人的口子）：
+        - 主意图为 transfer_agent **且置信 ≥ TRANSFER_CONFIDENT_CONF** → 客户主动要求人工
+          (低置信的 transfer_agent 多为乱码/连续低置信误判，靠 L1 关键词或下一轮高置信即可转)
+        - 主意图为敏感写(挂失/投诉) → **不受置信门槛**，合规底线即时转
+        - 敏感写仅出现在候补意图时，需整体置信 ≥ TRANSFER_CONFIDENT_CONF 才立即转
+          (如"卡丢了顺便查最后一笔"高置信多意图；乱码幻觉出的敏感候补低置信则不得拉真人)
+        - 情感 negative/angry 且置信 > 0.8
         """
-        if intent.primary_intent == IntentLabel.TRANSFER_AGENT:
+        conf = intent.primary_confidence
+        if intent.primary_intent in TRANSFER_INTENTS and conf >= TRANSFER_CONFIDENT_CONF:
             return True, "L2_INTENT_TRANSFER: 用户主动要求转人工"
 
-        if intent.primary_intent == IntentLabel.COMPLAINT:
-            return True, "L2_INTENT_COMPLAINT: 投诉意图"
+        if intent.primary_intent in SENSITIVE_INTENTS:
+            return True, f"L2_INTENT_{intent.primary_intent.name}: 敏感写意图={intent.primary_intent.value}"
 
-        if sentiment in (SentimentLabel.NEGATIVE, SentimentLabel.ANGRY) and intent.primary_confidence > 0.8:
-            return True, f"L2_NEGATIVE_SENTIMENT: 情感={sentiment.value}, 置信度={intent.primary_confidence:.2f}"
+        # 次要意图里也含敏感写的场景 (如"卡丢了,顺便查最后一笔消费"挂失主+交易次),
+        # 集合判断避免拆细后精确比较漏判敏感意图。
+        # 仅当整体置信不低时才据此即时转 —— 乱码被幻觉出 complaint 候补(已复现)必须被拦下。
+        alt_labels = set(intent.alternatives or [])
+        if alt_labels & SENSITIVE_INTENTS and conf >= TRANSFER_CONFIDENT_CONF:
+            sensitive = next(iter(alt_labels & SENSITIVE_INTENTS))
+            return True, f"L2_INTENT_SENSITIVE: 命中敏感意图={sensitive.value}"
+
+        if sentiment in (SentimentLabel.NEGATIVE, SentimentLabel.ANGRY) and conf > 0.8:
+            return True, f"L2_NEGATIVE_SENTIMENT: 情感={sentiment.value}, 置信度={conf:.2f}"
 
         return False, ""
 

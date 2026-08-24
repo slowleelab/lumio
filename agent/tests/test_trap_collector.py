@@ -3,6 +3,7 @@
 覆盖: PII 打码、采样触发条件、上下文归属、后台落库、分类器接缝注入.
 不加载真实 torch / 不依赖 PG (用 fake session factory 捕获落库行).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -109,9 +110,7 @@ class TestShouldCapture:
 
     def test_clear_normal_not_captured(self) -> None:
         # 高置信 + 无分歧 + 无慢路径 → 不采 (除非 ambient)
-        assert not self.collector.should_capture(
-            _rec(final_source="fast", final_confidence=0.9, margin=0.3)
-        )
+        assert not self.collector.should_capture(_rec(final_source="fast", final_confidence=0.9, margin=0.3))
 
     def test_disabled_never_captures(self) -> None:
         c = TrapCollector(enabled=False, ambient_rate=0.0)
