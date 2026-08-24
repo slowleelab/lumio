@@ -185,6 +185,12 @@ public class SessionManager implements SessionStateListener {
      * 将坐席分配给会话
      */
     private boolean assignAgentToSession(Session session, Agent agent) {
+        // 先把归属坐席落到 session 上, 使 ASSIGN_AGENT 事件监听器(如 AgentChannelHandler.onSessionAssigned)
+        // 能取到 getAgentId() 推送新会话帧; 否则监听器此时仍为 null, 坐席 WebSocket 拿不到新会话,
+        // 坐席会话列表实时不出现转来的会话, 后续客户消息也无法计入未读。
+        session.setAgentId(agent.getAgentId());
+        session.setBackendId(agent.getBackendId());
+
         // 执行状态转换
         SessionTransitionResult result = transitionManager.transition(session, SessionEvent.ASSIGN_AGENT, agent, null);
 
@@ -194,8 +200,6 @@ public class SessionManager implements SessionStateListener {
         }
 
         // 更新会话信息
-        session.setAgentId(agent.getAgentId());
-        session.setBackendId(agent.getBackendId());
         session.setSubStatus(SessionSubStatus.RINGING);
         sessionStore.save(session);
 
