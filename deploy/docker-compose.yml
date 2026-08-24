@@ -123,7 +123,7 @@ services:
 
   # ── Milvus 2.4 Standalone ─────────────────────────
   milvus:
-    image: milvusdb/milvus:v2.4.0
+    image: milvusdb/milvus:v2.4.24
     container_name: lumio-milvus
     restart: unless-stopped
     command: ["milvus", "run", "standalone"]
