@@ -24,6 +24,7 @@ from lumio.shared.models import (
     DialogueTurn,
     Entity,
     IntentResult,
+    PendingAction,
     SessionPhase,
     SessionState,
     SessionSubPhase,
@@ -246,6 +247,18 @@ class SessionManager:
                         continue
             return out
 
+        # 待确认操作防御解析: patch_state 写入的 pending_action 若不在此解析回填,
+        # 会被静默丢弃 —— L3 转人工确认("是/需要")与敏感工具确认整条状态机形同虚设
+        # (实测: patch 返回 ok 且版本递增, 但 get_session 读回 pending_action=None)。
+        def _parse_pending_action(v: Any) -> PendingAction | None:
+            if not isinstance(v, dict) or not v.get("tool_name"):
+                return None
+            try:
+                return PendingAction(**v)
+            except Exception:
+                logger.warning("pending_action 解析失败, 按空处理: %r", v)
+                return None
+
         return SessionState(
             session_id=meta["session_id"],
             customer_id=meta.get("customer_id"),
@@ -280,6 +293,7 @@ class SessionManager:
             agent_id=meta.get("agent_id"),
             transfer_reason=meta.get("transfer_reason"),
             transfer_summary=meta.get("transfer_summary"),
+            pending_action=_parse_pending_action(meta.get("pending_action")),
             created_at=datetime.fromisoformat(meta["created_at"]).replace(tzinfo=None)
             if meta.get("created_at")
             else datetime.now(),
@@ -729,6 +743,9 @@ class SessionManager:
             "agent_id": state.agent_id,
             "transfer_reason": state.transfer_reason,
             "transfer_summary": state.transfer_summary,
+            # P0 修复: pending_action 必须序列化 —— 此前缺失, 每次 _save_meta 全量 SET
+            # 都会把 patch_state 刚写入的待确认操作整体擦除 (转人工/敏感工具确认链全断).
+            "pending_action": state.pending_action.model_dump(mode="json") if state.pending_action else None,
             "created_at": state.created_at.isoformat(),
             "last_active_at": state.last_active_at.isoformat(),
             "version": state.version,

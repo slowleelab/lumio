@@ -1759,3 +1759,191 @@ class TestNoiseGateMultiTurn:
         reason, evidence = await agent._evaluate_noise_gate("s1", "臼杷扡尢", intent, [], [])
         assert reason == "input_gate_surprisal_corroborated"
         assert evidence["input_gate"]["block_reason"] == "surprisal_corroborated"
+
+
+class TestOfferTransferAnswerAppend:
+    """L3『先确认再转』先答后问: 已生成真实答案时答案下发 + 邀约追加, 同时挂 pending_action。
+
+    回归锚点 (会话 f08227d4): 客户连问两次"分期", 第二次答案已生成却被邀约整条替换。
+    """
+
+    def _make_agent(self) -> tuple[LumioAgent, MagicMock]:
+        sm = MagicMock()
+        sm.get_session = AsyncMock(return_value=MagicMock(version=7))
+        sm.patch_state = AsyncMock(return_value=True)
+        deps = {
+            "classifier": MagicMock(),
+            "degradation_mgr": MagicMock(),
+            "transfer_checker": MagicMock(),
+            "session_manager": sm,
+        }
+        return LumioAgent(**deps), sm
+
+    @pytest.mark.asyncio
+    async def test_offer_with_answer_appends_answer_and_offer(self) -> None:
+        agent, sm = self._make_agent()
+        intent = IntentResult(primary_intent=IntentLabel.INSTALLMENT_INQUIRY, primary_confidence=0.8)
+
+        result = await agent._offer_transfer(
+            "s1", "分期", intent, [], SentimentLabel.NEUTRAL, "累计低置信", answer="分期手续费为每期0.385%。"
+        )
+
+        assert result["response"].startswith("分期手续费为每期0.385%。")
+        assert _TRANSFER_OFFER_PROMPT in result["response"]
+        assert result["response_source"] == "llm"
+        assert result["should_transfer"] is False
+        # 仍挂待确认: 下一轮"是/需要"才真派真人
+        sm.patch_state.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_offer_without_answer_keeps_offer_only(self) -> None:
+        agent, sm = self._make_agent()
+        intent = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.2)
+
+        result = await agent._offer_transfer("s1", "卡卡卡卡", intent, [], SentimentLabel.NEUTRAL, "累计低置信")
+
+        assert result["response"] == _TRANSFER_OFFER_PROMPT
+        assert result["response_source"] == "clarify"
+        sm.patch_state.assert_awaited_once()
+
+
+class TestSlotHintPrompt:
+    """近线低置信槽位追问: 只按意图槽位定义拼追问, 不回答实质内容。"""
+
+    @staticmethod
+    def _make_agent() -> LumioAgent:
+        return LumioAgent(
+            classifier=MagicMock(),
+            degradation_mgr=MagicMock(),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(),
+        )
+
+    def test_installment_missing_amount_and_period(self) -> None:
+        agent = self._make_agent()
+        prompt = agent._build_slot_hint(IntentLabel.INSTALLMENT_INQUIRY, ["amount", "period"])
+        assert prompt == "请问您想分期的金额是多少？您希望分几期？"
+
+    def test_card_loss_missing_tail(self) -> None:
+        agent = self._make_agent()
+        prompt = agent._build_slot_hint(IntentLabel.CARD_LOSS, ["card_tail"])
+        assert prompt == "请提供您信用卡的后四位以便验证身份"
+
+    def test_no_missing_names_returns_empty(self) -> None:
+        agent = self._make_agent()
+        assert agent._build_slot_hint(IntentLabel.FAQ, ["amount"]) == ""
+        assert agent._build_slot_hint(IntentLabel.INSTALLMENT_INQUIRY, []) == ""
+
+
+class TestPendingRoutingWithoutTools:
+    """P0 修复: L3 转人工确认拦截不依赖工具执行器 (MCP 关闭环境 _tool_executor 恒 None)。
+
+    此前 run() 的 pending 拦截门控挂在 _tool_executor is not None 上,
+    TRANSFER_OFFER 确认永远不触发, 客户回"是"被当成普通消息重新分类。
+    """
+
+    @pytest.mark.asyncio
+    async def test_transfer_offer_confirm_works_without_tool_executor(self) -> None:
+        sm = MagicMock()
+        state = SessionState(
+            session_id="s1",
+            current_phase=SessionPhase.BOT,
+            sub_phase=SessionSubPhase.BOT_ACTIVE,
+        )
+        state.pending_action = PendingAction(
+            tool_name="TRANSFER_OFFER",
+            confirm_prompt="这几次似乎还没能帮您解决问题，需要为您转接人工客服吗？",
+            arguments={"transfer_reason": "累计低置信"},
+        )
+        sm.get_session = AsyncMock(return_value=state)
+        sm.patch_state = AsyncMock(return_value=True)
+        sm.get_history = AsyncMock(return_value=[])
+
+        agent = LumioAgent(
+            classifier=MagicMock(),
+            degradation_mgr=MagicMock(),
+            transfer_checker=MagicMock(),
+            session_manager=sm,
+            # 不传 tool_executor: MCP 关闭环境的真实形态
+        )
+        result = await agent.run("s1", "是")
+
+        assert result["should_transfer"] is True
+        assert result["response_source"] == "template"
+        assert "转人工" in result["response"]
+        # 确认后 pending 清除
+        sm.patch_state.assert_awaited()
+
+
+class TestPreferSlotHint:
+    """分歧门/低置信拦截后的槽位追问判定 (只问不答, 零幻觉风险)。"""
+
+    @staticmethod
+    def _make_agent() -> LumioAgent:
+        return LumioAgent(
+            classifier=MagicMock(),
+            degradation_mgr=MagicMock(),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(),
+        )
+
+    def test_low_conf_near_miss_with_missing_slots(self) -> None:
+        agent = self._make_agent()
+        assert agent._prefer_slot_hint("low_confidence", 0.29, True) is True
+
+    def test_low_conf_below_floor_stays_clarify(self) -> None:
+        agent = self._make_agent()
+        assert agent._prefer_slot_hint("low_confidence", 0.24, True) is False
+
+    def test_disagreement_high_slow_conf_with_missing_slots(self) -> None:
+        """会话 fb87b1a4: 分期慢通道 0.8 正确被分歧门拦 → 给槽位追问。"""
+        agent = self._make_agent()
+        assert agent._prefer_slot_hint("fast_slow_disagreement", 0.8, True) is True
+
+    def test_disagreement_low_slow_conf_stays_clarify(self) -> None:
+        agent = self._make_agent()
+        assert agent._prefer_slot_hint("fast_slow_disagreement", 0.6, True) is False
+
+    def test_disagreement_without_required_slots_stays_clarify(self) -> None:
+        """e33d1fa8 形态 (乱码→无必填槽意图) 不受影响, P0 防线不变。"""
+        agent = self._make_agent()
+        assert agent._prefer_slot_hint("fast_slow_disagreement", 0.9, False) is False
+
+    def test_other_gate_reasons_stay_clarify(self) -> None:
+        agent = self._make_agent()
+        for reason in ("noise", "ood_unknown", "arbiter_noise", "input_gate_surprisal_corroborated"):
+            assert agent._prefer_slot_hint(reason, 0.95, True) is False
+
+
+class TestFallbackConfidenceAccounting:
+    """P2 修复: fallback 路径按真实分类置信记账 (此前硬编码 0.0 → streak 虚涨误触发 L3 邀约)。"""
+
+    @pytest.mark.asyncio
+    async def test_fallback_result_carries_real_confidence(self) -> None:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(
+                IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.9),
+                [],
+                MagicMock(),
+                "",
+            )
+        )
+        degradation_mgr = MagicMock()
+        degradation_mgr.generate_with_fallback = AsyncMock(
+            return_value=MagicMock(content="请您提供更多信息。", source="llm")
+        )
+        sm = MagicMock()
+        sm.get_history = AsyncMock(return_value=[])
+
+        agent = LumioAgent(
+            classifier=classifier,
+            degradation_mgr=degradation_mgr,
+            transfer_checker=MagicMock(),
+            session_manager=sm,
+        )
+        result = await agent.run("s-fb", "kk")
+
+        assert result["response_source"] == "llm"
+        assert result["intent"].primary_intent == IntentLabel.CHITCHAT
+        assert result["intent"].primary_confidence == 0.9

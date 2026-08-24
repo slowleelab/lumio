@@ -222,8 +222,12 @@ class LumioAgent:
                 logger.warning("apply_learned_profile 调度失败: %s", exc)
 
         # ── 工具确认状态机拦截：存在未过期 pending_action 时，本轮解读为确认/取消 ──
+        # P0 修复: 此前门控挂在 _tool_executor is not None 上, 而 MCP 关闭的环境恒为 None —
+        # L3 转人工确认(TRANSFER_OFFER, 不需要任何工具)因此从未触发, 客户回"是"永远被
+        # 当成普通消息重新分类。确认拦截只依赖会话状态, 工具类 pending 在 _handle_pending_action
+        # 内自行兜底 (无执行器则清除并放行新消息)。
         result: dict[str, Any] | None = None
-        if self._tool_executor is not None and self._session_manager is not None:
+        if self._session_manager is not None:
             try:
                 state = await self._session_manager.get_session(session_id)
             except Exception:
@@ -505,7 +509,7 @@ class LumioAgent:
         except Exception:
             return IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0), [], SentimentLabel.NEUTRAL
 
-    async def _classify_context(self, session_id: str | None) -> list[dict[str, str]] | None:
+    async def _classify_context(self, session_id: str | None) -> list[dict[str, Any]] | None:
         """拉取最近对话轮次, 拼成 BERT 多轮上下文 (speaker/content, 时间升序)。
 
         轻量取近几轮 (不触发 _load_history 的 LLM 摘要/压缩), 失败静默返回 None,
@@ -518,7 +522,13 @@ class LumioAgent:
         except Exception:
             return None
         return [
-            {"speaker": t.speaker, "content": t.content}
+            {
+                "speaker": t.speaker,
+                "content": t.content,
+                # 供上下文过滤使用: clarify 收尾的乱码轮对不进 BERT 输入 (见 _build_dialog_input)
+                "confidence": t.confidence,
+                "response_source": t.response_source,
+            }
             for t in turns
             if t.speaker in ("customer", "bot") and t.content
         ][-6:]
@@ -608,11 +618,31 @@ class LumioAgent:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
             # P3 误杀探针: 上轮"回话放行"后本轮被拦 → 疑似误杀, 回流人审
             await self._maybe_flag_mis_kill(session_id, user_input, gate_reason)
+            # 近线槽位追问: 低置信/分歧门拦截但意图落在有必填缺槽的业务意图时,
+            # 与其回通用"没太理解"或让澄清轮补判替换成转人工邀约, 不如按槽位定义追问
+            # —— 追问不回答任何实质内容 (零幻觉风险), 且能避免客户在澄清话术里打转
+            # (会话 f08227d4: 分期@0.2986 差澄清线 0.0014; 会话 fb87b1a4: 分期@0.8
+            #  慢通道正确却被分歧门拦, 澄清轮又撞 streak==3 直接变转人工邀约)。
+            # source=slot_hint 独立于 clarify: 不进 L3 澄清轮补判, 也不被上下文过滤剔除。
+            reply = CLARIFY_RESPONSE
+            response_source = "clarify"
+            missing_names = [s[0] for s in missing_slots] if missing_slots else []
+            if self._prefer_slot_hint(gate_reason, intent.primary_confidence, bool(missing_names)):
+                reply = self._build_slot_hint(intent.primary_intent, missing_names)
+                response_source = "slot_hint"
+                logger.info(
+                    "槽位追问替代澄清: session=%s reason=%s intent=%s conf=%.3f slots=%s",
+                    session_id,
+                    gate_reason,
+                    intent.primary_intent.value,
+                    intent.primary_confidence,
+                    missing_names,
+                )
             return self._build_result(
                 session_id,
                 user_input,
-                CLARIFY_RESPONSE,
-                "clarify",
+                reply,
+                response_source,
                 intent.primary_intent.value,
                 intent.primary_confidence,
                 entities=entities,
@@ -753,8 +783,17 @@ class LumioAgent:
             user_input, intent, sentiment, session_id=session_id
         )
         # L3『先确认再转』: 连续低置信/兜底累计不派真人, 先挂确认回话 (真·明确转人工 L1/L2 仍即时转)。
+        # 已生成真实答案时先答后问 (答案 + 邀约追加), 不再整条替换。
         if transfer_level == TransferTriggerLevel.L3:
-            return await self._offer_transfer(session_id, user_input, intent, entities or [], sentiment, transfer_reason)
+            return await self._offer_transfer(
+                session_id,
+                user_input,
+                intent,
+                entities or [],
+                sentiment,
+                transfer_reason,
+                answer=result.content if result.source == "llm" else None,
+            )
         # P1-8 修复: 降级回复 (模板/兜底) 不只是文案说"转人工" — 真正触发转人工.
         # 此前 should_transfer 恒 False, 客户看到"请输入转人工"还要再发一条消息.
         if result.source in ("template", "fallback") and not should_transfer:
@@ -935,9 +974,17 @@ class LumioAgent:
         should_transfer, transfer_reason, transfer_level = await self._check_transfer(
             user_input, intent, sentiment, session_id=session_id
         )
-        # L3『先确认再转』(同上)
+        # L3『先确认再转』(同上, 已生成真实答案时先答后问)
         if transfer_level == TransferTriggerLevel.L3:
-            return await self._offer_transfer(session_id, user_input, intent, entities or [], sentiment, transfer_reason)
+            return await self._offer_transfer(
+                session_id,
+                user_input,
+                intent,
+                entities or [],
+                sentiment,
+                transfer_reason,
+                answer=result.content if result.source == "llm" else None,
+            )
         # P1-8: 降级回复真正触发转人工 (同上)
         if result.source in ("template", "fallback") and not should_transfer:
             should_transfer = True
@@ -1031,6 +1078,16 @@ class LumioAgent:
         # L3『先确认再转』的转人工邀请: 独立于敏感工具确认, 走专用状态机。
         if pending.tool_name == "TRANSFER_OFFER":
             return await self._handle_transfer_offer(session_id, user_input, state)
+        # 工具类确认需要工具执行器; 无工具装配的环境 (MCP 关闭) 不会产生工具类 pending,
+        # 防御性兜底: 清除残留并放行新消息, 避免客户被卡在确认态。
+        if self._tool_executor is None:
+            logger.warning(
+                "工具 pending 无执行器可确认, 清除并放行: session=%s tool=%s",
+                session_id,
+                pending.tool_name,
+            )
+            await self._clear_pending_action(session_id, state.version)
+            return {"pending_released": True}
         actor_id = customer_id or state.customer_id or session_id
 
         # 过期：清除并提示重新发起
@@ -1372,14 +1429,19 @@ class LumioAgent:
             )
             # L3『先确认再转』: 兜底路径同样不自动派真人, 改为挂确认回话。
             if transfer_level == TransferTriggerLevel.L3:
-                return await self._offer_transfer(session_id, user_input, intent, entities or [], sentiment, transfer_reason)
+                return await self._offer_transfer(
+                    session_id, user_input, intent, entities or [], sentiment, transfer_reason
+                )
         return self._build_result(
             session_id,
             user_input,
             result.content,
             result.source,
-            "chitchat",
-            0.0,
+            intent.primary_intent.value,
+            # P2 修复: 此前硬编码 0.0 — chitchat@0.9 过线作答的轮次在会话状态里仍记成
+            # 低置信, streak 虚涨把后续真实问题推过 L3 线误挂转人工邀约 (会话 fb87b1a4)。
+            # 记账必须用真实分类置信, streak 才准确反映"连续没听懂"。
+            intent.primary_confidence,
             entities=entities,
             sentiment=sentiment,
             should_transfer=should_transfer,
@@ -1575,10 +1637,14 @@ class LumioAgent:
         entities: list[Entity],
         sentiment: SentimentLabel,
         reason: str = "",
+        answer: str | None = None,
     ) -> dict[str, Any]:
         """L3『先确认再转』: 连续低置信/兜底累计触发的转人工不直接派真人坐席,
         而是挂一个待确认 (pending_action) 并返回固定确认话术 —— 下一轮客户明确回复"是/需要"
         才真正转人工。
+
+        answer 非空时 (本轮已生成真实答案) 先答后问: 答案照常下发, 邀约话术追加在末尾,
+        避免客户连问真实问题只得到"要转人工吗?"; 无答案 (降级稿/澄清轮) 仍只挂邀约。
 
         防『灌乱码刷真人』: 不能仅凭"连续 N 轮低置信"就自动把真人坐席派给输入; 也避免把
         这类自动升级谎标成『客户主动请求』。真·明确转人工 (L1 关键词 / L2 高置信 transfer_agent /
@@ -1593,14 +1659,20 @@ class LumioAgent:
                     arguments={"transfer_reason": reason},
                 )
                 await self._save_pending_action(session_id, pending)
-                logger.info("L3 转人工改为先确认: session=%s input=%r", session_id, user_input)
+                logger.info("L3 转人工改为先确认: session=%s input=%r answer=%s", session_id, user_input, bool(answer))
             except Exception:
                 logger.debug("挂转人工待确认失败, 本轮仅澄清不转: session=%s", session_id)
+        if answer:
+            reply = f"{answer}\n\n{_TRANSFER_OFFER_PROMPT}"
+            response_source = "llm"
+        else:
+            reply = _TRANSFER_OFFER_PROMPT
+            response_source = "clarify"
         return self._build_result(
             session_id,
             user_input,
-            _TRANSFER_OFFER_PROMPT,
-            "clarify",
+            reply,
+            response_source,
             intent.primary_intent.value,
             intent.primary_confidence,
             entities=entities,
@@ -2012,6 +2084,36 @@ class LumioAgent:
         tracker.apply_fills(fills)
         return [(s.name, s.label) for s in tracker.missing_required]
 
+    @staticmethod
+    def _build_slot_hint(intent_label: IntentLabel, missing_names: list[str]) -> str:
+        """按意图槽位定义拼追问话术 (近线低置信替代通用澄清用, 只问不答)。
+
+        只取缺的必填槽 (missing_names 来自会话状态计算), 最多拼 2 条追问,
+        输出如 "请问您想分期的金额是多少？您希望分几期？"。
+        """
+        tracker = SlotTracker.for_intent(intent_label)
+        ask_by_name = {s.name: s.ask_prompt for s in tracker.slots if s.ask_prompt}
+        prompts = [ask_by_name[n] for n in missing_names if ask_by_name.get(n)]
+        return "".join(prompts[:2])
+
+    @staticmethod
+    def _prefer_slot_hint(gate_reason: str, confidence: float, has_missing_slots: bool) -> bool:
+        """噪声门拦截后是否优先给槽位追问而非通用澄清。
+
+        - 无必填缺槽 → False (无槽可问, 保持澄清/邀约链路)。
+        - low_confidence: 近线带 (≥ _SLOT_HINT_CONF_FLOOR) 的真实意图 → True。
+        - fast_slow_disagreement: 慢通道高置信 (≥ _DISAGREE_SLOT_HINT_FLOOR) 且意图
+          有必填缺槽 → True; 槽位追问只问不答, 即便输入真是乱码也零风险。
+        - 其余拦截原因 (noise/ood/arbiter/input_gate) → False, 维持既有保守链路。
+        """
+        if not has_missing_slots:
+            return False
+        if gate_reason == "low_confidence":
+            return confidence >= _SLOT_HINT_CONF_FLOOR
+        if gate_reason == "fast_slow_disagreement":
+            return confidence >= _DISAGREE_SLOT_HINT_FLOOR
+        return False
+
     async def _evaluate_noise_gate(
         self,
         session_id: str,
@@ -2243,6 +2345,19 @@ def _is_farewell(text: str) -> bool:
 # fallback 判定阈值一致)。knowledge 与 fallback 两条生成路径共同遵守——低于此
 # 时不交给 LLM 编造作答, 一律回确定性澄清话术(零幻觉、秒回)。
 CLARIFY_CONFIDENCE_FLOOR = 0.3
+
+# 近线槽位追问下限: 置信低于澄清线但 ≥ 此值、且意图有必填缺槽时, 用槽位追问
+# 替代通用澄清话术 (只问不答, 零幻觉风险)。低于此值的乱码仍是通用澄清。
+# 实测依据 (会话 f08227d4): 乱码落点 ~0.18-0.29, 真实"分期"被乱码历史拖到 0.2986;
+# 0.25 能把"近线真实意图"与"纯乱码"分开, 且不改变 P0 防线 (仍不进 LLM 生成)。
+_SLOT_HINT_CONF_FLOOR = 0.25
+
+# 分歧门拦截后的槽位追问下限 (慢通道置信): 慢通道高置信 + 意图有必填缺槽时才改给
+# 槽位追问。会话 fb87b1a4: 分期慢通道 0.8 正确、快通道误判 transfer_agent@0.325,
+# 被分歧门拦后澄清轮撞 streak==3 直接变转人工邀约 —— 客户连问真实问题得不到答案。
+# 乱码被慢通道通胀成无必填槽的意图 (如 bill_query@0.7, e33d1fa8) 时 missing_slots 为空,
+# 不会走此路径, P0 防线不受影响。
+_DISAGREE_SLOT_HINT_FLOOR = 0.7
 
 # P3 误杀探针生命周期: 放行记录定长上限 + "紧接着被拦"的新鲜度窗口。
 # 长运行服务内存有界; 只有窗口内(紧接上一轮)被拦才算疑似误杀, 过久不归因。

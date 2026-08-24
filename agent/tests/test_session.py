@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,7 +15,9 @@ from lumio.shared.models import (
     DialogueTurn,
     IntentLabel,
     IntentResult,
+    PendingAction,
     SessionPhase,
+    SessionState,
     SessionSubPhase,
 )
 
@@ -129,6 +131,87 @@ async def test_get_session_exists() -> None:
     assert state is not None
     assert state.session_id == "test-session"
     assert state.current_phase == SessionPhase.BOT
+
+
+@pytest.mark.asyncio
+async def test_get_session_parses_pending_action() -> None:
+    """P0 修复: get_session 必须解析 pending_action。
+
+    此前 patch_state 写入成功(版本递增)但读回时字段被丢弃 —— L3 转人工确认
+    ("是/需要")与敏感工具确认的状态机整条失效, 客户回复"是"永远进不了确认路由。
+    """
+    redis = _mock_redis()
+    meta = json.dumps(
+        {
+            "session_id": "test-session",
+            "customer_id": None,
+            "channel_type": "web",
+            "current_phase": "bot",
+            "sub_phase": "bot:active",
+            "end_reason": None,
+            "vip_level": "普通",
+            "card_types": [],
+            "risk_tolerance": "R2",
+            "turn_count": 0,
+            "last_intent": None,
+            "last_entities": [],
+            "confidence_history": [],
+            "low_confidence_streak": 0,
+            "human_request_score": 0,
+            "agent_id": None,
+            "transfer_reason": None,
+            "transfer_summary": None,
+            "created_at": datetime.now().isoformat(),
+            "last_active_at": datetime.now().isoformat(),
+            "version": 9,
+            "pending_action": {
+                "tool_name": "TRANSFER_OFFER",
+                "confirm_prompt": "这几次似乎还没能帮您解决问题，需要为您转接人工客服吗？",
+                "expires_at": (datetime.now() + timedelta(seconds=120)).isoformat(),
+                "arguments": {"transfer_reason": "累计低置信"},
+            },
+        },
+        ensure_ascii=False,
+    )
+    redis.get = AsyncMock(return_value=meta)
+    redis.lrange = AsyncMock(return_value=[])
+
+    manager = SessionManager(redis)
+    state = await manager.get_session("test-session")
+    assert state is not None
+    assert state.pending_action is not None
+    assert state.pending_action.tool_name == "TRANSFER_OFFER"
+    assert state.pending_action.expires_at is not None
+    assert state.pending_action.arguments.get("transfer_reason") == "累计低置信"
+
+
+@pytest.mark.asyncio
+async def test_get_session_pending_action_invalid_falls_back_none() -> None:
+    """pending_action 数据损坏时按 None 处理, 不崩解析。"""
+    redis = _mock_redis()
+    meta = json.dumps(
+        {
+            "session_id": "test-session",
+            "channel_type": "web",
+            "current_phase": "bot",
+            "sub_phase": "bot:active",
+            "card_types": [],
+            "last_entities": [],
+            "confidence_history": [],
+            "created_at": datetime.now().isoformat(),
+            "last_active_at": datetime.now().isoformat(),
+            "version": 3,
+            "pending_action": {"tool_name": 12345},
+        },
+        ensure_ascii=False,
+    )
+    redis.get = AsyncMock(return_value=meta)
+    redis.lrange = AsyncMock(return_value=[])
+
+    manager = SessionManager(redis)
+    state = await manager.get_session("test-session")
+    assert state is not None
+    assert state.pending_action is None
 
 
 # ── 追加对话 ──
@@ -976,3 +1059,65 @@ def test_apply_merge_entity_pool_dedup() -> None:
         {"entity_pool": [{"entity_type": "card_type", "value": "platinum"}, {"entity_type": "city", "value": "北京"}]},
     )
     assert len(merged["entity_pool"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_save_meta_persists_pending_action() -> None:
+    """P0 修复: _save_meta 全量序列化必须包含 pending_action。
+
+    此前 _save_meta 的 meta 字典漏掉该字段, 每次 add_turn 全量 SET 都把
+    patch_state 刚写入的待确认操作整体擦除 —— L3 转人工"是/需要"确认与
+    敏感工具确认的状态机形同虚设 (实测: pending 写入后立刻被路由层覆盖)。
+    """
+    redis = _mock_redis()
+    manager = SessionManager(redis)
+
+    state = SessionState(
+        session_id="s-pending",
+        current_phase=SessionPhase.BOT,
+        sub_phase=SessionSubPhase.BOT_ACTIVE,
+    )
+    state.pending_action = PendingAction(
+        tool_name="TRANSFER_OFFER",
+        confirm_prompt="要转人工吗？",
+        arguments={"transfer_reason": "low_conf"},
+    )
+
+    captured: dict[str, dict] = {}
+
+    async def fake_eval(script: str, numkeys: int, key: str, expected: str, new_value: str, ttl: str) -> int:
+        captured["meta"] = json.loads(new_value)
+        return 1
+
+    redis.eval = AsyncMock(side_effect=fake_eval)
+
+    await manager._save_meta(state)
+    saved = captured["meta"]["pending_action"]
+    assert saved is not None
+    assert saved["tool_name"] == "TRANSFER_OFFER"
+    assert saved["confirm_prompt"] == "要转人工吗？"
+    assert saved["arguments"] == {"transfer_reason": "low_conf"}
+
+
+@pytest.mark.asyncio
+async def test_save_meta_pending_none_serializes_null() -> None:
+    """无 pending 时序列化为 null (不写脏值)。"""
+    redis = _mock_redis()
+    manager = SessionManager(redis)
+
+    state = SessionState(
+        session_id="s-empty",
+        current_phase=SessionPhase.BOT,
+        sub_phase=SessionSubPhase.BOT_ACTIVE,
+    )
+
+    captured: dict[str, dict] = {}
+
+    async def fake_eval(script: str, numkeys: int, key: str, expected: str, new_value: str, ttl: str) -> int:
+        captured["meta"] = json.loads(new_value)
+        return 1
+
+    redis.eval = AsyncMock(side_effect=fake_eval)
+
+    await manager._save_meta(state)
+    assert captured["meta"]["pending_action"] is None

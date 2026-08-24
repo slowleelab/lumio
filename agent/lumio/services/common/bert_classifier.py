@@ -160,18 +160,36 @@ class BertIntentClassifier:
         return logit_energy(logits.tolist())
 
     @staticmethod
-    def _build_dialog_input(text: str, history: list[dict[str, str]] | None) -> str:
+    def _build_dialog_input(text: str, history: list[dict[str, Any]] | None) -> str:
         """把历史轮次拼成 BERT 输入串 (方案: 文本上下文拼接)。
 
         仅取 customer/bot 双方的消息, 逆时间拼接 (最新轮在最前, 越近越关键),
         总长受 _MAX_HISTORY_CHARS 约束, 保证当前句 text 不被挤压。
+
+        乱码轮过滤: bot 以 clarify 收尾的轮对 (上一句 customer 是本轮 clarify 的对象)
+        不进上下文 —— 乱码历史会把真实意图的置信度拖低 (实测同句"分期"背着乱码历史
+        conf 0.30, 背着自己上一轮 0.62), 且澄清轮没有任何语义信息可借。
         """
         if not history:
             return text
+        # 正序遍历标记被澄清的轮对 (customer 乱码句 + 其后 clarify 的 bot 句)
+        excluded: set[int] = set()
+        for i in range(1, len(history)):
+            prev, cur = history[i - 1], history[i]
+            if (
+                cur.get("speaker") == "bot"
+                and cur.get("response_source") == "clarify"
+                and prev.get("speaker") == "customer"
+            ):
+                excluded.add(i - 1)
+                excluded.add(i)
         buf: list[str] = []
         used = 0
         # 从最近往回扫, 只带最关键的历史
-        for turn in reversed(history):
+        for idx in range(len(history) - 1, -1, -1):
+            if idx in excluded:
+                continue
+            turn = history[idx]
             speaker = _ROLE_TAG.get(turn.get("speaker", ""))
             content = (turn.get("content") or "").strip()
             if not speaker or not content:

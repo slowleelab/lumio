@@ -453,3 +453,40 @@ async def test_llm_arbitrate_parses_domain() -> None:
     res = await clf.arbitrate("x")
     assert res["domain"] == "unknown"
     assert res["structured"] is False
+
+
+def test_bert_build_dialog_input_filters_clarify_pairs() -> None:
+    """clarify 收尾的乱码轮对不进上下文 (乱码历史拖低真实意图置信, 会话 f08227d4)。"""
+    from lumio.services.common.bert_classifier import BertIntentClassifier
+
+    inp = BertIntentClassifier._build_dialog_input(
+        "分期",
+        [
+            {"speaker": "customer", "content": "额佛呢份"},
+            {"speaker": "bot", "content": "您的意思我还没太理解。", "response_source": "clarify"},
+            {"speaker": "customer", "content": "分期"},
+            {"speaker": "bot", "content": "请问您想分期的金额是多少？", "response_source": "llm"},
+        ],
+    )
+    assert "额佛呢份" not in inp
+    assert "您的意思我还没太理解" not in inp
+    # 非 clarify 轮次正常保留
+    assert "分期" in inp
+    assert "请问您想分期的金额是多少" in inp
+    assert inp.endswith("分期")
+
+
+def test_bert_build_dialog_input_keeps_turns_without_source_marker() -> None:
+    """无 response_source 标记的历史轮次 (旧调用方) 全部保留, 向后兼容。"""
+    from lumio.services.common.bert_classifier import BertIntentClassifier
+
+    inp = BertIntentClassifier._build_dialog_input(
+        "手续费怎么收",
+        [
+            {"speaker": "customer", "content": "我想分期"},
+            {"speaker": "bot", "content": "好的, 请问要分几期呢?"},
+        ],
+    )
+    assert "我想分期" in inp
+    assert "请问要分几期呢" in inp
+    assert inp.endswith("手续费怎么收")
