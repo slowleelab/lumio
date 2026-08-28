@@ -63,12 +63,12 @@ def select_candidates(
     pairs: Sequence[tuple[Any, Any]],
     *,
     max_n: int = 50,
-    seen: set[str] | None = None,
+    seen: set[tuple[Any, Any]] | None = None,
 ) -> list[BackflowCandidate]:
     """从 (sample, verdict) 对中选出分类层失败样本, 做 {text|intent} 去重."""
     from lumio.services.common.trap_eval import EvalLayer, VerdictType
 
-    seen = set() if seen is None else set(seen)
+    dedup: set[tuple[Any, Any]] = set() if seen is None else set(seen)
     out: list[BackflowCandidate] = []
     for sample, verdict in pairs:
         if len(out) >= max_n:
@@ -78,9 +78,9 @@ def select_candidates(
         if verdict.verdict in (VerdictType.HEALTHY,):
             continue
         key = (sample.text, sample.final_intent)
-        if key in seen:
+        if key in dedup:
             continue
-        seen.add(key)
+        dedup.add(key)
         reason = "; ".join(verdict.evidences[:3]) if verdict.evidences else verdict.verdict.value
         out.append(
             BackflowCandidate(
@@ -148,7 +148,11 @@ def finalize_confirmed(
 
     data.setdefault("examples", []).extend(new_rows)
     meta = data.setdefault("meta", {})
-    meta["examples"] = len(data["examples"])
+    # counts 是 seed 数据集的官方计数口径 (README/golden 门均读它); 直接写 meta.examples
+    # 会让 counts 过期, 与 144/13 vs 129/12 同类漂移。此处只递增 counts.examples,
+    # confusable_pairs 保持原值。
+    counts = meta.setdefault("counts", {})
+    counts["examples"] = len(data["examples"])
     meta["version"] = _bump_patch(str(meta.get("version", "0.0.0")))
     meta["source"] = "rule-aligned seeds + 人工撰写 + closed-loop 回流"
     seed.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
