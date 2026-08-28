@@ -37,6 +37,14 @@ class _FakeResult:
     def scalar_one_or_none(self):
         return self._one
 
+    def first(self):
+        """行式查询 (select 具名列) 的取首行入口"""
+        return self._one
+
+    def all(self):
+        """行式查询多行入口"""
+        return self._rows
+
     def scalars(self):
         return _Scalars(self._rows)
 

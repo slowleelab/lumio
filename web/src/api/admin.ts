@@ -37,6 +37,19 @@ export function deleteDocument(docId: string): Promise<{ status: string; doc_id:
   return client.delete(`/kb/documents/${docId}`)
 }
 
+export interface DocumentSource {
+  doc_id: string
+  title: string
+  file_path: string
+  kind: "text" | "binary"
+  content?: string
+  download_url?: string
+}
+
+export function getDocumentSource(docId: string): Promise<DocumentSource> {
+  return client.get(`/kb/documents/${docId}/source`)
+}
+
 export function getDocumentStatus(docId: string): Promise<KbDocumentStatus> {
   return client.get(`/kb/documents/${docId}/status`)
 }

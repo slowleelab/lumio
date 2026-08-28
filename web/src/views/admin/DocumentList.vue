@@ -63,6 +63,21 @@
       </template>
     </el-dialog>
 
+    <!-- 原始文档预览 -->
+    <el-dialog v-model="sourceVisible" :title="`原始文档 — ${source?.title ?? ''}`" width="760px" top="6vh">
+      <div v-loading="sourceLoading">
+        <template v-if="source">
+          <div class="source-meta">{{ source.file_path }}</div>
+          <pre v-if="source.kind === 'text'" class="source-block">{{ source.content }}</pre>
+          <div v-else class="source-binary">
+            该格式不支持在线预览，
+            <el-link type="primary" :href="source.download_url" target="_blank">点击下载原文件</el-link>
+            （链接 1 小时内有效）
+          </div>
+        </template>
+      </div>
+    </el-dialog>
+
     <!-- 文档表格 -->
     <el-table :data="documents" v-loading="loading" stripe style="margin-top: 16px">
       <el-table-column prop="title" label="文档标题" min-width="200" />
@@ -81,8 +96,9 @@
           {{ row.created_at?.slice(0, 16).replace("T", " ") || "-" }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="140" fixed="right">
+      <el-table-column label="操作" width="180" fixed="right">
         <template #default="{ row }">
+          <el-button link type="primary" size="small" @click="viewSource(row)">查看</el-button>
           <el-button link type="primary" size="small" @click="viewStatus(row)">状态</el-button>
           <el-popconfirm title="确定删除此文档？" @confirm="handleDelete(row.doc_id)">
             <template #reference>
@@ -129,8 +145,25 @@
 import { ref, reactive } from "vue"
 import { ElMessage } from "element-plus"
 import { Upload } from "@element-plus/icons-vue"
-import { listDocuments, uploadDocument, deleteDocument, getDocumentStatus } from "@/api/admin"
+import { listDocuments, uploadDocument, deleteDocument, getDocumentStatus, getDocumentSource, type DocumentSource } from "@/api/admin"
 import type { KbDocument, KbDocumentStatus } from "@/api/types"
+
+const sourceVisible = ref(false)
+const sourceLoading = ref(false)
+const source = ref<DocumentSource | null>(null)
+
+async function viewSource(row: KbDocument) {
+  sourceVisible.value = true
+  sourceLoading.value = true
+  source.value = null
+  try {
+    source.value = await getDocumentSource(row.doc_id)
+  } catch {
+    sourceVisible.value = false
+  } finally {
+    sourceLoading.value = false
+  }
+}
 
 const documents = ref<KbDocument[]>([])
 const total = ref(0)
@@ -227,4 +260,19 @@ load()
 .page-header h2 { margin: 0; font-size: 20px; }
 .header-actions { display: flex; gap: 12px; }
 .pagination-wrap { margin-top: 16px; display: flex; justify-content: flex-end; }
+.source-meta { font-size: 12px; color: #909399; margin-bottom: 8px; word-break: break-all; }
+.source-block {
+  margin: 0;
+  max-height: 62vh;
+  overflow: auto;
+  padding: 12px;
+  background: var(--color-bg-page, #f5f7fa);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.source-binary { padding: 24px 0; text-align: center; }
 </style>
