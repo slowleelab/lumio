@@ -32,6 +32,7 @@ DIR_CATEGORY_MAP: dict[str, str] = {
     "repayment": "还款",
     "security": "安全",
     "activity": "活动",
+    "process": "办理",
     "other": "OTHER",
 }
 
@@ -129,24 +130,26 @@ def scan_files(base_dir: Path) -> list[dict]:
         # MinIO object key: {category}/{filename}
         object_key = f"{category}/{fp.name}"
 
-        results.append({
-            "file_path": str(fp),
-            "filename": fp.name,
-            "title": title,
-            "category": category,
-            "doc_type": doc_type,
-            "card_type": card_type if card_type and card_type != "null" else None,
-            "customer_tier": customer_tier if customer_tier and customer_tier != "null" else None,
-            "security_level": security_level,
-            "version": version,
-            "effective_date": effective_date,
-            "expiry_date": expiry_date,
-            "keywords": keywords_str,
-            "content_hash": content_hash,
-            "file_size": file_size,
-            "object_key": object_key,
-            "full_content": full_content,
-        })
+        results.append(
+            {
+                "file_path": str(fp),
+                "filename": fp.name,
+                "title": title,
+                "category": category,
+                "doc_type": doc_type,
+                "card_type": card_type if card_type and card_type != "null" else None,
+                "customer_tier": customer_tier if customer_tier and customer_tier != "null" else None,
+                "security_level": security_level,
+                "version": version,
+                "effective_date": effective_date,
+                "expiry_date": expiry_date,
+                "keywords": keywords_str,
+                "content_hash": content_hash,
+                "file_size": file_size,
+                "object_key": object_key,
+                "full_content": full_content,
+            }
+        )
 
     return results
 
@@ -221,10 +224,14 @@ def insert_to_database(docs: list[dict]) -> None:
     with Session(engine) as session:
         for doc in docs:
             # 查重：按 content_hash 检查
-            existing = session.query(KbDocument).filter(
-                KbDocument.content_hash == doc["content_hash"],
-                KbDocument.is_deleted.is_(False),
-            ).first()
+            existing = (
+                session.query(KbDocument)
+                .filter(
+                    KbDocument.content_hash == doc["content_hash"],
+                    KbDocument.is_deleted.is_(False),
+                )
+                .first()
+            )
 
             if existing:
                 print(f"   ⚠️  跳过（已存在）: {doc['filename']} (hash={doc['content_hash'][:12]}...)")
