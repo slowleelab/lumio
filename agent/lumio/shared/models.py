@@ -44,55 +44,258 @@ class SessionSubPhase(StrEnum):
 
 
 class IntentLabel(StrEnum):
-    """意图标签，覆盖主要信用卡业务场景"""
+    """意图标签全集 (draft-0.3 主表: 14 域 × 149 意图 + 10 个旧 flat 别名)。
 
-    FAQ = "faq"
-    BILL_QUERY = "bill_query"
-    TRANSACTION_QUERY = "transaction_query"
-    LIMIT_QUERY = "limit_query"
-    INSTALLMENT_INQUIRY = "installment_inquiry"
-    REWARD_QUERY = "reward_query"
-    CARD_LOSS = "card_loss"
-    COMPLAINT = "complaint"
-    TRANSFER_AGENT = "transfer_agent"
-    CHITCHAT = "chitchat"
+    旧 10 个 flat 值保留为别名成员, normalize_intent 把旧字符串归一化到主名
+    (如 "bill_query" → account_bill_query)。分类器(规则/BERT/LLM)在批 2 重训前
+    仍输出旧值, 路由/合规/槽位等边界统一在入口 normalize 后比较; 持久化层
+    (session 反序列化)已走 normalize, 存量旧字符串读回即主名。
+    """
+
+    # ── 旧 flat 别名 (存量兼容; 归一化目标见 _INTENT_NORMALIZATION) ──
+    FAQ = "faq"  # → faq_product
+    BILL_QUERY = "bill_query"  # → account_bill_query
+    TRANSACTION_QUERY = "transaction_query"  # → txn_query
+    LIMIT_QUERY = "limit_query"  # 旧值=主名 identity
+    INSTALLMENT_INQUIRY = "installment_inquiry"  # → inst_param_query
+    REWARD_QUERY = "reward_query"  # → points_balance_query
+    CARD_LOSS = "card_loss"  # → card_loss_report
+    COMPLAINT = "complaint"  # → dispute_submit
+    TRANSFER_AGENT = "transfer_agent"  # 旧值=主名 identity
+    CHITCHAT = "chitchat"  # → nb_chitchat
+
+    # ── 1.1 账户与账单域 (account, 10) ──
+    ACCOUNT_BILL_QUERY = "account_bill_query"
+    ACCOUNT_E_BILL_SET = "account_e_bill_set"
+    ACCOUNT_PAPER_BILL_REISSUE = "account_paper_bill_reissue"
+    ACCOUNT_STMT_QUERY = "account_stmt_query"
+    ACCOUNT_STMT_DISPUTE = "account_stmt_dispute"
+    ACCOUNT_BILL_EXPORT = "account_bill_export"
+    ACCOUNT_BILL_REPAY_SPLIT_SET = "account_bill_repay_split_set"
+    ACCOUNT_BILL_ALERT_SET = "account_bill_alert_set"
+    ACCOUNT_BALANCE_QUERY = "account_balance_query"
+    ACCOUNT_FOREX_RATE_QUERY = "account_forex_rate_query"
+
+    # ── 1.2 交易与消费域 (transaction, 10) ──
+    TXN_QUERY = "txn_query"
+    TXN_CASH_ADVANCE_QUERY = "txn_cash_advance_query"
+    TXN_AUTO_DEBIT_SET = "txn_auto_debit_set"
+    TXN_AUTO_DEBIT_QUERY = "txn_auto_debit_query"
+    TXN_REFUND_QUERY = "txn_refund_query"
+    TXN_RECEIPT_GET = "txn_receipt_get"
+    TXN_CURRENCY_SET = "txn_currency_set"
+    TXN_OVERSEAS_LOCK = "txn_overseas_lock"
+    TXN_CATEGORY_STAT = "txn_category_stat"
+    TXN_EXPORT = "txn_export"
+
+    # ── 1.3 还款与还款日域 (repay, 14) ──
+    REPAY_PLAN_QUERY = "repay_plan_query"
+    REPAY_RECORD_QUERY = "repay_record_query"
+    REPAY_CALC = "repay_calc"
+    REPAY_METHOD_QUERY = "repay_method_query"
+    REPAY_AUTO_SET = "repay_auto_set"
+    REPAY_EARLY = "repay_early"
+    REPAY_GRACE_PERIOD = "repay_grace_period"
+    REPAY_OVERDUE_QUERY = "repay_overdue_query"
+    REPAY_OVERDUE_RELIEF = "repay_overdue_relief"
+    REPAY_OVERDUE_PLAN = "repay_overdue_plan"
+    REPAY_APPOINTMENT = "repay_appointment"
+    REPAY_VOUCHER = "repay_voucher"
+    REPAY_SETTLE = "repay_settle"
+    REPAY_DEDUCTION_ORDER = "repay_deduction_order"
+
+    # ── 1.4 额度与授信域 (limit, 9) ──
+    LIMIT_APPLY_INCREASE = "limit_apply_increase"
+    LIMIT_APPLY_DECREASE = "limit_apply_decrease"
+    LIMIT_POLICY_QUERY = "limit_policy_query"
+    LIMIT_HISTORY_QUERY = "limit_history_query"
+    LIMIT_APPLY_STATUS = "limit_apply_status"
+    LIMIT_TYING_QUERY = "limit_tying_query"
+    LIMIT_POOL_QUERY = "limit_pool_query"
+    LIMIT_USAGE_ALERT_SET = "limit_usage_alert_set"
+
+    # ── 1.5 分期业务域 (installment, 11) ──
+    INST_APPLY = "inst_apply"
+    INST_PARAM_QUERY = "inst_param_query"
+    INST_CALC = "inst_calc"
+    INST_STATUS_QUERY = "inst_status_query"
+    INST_EARLY_SETTLE = "inst_early_settle"
+    INST_CHANGE_SET = "inst_change_set"
+    INST_CANCEL = "inst_cancel"
+    INST_REFUND_RULE = "inst_refund_rule"
+    INST_FOREX = "inst_forex"
+    INST_PROMOTION = "inst_promotion"
+    INST_CONTRACT = "inst_contract"
+
+    # ── 1.6 积分与权益域 (points, 13) ──
+    POINTS_BALANCE_QUERY = "points_balance_query"
+    POINTS_REDEEM = "points_redeem"
+    POINTS_EXPIRY_QUERY = "points_expiry_query"
+    POINTS_EXPIRY_ALARM_SET = "points_expiry_alarm_set"
+    POINTS_TRANSFER = "points_transfer"
+    POINTS_RULE_QUERY = "points_rule_query"
+    POINTS_ORDER_QUERY = "points_order_query"
+    BENEFIT_QUERY = "benefit_query"
+    BENEFIT_CLAIM = "benefit_claim"
+    BENEFIT_REASSIGN = "benefit_reassign"
+    BENEFIT_UPGRADE = "benefit_upgrade"
+    CAMPAIGN_QUERY = "campaign_query"
+    CAMPAIGN_SIGNUP = "campaign_signup"
+
+    # ── 1.7 卡片与生命周期域 (card, 15) ──
+    CARD_LOSS_REPORT = "card_loss_report"
+    CARD_LOSS_CANCEL = "card_loss_cancel"
+    CARD_REISSUE = "card_reissue"
+    CARD_APPLY_NEW = "card_apply_new"
+    CARD_ACTIVATE = "card_activate"
+    CARD_EXPIRE_RENEW = "card_expire_renew"
+    CARD_CANCEL = "card_cancel"
+    CARD_STATUS_QUERY = "card_status_query"
+    CARD_FREEZE = "card_freeze"
+    CARD_PIN_SET = "card_pin_set"
+    CARD_PIN_FORGOT = "card_pin_forgot"
+    CARD_INFO_QUERY = "card_info_query"
+    CARD_SUPPLEMENTARY = "card_supplementary"
+    CARD_UPGRADE = "card_upgrade"
+    CARD_GIFT_QUERY = "card_gift_query"
+
+    # ── 1.8 支付与渠道域 (payment, 9) ──
+    PAY_METHOD_QUERY = "pay_method_query"
+    PAY_WALLET_BIND = "pay_wallet_bind"
+    PAY_WALLET_UNBIND = "pay_wallet_unbind"
+    PAY_CONTACTLESS = "pay_contactless"
+    PAY_LARGE_VERIFY = "pay_large_verify"
+    PAY_ONLINE_SET = "pay_online_set"
+    PAY_PASSWORD_ONLINE = "pay_password_online"
+    PAY_PAUSE = "pay_pause"
+    PAY_MAGNETIC_ISSUE = "pay_magnetic_issue"
+
+    # ── 1.9 费用与费率域 (fee, 13) ──
+    FEE_ANNUAL = "fee_annual"
+    FEE_INTEREST = "fee_interest"
+    FEE_PENALTY = "fee_penalty"
+    FEE_OVERLIMIT = "fee_overlimit"
+    FEE_SERVICE = "fee_service"
+    FEE_OVERSEAS = "fee_overseas"
+    FEE_CASH = "fee_cash"
+    FEE_TRANSFER = "fee_transfer"
+    FEE_CARD_MATERIAL = "fee_card_material"
+    FEE_RATE_QUERY = "fee_rate_query"
+    FEE_SETTLE_INQUIRY = "fee_settle_inquiry"
+    FEE_CHARGED_QUERY = "fee_charged_query"
+    FEE_APPEAL = "fee_appeal"
+
+    # ── 1.10 风险管理域 (risk, 13) ──
+    RISK_FRAUD_REPORT = "risk_fraud_report"
+    RISK_CASH_ADVANCE_WARN = "risk_cash_advance_warn"
+    RISK_MONEY_LAUNDRY = "risk_money_laundry"
+    RISK_ACCOUNT_FREEZE = "risk_account_freeze"
+    RISK_CONTACT_WARN = "risk_contact_warn"
+    RISK_FRAUD_HOTLINE = "risk_fraud_hotline"
+    RISK_ATM_ANOMALY = "risk_atm_anomaly"
+    RISK_POS_ANOMALY = "risk_pos_anomaly"
+    RISK_KYC = "risk_kyc"
+    RISK_SMS_VERIFY = "risk_sms_verify"
+    RISK_PIN_LEAK = "risk_pin_leak"
+    RISK_OVERSEAS_TRAVEL = "risk_overseas_travel"
+    RISK_WALLET_SAFETY = "risk_wallet_safety"
+
+    # ── 1.11 争议与投诉域 (dispute, 12) ──
+    DISPUTE_SUBMIT = "dispute_submit"
+    DISPUTE_STATUS = "dispute_status"
+    DISPUTE_APPEAL = "dispute_appeal"
+    DISPUTE_CHARGEBACK = "dispute_chargeback"
+    DISPUTE_REGULATE = "dispute_regulate"
+    DISPUTE_HOTLINE = "dispute_hotline"
+    DISPUTE_URGE = "dispute_urge"
+    DISPUTE_WITHDRAW = "dispute_withdraw"
+    DISPUTE_MATERIAL = "dispute_material"
+    DISPUTE_COMPENSATION = "dispute_compensation"
+    DISPUTE_CLOSE = "dispute_close"
+    DISPUTE_POLICY = "dispute_policy"
+
+    # ── 1.12 转人工与人工服务域 (handoff, 8) ──
+    # transfer_agent 即旧 flat 值 (identity), 已在上方别名区声明
+    HANDOFF_QUEUE_QUERY = "handoff_queue_query"
+    HANDOFF_HOURS_QUERY = "handoff_hours_query"
+    HANDOFF_END = "handoff_end"
+    HANDOFF_RESTART = "handoff_restart"
+    HANDOFF_SCHEDULE = "handoff_schedule"
+    HANDOFF_HOTLINE = "handoff_hotline"
+    HANDOFF_VERIFY = "handoff_verify"
+
+    # ── 1.13 知识问答与政策域 (faq, 9) ──
+    FAQ_PRODUCT = "faq_product"
+    FAQ_CREDIT_REPORT = "faq_credit_report"
+    FAQ_CONTRACT = "faq_contract"
+    FAQ_NOTICE = "faq_notice"
+    FAQ_COMPLIANCE = "faq_compliance"
+    FAQ_DATA = "faq_data"
+    FAQ_CHANNEL = "faq_channel"
+    FAQ_ACCOUNT_POLICY = "faq_account_policy"
+    FAQ_ANY = "faq_any"
+
+    # ── 1.14 非业务域 (nonbusiness, 3) ──
+    NB_CHITCHAT = "nb_chitchat"
+    NB_NOISE = "nb_noise"
+    NB_HELP = "nb_help"
 
 
-# 旧 flat 意图值 -> 归一化后的主意图。阶段 B 将现有宽泛类拆成 300+ 子意图时,
-# 存量 Redis/PG/回流样本里的旧字符串会在此归一化 (identity 即不拆分时的默认)。
-# 未在映射内的未知字符串由 normalize_intent 兜底为 FAQ, 反序列化不抛异常。
+# 旧 flat 意图值 -> 归一化后的主意图 (draft-0.3 §3.1 兼容映射)。
+# 存量 Redis/PG/回流样本里的旧字符串在此归一化; 未知字符串兜底 FAQ。
 _INTENT_NORMALIZATION: dict[str, IntentLabel] = {
-    "faq": IntentLabel.FAQ,
-    "bill_query": IntentLabel.BILL_QUERY,
-    "transaction_query": IntentLabel.TRANSACTION_QUERY,
-    "limit_query": IntentLabel.LIMIT_QUERY,
-    "installment_inquiry": IntentLabel.INSTALLMENT_INQUIRY,
-    "reward_query": IntentLabel.REWARD_QUERY,
-    "card_loss": IntentLabel.CARD_LOSS,
-    "complaint": IntentLabel.COMPLAINT,
-    "transfer_agent": IntentLabel.TRANSFER_AGENT,
-    "chitchat": IntentLabel.CHITCHAT,
+    "faq": IntentLabel.FAQ_PRODUCT,
+    "bill_query": IntentLabel.ACCOUNT_BILL_QUERY,
+    "transaction_query": IntentLabel.TXN_QUERY,
+    "limit_query": IntentLabel.LIMIT_QUERY,  # identity
+    "installment_inquiry": IntentLabel.INST_PARAM_QUERY,
+    "reward_query": IntentLabel.POINTS_BALANCE_QUERY,
+    "card_loss": IntentLabel.CARD_LOSS_REPORT,
+    "complaint": IntentLabel.DISPUTE_SUBMIT,
+    "transfer_agent": IntentLabel.TRANSFER_AGENT,  # identity
+    "chitchat": IntentLabel.NB_CHITCHAT,
 }
 
 
 def normalize_intent(value: str) -> IntentLabel:
-    """把 (旧/新) 意图字符串归一化为受支持的 IntentLabel。
+    """把 (旧/新) 意图字符串归一化为主意图 IntentLabel (draft-0.3 §3.2)。
 
-    - 已是合法 IntentLabel 值 → 直接返回
-    - 旧 flat 值 → 归一化到主意图 (兼容存量数据)
+    - 旧 flat 值 → 归一化到主名 (存量兼容, 查 _INTENT_NORMALIZATION)
+    - 已是主名/合法枚举值 → 直接返回
     - 未知字符串 → 兜底 FAQ, 不抛异常
     """
+    canonical = _INTENT_NORMALIZATION.get(value)
+    if canonical is not None:
+        return canonical
     try:
         return IntentLabel(value)
     except ValueError:
         pass
-    return _INTENT_NORMALIZATION.get(value, IntentLabel.FAQ)
+    return IntentLabel.FAQ
 
 
 # 敏感写意图: 命中必须紧急转人工 / assist URGENT, 不允许走工具或 RAG 兜底 (合规底线)。
-# 阶段 B 拆分为 300+ 子意图时, 把 fraud/争议/冻结/反欺诈等风险子意图并入此集合。
-# 使用 in {集合} 而非点对点精确比较, 保证拆细后不漏判。
-SENSITIVE_INTENTS: frozenset[IntentLabel] = frozenset({IntentLabel.CARD_LOSS, IntentLabel.COMPLAINT})
+# draft-0.3 主表 ⚠️ 集合 + 旧 flat 别名 (分类器重训前仍输出旧值, 集合双世界兼容),
+# 使用 in {集合} 而非点对点精确比较。
+SENSITIVE_INTENTS: frozenset[IntentLabel] = frozenset(
+    {
+        # 旧 flat 别名
+        IntentLabel.CARD_LOSS,
+        IntentLabel.COMPLAINT,
+        # draft-0.3 ⚠️ 主名集合
+        IntentLabel.CARD_LOSS_REPORT,
+        IntentLabel.CARD_PIN_FORGOT,
+        IntentLabel.RISK_FRAUD_REPORT,
+        IntentLabel.RISK_ACCOUNT_FREEZE,
+        IntentLabel.RISK_CONTACT_WARN,
+        IntentLabel.RISK_SMS_VERIFY,
+        IntentLabel.RISK_PIN_LEAK,
+        IntentLabel.DISPUTE_SUBMIT,
+        IntentLabel.DISPUTE_APPEAL,
+        IntentLabel.DISPUTE_CHARGEBACK,
+        IntentLabel.FEE_APPEAL,
+    }
+)
 
 # 主动转人工意图: 用户明确要求转人工。
 TRANSFER_INTENTS: frozenset[IntentLabel] = frozenset({IntentLabel.TRANSFER_AGENT})
@@ -279,6 +482,30 @@ class PendingAction(BaseModel):
     expires_at: datetime | None = None  # 过期时间，超时需重新发起
     trace_id: str = ""  # 链路追踪 id
     unclear_count: int = 0  # 确认窗口内无法判定的次数, ≥3 自动取消并放行新消息
+    # 身份核验状态机 (会话 564db34d 复盘): 敏感写工具执行前先经前端身份核验弹框
+    # none -> pending(已发起核验, 等前端回传) -> verified(核验通过, 等客户确认)
+    verification_state: str = "none"  # none | pending | verified
+    verification_token: str = ""  # 前端核验回传凭据
+
+
+class VerificationRequest(BaseModel):
+    """前端身份核验弹框信号 (后端 -> 前端)
+
+    poll 响应带该结构化字段时, 前端据此弹出核验框(短信/人脸/交易密码)。
+    """
+
+    token: str  # 核验会话令牌, 前端核验完成后原样回传
+    type: str = "sms"  # sms | face | password
+    title: str = "身份核验"
+    description: str = ""  # 待办理业务摘要(如"办理 3 期账单分期, 金额 8000 元")
+    business: str = ""  # 待办理工具名
+
+
+class VerificationResult(BaseModel):
+    """前端身份核验结果回传 (前端 -> 后端, 经 /chat/send)"""
+
+    token: str
+    status: str = "success"  # success | cancel | failed
 
 
 class SlotValue(BaseModel):
@@ -331,6 +558,13 @@ class SessionState(BaseModel):
 
     # 槽位已填值（生产级: 随会话 meta 持久化, 单一真相源, 跨意图保留）
     slot_values: dict[str, SlotValue] = Field(default_factory=dict)
+
+    # 槽位等待快照（P0 会话 1fb54681 复盘）: bot 发出槽位追问/参数索取的那一轮把
+    # "我在等什么槽"写进来, 下一轮短回复("3"/"3000"/裸卡号)无论被分类成什么,
+    # 噪声门都读这份上文快照判回话, 不再依赖本轮意图(短填充必然 faq@0.00)重算 tracker。
+    # 结构: {"intent": "installment_inquiry", "slots": [("amount","分期金额"), ...]}
+    # 只存槽名/标签等元信息, 不含敏感值; 下轮放行/正常流转后整体覆写清空。
+    awaiting_slots: dict[str, Any] = Field(default_factory=dict)
 
     # 对话摘要压缩（长对话场景）
     conversation_summary: str = ""  # 被裁剪轮次的摘要
@@ -580,6 +814,8 @@ class ChatRequest(BaseModel):
     channel: ChannelType = ChannelType.WEB
     # FIX-7: 客户端幂等键 — 双击/重试时携带同一 client_message_id, 服务端只处理一次
     client_message_id: str | None = Field(default=None, max_length=64)
+    # 身份核验结果回传 (前端弹框完成后回传, 复用 /chat/send 通道)
+    verification_result: VerificationResult | None = None
 
 
 class ChatResponse(BaseModel):
@@ -622,6 +858,8 @@ class PollResponse(BaseModel):
     is_transfer: bool = False
     transfer_url: str = ""
     transfer_reason: str = ""
+    # 身份核验弹框信号: 非空时前端弹出核验框 (短信/人脸/交易密码)
+    verification: VerificationRequest | None = None
 
 
 class SessionUpdateRequest(BaseModel):
