@@ -203,45 +203,67 @@ async def replay_conversation(
     include_context: bool = Query(False, description="是否包含 retrieval_context（可能很大）"),
     turn_limit: int = Query(500, ge=1, le=2000),
 ) -> dict[str, Any]:
-    """单会话完整回放：对话轮次 + 决策链 + 消息处理记录（三段结构）"""
+    """单会话完整回放：对话轮次 + 决策链 + 消息处理记录（三段结构）
+
+    只选业务列, 不物化 ORM 实体: Uuid(native_uuid=False) 下 asyncpg 反序列化
+    UUID 主键列会抛 'pgproto.UUID' object has no attribute 'replace' (会话 48882b05 同源坑)。
+    """
     turn_rows = (
-        (
-            await db.execute(
-                select(DialogueLog)
-                .where(DialogueLog.session_id == session_id)
-                .order_by(DialogueLog.timestamp)
-                .limit(turn_limit)
+        await db.execute(
+            select(
+                DialogueLog.turn_id,
+                DialogueLog.speaker,
+                DialogueLog.content,
+                DialogueLog.intent,
+                DialogueLog.confidence,
+                DialogueLog.entities,
+                DialogueLog.response_source,
+                DialogueLog.emotion_label,
+                DialogueLog.emotion_score,
+                DialogueLog.retrieval_context,
+                DialogueLog.timestamp,
             )
+            .where(DialogueLog.session_id == session_id)
+            .order_by(DialogueLog.timestamp)
+            .limit(turn_limit)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
 
     decision_rows = (
-        (
-            await db.execute(
-                select(DecisionLog)
-                .where(DecisionLog.session_id == session_id)
-                .order_by(DecisionLog.created_at)
-                .limit(500)
+        await db.execute(
+            select(
+                DecisionLog.decision_id,
+                DecisionLog.turn_id,
+                DecisionLog.agent_name,
+                DecisionLog.action,
+                DecisionLog.reasoning,
+                DecisionLog.evidence_json,
+                DecisionLog.latency_ms,
+                DecisionLog.created_at,
             )
+            .where(DecisionLog.session_id == session_id)
+            .order_by(DecisionLog.created_at)
+            .limit(500)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
 
     message_rows = (
-        (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.session_id == session_id)
-                .order_by(ChatMessage.created_at)
-                .limit(turn_limit)
+        await db.execute(
+            select(
+                ChatMessage.message_id,
+                ChatMessage.content,
+                ChatMessage.intent,
+                ChatMessage.processing_status,
+                ChatMessage.processing_duration_ms,
+                ChatMessage.source,
+                ChatMessage.error_message,
+                ChatMessage.created_at,
             )
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at)
+            .limit(turn_limit)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
 
     return {
         "session_id": session_id,

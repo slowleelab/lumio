@@ -179,7 +179,7 @@ class TestReplay:
             error_message=None,
             created_at=_NOW,
         )
-        fake = FakeSession([_Result(scalars=[turn]), _Result(scalars=[decision]), _Result(scalars=[message])])
+        fake = FakeSession([_Result(rows=[turn]), _Result(rows=[decision]), _Result(rows=[message])])
         resp = await _get(_make_app(ADMIN, fake), "/api/admin/conversations/s-1/replay")
         assert resp.status_code == 200
         body = resp.json()
@@ -204,7 +204,7 @@ class TestReplay:
             retrieval_context="知识原文",
             timestamp=_NOW,
         )
-        fake = FakeSession([_Result(scalars=[turn]), _Result(scalars=[]), _Result(scalars=[])])
+        fake = FakeSession([_Result(rows=[turn]), _Result(rows=[]), _Result(rows=[])])
         resp = await _get(_make_app(ADMIN, fake), "/api/admin/conversations/s-1/replay?include_context=true")
         assert resp.status_code == 200
         assert resp.json()["turns"][0]["retrieval_context"] == "知识原文"
