@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lumio.shared.orm_models import AuditLog, ChatMessage, ChatMessageStatus
@@ -81,25 +82,37 @@ async def write_chat_message(
     channel: str = "web",
     quick_intent: str | None = None,
     trace_id: str | None = None,
-) -> ChatMessage | None:
+) -> str | None:
     """写入消息审计记录（初始状态 queued）
 
     Returns:
-        ChatMessage 对象，失败返回 None
+        新插入记录的 message_id；冲突(已存在)/失败返回 None。
+        只 returning message_id(String 列): returning(ChatMessage) 会物化 id UUID 列,
+        在 Uuid(native_uuid=False) 下 asyncpg 的 pgproto.UUID 反序列化报
+        'pgproto.UUID' object has no attribute 'replace', 整条审计静默丢失(会话 48882b05)。
     """
     try:
         async with session_factory() as session:
-            record = ChatMessage(
-                session_id=session_id,
-                message_id=message_id,
-                customer_id=customer_id or "",
-                channel=channel,
-                content=content,
-                quick_intent=quick_intent,
-                processing_status=ChatMessageStatus.QUEUED,
-                trace_id=trace_id,
+            # 幂等插入 (会话 0681c635 复盘): XAUTOCLAIM 重投递/幂等键失效时, 同一
+            # message_id 会被重复落库, 此前靠唯一约束硬顶出 IntegrityError 再 logger.exception
+            # 打完整 traceback, 反复刷屏且掩盖真实错误。ON CONFLICT DO NOTHING 静默跳过
+            # 已存在记录, 审计语义不变 (首写成功即留存)。
+            stmt = (
+                pg_insert(ChatMessage)
+                .values(
+                    session_id=session_id,
+                    message_id=message_id,
+                    customer_id=customer_id or "",
+                    channel=channel,
+                    content=content,
+                    quick_intent=quick_intent,
+                    processing_status=ChatMessageStatus.QUEUED,
+                    trace_id=trace_id,
+                )
+                .on_conflict_do_nothing(index_elements=["message_id"])
+                .returning(ChatMessage.message_id)
             )
-            session.add(record)
+            record = (await session.execute(stmt)).scalar_one_or_none()
             await session.commit()
             return record
     except Exception:

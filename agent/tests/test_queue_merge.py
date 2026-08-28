@@ -209,8 +209,8 @@ class TestQueueMerge:
                 quick_intent="default",
             )
 
-        # 每个 drain 的消息各写入一次
-        assert mock_session.add.call_count == 2
+        # 每个 drain 的消息各写入一次 (幂等插入走 execute, 非 add)
+        assert mock_session.execute.call_count == 2
 
     @pytest.mark.asyncio
     async def test_merged_audit_updated_with_merged_source(self):
