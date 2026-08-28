@@ -152,6 +152,32 @@ DEGRADATION_LEVEL = Gauge(
     "系统降级等级（0=normal, 1=degraded, 2=fallback），由 DegradationManager 写入",
 )
 
+# ── RAG 管理控制台观测补充（console 一期） ──
+
+RAG_CACHE_OPS = Counter(
+    "lumio_rag_cache_ops_total",
+    "RAG 检索 Redis 缓存命中/未命中次数",
+    ["result", "search_type"],  # result: hit/miss; search_type: hybrid/bm25/vector
+)
+
+RERANK_DEGRADATION = Counter(
+    "lumio_rerank_degradation_total",
+    "Reranker 降级回退 RRF 次数（按原因归因）",
+    ["reason"],  # reason: unavailable(模型不可用) / error(调用异常) / zero_scores(评分全0)
+)
+
+FAQ_MATCH = Counter(
+    "lumio_faq_match_total",
+    "FAQ 检索匹配结果计数（与 kb_faq_search_log 落库同源）",
+    ["match_type"],  # match_type: exact/semantic/miss
+)
+
+CIRCUIT_BREAKER_STATE = Gauge(
+    "lumio_circuit_breaker_state",
+    "熔断器当前状态（0=closed, 1=half_open, 2=open），按熔断器名",
+    ["name"],
+)
+
 # ── KV Cache 指标 (A0: 推理引擎 K/V tensor 命中率监控) ──
 
 KV_CACHE_HIT_RATE = Gauge(

@@ -14,7 +14,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from lumio.shared.config import get_settings
-from lumio.shared.metrics import RETRIEVE_DURATION
+from lumio.shared.metrics import RAG_CACHE_OPS, RERANK_DEGRADATION, RETRIEVE_DURATION
 from lumio.shared.models import RetrievedChunk, RetrieveRequest, RetrieveResponse
 from lumio.shared.tracing import traced
 
@@ -355,7 +355,7 @@ async def search_vector(
                         # Milvus ARRAY 字段(keywords)返回 protobuf RepeatedScalarContainer,
                         # 原样落 metadata 会让响应模型 JSON 序列化失败 (PydanticSerializationError)
                         metadata[field_name] = (
-                            list(value) if not isinstance(value, (str, int, float, bool, bytes)) else value
+                            list(value) if not isinstance(value, str | int | float | bool | bytes) else value
                         )
                 if parent_chunk_id and parent_chunk_id in parent_contents:
                     metadata["parent_content"] = parent_contents[parent_chunk_id]
@@ -508,6 +508,7 @@ async def retrieve(
         try:
             cached_raw = await redis_client.get(cache_key)
             if cached_raw:
+                RAG_CACHE_OPS.labels(result="hit", search_type=request.search_type).inc()
                 cached_data = json.loads(cached_raw)
                 cached_results = [
                     RetrievedChunk(
@@ -524,6 +525,7 @@ async def retrieve(
                     total_candidates=cached_data["total_candidates"],
                     latency_ms=int((time.monotonic() - start_time) * 1000),
                 )
+            RAG_CACHE_OPS.labels(result="miss", search_type=request.search_type).inc()
         except Exception:
             logger.debug("Redis 缓存读取失败，走检索路径")
 
@@ -626,11 +628,13 @@ async def retrieve(
                 # (Ollama/无模型时 _score_document 捕获异常返回 0.0), 回退到 RRF 结果,
                 # 避免 0 分全部命中置信度阈值而被过滤为空。
                 if all(rr.score <= 0.0 for rr in reranked):
+                    RERANK_DEGRADATION.labels(reason="zero_scores").inc()
                     logger.warning("Reranker 评分为全 0，判定为退化，回退到 RRF 结果")
                 else:
                     fused = reranked
                     use_reranker_threshold = True
         except Exception:
+            RERANK_DEGRADATION.labels(reason="error").inc()
             logger.warning("Reranker 调用失败，使用 RRF 结果", exc_info=True)
 
     # 置信度阈值过滤（RRF 和 Reranker 使用不同阈值）

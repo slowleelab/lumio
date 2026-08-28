@@ -512,6 +512,9 @@ async def _log_search(
     session_id: str | None,
 ) -> None:
     """记录检索日志（用于分析）"""
+    from lumio.shared.metrics import FAQ_MATCH
+
+    FAQ_MATCH.labels(match_type=match_type).inc()
     if not session_factory:
         return
     try:

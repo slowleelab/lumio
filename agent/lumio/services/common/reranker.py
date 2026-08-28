@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 
 import httpx
 
+from lumio.shared.metrics import RERANK_DEGRADATION
 from lumio.shared.models import RerankResult
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class OllamaReranker:
         except Exception:
             # 模型/服务无 rerank 能力 (404) 或调用失败 → 返回空, 检索端回退 RRF.
             # 不再走逐文档 /api/generate (BERT 重排模型无法生成, 白耗 GPU).
+            RERANK_DEGRADATION.labels(reason="unavailable").inc()
             logger.warning("Ollama rerank 不可用 (%s), 回退 RRF: %s", self.model, self.base_url)
             return []
 
@@ -160,6 +162,7 @@ class TEIReranker:
                 results.append(RerankResult(index=index, relevance_score=float(score), text=text))
             return results
         except Exception:
+            RERANK_DEGRADATION.labels(reason="error").inc()
             logger.exception("TEI 重排序请求失败")
             return []
 
