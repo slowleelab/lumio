@@ -475,12 +475,13 @@ async def rag_quality_summary(
         await db.execute(
             select(
                 DecisionLog.agent_name,
+                DecisionLog.action,
                 func.count().label("cnt"),
                 func.avg(DecisionLog.latency_ms).label("avg_ms"),
                 func.percentile_cont(0.95).within_group(DecisionLog.latency_ms).label("p95_ms"),
             )
             .where(DecisionLog.created_at >= since)
-            .group_by(DecisionLog.agent_name)
+            .group_by(DecisionLog.agent_name, DecisionLog.action)
             .order_by(func.count().desc())
         )
     ).all()
@@ -515,6 +516,7 @@ async def rag_quality_summary(
         "decision_latency": [
             {
                 "agent": r.agent_name,
+                "action": r.action,
                 "count": r.cnt,
                 "avg_ms": _round(r.avg_ms, 1),
                 "p95_ms": _round(r.p95_ms, 1),

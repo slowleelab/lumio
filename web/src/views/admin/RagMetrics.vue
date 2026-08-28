@@ -77,8 +77,9 @@
         <el-card shadow="never">
           <template #header>决策延迟（avg / p95 ms）</template>
           <el-table :data="summary?.decision_latency ?? []" stripe size="small">
-            <el-table-column prop="agent" label="Agent" min-width="140" />
-            <el-table-column prop="count" label="次数" width="90" align="center" />
+            <el-table-column prop="agent" label="Agent" min-width="110" />
+            <el-table-column prop="action" label="动作" min-width="110" show-overflow-tooltip />
+            <el-table-column prop="count" label="次数" width="80" align="center" />
             <el-table-column label="平均" width="100" align="right">
               <template #default="{ row }">{{ fmtMs(row.avg_ms) }}</template>
             </el-table-column>
@@ -154,7 +155,7 @@ function fmtPct(v: number | null | undefined) {
 // ── 实时指标卡 ──
 const statCards = computed(() => {
   const l = live.value
-  const hybrid = l?.retrieval?.["hybrid"]
+  const ragStep = summary.value?.decision_latency.find((x) => x.action === "rag_retrieve")
   const cacheHit = l?.rag_cache_ops ?? {}
   const hit = cacheHit["hit"] ?? 0
   const miss = cacheHit["miss"] ?? 0
@@ -163,8 +164,8 @@ const statCards = computed(() => {
   return [
     {
       label: "检索平均耗时",
-      value: fmtMs(hybrid?.avg != null ? hybrid.avg * 1000 : null),
-      sub: `hybrid 累计 ${fmtInt(hybrid?.count)}`,
+      value: fmtMs(ragStep?.avg_ms ?? null),
+      sub: `p95 ${fmtMs(ragStep?.p95_ms ?? null)} · 近 ${days.value} 天`,
     },
     {
       label: "FAQ 命中率",

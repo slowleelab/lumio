@@ -256,7 +256,10 @@ class TestRagQualitySummary:
             _Result(rows=[("exact", 1), ("semantic", 2), ("miss", 1)]),  # faq_total
             _Result(rows=[SimpleNamespace(intent="faq", cnt=8, avg_conf=0.9)]),  # intent_top
             _Result(one=SimpleNamespace(bot_turns=10, avg_conf=0.75, low_conf_bot=2)),  # confidence
-            _Result(rows=[SimpleNamespace(agent_name="bot_agent", cnt=9, avg_ms=100.0, p95_ms=250.0)]),  # latency
+            _Result(rows=[
+                SimpleNamespace(agent_name="bot_agent", action="intent_classify", cnt=5, avg_ms=300.0, p95_ms=400.0),
+                SimpleNamespace(agent_name="bot_agent", action="rag_retrieve", cnt=4, avg_ms=100.0, p95_ms=250.0),
+            ]),  # latency
         ]
         fake = FakeSession(results)
         resp = await _get(_make_app(ADMIN, fake), "/api/admin/rag/quality-summary?days=7")
@@ -269,7 +272,8 @@ class TestRagQualitySummary:
         assert body["faq"]["hit_rate"] == 0.75
         assert body["intent_top"][0]["intent"] == "faq"
         assert body["confidence"]["low_confidence_share"] == 0.2
-        assert body["decision_latency"][0]["p95_ms"] == 250.0
+        assert body["decision_latency"][1]["action"] == "rag_retrieve"
+        assert body["decision_latency"][1]["p95_ms"] == 250.0
 
     async def test_days_out_of_range_rejected(self) -> None:
         fake = FakeSession([])

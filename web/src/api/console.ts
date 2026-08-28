@@ -107,7 +107,7 @@ export interface RagQualitySummary {
     avg_bot_confidence: number | null
     low_confidence_share: number | null
   }
-  decision_latency: { agent: string; count: number; avg_ms: number | null; p95_ms: number | null }[]
+  decision_latency: { agent: string; action: string; count: number; avg_ms: number | null; p95_ms: number | null }[]
 }
 
 export interface HistStats {
