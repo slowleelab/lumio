@@ -45,6 +45,22 @@ def _cache_key(query: str) -> str:
 # ── CRUD ──
 
 
+def _coerce_faq_id(faq_id: str):
+    """字符串 ID → Uuid(native_uuid=False) 列可绑定的 uuid_utils.UUID。
+
+    字符串直接与 Uuid 列比较会在 bind 阶段抛 StatementError (审批/CRUD 全链路
+    此前只被 mock 单测覆盖, 未打过真实 PG, 会话 2026-08-28 界面联调发现)。
+    """
+    import uuid_utils
+
+    try:
+        return uuid_utils.UUID(str(faq_id))
+    except ValueError as exc:
+        from lumio.shared.exceptions import LumioError
+
+        raise LumioError(code=2001, message=f"FAQ ID 非法: {faq_id}") from exc
+
+
 async def create_faq(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -135,7 +151,7 @@ async def get_faq(
 ) -> dict | None:
     """获取 FAQ 详情"""
     async with session_factory() as session:
-        result = await session.execute(select(KbFaq).where(KbFaq.id == faq_id))
+        result = await session.execute(select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id)))
         f = result.scalar_one_or_none()
         if not f:
             return None
@@ -180,7 +196,7 @@ async def update_faq(
 ) -> bool:
     """更新 FAQ"""
     async with session_factory() as session:
-        result = await session.execute(select(KbFaq).where(KbFaq.id == faq_id))
+        result = await session.execute(select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id)))
         faq = result.scalar_one_or_none()
         if not faq:
             return False
@@ -211,7 +227,7 @@ async def delete_faq(
 ) -> bool:
     """软删除 FAQ"""
     async with session_factory() as session:
-        result = await session.execute(select(KbFaq).where(KbFaq.id == faq_id))
+        result = await session.execute(select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id)))
         faq = result.scalar_one_or_none()
         if not faq:
             return False
@@ -247,7 +263,7 @@ async def transition_faq_approval(
 ) -> dict:
     """执行 FAQ 审批状态转换"""
     async with session_factory() as session:
-        result = await session.execute(select(KbFaq).where(KbFaq.id == faq_id))
+        result = await session.execute(select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id)))
         faq = result.scalar_one_or_none()
         if not faq:
             from lumio.shared.exceptions import LumioError
