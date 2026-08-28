@@ -50,15 +50,15 @@ def _coerce_faq_id(faq_id: str):
 
     字符串直接与 Uuid 列比较会在 bind 阶段抛 StatementError (审批/CRUD 全链路
     此前只被 mock 单测覆盖, 未打过真实 PG, 会话 2026-08-28 界面联调发现)。
+    合法 UUID 归一为 UUID 对象; 非法字符串原样透传——交由上层"不存在"语义
+    (get→None / update、delete→False) 或真实 PG 的既有报错处理, 不在此处改写契约。
     """
     import uuid_utils
 
     try:
         return uuid_utils.UUID(str(faq_id))
-    except ValueError as exc:
-        from lumio.shared.exceptions import LumioError
-
-        raise LumioError(code=2001, message=f"FAQ ID 非法: {faq_id}") from exc
+    except ValueError:
+        return str(faq_id)
 
 
 async def create_faq(
@@ -248,6 +248,9 @@ _FAQ_TRANSITIONS = {
     "REJECTED": {"DRAFT"},
     "PUBLISHED": {"SUPERSEDED", "ARCHIVED"},
     "SUPERSEDED": {"ARCHIVED"},
+    # 归档不是死胡同: 允许回到草稿重新走审批链 (改版重发布), 否则归档内容
+    # 只能删除重建, 已填写的问答/变体/关键词全部作废。
+    "ARCHIVED": {"DRAFT"},
 }
 
 

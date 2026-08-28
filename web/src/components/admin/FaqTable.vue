@@ -31,6 +31,7 @@
           <el-button link type="warning" size="small" @click.stop="emitAction('archive', row)">归档</el-button>
         </template>
         <template v-else-if="row.approval_status === 'ARCHIVED'">
+          <el-button link type="primary" size="small" @click.stop="emitAction('restore', row)">恢复草稿</el-button>
           <el-popconfirm title="删除后不可恢复，确认删除该归档 FAQ？" confirm-button-text="删除" cancel-button-text="取消" @confirm="emitAction('delete', row)">
             <template #reference>
               <el-button link type="danger" size="small" @click.stop>删除</el-button>
@@ -54,7 +55,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "row-click", row: FaqItem): void
-  (e: "action",   action: "submit" | "approve" | "reject" | "publish" | "archive" | "delete" | "edit", row: FaqItem): void
+  (e: "action",   action: "submit" | "approve" | "reject" | "publish" | "archive" | "restore" | "delete" | "edit", row: FaqItem): void
 }>()
 
 const { tagType, text } = useFaqStatus()

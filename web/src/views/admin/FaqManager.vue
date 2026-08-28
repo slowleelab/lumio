@@ -87,7 +87,7 @@ import FaqCreateDialog from "@/components/admin/FaqCreateDialog.vue"
 const {
   faqs, total, loading, page, pageSize, filterStatus, filterCategory, pendingCount,
   load, loadPendingCount, reset,
-  submit, approve, reject, publish, archive,
+  submit, approve, reject, publish, archive, restore,
 } = useFaqAdmin()
 
 // ── 详情 / 编辑 ──
@@ -146,7 +146,7 @@ async function doCreate(payload: { question: string; answer: string; category: s
 }
 
 // ── 表格 action 路由 ──
-type FaqAction = "submit" | "approve" | "reject" | "publish" | "archive" | "delete" | "edit"
+type FaqAction = "submit" | "approve" | "reject" | "publish" | "archive" | "restore" | "delete" | "edit"
 async function onAction(action: FaqAction, row: FaqItem) {
   switch (action) {
     case "submit":  await submit(row.id);  break
@@ -154,6 +154,7 @@ async function onAction(action: FaqAction, row: FaqItem) {
     case "reject":  await reject(row.id); break
     case "publish": await publish(row.id); break
     case "archive": await archive(row.id); break
+    case "restore": await restore(row.id); break
     case "delete":
       try {
         await deleteFaq(row.id)

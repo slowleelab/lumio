@@ -94,3 +94,7 @@ export function publishFaq(faqId: string, comment = ""): Promise<FaqApprovalResu
 export function archiveFaq(faqId: string, comment = ""): Promise<FaqApprovalResult> {
   return client.post(`/kb/faq/${faqId}/archive`, { comment })
 }
+
+export function restoreFaq(faqId: string, comment = ""): Promise<FaqApprovalResult> {
+  return client.post(`/kb/faq/${faqId}/restore`, { comment })
+}

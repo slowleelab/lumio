@@ -223,6 +223,12 @@ async def archive_faq(faq_id: str, body: FaqApprovalRequest, request: Request, u
     return await _do_approval(faq_id, "ARCHIVED", body.comment, request, user)
 
 
+@router.post("/kb/faq/{faq_id}/restore")
+async def restore_faq(faq_id: str, body: FaqApprovalRequest, request: Request, user: CurrentUser):
+    """恢复草稿 (ARCHIVED → DRAFT): 归档内容改版后重新走审批链, 不必删除重建"""
+    return await _do_approval(faq_id, "DRAFT", body.comment, request, user)
+
+
 async def _do_approval(faq_id: str, target: str, comment: str, request: Request, user: CurrentUser):
     session_factory = getattr(request.app.state, "db_session_factory", None)
     redis_client = getattr(request.app.state, "redis_client", None)
