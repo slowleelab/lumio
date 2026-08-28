@@ -6,11 +6,84 @@
 
 from __future__ import annotations
 
+import json
+import os
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import quote_plus
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# 让 .env 对所有子 Settings 生效 (子类各自只有 env_prefix, 未带 env_file, 若不在此
+# 全局注入, RAG_/LLM_/ES_ 等前缀的值写入 .env 不会生效, 只读进程环境变量).
+# 真实进程环境变量优先级仍高于 .env (load_dotenv 默认 override=False).
+# 让 .env 对所有子 Settings 生效 (子类各自只有 env_prefix, 未带 env_file, 若不在此
+# 全局注入, RAG_/LLM_/ES_ 等前缀的值写入 .env 不会生效, 只读进程环境变量).
+# 真实进程环境变量优先级仍高于 .env (load_dotenv 默认 override=False).
+def _load_dotenv_search() -> None:
+    """探测并加载仓库 .env 到 os.environ (供所有子 Settings 读取)"""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover - python-dotenv 随 pydantic-settings 安装
+        return
+
+    # 默认 load_dotenv() 相对进程 CWD 解析, 而服务从 agent/ 启动, 会漏掉仓库根 .env.
+    # 仓库内以根 .env 为准 (与 .env.example 同目录, 唯一 config 源): 即使 cwd 下
+    # 存在历史残留的 agent/.env 也不允许其遮蔽根文件. 仅当 cwd 位于仓库外
+    # (如自包含的临时测试目录) 才退而使用 cwd/.env.
+    repo_root = Path(__file__).resolve().parents[3]
+    cwd_resolved = Path.cwd().resolve()
+    inside_repo = cwd_resolved == repo_root or repo_root in cwd_resolved.parents
+    candidates = (
+        (repo_root / ".env", cwd_resolved / ".env") if inside_repo else (cwd_resolved / ".env", repo_root / ".env")
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            break
+
+    # 密闭配置文件: 意图分类闭环开关(BERT 快路径 + trap 感知缝)的唯一版本化源.
+    # 线上 on/off 随代码入库, 不依赖本机未入库的 .env. 与 .env 同样的 override=False
+    # 语义 — 显式进程环境变量(CLS_*)仍可覆盖此文件(作逃生舱/临时关闭).
+    _inject_closed_loop_env(repo_root)
+
+
+# 四步闭环开关: 字段 → 对应 CLS_ 环境变量名 (ClassificationSettings env_prefix=CLS_)
+_CLOSED_LOOP_ENV_MAP: dict[str, str] = {
+    "bert_enabled": "CLS_BERT_ENABLED",
+    "trap_enabled": "CLS_TRAP_ENABLED",
+    "trap_sampling_band": "CLS_TRAP_SAMPLING_BAND",
+    "trap_ambient_rate": "CLS_TRAP_AMBIENT_RATE",
+    "rephrase_guard_enabled": "CLS_REPHRASE_GUARD_ENABLED",
+    "ood_enabled": "CLS_OOD_ENABLED",
+    "ood_energy_threshold": "CLS_OOD_ENERGY_THRESHOLD",
+    "ood_ambiguous_band": "CLS_OOD_AMBIGUOUS_BAND",
+    "ood_temperature": "CLS_OOD_TEMPERATURE",
+    "llm_arbiter_enabled": "CLS_LLM_ARBITER_ENABLED",
+    "noise_gate_enabled": "CLS_NOISE_GATE_ENABLED",
+    "anaphora_resolver_enabled": "CLS_ANAPHORA_RESOLVER_ENABLED",
+    "anaphora_llm_fallback_enabled": "CLS_ANAPHORA_LLM_FALLBACK_ENABLED",
+}
+
+
+def _inject_closed_loop_env(repo_root: Path) -> None:
+    """从已提交的 data/intent_classification/closed_loop.json 注入开关到 os.environ."""
+    cfg = repo_root / "agent" / "data" / "intent_classification" / "closed_loop.json"
+    if not cfg.is_file():
+        return
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for field, env_key in _CLOSED_LOOP_ENV_MAP.items():
+        # 保留 None 让 .env/默认值生效; 值统一转字符串注入
+        if data.get(field) is not None:
+            os.environ.setdefault(env_key, str(data[field]))
+
+
+_load_dotenv_search()
 
 
 class DatabaseSettings(BaseSettings):
@@ -74,6 +147,10 @@ class MilvusSettings(BaseSettings):
     port: int = 19530
     collection_name: str = "lumio_knowledge"
     vector_dim: int = 1024  # bge-large-zh-v1.5 输出维度
+    # 向量检索硬超时(秒): Milvus gRPC 通道死亡(容器重启/网络断)时 collection.search
+    # 无超时会永久挂起, 且挂在 to_thread 线程里事件循环无法自救 -- 必须客户端兜底,
+    # 超时降级为 BM25-only (实测: 死通道连噪声输入也拖到 60s 编排超时, 回复全瘫).
+    search_timeout: float = 5.0
 
 
 class MinIOSettings(BaseSettings):
@@ -99,7 +176,9 @@ class LLMSettings(BaseSettings):
     primary_model: str = "qwen2.5:7b"
     fallback_model: str = "qwen2.5:7b"
     temperature: float = 0.2
-    max_tokens: int = 2048
+    # 生成输出上限: 实测本地 qwen2.5:7b RAG 答复多为 60~90 token, 2048 上限
+    # 不收益且给解码预留过大解码预算; 512 有 6x 余量, 并限制异常长解码拖慢一轮。
+    max_tokens: int = 512
     timeout_seconds: float = 60.0
 
     # 健康探测
@@ -109,8 +188,20 @@ class LLMSettings(BaseSettings):
     health_probe_fail_threshold: int = 2  # 连续失败降级阈值
     health_probe_success_threshold: int = 2  # 连续成功恢复阈值
     # 各类独立超时
-    classify_timeout: float = 1.5  # 分类独立超时
-    generate_timeout: float = 2.0  # 生成独立超时
+    # 分类独立超时 (LLM 慢路径硬总时长): 既约束慢路径 LLM 分类最坏等待, 又留足正常
+    # 分类余量. 此前 1.5s 只是透传 SDK per-read 超时(对流式永不触发), 实为死配置;
+    # 现由 classifier 的 asyncio.wait_for 强制总 deadline, 故设 3s: 拖慢的 8s+ 分类被
+    # 封顶, 正常分类(热机 ~1-2s)不受影响. 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清.
+    classify_timeout: float = 3.0
+    # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
+    # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
+    classify_cache_enabled: bool = True
+    classify_cache_ttl_seconds: int = 300
+    classify_cache_max_entries: int = 512
+    # 生成独立超时: 15s 对热机 qwen2.5:7b 足够, 但在健康探测或其他渲染抢占 GPU 时,
+    # 慢而成功的调用可能顶破 15s → 触发"超时→重试"把一轮翻倍 (实测 24.5s 尖峰)。
+    # 抬到 20s: 让慢一点但能成功的单次调用一次走完(20s<25s 长轮询窗口), 避免重试翻倍。
+    generate_timeout: float = 20.0
 
     # ── A0: KV Cache 优化配置 ──
     # 三层 cache 控制
@@ -125,7 +216,10 @@ class LLMSettings(BaseSettings):
     # 分层 token 预算 (A2)
     budget_static: int = 800  # 稳态层
     budget_customer: int = 400  # 半稳态层 (客户画像)
-    budget_rag: int = 1200  # 动态层 (RAG 检索)
+    # 动态层 (RAG 检索): 1200→600. 实测此类问答 prompt 中 RAG 检索内容占 ~1067/1506
+    # token, 是 prefill (~220tok/s) 的头号贡献者; 单轮只需保留 top 1-2 相关 chunk,
+    # 600 预算即够, prefill 显著下降. 检索端已按此预算截断, 不会多取。
+    budget_rag: int = 600  # 动态层 (RAG 检索)
     budget_history: int = 1500  # 动态层 (历史)
     budget_current: int = 200  # 动态层 (当前轮)
 
@@ -250,6 +344,69 @@ class ClassificationSettings(BaseSettings):
     intent_threshold: float = 0.6
     # 实体抽取
     min_entity_confidence: float = 0.7
+    # 轻量 BERT 意图分类器 (torch 推理快路径): 开启后取代规则快路径, 置信度不足仍回退 LLM
+    bert_enabled: bool = False
+    # 已微调 BERT 模型目录 (相对路径以 agent/ 为基准; 权重不入 git, 部署需随服携带)
+    bert_model_path: str = "data/intent_classification/out_intent_clf"
+
+    # ── 闭环 P1 感知缝 (TrapCollector) ──
+    # 采样: 走慢路径/兜底、贴近决策边界、规则-BERT 分歧 + 固定小概率随机的样本落库
+    trap_enabled: bool = False
+    # 有界留存: 超过该天数自动清档
+    trap_retention_days: int = 90
+    # 贴近决策边界的带宽 (abs(final_confidence - threshold) < band 即采样)
+    trap_sampling_band: float = 0.15
+    # 环境随机采样率 (打破"只采异常"的选择偏差, 支撑漂移检测)
+    trap_ambient_rate: float = 0.02
+
+    # ── 多轮噪声/闲聊治理 (P0) ──
+    # 噪声门先判"是否在回上文话"(填上缺的必填槽/纯数字/确认词)再判噪声的开关.
+    # 关闭 = 旧行为(只看当前句); 开启 = 回话放行, 防"上轮问卡号/金额, 本句答数字"被误判噪声.
+    # 灰度: 先在 staging 开 + 用 decision_log 的 NOISE_BLOCKED 对账真实误伤, 再上生产.
+    # 由 closed_loop.json 同源注入(见 _CLOSED_LOOP_ENV_MAP)。
+    rephrase_guard_enabled: bool = False
+
+    # ── 闭环 P1 提纯"认不认": energy-OOD + 温度校准 + LLM 模糊仲裁 ──
+    # energy ("不认"通道): -logsumexp(logits) —— 封闭意图集外输入该值显著更"负"(分散).
+    # BERT 快路径产生该分数; LLM 慢路径/无 torch 环境不产生, 由上层走置信度 + 更多信号.
+    # 实测标注 (2026-08, closed_loop.json switch_rationale): 乱码样本 energy 反而更低
+    # (-2.55 vs 阈值 -3.4) 被判"认得", 无区分度 → 默认关, 只作观测位; 开启前必须在
+    # 部署环境用真实噪声/真实业务样本重新标定阈值, 否则是"假开关"。
+    ood_enabled: bool = False  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
+    # energy 阈值: energy 高于此 → 认为"认识"可用(信任 BERT); 低于 → "不认"倾向 OOD/噪声.
+    # energy 数值尺度取决于 logits 绝对值, 需在部署环境用验证集标定, 这里给保守初值.
+    ood_energy_threshold: float = 0.0
+    # 温度缩放: logits / temperature 后再 softmax. 1.0 = 不缩放. 用验证集一维标定,
+    # 把置信度校准到与准确率匹配(>1 更保守、压低过拟合 BERT 的虚高置信).
+    ood_temperature: float = 1.0
+    # 模糊带宽仲裁: 多信号落在"模糊带"(energy/BERT 置信中段、无铁证)时, 把原文交 LLM
+    # 判 {business|chitchat|noise} 与证据链投票. LLM 结果不单独作通过依据(弱信号).
+    llm_arbiter_enabled: bool = False
+    # LLM 仲裁输入也走 BERT 快路径时的 energy 模糊带宽 (|energy - 阈值| 内即模糊)
+    ood_ambiguous_band: float = 1.0
+
+    # ── 闭环 P2 中英多信号噪声闸 (InputGate) ──
+    # 打开后由 InputGate 在噪声门内额外做惊讶度(中/英)多信号投票; 默认关。
+    # 实测标注 (2026-08, closed_loop.json switch_rationale): 惊讶度无区分度
+    # (乱码 7.2-8.3 vs 真实 6.9-8.3 区间重叠), 只作观测/框架预留, 不建议开启;
+    # 未来若要启用需先回流标定分段阈值。
+    noise_gate_enabled: bool = False
+
+    # ── 多轮指代消解 (回指落实体) ──
+    # 规则预扫层: 当前句命中回指(这/那张卡/那笔)时, 从历史实体池取"唯一候选"解析进实体.
+    # 唯一性约束保证安全性: 候选 0 个或多于 1 个时规则层绝不乱猜. 由 closed_loop.json 同源注入.
+    anaphora_resolver_enabled: bool = False
+    # LLM 兜底层: 仅当规则层判定"存在回指但候选不唯一/无法确定"时按此开关触发, 供多候选难例.
+    # 默认关; 与规则层独立, 需单独灰度.
+    anaphora_llm_fallback_enabled: bool = False
+
+    # ── 闭环 P3 版本化优化 ──
+    # 模型注册表状态文件 (相对 agent/ 解析; 仅存版本指针, 不存权重)
+    model_registry_path: str = "data/intent_classification/model_registry.json"
+    # 样本回流人审 staging 文件
+    backflow_review_path: str = "data/intent_classification/backflow_review.jsonl"
+    # 回流并入的种子数据集
+    seed_dataset_path: str = "data/intent_classification/seed_dataset.json"
 
 
 class RAGSettings(BaseSettings):
@@ -266,6 +423,12 @@ class RAGSettings(BaseSettings):
     rrf_confidence_threshold: float = 0.0
     # Reranker 置信度阈值（Reranker 分数范围 0-1）
     confidence_threshold: float = 0.5
+    # 词法证据门 (P1): ES 已应答但 BM25 零命中(没有任何 token 匹配) -> 判定无相关知识,
+    # 不把向量召回(实测无区分度: 乱码 0.55-0.63 / 真实 0.52-0.79 重叠)的文档喂 LLM.
+    # 注意: 绝对分数下限被实测证伪不可用 -- 真实短查询'年费'@0.92 与乱码'额佛呢份'@2.77
+    # 区间重叠, BM25 分数混合了查询词特异度与相关性, 无一刀切阈值; 零命中是唯一无歧义信号.
+    # reranker 分数生效时(生产 TEI)由 confidence_threshold 主导, 本门不拦.
+    require_lexical_evidence: bool = True
     # Embedding 模型
     embedding_provider: str = "ollama"  # ollama / tei
     embedding_model: str = "mxbai-embed-large"  # Ollama 开发环境模型
@@ -330,6 +493,9 @@ class BotSettings(BaseSettings):
     message_ttl_seconds: int = 8
     # fast_reply 冷却时间（秒），同一会话两次 fast_reply 的最小间隔
     fast_reply_cooldown: int = 5
+    # 单会话在途消息队列深度上限。防止单会话短时灌入大量消息 → 无界内存队列;
+    # 队列满时消息留在 Redis Stream(PEL), 由 XAUTOCLAIM/TTL 后续重投或超时兜底.
+    max_session_queue: int = 20
     # P2-16: 同一客户同时进行的活跃会话数上限 (多设备/多标签页防资源耗尽)
     max_sessions_per_customer: int = 3
 
@@ -378,7 +544,9 @@ class OrchestrationSettings(BaseSettings):
     d2_emotion_score_threshold: float = 0.3
 
     # 全局超时（对应文档 §3.5 仲裁超时兜底）
-    global_timeout_ms: int = 5000
+    # 5s 对 RAG 自问答过紧: 仅 ES/Milvus 检索 + embed + rerank 就约 4s, 加 LLM 生成必超标导致"回复超时"。
+    # 抬到 20s, 介于前端 25s 长轮询超时之内留有余量, 典型问答仍数秒返回, 该值仅作最坏情况兜底。
+    global_timeout_ms: int = 20000
 
     # 执行器 SLA（对应文档 §3.4 执行器 SLA 表）
     e1_sla_ms: int = 3000  # AI 服务
@@ -481,8 +649,10 @@ class MCPBackend(BaseModel):
 
     # 后端逻辑名（用于分发索引与日志，不进入 host-facing 工具名）
     name: str
-    # 后端 MCP 入口 URL（streamable-http）
+    # 后端 MCP 入口 URL（streamable-http 或 SSE 基址）
     endpoint: str
+    # 传输协议: streamable-http(默认, 经 Higress 网关) | sse(直连 SSE 后端, 如 Java MCP Server)
+    transport: str = "streamable-http"
     # host-facing 工具名前缀（域命名空间，如 "card."）；单后端留空即原名
     prefix: str = ""
     # 该后端的敏感工具原名白名单（与工具注解、全局 sensitive_tools 取并集）
@@ -499,6 +669,8 @@ class MCPSettings(BaseSettings):
 
     # 总开关：关闭时不加载任何工具，bot 走原有 RAG/LLM 生成路径
     enabled: bool = False
+    # 单后端传输协议: streamable-http(默认, 经 Higress) | sse(直连 Java MCP Server :8090)
+    transport: str = "streamable-http"
     # Higress MCP 入口 URL（经 Nacos MCP Registry 发现的工具经此暴露）。
     # 默认指向 Higress AI 网关统一 MCP 入口（streamable-http）；本地联调可改指参考 Server（:8080/mcp）。
     endpoint: str = "http://localhost:10000/mcp/credit-card"
@@ -514,6 +686,12 @@ class MCPSettings(BaseSettings):
     sensitive_tools: list[str] = Field(default_factory=list)
     # 工具调用循环最大轮数（防死循环）
     max_tool_iterations: int = 5
+    # 工具循环内每次 LLM 调用的超时（秒）。chat_with_tools 未显式传 timeout 时
+    # 会回落 OpenAI 客户端默认 60s，一次慢调用即能吃掉外层 20s 编排预算 → 强制短超时。
+    tool_loop_llm_timeout_seconds: float = 15.0
+    # 整个工具循环的整体预算（毫秒）。多轮工具调用串联时必须有一个总上限，
+    # 防止第 2/3/4 轮调用把请求拖过外层全局超时。默认小于 global_timeout_ms(20s)。
+    tool_loop_timeout_ms: int = 15000
     # 待确认操作（pending_action）过期时间（秒）
     confirmation_ttl_seconds: int = 300
     # 确认窗口内无法判定（unclear）连续次数上限, 达到后自动取消 pending 并放行新消息

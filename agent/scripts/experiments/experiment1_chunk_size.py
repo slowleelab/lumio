@@ -65,10 +65,12 @@ def main() -> None:
         }
         print(f"  MRR={metrics['mrr']:.4f}, Hit@3={metrics['hit@3']:.4f}, Hit@5={metrics['hit@5']:.4f}")
 
-        results.append({
-            "params": {"策略": config["name"]},
-            "metrics": metrics,
-        })
+        results.append(
+            {
+                "params": {"策略": config["name"]},
+                "metrics": metrics,
+            }
+        )
 
     # 输出对比表
     table = format_results_table(results)

@@ -55,11 +55,17 @@ websocket:
     port: 8889
     max-wait-time-seconds: 300
     heartbeat-interval-seconds: 30
+  agent:
+    # 坐席通道握手鉴权：true(默认) 要求 Lumio JWT 且角色为 agent/admin;
+    # 演示环境可设 false 整体关闭（生产必须开启）
+    auth-enabled: true
 
 # Lumio 回调配置
 lumio:
   assist:
     url: http://localhost:8001
+  jwt:
+    secret: lumio-dev-secret-change-in-production
 
 # 会话配置
 session:

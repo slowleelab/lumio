@@ -17,7 +17,6 @@ import json
 import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
 import httpx
 
@@ -258,6 +257,7 @@ def _print_report(report: LoadTestReport) -> None:
 
 # ── 阶跃式压测 (Ramp-up) ──
 
+
 async def run_ramp_test(
     base_url: str,
     rps_levels: list[int] = (10, 50, 100, 500, 1000),
@@ -283,6 +283,7 @@ async def run_ramp_test(
 
 # ── 入口 ──
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lumio 压测工具")
     parser.add_argument("--url", default="http://localhost:8000", help="服务地址")
@@ -294,9 +295,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.ramp:
-        reports = asyncio.run(
-            run_ramp_test(args.url, duration_per_level=args.duration)
-        )
+        reports = asyncio.run(run_ramp_test(args.url, duration_per_level=args.duration))
         if args.output:
             with open(args.output, "w", encoding="utf-8") as f:
                 json.dump(

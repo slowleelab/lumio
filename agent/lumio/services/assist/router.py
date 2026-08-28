@@ -257,8 +257,11 @@ async def session_update(body: SessionUpdateRequest, request: Request):
             raise LumioError(code=2001, message=f"无效的子阶段: {body.sub_phase}") from None
 
     reason = body.end_reason or body.agent_id or ""
+    # chat-svc 回调可能携带 session-xxxx(别名), 需先反解回 Lumio 会话 id 再操作状态层;
+    # 而 ws_pool/静音任务仍按 chat-svc id(body.session_id) 索引, 故二者分开使用。
+    sid = await session_manager.resolve_session_id(body.session_id)
     updated_state = await session_manager.transition_phase(
-        session_id=body.session_id,
+        session_id=sid,
         new_phase=phase,
         new_sub_phase=new_sub_phase,
         reason=reason,
@@ -268,13 +271,13 @@ async def session_update(body: SessionUpdateRequest, request: Request):
     if body.agent_id and updated_state.agent_id != body.agent_id:
         try:
             await session_manager.patch_state(
-                session_id=body.session_id,
+                session_id=sid,
                 expected_version=updated_state.version,
                 patches={"agent_id": body.agent_id},
                 writer="session_update",
             )
         except Exception:
-            logger.warning("agent_id 更新失败: session=%s", body.session_id)
+            logger.warning("agent_id 更新失败: session=%s", sid)
 
     # ENDED 时清理 WebSocket 和超时守卫
     if phase == SessionPhase.ENDED:
@@ -1244,3 +1247,21 @@ async def transfer_to_bot(body: TransferToBotRequest, request: Request):
 
     logger.info("会话转回 Bot: session=%s agent=%s", body.session_id, body.agent_id)
     return {"status": "ok", "session_id": body.session_id, "transferred_to": "bot"}
+
+
+# ── E2 可解释性: 决策日志查询 (监管审计 / 客户可追溯) ──
+
+
+@router.get("/decision-log/session/{session_id}")
+async def query_decision_log(session_id: str, limit: int = 50):
+    """查询某会话的 AI 决策日志 (持久化, 走 PG; PG 不可用时回退 Redis)。
+
+    监管可追溯: "客户问什么, AI 怎么答, 依据是什么"。
+    返回按创建时间降序的决策记录列表。
+    """
+    from lumio.services.common.decision_log import get_decision_logger
+
+    if limit < 1 or limit > 500:
+        raise LumioError(code=2001, message="limit 需在 1~500 之间")
+    records = await get_decision_logger().query_session_pg(session_id, limit=limit)
+    return {"session_id": session_id, "count": len(records), "records": records}

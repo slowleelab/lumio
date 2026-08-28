@@ -12,7 +12,14 @@
         :class="{ active: session.sessionId === assistStore.activeSessionId }"
         @click="assistStore.selectSession(session.sessionId)"
       >
-        <div class="session-name">{{ session.customerName || session.sessionId }}</div>
+        <div class="session-name">
+          <span class="session-title">{{ session.customerName || session.sessionId }}</span>
+          <span
+            v-if="(assistStore.unread[session.sessionId] ?? 0) > 0"
+            class="unread-dot"
+            :title="`${assistStore.unread[session.sessionId]} 条未读`"
+          >{{ assistStore.unread[session.sessionId] }}</span>
+        </div>
         <div class="session-meta">
           <el-tag :type="phaseTagType(session.phase)" size="small">
             {{ phaseLabel(session.phase) }}
@@ -50,7 +57,7 @@ function phaseLabel(phase: SessionPhase) {
 }
 
 function formatTime(date: Date): string {
-  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
 }
 </script>
 
@@ -98,10 +105,35 @@ function formatTime(date: Date): string {
 }
 
 .session-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: var(--fs-base);
   font-weight: 500;
   color: var(--color-text-primary);
   margin-bottom: 6px;
+}
+
+.session-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.unread-dot {
+  flex-shrink: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--color-danger, #f56c6c);
+  color: #fff;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
 }
 
 .session-meta {

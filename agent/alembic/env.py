@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
+
+# 保证从任意 cwd 运行 alembic 时都能 import lumio 包 (agent/ 为包根)
+_AGENT_ROOT = Path(__file__).resolve().parents[1]
+if str(_AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AGENT_ROOT))
 
 # Alembic Config 对象
 config = context.config

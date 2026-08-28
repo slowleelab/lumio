@@ -18,6 +18,7 @@ export interface ChatSvcSessionRaw {
   agentId: string | null
   createTime: number  // epoch ms
   customerId: string | null
+  customerName?: string | null
 }
 
 export interface ChatSvcMessageRaw {
@@ -25,6 +26,7 @@ export interface ChatSvcMessageRaw {
   content: string
   messageId: string
   timestamp: number  // epoch ms
+  seq: number  // 会话内单调序号（消息游标/离线补发）
 }
 
 // ── 会话 ──
@@ -55,9 +57,22 @@ export async function sendChatSvcMessage(
   return (await client.post(`/chat-svc/sessions/${encodeURIComponent(sid)}/messages`, body)) as unknown as { messageId: string; timestamp: number }
 }
 
+/** 关闭 chat-svc 会话 (客户结束会话时调用, 避免坐席列表残留 ACTIVE 会话) */
+export async function closeChatSvcSession(sid: string): Promise<void> {
+  await client.delete(`/chat-svc/customer/session/${encodeURIComponent(sid)}`)
+}
+
+/** 一次性读取会话历史 (非阻塞, since=0 返回全部) — 会话激活时用于载入存量消息 */
+export async function getChatSvcMessages(
+  sid: string,
+  since = 0,
+): Promise<ChatSvcMessageRaw[]> {
+  return (await client.get(`/chat-svc/sessions/${encodeURIComponent(sid)}/messages?since=${since}`)) as unknown as ChatSvcMessageRaw[]
+}
+
 // ── 长轮询 (单独走 fetch, 因为 axios 不支持 25s 长 timeout 与 SSE 风格) ──
 
-/** 长轮询新消息. 返回消息数组, 调用方负责维护 since 游标.
+/** 长轮询新消息. 返回消息数组, 调用方负责维护 seq 游标.
  *
  * 仍然带 Bearer 头, 但 4xx/5xx 不再静默吞 — 由 B1 usePolling 的 onError 接管.
  * 401 走 axios 拦截器跳登录 (本函数手工抛 401 让外层处理).
@@ -66,11 +81,13 @@ export async function pollChatSvcMessages(
   sid: string,
   since: number,
   timeoutMs = 25000,
+  signal?: AbortSignal,
 ): Promise<ChatSvcMessageRaw[]> {
   const token = getToken()
   const url = `/api/chat-svc/sessions/${encodeURIComponent(sid)}/poll?timeout=${timeoutMs}&since=${since}`
   const resp = await fetch(url, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal,
   })
   if (resp.status === 401) {
     // 与 axios 拦截器保持一致: 跳登录

@@ -39,7 +39,9 @@ def generate():
         print(f"🔧 编译 {proto_file}...")
 
         cmd = [
-            sys.executable, "-m", "grpc_tools.protoc",
+            sys.executable,
+            "-m",
+            "grpc_tools.protoc",
             f"--proto_path={PROTO_DIR}",
             f"--python_out={OUTPUT_DIR}",
             f"--grpc_python_out={OUTPUT_DIR}",

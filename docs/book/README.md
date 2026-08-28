@@ -47,7 +47,7 @@ tags: ["lumio", "索引", "阅读路径"]
 | 章节 | 标题 | 难度 | 时长 |
 |---|---|---|---|
 | [08](chapters/08-error-handling.md) | 错误处理: 35 错误码 + 统一响应体 | 中级 | 12 分 |
-| [09](chapters/09-rag-ingestion.md) | RAG 摄入管线: 5 阶段 + 双写回滚 | 中级 | 12 分 |
+| [09](chapters/09-rag-ingestion.md) | 知识库搭建: 摄入管线 + FAQ + 验证 | 中级 | 18 分 |
 | [10](chapters/10-observability.md) | 可观测性: 17 指标 + OTel 跨服务追踪 | 中级 | 14 分 |
 | [11](chapters/11-security-compliance.md) | 安全合规: JWT + PBKDF2 + 双重审计 | 中级 | 14 分 |
 | [12](chapters/12-data-layer.md) | 数据层: PG 19 表 + Redis 15 key + 双写一致性 | 中级 | 14 分 |

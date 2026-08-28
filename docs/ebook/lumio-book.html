@@ -84,7 +84,7 @@
 <li><a href="#06-会话状态机">06 会话状态机</a></li>
 <li><a href="#07-MCP-工具集成">07 MCP 工具集成</a></li>
 <li class="part"><a href="#08-错误处理">08 错误处理</a></li>
-<li><a href="#09-RAG-摄入管线">09 RAG 摄入管线</a></li>
+<li><a href="#09-知识库搭建">09 知识库搭建</a></li>
 <li><a href="#10-可观测性">10 可观测性</a></li>
 <li><a href="#11-安全合规">11 安全合规</a></li>
 <li><a href="#12-数据层">12 数据层</a></li>
@@ -279,9 +279,9 @@ async def _session_worker(self, session_id: str) -&gt; None:
 </tr>
 <tr>
 <td><a href="chapters/09-rag-ingestion.md">09</a></td>
-<td>RAG 摄入管线: 5 阶段 + 双写回滚</td>
+<td>知识库搭建: 摄入管线 + FAQ + 验证</td>
 <td>中级</td>
-<td>12 分</td>
+<td>18 分</td>
 </tr>
 <tr>
 <td><a href="chapters/10-observability.md">10</a></td>
@@ -5162,13 +5162,93 @@ if result.source in (&quot;template&quot;, &quot;fallback&quot;) and not should_
 - <a href="../06-session-state-machine.md">第 6 章 会话状态机</a> — <code>InvalidTransitionError</code> 3005 详解</p>
 </blockquote>
 </section>
-<section class="chapter" id="09-RAG-摄入管线">
-<h1 class="chapter-title">09 RAG 摄入管线</h1>
-<h1 id="第-9-章:-RAG-摄入管线">第 9 章: RAG 摄入管线</h1>
+<section class="chapter" id="09-知识库搭建">
+<h1 class="chapter-title">09 知识库搭建</h1>
+<h1 id="第-9-章:-知识库搭建:-摄入管线-+-FAQ-+-验证">第 9 章: 知识库搭建: 摄入管线 + FAQ + 验证</h1>
 <blockquote>
-<p>本章拆解 Lumio 把一份原始文档送进 ES + Milvus 的完整路径, 重点回答: 5 阶段为什么是这 5 个? 双写失败时怎么回滚? 如何做到增量版本管理?</p>
+<p>本章从操作者的视角, 讲清把一份银行文档变成一个可检索知识库的完整路径: 文档怎么组织、怎么传进系统、中间经历了哪些处理、FAQ 怎么建、搭完之后怎么验证能检索. 重点回答: 知识源要不要按目录分? frontmatter 里的元数据有什么用? 5 阶段摄入为什么是这 5 个? FAQ 和文档检索有什么区别? 怎么确认知识库"真的能用"?</p>
 </blockquote>
-<h2 id="9.1-5-阶段管线总览">9.1 5 阶段管线总览</h2>
+<h2 id="9.1-从零搭建全景-—-主路径图">9.1 从零搭建全景 — 主路径图</h2>
+<p>搭建一个知识库不像"上传几个文件"那么简单. 一份《信用卡章程》PDF 要能被客户问"年费怎么免"时检索到, 中间要经过 5 个环节. 下面这张图是本章的总览, 每个环节对应后续一小节:</p>
+<pre><code class="language-mermaid">flowchart TB
+    A1[知识源组织&lt;br/&gt;目录 + frontmatter 元数据] --&gt; A2[上传建档&lt;br/&gt;MinIO + KbDocument]
+    A2 --&gt; A3[摄入管线&lt;br/&gt;Parse→Clean→Chunk→Embed→Dual-Write]
+    A3 --&gt; A4[FAQ 结构化库&lt;br/&gt;KbFaq + 同义问句]
+    A4 --&gt; A5[搭建后验证&lt;br/&gt;verify_all + 检索验收]
+
+    A1 -.-&gt;|9.2| N1[9.2 知识源组织]
+    A2 -.-&gt;|9.3| N2[9.3 上传入口]
+    A3 -.-&gt;|9.4-9.13| N3[9.4-9.13 摄入管线]
+    A4 -.-&gt;|9.14| N4[9.14 FAQ 结构化库]
+    A5 -.-&gt;|9.15| N5[9.15 搭建后验证]
+
+    style A1 fill:#fff4e1
+    style A2 fill:#fff4e1
+    style A3 fill:#e1efff
+    style A4 fill:#d4f4dd
+    style A5 fill:#ffe1e1
+</code></pre>
+<ul>
+<li><strong>9.2 知识源组织</strong>: 决定文档放哪个目录、元数据写什么, 是搭建的起点</li>
+<li><strong>9.3 上传入口</strong>: 文件怎么进系统, 三个前置检查挡掉可预判的失败</li>
+<li><strong>9.4-9.13 摄入管线</strong>: 核心环节, 把原始文档变成可检索的向量 + BM25 索引</li>
+<li><strong>9.14 FAQ 结构化库</strong>: 高频问题直答, 与文档检索互补</li>
+<li><strong>9.15 搭建后验证</strong>: 确认中间件连通、检索能召回, 才算搭完</li>
+</ul>
+<h2 id="9.2-知识源组织">9.2 知识源组织</h2>
+<p>搭建知识库的第一步, 是决定<strong>文档怎么组织</strong>——这决定了后面的分类、权限、检索过滤. Lumio 用"目录 + frontmatter 元数据"两个维度组织知识源, 由 <code>agent/scripts/seed_knowledge.py</code> 处理.</p>
+<h3 id="9.2.1-目录决定分类">9.2.1 目录决定分类</h3>
+<p><code>seed_knowledge.py:26-36</code> 定义了一级目录名到业务分类的映射:</p>
+<pre><code class="language-python"># agent/scripts/seed_knowledge.py:26
+DIR_CATEGORY_MAP: dict[str, str] = {
+    &quot;faq&quot;: &quot;FAQ&quot;,          &quot;fee&quot;: &quot;费率&quot;,
+    &quot;points&quot;: &quot;积分&quot;,      &quot;annual_fee&quot;: &quot;年费&quot;,
+    &quot;regulations&quot;: &quot;章程&quot;, &quot;repayment&quot;: &quot;还款&quot;,
+    &quot;security&quot;: &quot;安全&quot;,    &quot;activity&quot;: &quot;活动&quot;,
+    &quot;other&quot;: &quot;OTHER&quot;,
+}
+</code></pre>
+<p>目录名是<strong>英文 slug</strong>, 分类值是<strong>中文业务名</strong>. 扫描时 (<code>scan_files</code> L68) 用 <code>rel_parts[0]</code> 取一级目录名, 再查映射得出分类. 例如 <code>test_data/fee/fee-annual-card-type.md</code> 会被归到"费率"。</p>
+<p><code>agent/test_data/</code> 的实际一级目录 (<code>activity</code> / <code>annual_fee</code> / <code>faq</code> / <code>fee</code> / <code>other</code> / <code>points</code> / <code>regulations</code> / <code>repayment</code> / <code>security</code>) 跟映射 key 一一对应, 新增分类时只需在映射表加一行, 无需改扫描逻辑。</p>
+<h3 id="9.2.2-frontmatter-决定元数据">9.2.2 frontmatter 决定元数据</h3>
+<p>每个 Markdown 文件顶部可写 YAML frontmatter, 提供比目录更细的元数据。<code>parse_frontmatter</code> (<code>:39</code>) 解析 <code>---</code> 包裹的头部:</p>
+<pre><code class="language-markdown">---
+title: 白金卡年费减免政策
+category: fee            # 覆盖目录映射的分类
+doc_type: faq            # 文档类型
+card_type: platinum      # 适用卡种
+customer_tier: vip       # 适用客户层级
+security_level: internal # 密级
+version: &quot;1.1&quot;
+effective_date: 2026-01-01
+expiry_date: 2026-12-31
+keywords: [年费, 减免, 白金卡]
+---
+</code></pre>
+<p><strong>元数据的三来源优先级</strong> (<code>scan_files</code> L90-96): <strong>frontmatter 优先 &gt; 目录映射兜底 &gt; 默认值</strong>。例如:</p>
+<ul>
+<li><code>category</code>: frontmatter 有则用, 否则用目录映射的分类, 再否则 <code>OTHER</code></li>
+<li><code>doc_type</code>: 默认 <code>faq</code></li>
+<li><code>security_level</code>: 默认 <code>internal</code></li>
+<li><code>card_type</code>/<code>customer_tier</code>: 可留空, 空值表示"对全卡种/全员可见" (见 9.12)</li>
+</ul>
+<p><strong>为什么用 frontmatter 而不是在目录上区分</strong>: 分类是粗粒度 (文档属于费率), 而 <code>card_type</code>/<code>security_level</code>/<code>effective_date</code> 是每份文档的细粒度属性, 目录无法表达。frontmatter 让"一份文档可以有多个适用卡种"这类多维属性落在文档自身, 目录只承担最粗的分类。</p>
+<h3 id="9.2.3-用-seed-脚本试跑">9.2.3 用 seed 脚本试跑</h3>
+<p><code>seed_knowledge.py</code> 的 <code>main</code> (<code>:261</code>) 支持 <code>--dry-run</code>, 只扫描不入库, 是搭建时预览的好工具:</p>
+<pre><code class="language-bash">poetry run python scripts/seed_knowledge.py --dry-run
+poetry run python scripts/seed_knowledge.py --dir /path/to/docs
+</code></pre>
+<p><code>--dry-run</code> 会打印扫描摘要 (<code>print_scan_summary</code> L154): 序号 / 文件名 / 分类 / 类型 / 标题, 让你在上传前确认目录和元数据对不对。正式运行时 (<code>:288-289</code>) 先把文件传 MinIO (<code>upload_to_minio</code> L163, object key 为 <code>{category}/{filename}</code>), 再按 content_hash 查重后写 <code>KbDocument</code> (<code>insert_to_database</code> L205) — 重复文件直接跳过, 不产生脏数据。</p>
+<h2 id="9.3-上传入口:-从-HTTP-文件到-5-阶段管线的&quot;最后一公里&quot;">9.3 上传入口: 从 HTTP 文件到 5 阶段管线的"最后一公里"</h2>
+<p>摄入管线的上游是 <code>upload_document</code> 端点 (<code>bot/router.py:1443</code>), 这一段的职责不是"解析文档", 而是<strong>在文件进管线之前把一切可预判的失败挡掉</strong>。三个检查按成本从低到高排列:</p>
+<ol>
+<li><strong>扩展名白名单</strong> (<code>_ALLOWED_EXTENSIONS</code>): <code>.pdf/.docx/.html/.md/.txt/.xlsx</code> 六个后缀, 其余一律 400 (<code>DocumentFormatError</code> 2010)。白名单比黑名单安全——<code>.exe</code>/<code>.sh</code> 这类可执行文件连进入对象存储的机会都没有。</li>
+<li><strong>文件大小上限 50MB</strong>: 优先读 <code>Content-Length</code> header (不读 body 就能拒绝), header 缺失时才读完整内容后按 <code>len(content_bytes)</code> 判定。50MB 是经验值: 银行 PDF 章程通常 5-20MB, 批量上传峰值留 2-3 倍冗余; 再大就应走对象存储分片上传, 不应塞 HTTP body。</li>
+<li><strong>SHA-256 内容哈希</strong>: <code>content_hash</code> 写入 <code>kb_document</code>, 同一份文件重复上传时可按哈希识别去重, 也是将来做"内容变更检测" (内容变但文件名没变) 的锚点。</li>
+</ol>
+<p>三个检查过后, 文件才进 MinIO (<code>{category}/{filename}</code> 二级 key), 再创建 <code>KbDocument</code> 记录 (status=<code>PENDING</code>), 最后调用 <code>ingest_document()</code> 触发 5 阶段管线并回写最终状态 (<code>COMPLETED</code> / <code>FAILED</code>)。<strong>注意端点的返回不阻塞在摄入完成</strong>: <code>ingest_document</code> 是 await 的, 但状态字段 (<code>doc.status</code>) 的最终值由摄入结果回填, 客户端可以通过 <code>GET /kb/documents/{doc_id}/status</code> 轮询——上传接口永远先返回, 长耗时在后台完成。</p>
+<p><strong>为什么摄入异常不向上抛?</strong> <code>upload_document</code> 里对 <code>ingest_document</code> 的调用包在 <code>try/except</code> 里, 异常时只把 <code>kb_doc.status</code> 置为 <code>FAILED</code>。这样"文件已收、摄入失败"不会让客户端拿到 500 重试上传——重试摄入比重传文件便宜得多 (MinIO 里已经有原件了)。</p>
+<h2 id="9.4-摄入管线-5-阶段总览">9.4 摄入管线 5 阶段总览</h2>
 <p><strong>先讲个业务场景</strong>: 银行的法务部上传了一份《信用卡章程》PDF (200 页). 这份文档要能被客户问"年费怎么免"时检索到 — 但 200 页塞进系统可不像复制粘贴那么简单: PDF 要转文字, 页眉页脚要去掉, 长段落要切成小块, 每块要变成向量, 最后同时写进两个检索库. 任何一个环节出错 (PDF 解析失败/双写一半成功), 客户就可能问到<strong>残缺的答案</strong> — 这是合规事故.</p>
 <p>文档摄入是 RAG 系统里最容易被低估的环节. 检索端 (<code>第 5 章</code>) 拿到的是已经向量化的 chunk, 看上去只取决于 Embedding 模型; 但 chunk 的边界是否合理、元数据是否完整、版本是否可追溯, 全部由摄入管线决定. Lumio 把摄入拆成 5 个明确的阶段, 每个阶段都写一条 <code>kb_ingestion_log</code> 流水:</p>
 <pre><code class="language-mermaid">flowchart LR
@@ -5185,7 +5265,7 @@ if result.source in (&quot;template&quot;, &quot;fallback&quot;) and not should_
 </code></pre>
 <p>为什么是 <strong>Parse → Clean → Chunk → Embed → Dual-Write</strong> 这五步? 核心约束是"先纯化, 再切分, 再向量化, 最后落库". Parse 阶段把二进制变成字符串, Clean 阶段去掉页眉页脚/控制字符等噪声, Chunk 阶段才能在干净的文本上找到语义边界; 如果反过来先切再清洗, 切出来的 chunk 边界很可能落在页眉上, 检索时把"第 3 页 / 共 20 页" 当成正文返回. Embed 必须在 Chunk 之后: 一次性把整篇文档塞给 Embedding 服务, 显存压力和超时风险都不可控. Dual-Write 最后做, 是因为只有到这一刻, 我们才拥有"可以同时被 ES (BM25) 和 Milvus (向量) 检索"的完整对象.</p>
 <p><code>ingest_document()</code> 是顶层编排器, 在 <code>agent/lumio/services/common/ingestion.py:522</code> 起. 它先查文档记录, 把 <code>doc.status</code> 置为 <code>PROCESSING</code>, 然后线性走完 5 个阶段. chunker 逻辑内联进 <code>ingestion.py</code>, 阶段间只通过字符串 / 字典传递, 减少了临时状态序列化开销.</p>
-<h2 id="9.2-Parse-阶段:-6-种文件格式">9.2 Parse 阶段: 6 种文件格式</h2>
+<h2 id="9.5-Parse-阶段:-6-种文件格式">9.5 Parse 阶段: 6 种文件格式</h2>
 <p>Parse 阶段的目标只有一个: 把任何格式变成纯文本. 6 种格式的解析器集中在 <code>ingestion.py:54-188</code>, 通过 <code>_PARSE_DISPATCH</code> 字典按 <code>KbSourceType</code> 派发:</p>
 <table>
 <thead>
@@ -5238,7 +5318,7 @@ if result.source in (&quot;template&quot;, &quot;fallback&quot;) and not should_
 <p>为什么 HTML 解析要主动 <code>decompose</code> nav/footer/header? 因为这些标签里几乎全是导航链接、版权信息、备案号, 检索时召回它们会污染 top-K 结果. 举个例子, 一份产品手册的"联系我们"区块如果被切成 chunk, 用户问"怎么退款" 时反而可能优先命中 footer 里的电话. 主动过滤是廉价的预防.</p>
 <p>Markdown 的 token 树方案比正则替换更稳. 写法上 <code>parse_markdown</code> 不去管标题/列表语义, 只收集 <code>inline.text</code> 子节点, 然后在块级元素之间补 <code>\n</code> 维持段落感. 这种"语义忽略, 文本提取" 的策略在表格 / 代码块上有信息损失, 但配合后续 Chunk 阶段的中文句末优先断点已经够用.</p>
 <p>PDF 是 6 种里唯一可能解析失败的 (扫描件), 目前 <code>parse_pdf</code> 抛异常会冒泡到顶层 <code>try/except</code>, 直接把 <code>doc.status</code> 标记为 <code>FAILED</code> (<code>:720</code>). 未来如果要支持扫描件, 应在 Parse 内部接 OCR 而不是把噪声推给下游.</p>
-<h2 id="9.3-Clean-阶段:-5-步清洗">9.3 Clean 阶段: 5 步清洗</h2>
+<h2 id="9.6-Clean-阶段:-5-步清洗">9.6 Clean 阶段: 5 步清洗</h2>
 <p><code>clean_text()</code> 在 <code>ingestion.py:211</code>, 5 步串行:</p>
 <pre><code class="language-python"># agent/lumio/services/common/ingestion.py:220
 text = _RE_PAGE_HEADER_FOOTER.sub(&quot;&quot;, raw)      # 1. 去页眉页脚
@@ -5257,7 +5337,7 @@ _RE_PAGE_HEADER_FOOTER = re.compile(
 )
 </code></pre>
 <p><code>re.IGNORECASE</code> 让 <code>Page 3 of 20</code> 和 <code>PAGE 3 OF 20</code> 都能命中, 但代价是无法区分"正文里出现'第 3 页' 这种字面量" — 真实业务里这个概率极低, 当前可以接受.</p>
-<h2 id="9.4-Chunk-阶段:-递归字符分割">9.4 Chunk 阶段: 递归字符分割</h2>
+<h2 id="9.7-Chunk-阶段:-递归字符分割">9.7 Chunk 阶段: 递归字符分割</h2>
 <p><code>chunk_text()</code> 在 <code>ingestion.py:297</code>, 默认 <code>chunk_size=1500</code>, <code>overlap=200</code>. 这里 1500 是中文字符数, 约等于 600-800 个英文 token, 对 <code>bge-large-zh-v1.5</code> 的 512 token 上限有充足余量 (一段中文 token 化后大约 1.8 倍字符数).</p>
 <p>断点搜索在 <code>_find_break_point()</code> (<code>:251</code>), 3 个优先级:</p>
 <ol>
@@ -5267,7 +5347,7 @@ _RE_PAGE_HEADER_FOOTER = re.compile(
 </ol>
 <p>搜索窗口是目标位置前后 ±200 字符 (<code>search_start = max(start, target - 200)</code>, <code>:262</code>). 为什么是 200? 它等于 overlap, 保证即使断点落在窗口最远端, 下一块也能从 <code>break_pos - 200</code> 继续, 不会和上一块完全无重叠.</p>
 <p>为什么句末优先级最高? 因为中文的句号 / 问号 / 感叹号背后是完整的语义单元, 在这里断开 chunk 不会切断"主谓宾". 短语标点 (顿号 / 逗号) 通常连接并列项, 单独切断一个并列项会导致该 chunk 失去上下文. 空格是英文 / 数字的兜底断点, 命中率比前两个低很多.</p>
-<h2 id="9.5-Embed-阶段:-批大小-128-+-熔断器">9.5 Embed 阶段: 批大小 128 + 熔断器</h2>
+<h2 id="9.8-Embed-阶段:-批大小-128-+-熔断器">9.8 Embed 阶段: 批大小 128 + 熔断器</h2>
 <p><code>embed_chunks()</code> (<code>:344</code>) 把 chunks 按 <code>batch_size=128</code> 分批:</p>
 <pre><code class="language-python"># agent/lumio/services/common/ingestion.py:362
 for i in range(0, len(chunks), batch_size):
@@ -5285,7 +5365,7 @@ self._recovery_threshold = 2
 </code></pre>
 <p>为什么不"1 失败就开"? 因为单次健康探测可能因网络抖动失败, 1 次就熔断会让系统过于敏感. 3 次连续失败 (累计 90s 探测窗口) 几乎可以确认后端真出问题了. 关闭条件用 2 次成功而不是 1 次, 是为了避免"刚开又关" 的抖动. 30s 探测间隔是经验值, 嵌入服务出问题一般 30s 内仍处于恢复阶段, 没必要更密.</p>
 <p>熔断器初始 <code>_is_open = True</code> (<code>:241</code>), 首次 <code>health_check()</code> 成功后才关闭. 这是冷启动安全: 进程刚起时不假定 TEI 一定可用, 一定要探一次.</p>
-<h2 id="9.6-Dual-Write-阶段:-ES-先,-Milvus-后">9.6 Dual-Write 阶段: ES 先, Milvus 后</h2>
+<h2 id="9.9-Dual-Write-阶段:-ES-先,-Milvus-后">9.9 Dual-Write 阶段: ES 先, Milvus 后</h2>
 <p>Dual-Write 是整个管线最容易出错的地方. Lumio 选择 <strong>ES 先, Milvus 后</strong>, 不是没有理由. ES 写入是单文档 <code>index()</code> 调用, 失败可以精确定位到 chunk_id; Milvus 是批量 <code>insert()</code>, 失败时只能回滚整批. 顺序反过来如果 Milvus 失败, 已经写入 ES 的 chunk 没法追溯是哪些 (因为还没回填 doc_group), 会出现"ES 有文档但用户搜不到" 的鬼影数据.</p>
 <p>判定条件是 <code>es_count == len(chunk_records)</code> (<code>:653</code>):</p>
 <pre><code class="language-python"># agent/lumio/services/common/ingestion.py:652
@@ -5313,12 +5393,12 @@ es_ok = es_count == len(chunk_records)
     I-&gt;&gt;DB: doc.status = FAILED
     I-&gt;&gt;DB: kb_ingestion_log(MILVUS_WRITE, FAILED)
 </code></pre>
-<h2 id="9.7-摄入日志:-7-阶段流水">9.7 摄入日志: 7 阶段流水</h2>
+<h2 id="9.10-摄入日志:-7-阶段流水">9.10 摄入日志: 7 阶段流水</h2>
 <p><code>kb_ingestion_log</code> 表在 <code>shared/orm_models.py:412</code>, 配合 <code>KbIngestionStage</code> 枚举 (<code>:93</code>) 提供 7 个固定阶段:</p>
 <p><code>PARSE</code> → <code>CLEAN</code> → <code>CHUNK</code> → <code>EMBED</code> → <code>ES_WRITE</code> → <code>MILVUS_WRITE</code> → <code>KAFKA_PUBLISH</code></p>
 <p>注意 <code>KAFKA_PUBLISH</code> 在当前 <code>ingestion.py</code> 内联编排器里没有显式调用 — 它属于" 摄入完成后通知下游" 的发布阶段, 由上层服务 (例如 ingestion worker) 触发, 写日志时复用同一张表. 7 个阶段共用同一张流水表的好处是: 给定 <code>doc_id</code>, 一条 <code>SELECT stage, status, duration_ms, step_detail, created_at ORDER BY created_at</code> 就能复盘整个文档的生命周期.</p>
 <p>每行写 (stage, status, duration_ms, step_detail), 其中 <code>step_detail</code> 是 JSON 字段, 容纳阶段特定的元数据. 例如 CHUNK 阶段写 <code>{"chunk_count": N}</code> (<code>:594</code>), EMBED 阶段写 <code>{"embedding_dim": 1024}</code> (<code>:606</code>), ES_WRITE 阶段写 <code>{"success_count": M, "total": N}</code> (<code>:660</code>). 这种"通用字段 + JSON 详情" 的设计避免了阶段专属列膨胀.</p>
-<h2 id="9.8-增量摄入与版本管理">9.8 增量摄入与版本管理</h2>
+<h2 id="9.11-增量摄入与版本管理">9.11 增量摄入与版本管理</h2>
 <p>企业知识库是持续演化的, 同一份产品手册会有 v1.0 / v1.1 / v2.0 多个版本. Lumio 的版本模型不靠"先删后写", 而是靠 PostgreSQL 的 <strong>部分唯一索引</strong>:</p>
 <pre><code class="language-sql">-- orm_models.py:282
 Index(
@@ -5329,24 +5409,7 @@ Index(
 </code></pre>
 <p>含义: 同一 <code>doc_group</code> 下, 只能有 1 条记录同时满足 <code>is_current_version=true AND is_deleted=false</code>. 增量摄入时, 旧版本自动设 <code>is_current_version=false</code> (即被 supersede), 新版本占位为 <code>true</code>. 部分唯一索引让数据库本身保证一致性, 应用层不需要分布式锁.</p>
 <p>ES 和 Milvus 在检索时会带上 <code>approval_status=PUBLISHED AND is_current_version=true</code> 的过滤 (<code>ingestion.py:409-411</code>), 旧版本 chunk 物理上还在索引里, 但永远不会被召回, 既保证可回滚又保证检索不返祖.</p>
-<h2 id="9.9-测试覆盖">9.9 测试覆盖</h2>
-<p><code>agent/tests/test_ingestion.py</code> 覆盖三个核心场景类:</p>
-<ul>
-<li><strong>TestCleanText</strong> (<code>:18</code>): 页眉页脚清除 / 多空格合并 / 控制字符清理</li>
-<li><strong>TestChunkText</strong> (<code>:58</code>): 短文本直通 / 长文本分块 / 中文句末边界优先</li>
-<li><strong>TestParse</strong> (<code>:95</code>): Markdown token 树 / TXT 直通</li>
-</ul>
-<p>其中 <code>test_chunk_respects_chinese_sentence_boundary</code> (<code>:81</code>) 是最关键的一条: 它构造一段长文本断言 chunk 边界落在 <code>。</code> 而非中段, 直接锁定了第 9.4 节的优先级约定. Milvus 写入和 ES 回滚走集成测试 (需要真集群), 不在单测范围.</p>
-<h2 id="9.9.1-上传入口:从-HTTP-文件到-5-阶段管线的&quot;最后一公里&quot;">9.9.1 上传入口:从 HTTP 文件到 5 阶段管线的"最后一公里"</h2>
-<p>摄入管线的上游是 <code>upload_document</code> 端点 (<code>bot/router.py:1443</code>), 这一段的职责不是"解析文档", 而是<strong>在文件进管线之前把一切可预判的失败挡掉</strong>。三个检查按成本从低到高排列:</p>
-<ol>
-<li><strong>扩展名白名单</strong> (<code>_ALLOWED_EXTENSIONS</code>): <code>.pdf/.docx/.html/.md/.txt/.xlsx</code> 六个后缀, 其余一律 400 (<code>DocumentFormatError</code> 2010)。白名单比黑名单安全——<code>.exe</code>/<code>.sh</code> 这类可执行文件连进入对象存储的机会都没有。</li>
-<li><strong>文件大小上限 50MB</strong>: 优先读 <code>Content-Length</code> header (不读 body 就能拒绝), header 缺失时才读完整内容后按 <code>len(content_bytes)</code> 判定。50MB 是经验值: 银行 PDF 章程通常 5-20MB, 批量上传峰值留 2-3 倍冗余; 再大就应走对象存储分片上传, 不应塞 HTTP body。</li>
-<li><strong>SHA-256 内容哈希</strong>: <code>content_hash</code> 写入 <code>kb_document</code>, 同一份文件重复上传时可按哈希识别去重, 也是将来做"内容变更检测" (内容变但文件名没变) 的锚点。</li>
-</ol>
-<p>三个检查过后, 文件才进 MinIO (<code>{category}/{filename}</code> 二级 key), 再创建 <code>KbDocument</code> 记录 (status=<code>PENDING</code>), 最后调用 <code>ingest_document()</code> 触发 5 阶段管线并回写最终状态 (<code>COMPLETED</code> / <code>FAILED</code>)。<strong>注意端点的返回不阻塞在摄入完成</strong>: <code>ingest_document</code> 是 await 的, 但状态字段 (<code>doc.status</code>) 的最终值由摄入结果回填, 客户端可以通过 <code>GET /kb/documents/{doc_id}/status</code> 轮询——上传接口永远先返回, 长耗时在后台完成。</p>
-<p><strong>为什么摄入异常不向上抛?</strong> <code>upload_document</code> 里对 <code>ingest_document</code> 的调用包在 <code>try/except</code> 里, 异常时只把 <code>kb_doc.status</code> 置为 <code>FAILED</code>。这样"文件已收、摄入失败"不会让客户端拿到 500 重试上传——重试摄入比重传文件便宜得多 (MinIO 里已经有原件了)。</p>
-<h2 id="9.9.2-元数据如何影响检索:过滤不是检索后做的">9.9.2 元数据如何影响检索:过滤不是检索后做的</h2>
+<h2 id="9.12-元数据如何影响检索:-过滤不是检索后做的">9.12 元数据如何影响检索: 过滤不是检索后做的</h2>
 <p><code>DocumentMetadata</code> 是摄入时写入、检索时消费的"契约"。它携带 8 个字段, 其中 5 个是检索过滤键:</p>
 <table>
 <thead>
@@ -5386,7 +5449,7 @@ Index(
 </table>
 <p><strong>设计要点: 过滤键在摄入时就要写对, 检索时只能消费</strong>。如果文档上传时漏填 <code>card_type</code>, 检索端不会"猜"——空值按"对全卡种可见"处理, 而不是按"对谁都不可见"处理。这符合银行知识库的可见性直觉: 未标注的文档默认公开给所有坐席, 密级文档必须显式标注才受限。</p>
 <p><code>keywords</code> 的拆分逻辑 (<code>[k.strip() for k in keywords.split(",") if k.strip()]</code>) 有一个边界: 全角逗号 <code>，</code> 不会被拆分——上传文档的人用中文输入法很容易踩中, 表现为"关键词只有一个超长串"。这是刻意保持的简单行为, 因为自动做全角归一化会引入"关键词被意外合并"的另一个错误方向, 而检索端对空关键词有兜底 (退化到纯 BM25 全文匹配)。</p>
-<h2 id="9.9.3-摄入失败后怎么重试:PARTIAL-索引-+-幂等重建">9.9.3 摄入失败后怎么重试:PARTIAL 索引 + 幂等重建</h2>
+<h2 id="9.13-摄入失败后怎么重试:-PARTIAL-索引-+-幂等重建">9.13 摄入失败后怎么重试: PARTIAL 索引 + 幂等重建</h2>
 <p>摄入失败 (ES 或 Milvus 写入异常) 后, 重试不是"重新上传一遍", 而是<strong>用相同的 <code>chunk_id</code> 重建索引</strong>:</p>
 <ol>
 <li>失败时 <code>doc.status = FAILED</code>, 但 <code>kb_chunk</code> 行 (含 <code>chunk_id</code>) 已经落库;</li>
@@ -5394,12 +5457,204 @@ Index(
 <li>重试时 ES 用 <code>index</code> (upsert 语义) 而非 <code>create</code>——同 <code>chunk_id</code> 幂等覆盖, 不会产生重复文档。</li>
 </ol>
 <p>这个设计的巧妙之处在第 12 章的 <code>es_indexed</code> / <code>milvus_indexed</code> 状态字段: <strong>PG 是真相之源, ES/Milvus 只是投影</strong>。即使两个检索引擎的数据短暂不一致, worker 也能从 PG 的 PARTIAL 索引精确知道"哪些 chunk 缺哪个引擎", 不需要去对账两个外部系统。这也是为什么第 12.7 节的降级路由 (单路召回) 能成立——降级前先看 PG 状态, 而不是试错。</p>
-<h2 id="9.10-小结">9.10 小结</h2>
-<p>Lumio 的摄入管线把" 让 ES 和 Milvus 数据一致" 这个难题拆成 5 个串行阶段 + 1 个对账回滚路径. Parse 阶段屏蔽 6 种格式差异, Clean 阶段用 5 步正则清洗噪声, Chunk 阶段在中文句末优先断点, Embed 阶段走 128 批 TEI + 3/2/30s 熔断器, Dual-Write 阶段用 ES 先 / Milvus 后 + <code>_rollback_es_docs</code> 保证原子性. 7 阶段 <code>kb_ingestion_log</code> 是出问题时的第一现场, 部分唯一索引让版本管理不依赖应用层逻辑.</p>
+<h2 id="9.14-FAQ-结构化知识库">9.14 FAQ 结构化知识库</h2>
+<p>文档摄入适合处理长文档 (章程/手册), 但银行客服有大量<strong>高频短问答</strong> ("年费怎么免?""账单日是哪天?"), 这类问题用文档检索反而低效——要检索、分块、命中的是一条长文档的片段, 慢且可能答不准。Lumio 用 <code>KbFaq</code> 结构化表单独存这类问答对, 走独立的检索路径。</p>
+<h3 id="9.14.1-KbFaq-表结构">9.14.1 KbFaq 表结构</h3>
+<p><code>KbFaq</code> 在 <code>shared/orm_models.py:729</code>, 每条记录是一个独立的 Q&amp;A 检索单元, 不需要分块:</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+<th>关键点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>question</code></td>
+<td>标准问题</td>
+<td><code>"白金卡年费多少?"</code></td>
+</tr>
+<tr>
+<td><code>answer</code></td>
+<td>标准答案 (Markdown)</td>
+<td>可直接展示给客户</td>
+</tr>
+<tr>
+<td><code>variant_questions</code></td>
+<td>同义问句列表</td>
+<td><code>["年费能省吗", "年费怎么退"]</code></td>
+</tr>
+<tr>
+<td><code>category</code></td>
+<td>分类</td>
+<td>年费/积分/账单/...</td>
+</tr>
+<tr>
+<td><code>card_types</code></td>
+<td>适用卡种</td>
+<td>空=通用</td>
+</tr>
+<tr>
+<td><code>customer_tiers</code></td>
+<td>适用客户层级</td>
+<td>空=通用</td>
+</tr>
+<tr>
+<td><code>keywords</code></td>
+<td>检索关键词</td>
+<td>检索加权</td>
+</tr>
+<tr>
+<td><code>approval_status</code></td>
+<td>审批状态</td>
+<td>DRAFT/IN_REVIEW/PUBLISHED/...</td>
+</tr>
+<tr>
+<td><code>version</code> / <code>doc_group</code></td>
+<td>版本控制</td>
+<td>同文档模型</td>
+</tr>
+</tbody>
+</table>
+<p><strong><code>variant_questions</code> 是 FAQ 的核心设计</strong>。它把"客户可能问的多种说法"预存起来, 让精确匹配能覆盖口语变体——"年费怎么退"和"年费能省吗"是同一个答案, 不需要等语义检索去猜, 提前在创建时写死。</p>
+<h3 id="9.14.2-三级检索路径">9.14.2 三级检索路径</h3>
+<p><code>search_faq</code> (<code>faq_service.py:346</code>) 是 FAQ 检索总入口, 三级串行短路, 返回 <code>{"match_type": "exact"|"semantic"|"miss", "results": [...]}</code>:</p>
+<ol>
+<li><strong>精确匹配 (Redis 缓存)</strong> (<code>:367-384</code>): 用归一化后的 query (<code>_normalize_query</code> L32, NFKC+小写+压缩空格) 取 md5 作为 key, 查 <code>lumio:faq:exact:{md5}</code>。命中后做权限/卡种过滤, 通过则直接返回 <code>match_type="exact"</code>。这是最快路径, 一次 Redis GET, 无 LLM 无向量。</li>
+<li><strong>语义匹配 (Milvus)</strong> (<code>:386-429</code>): 精确 miss 后, <code>embed_query</code> 生成查询向量, 直接调 <code>milvus_collection.search</code> (COSINE, nprobe=16, top_k×2), 过滤 <code>chunk_type=="faq_qa" AND approval_status=="PUBLISHED" AND is_current_version==true</code>。注意 FAQ 语义检索<strong>内联</strong>在 faq_service 里, 不走通用文档检索的 <code>search_vector</code> (那是 5 章讲的路径)。</li>
+<li><strong>降级 miss</strong> (<code>:433-435</code>): 前两级都未命中, 返回 <code>match_type="miss"</code>, 由上层落到通用文档检索。</li>
+</ol>
+<p><strong>FAQ embedding 的组织</strong>: 发布时 (<code>_index_faq_to_search</code> L441) 把 <code>question</code> + 每个 <code>variant_questions</code> 各作为一条 <code>chunk_type="faq_qa"</code> 的独立 embedding 条目写入索引。这样"年费怎么退"这条 variant 有自己的向量, 语义检索能直接命中它, 而不需要先命中标准问题再映射。</p>
+<h3 id="9.14.3-发布、预热与去重">9.14.3 发布、预热与去重</h3>
+<ul>
+<li><strong>发布时写索引 + 预热缓存</strong> (<code>transition_faq_approval</code> L238): FAQ 从 DRAFT 走到 PUBLISHED 时, 才调用 <code>_index_faq_to_search</code> (L285) 写索引, 并用 <code>_warm_exact_match_cache</code> (L288) 对 question + 所有 variant 分别 setex 预热精确缓存。未发布的 FAQ 不占索引、不进缓存。</li>
+<li><strong>下线时清缓存</strong> (<code>_remove_faq_from_cache</code> L494): 删除 FAQ 时同步清掉精确缓存, 避免死数据命中。</li>
+<li><strong>语义去重</strong> (<code>check_faq_duplicate</code> L303): 创建前用 Milvus 语义相似度检测, threshold 默认 0.92, 重复返回 409。防止"同一条知识以不同问法建两份"。</li>
+<li><strong>过期自动下线</strong> (<code>expire_overdue_faqs</code> L538): 定时任务把超过 <code>expiry_date</code> 的 PUBLISHED FAQ 自动下线, 保证不再召回已失效的答案。</li>
+</ul>
+<h3 id="9.14.4-FAQ-与文档检索怎么选">9.14.4 FAQ 与文档检索怎么选</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>文档检索 (5 章)</th>
+<th>FAQ (本节)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据形态</td>
+<td>长文档分块</td>
+<td>结构化问答对</td>
+</tr>
+<tr>
+<td>匹配方式</td>
+<td>BM25 + 向量 RRF 融合</td>
+<td>精确缓存 → 向量 COSINE</td>
+</tr>
+<tr>
+<td>适用问法</td>
+<td>开放式 / 长句 / 需要上下文</td>
+<td>高频短问答 / 口语变体多</td>
+</tr>
+<tr>
+<td>答得准</td>
+<td>需检索片段拼装</td>
+<td>标准答案直接返回</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>文档检索 + RRF</td>
+<td>最快可一次 Redis 命中</td>
+</tr>
+</tbody>
+</table>
+<p><strong>实际分工</strong>: 客户问"白金卡年费多少?" 这种高频标准问题, FAQ 一次 Redis 命中直接给标准答案; 问"我上次刷了 5800 块还没出账单, 这笔什么时候记账?" 这种带具体上下文的, 走文档检索。Flash 的 <code>match_type</code> 字段让上层能观测到"这次是 FAQ 答的还是文档答的", 用于调优两套库的比例。</p>
+<h2 id="9.15-搭建后验证">9.15 搭建后验证</h2>
+<p>知识库搭完, 不能假设"能跑就完了"——要确认两件事: <strong>中间件都连通</strong> + <strong>检索真能召回</strong>。</p>
+<h3 id="9.15.1-verify_all.py-—-中间件连通性">9.15.1 <code>verify_all.py</code> — 中间件连通性</h3>
+<p><code>agent/scripts/verify_all.py</code> 一键验证 9 项中间件 (<code>main</code> L177-222), 通过 <code>make verify</code> 触发:</p>
+<table>
+<thead>
+<tr>
+<th>检查函数</th>
+<th>行号</th>
+<th>验证什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>check_postgresql</code></td>
+<td>L18</td>
+<td>PostgreSQL 16 (asyncpg SELECT 1)</td>
+</tr>
+<tr>
+<td><code>check_redis</code></td>
+<td>L46</td>
+<td>Redis 7.2 (ping + server version)</td>
+</tr>
+<tr>
+<td><code>check_elasticsearch</code></td>
+<td>L59</td>
+<td>Elasticsearch 8.19 (es.info 版本)</td>
+</tr>
+<tr>
+<td><code>check_milvus</code></td>
+<td>L71</td>
+<td>Milvus 2.4 (connect + server version)</td>
+</tr>
+<tr>
+<td><code>check_minio</code></td>
+<td>L83</td>
+<td>MinIO (列 buckets)</td>
+</tr>
+<tr>
+<td><code>check_kafka</code></td>
+<td>L100</td>
+<td>Kafka (消费 topics 数量)</td>
+</tr>
+<tr>
+<td><code>check_ollama</code></td>
+<td>L123</td>
+<td>Ollama (GET /api/tags 列模型)</td>
+</tr>
+<tr>
+<td><code>check_nacos</code></td>
+<td>L142</td>
+<td>Nacos (MCP 关闭时跳过, 默认视为通过)</td>
+</tr>
+<tr>
+<td><code>check_higress</code></td>
+<td>L158</td>
+<td>Higress 网关 (同上)</td>
+</tr>
+</tbody>
+</table>
+<p>每条 check 返回 <code>(ok, 详情)</code>, 输出用 ✅/❌ 标记, 只要有失败就 <code>sys.exit(1)</code> (<code>:216</code>), 适合做 CI gate。Nacos/Higress 两项由 <code>_mcp_enabled()</code> (L137) 决定是否校验——MCP 工具关闭时默认跳过, 保证 <code>make verify</code> 在默认环境全绿。</p>
+<h3 id="9.15.2-检索验收-—-知识库&quot;真的能用&quot;吗">9.15.2 检索验收 — 知识库"真的能用"吗</h3>
+<p>中间件连通只证明"服务活着", 不证明"知识库能答对"。搭建后的验收应包括:</p>
+<ol>
+<li><strong>跑一遍 seed</strong>: <code>poetry run python scripts/seed_knowledge.py --dry-run</code> 确认扫描结果正确, 再正式入库。</li>
+<li><strong>FAQ 检索验收</strong>: 用 <code>POST /kb/faq/search</code> (<code>faq_router.py:246</code>) 逐个测核心 FAQ, 确认 <code>match_type</code> 是 <code>exact</code> 或 <code>semantic</code>, 而不是 <code>miss</code>。精确命中说明缓存预热成功, 语义命中说明向量索引正常。</li>
+<li><strong>文档召回验收</strong>: 对一个已知文档里的问题跑检索, 确认能召回对应 chunk。召回率低时排查 Chunk 边界 (9.7) / 元数据过滤 (9.12) / Embedding 模型 (9.8)。</li>
+<li><strong>版本验收</strong>: 更新一份文档触发新版本, 确认旧版本不再被召回 (9.11)。</li>
+</ol>
+<h2 id="9.16-测试覆盖">9.16 测试覆盖</h2>
+<p><code>agent/tests/test_ingestion.py</code> 覆盖三个核心场景类:</p>
+<ul>
+<li><strong>TestCleanText</strong> (<code>:18</code>): 页眉页脚清除 / 多空格合并 / 控制字符清理</li>
+<li><strong>TestChunkText</strong> (<code>:58</code>): 短文本直通 / 长文本分块 / 中文句末边界优先</li>
+<li><strong>TestParse</strong> (<code>:95</code>): Markdown token 树 / TXT 直通</li>
+</ul>
+<p>其中 <code>test_chunk_respects_chinese_sentence_boundary</code> (<code>:81</code>) 是最关键的一条: 它构造一段长文本断言 chunk 边界落在 <code>。</code> 而非中段, 直接锁定了第 9.7 节的优先级约定. Milvus 写入和 ES 回滚走集成测试 (需要真集群), 不在单测范围.</p>
+<h2 id="9.17-小结">9.17 小结</h2>
+<p>搭建一个知识库, 从操作视角看是 5 个环节的串联: <strong>知识源组织</strong> (目录 + frontmatter 决定分类和过滤) → <strong>上传建档</strong> (白名单/大小/哈希三检查) → <strong>摄入管线</strong> (Parse 屏蔽 6 种格式, Clean 5 步清洗, Chunk 中文句末断点, Embed 128 批 + 熔断, Dual-Write ES 先 Milvus 后 + 回滚保证原子性) → <strong>FAQ 结构化库</strong> (精确缓存 → 语义 COSINE 三级检索) → <strong>验证</strong> (verify_all 连通性 + 检索验收).</p>
+<p>贯穿始终的两个设计原则: <strong>PG 是真相之源, ES/Milvus 只是投影</strong> (重试靠 PARTIAL 索引对账, 不靠外部系统对账); <strong>过滤在摄入时就要写对, 检索时只能消费</strong> (元数据契约). 7 阶段 <code>kb_ingestion_log</code> 是出问题时的第一现场, 部分唯一索引让版本管理不依赖应用层逻辑.</p>
 <blockquote>
 <p><strong>延伸阅读</strong>:
-- <a href="../05-rag-pipeline.md">第 5 章 RAG 检索全链路</a> — 检索端细节
-- <a href="12-data-layer.md">第 12 章 数据层</a> — ES/Milvus 索引设计
+- <a href="../05-rag-pipeline.md">第 5 章 RAG 检索全链路</a> — 文档检索端细节
+- <a href="12-data-layer.md">第 12 章 数据层</a> — ES/Milvus 索引设计 + 降级路由
 - <a href="../appendix/A-glossary.md#a6-rag-检索术语">附录 A 术语表</a> — RAG 术语速查</p>
 </blockquote>
 </section>

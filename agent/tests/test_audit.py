@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -66,7 +67,11 @@ class TestWriteChatMessage:
     @pytest.mark.asyncio
     async def test_write_success(self):
         """正常写入一条审计记录"""
+        fake_record = MagicMock()
+        fake_result = MagicMock()
+        fake_result.scalar_one_or_none = MagicMock(return_value=fake_record)
         mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=fake_result)
         mock_session_factory = MagicMock()
         mock_session_factory.return_value.__aenter__.return_value = mock_session
 
@@ -82,13 +87,17 @@ class TestWriteChatMessage:
         )
 
         assert result is not None
-        mock_session.add.assert_called_once()
+        mock_session.execute.assert_called_once()
         mock_session.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_write_minimal_fields(self):
         """仅必填字段写入"""
+        fake_record = MagicMock()
+        fake_result = MagicMock()
+        fake_result.scalar_one_or_none = MagicMock(return_value=fake_record)
         mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=fake_result)
         mock_session_factory = MagicMock()
         mock_session_factory.return_value.__aenter__.return_value = mock_session
 
@@ -100,12 +109,13 @@ class TestWriteChatMessage:
         )
 
         assert result is not None
-        args = mock_session.add.call_args[0][0]
-        assert args.session_id == "sess-002"
-        assert args.message_id == "msg-002"
-        assert args.content == "你好"
-        assert args.processing_status == ChatMessageStatus.QUEUED
-        assert args.channel == "web"
+        stmt = mock_session.execute.call_args.args[0]
+        values = stmt.compile().params
+        assert values.get("session_id") == "sess-002"
+        assert values.get("message_id") == "msg-002"
+        assert values.get("content") == "你好"
+        assert values.get("processing_status") == ChatMessageStatus.QUEUED
+        assert values.get("channel") == "web"
 
     @pytest.mark.asyncio
     async def test_write_db_error_returns_none(self):
@@ -271,6 +281,31 @@ class TestAuditIntegration:
             source="llm",
         )
 
-        assert session.add.call_count == 1
-        assert session.execute.call_count == 1
+        assert session.execute.call_count == 2  # write 幂等插入 + update 各一次
         assert session.commit.call_count == 2
+
+
+class TestWriteChatMessageReturningColumn:
+    """会话 48882b05 P0 回归: returning(ChatMessage) 物化 id UUID 列,
+    asyncpg (Uuid native_uuid=False) 反序列化 pgproto.UUID 直接炸,
+    每条消息审计静默丢失 —— 只允许 returning String 列 message_id。
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_only_message_id_column(self):
+        from sqlalchemy.dialects import postgresql
+
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value="msg-1")))
+        mock_factory = MagicMock()
+        mock_factory.return_value.__aenter__.return_value = mock_session
+
+        await write_chat_message(mock_factory, session_id="s-r", message_id="msg-1", content="c")
+
+        stmt = mock_session.execute.call_args.args[0]
+        sql = str(stmt.compile(dialect=postgresql.dialect()))
+        assert "RETURNING" in sql
+        assert "message_id" in sql
+        # id UUID 列不得出现在 RETURNING 中 (pgproto.UUID 反序列化缺陷)
+        returning_part = sql[sql.index("RETURNING") :]
+        assert re.search(r"\bid\b", returning_part) is None

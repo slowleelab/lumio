@@ -1,24 +1,131 @@
 ---
-title: "第 9 章: RAG 摄入管线"
+title: "第 9 章: 知识库搭建: 摄入管线 + FAQ + 验证"
 chapter: 9
 part: "横切关注点"
 difficulty: "中级"
-reading_time: "12 分钟"
+reading_time: "18 分钟"
 prerequisites: ["第 5 章: RAG 检索全链路"]
 code_references:
   - "agent/lumio/services/common/ingestion.py"
   - "agent/lumio/services/common/embedding.py"
+  - "agent/lumio/services/common/faq_service.py"
   - "agent/lumio/shared/orm_models.py"
-last_updated: "2026-08-05"
-summary: "5 阶段摄入管线 (Parse→Clean→Chunk→Embed→Dual-Write) + 双写回滚 + 增量版本管理."
-tags: ["rag", "ingestion", "embedding", "dual-write"]
+  - "agent/scripts/seed_knowledge.py"
+  - "agent/scripts/verify_all.py"
+last_updated: "2026-08-15"
+summary: "从零搭建一个知识库的完整路径: 知识源组织 → 上传建档 → 5 阶段摄入管线 → FAQ 结构化库 → 搭建后验证."
+tags: ["rag", "ingestion", "embedding", "dual-write", "faq", "knowledge-base"]
 ---
 
-# 第 9 章: RAG 摄入管线
+# 第 9 章: 知识库搭建: 摄入管线 + FAQ + 验证
 
-> 本章拆解 Lumio 把一份原始文档送进 ES + Milvus 的完整路径, 重点回答: 5 阶段为什么是这 5 个? 双写失败时怎么回滚? 如何做到增量版本管理?
+> 本章从操作者的视角, 讲清把一份银行文档变成一个可检索知识库的完整路径: 文档怎么组织、怎么传进系统、中间经历了哪些处理、FAQ 怎么建、搭完之后怎么验证能检索. 重点回答: 知识源要不要按目录分? frontmatter 里的元数据有什么用? 5 阶段摄入为什么是这 5 个? FAQ 和文档检索有什么区别? 怎么确认知识库"真的能用"?
 
-## 9.1 5 阶段管线总览
+## 9.1 从零搭建全景 — 主路径图
+
+搭建一个知识库不像"上传几个文件"那么简单. 一份《信用卡章程》PDF 要能被客户问"年费怎么免"时检索到, 中间要经过 5 个环节. 下面这张图是本章的总览, 每个环节对应后续一小节:
+
+```mermaid
+flowchart TB
+    A1[知识源组织<br/>目录 + frontmatter 元数据] --> A2[上传建档<br/>MinIO + KbDocument]
+    A2 --> A3[摄入管线<br/>Parse→Clean→Chunk→Embed→Dual-Write]
+    A3 --> A4[FAQ 结构化库<br/>KbFaq + 同义问句]
+    A4 --> A5[搭建后验证<br/>verify_all + 检索验收]
+
+    A1 -.->|9.2| N1[9.2 知识源组织]
+    A2 -.->|9.3| N2[9.3 上传入口]
+    A3 -.->|9.4-9.13| N3[9.4-9.13 摄入管线]
+    A4 -.->|9.14| N4[9.14 FAQ 结构化库]
+    A5 -.->|9.15| N5[9.15 搭建后验证]
+
+    style A1 fill:#fff4e1
+    style A2 fill:#fff4e1
+    style A3 fill:#e1efff
+    style A4 fill:#d4f4dd
+    style A5 fill:#ffe1e1
+```
+
+- **9.2 知识源组织**: 决定文档放哪个目录、元数据写什么, 是搭建的起点
+- **9.3 上传入口**: 文件怎么进系统, 三个前置检查挡掉可预判的失败
+- **9.4-9.13 摄入管线**: 核心环节, 把原始文档变成可检索的向量 + BM25 索引
+- **9.14 FAQ 结构化库**: 高频问题直答, 与文档检索互补
+- **9.15 搭建后验证**: 确认中间件连通、检索能召回, 才算搭完
+
+## 9.2 知识源组织
+
+搭建知识库的第一步, 是决定**文档怎么组织**——这决定了后面的分类、权限、检索过滤. Lumio 用"目录 + frontmatter 元数据"两个维度组织知识源, 由 `agent/scripts/seed_knowledge.py` 处理.
+
+### 9.2.1 目录决定分类
+
+`seed_knowledge.py:26-36` 定义了一级目录名到业务分类的映射:
+
+```python
+# agent/scripts/seed_knowledge.py:26
+DIR_CATEGORY_MAP: dict[str, str] = {
+    "faq": "FAQ",          "fee": "费率",
+    "points": "积分",      "annual_fee": "年费",
+    "regulations": "章程", "repayment": "还款",
+    "security": "安全",    "activity": "活动",
+    "other": "OTHER",
+}
+```
+
+目录名是**英文 slug**, 分类值是**中文业务名**. 扫描时 (`scan_files` L68) 用 `rel_parts[0]` 取一级目录名, 再查映射得出分类. 例如 `test_data/fee/fee-annual-card-type.md` 会被归到"费率"。
+
+`agent/test_data/` 的实际一级目录 (`activity` / `annual_fee` / `faq` / `fee` / `other` / `points` / `regulations` / `repayment` / `security`) 跟映射 key 一一对应, 新增分类时只需在映射表加一行, 无需改扫描逻辑。
+
+### 9.2.2 frontmatter 决定元数据
+
+每个 Markdown 文件顶部可写 YAML frontmatter, 提供比目录更细的元数据。`parse_frontmatter` (`:39`) 解析 `---` 包裹的头部:
+
+```markdown
+---
+title: 白金卡年费减免政策
+category: fee            # 覆盖目录映射的分类
+doc_type: faq            # 文档类型
+card_type: platinum      # 适用卡种
+customer_tier: vip       # 适用客户层级
+security_level: internal # 密级
+version: "1.1"
+effective_date: 2026-01-01
+expiry_date: 2026-12-31
+keywords: [年费, 减免, 白金卡]
+---
+```
+
+**元数据的三来源优先级** (`scan_files` L90-96): **frontmatter 优先 > 目录映射兜底 > 默认值**。例如:
+
+- `category`: frontmatter 有则用, 否则用目录映射的分类, 再否则 `OTHER`
+- `doc_type`: 默认 `faq`
+- `security_level`: 默认 `internal`
+- `card_type`/`customer_tier`: 可留空, 空值表示"对全卡种/全员可见" (见 9.12)
+
+**为什么用 frontmatter 而不是在目录上区分**: 分类是粗粒度 (文档属于费率), 而 `card_type`/`security_level`/`effective_date` 是每份文档的细粒度属性, 目录无法表达。frontmatter 让"一份文档可以有多个适用卡种"这类多维属性落在文档自身, 目录只承担最粗的分类。
+
+### 9.2.3 用 seed 脚本试跑
+
+`seed_knowledge.py` 的 `main` (`:261`) 支持 `--dry-run`, 只扫描不入库, 是搭建时预览的好工具:
+
+```bash
+poetry run python scripts/seed_knowledge.py --dry-run
+poetry run python scripts/seed_knowledge.py --dir /path/to/docs
+```
+
+`--dry-run` 会打印扫描摘要 (`print_scan_summary` L154): 序号 / 文件名 / 分类 / 类型 / 标题, 让你在上传前确认目录和元数据对不对。正式运行时 (`:288-289`) 先把文件传 MinIO (`upload_to_minio` L163, object key 为 `{category}/{filename}`), 再按 content_hash 查重后写 `KbDocument` (`insert_to_database` L205) — 重复文件直接跳过, 不产生脏数据。
+
+## 9.3 上传入口: 从 HTTP 文件到 5 阶段管线的"最后一公里"
+
+摄入管线的上游是 `upload_document` 端点 (`bot/router.py:1443`), 这一段的职责不是"解析文档", 而是**在文件进管线之前把一切可预判的失败挡掉**。三个检查按成本从低到高排列:
+
+1. **扩展名白名单** (`_ALLOWED_EXTENSIONS`): `.pdf/.docx/.html/.md/.txt/.xlsx` 六个后缀, 其余一律 400 (`DocumentFormatError` 2010)。白名单比黑名单安全——`.exe`/`.sh` 这类可执行文件连进入对象存储的机会都没有。
+2. **文件大小上限 50MB**: 优先读 `Content-Length` header (不读 body 就能拒绝), header 缺失时才读完整内容后按 `len(content_bytes)` 判定。50MB 是经验值: 银行 PDF 章程通常 5-20MB, 批量上传峰值留 2-3 倍冗余; 再大就应走对象存储分片上传, 不应塞 HTTP body。
+3. **SHA-256 内容哈希**: `content_hash` 写入 `kb_document`, 同一份文件重复上传时可按哈希识别去重, 也是将来做"内容变更检测" (内容变但文件名没变) 的锚点。
+
+三个检查过后, 文件才进 MinIO (`{category}/{filename}` 二级 key), 再创建 `KbDocument` 记录 (status=`PENDING`), 最后调用 `ingest_document()` 触发 5 阶段管线并回写最终状态 (`COMPLETED` / `FAILED`)。**注意端点的返回不阻塞在摄入完成**: `ingest_document` 是 await 的, 但状态字段 (`doc.status`) 的最终值由摄入结果回填, 客户端可以通过 `GET /kb/documents/{doc_id}/status` 轮询——上传接口永远先返回, 长耗时在后台完成。
+
+**为什么摄入异常不向上抛?** `upload_document` 里对 `ingest_document` 的调用包在 `try/except` 里, 异常时只把 `kb_doc.status` 置为 `FAILED`。这样"文件已收、摄入失败"不会让客户端拿到 500 重试上传——重试摄入比重传文件便宜得多 (MinIO 里已经有原件了)。
+
+## 9.4 摄入管线 5 阶段总览
 
 **先讲个业务场景**: 银行的法务部上传了一份《信用卡章程》PDF (200 页). 这份文档要能被客户问"年费怎么免"时检索到 — 但 200 页塞进系统可不像复制粘贴那么简单: PDF 要转文字, 页眉页脚要去掉, 长段落要切成小块, 每块要变成向量, 最后同时写进两个检索库. 任何一个环节出错 (PDF 解析失败/双写一半成功), 客户就可能问到**残缺的答案** — 这是合规事故.
 
@@ -42,7 +149,7 @@ flowchart LR
 
 `ingest_document()` 是顶层编排器, 在 `agent/lumio/services/common/ingestion.py:522` 起. 它先查文档记录, 把 `doc.status` 置为 `PROCESSING`, 然后线性走完 5 个阶段. chunker 逻辑内联进 `ingestion.py`, 阶段间只通过字符串 / 字典传递, 减少了临时状态序列化开销.
 
-## 9.2 Parse 阶段: 6 种文件格式
+## 9.5 Parse 阶段: 6 种文件格式
 
 Parse 阶段的目标只有一个: 把任何格式变成纯文本. 6 种格式的解析器集中在 `ingestion.py:54-188`, 通过 `_PARSE_DISPATCH` 字典按 `KbSourceType` 派发:
 
@@ -61,7 +168,7 @@ Markdown 的 token 树方案比正则替换更稳. 写法上 `parse_markdown` �
 
 PDF 是 6 种里唯一可能解析失败的 (扫描件), 目前 `parse_pdf` 抛异常会冒泡到顶层 `try/except`, 直接把 `doc.status` 标记为 `FAILED` (`:720`). 未来如果要支持扫描件, 应在 Parse 内部接 OCR 而不是把噪声推给下游.
 
-## 9.3 Clean 阶段: 5 步清洗
+## 9.6 Clean 阶段: 5 步清洗
 
 `clean_text()` 在 `ingestion.py:211`, 5 步串行:
 
@@ -89,7 +196,7 @@ _RE_PAGE_HEADER_FOOTER = re.compile(
 
 `re.IGNORECASE` 让 `Page 3 of 20` 和 `PAGE 3 OF 20` 都能命中, 但代价是无法区分"正文里出现'第 3 页' 这种字面量" — 真实业务里这个概率极低, 当前可以接受.
 
-## 9.4 Chunk 阶段: 递归字符分割
+## 9.7 Chunk 阶段: 递归字符分割
 
 `chunk_text()` 在 `ingestion.py:297`, 默认 `chunk_size=1500`, `overlap=200`. 这里 1500 是中文字符数, 约等于 600-800 个英文 token, 对 `bge-large-zh-v1.5` 的 512 token 上限有充足余量 (一段中文 token 化后大约 1.8 倍字符数).
 
@@ -103,7 +210,7 @@ _RE_PAGE_HEADER_FOOTER = re.compile(
 
 为什么句末优先级最高? 因为中文的句号 / 问号 / 感叹号背后是完整的语义单元, 在这里断开 chunk 不会切断"主谓宾". 短语标点 (顿号 / 逗号) 通常连接并列项, 单独切断一个并列项会导致该 chunk 失去上下文. 空格是英文 / 数字的兜底断点, 命中率比前两个低很多.
 
-## 9.5 Embed 阶段: 批大小 128 + 熔断器
+## 9.8 Embed 阶段: 批大小 128 + 熔断器
 
 `embed_chunks()` (`:344`) 把 chunks 按 `batch_size=128` 分批:
 
@@ -132,7 +239,7 @@ self._recovery_threshold = 2
 
 熔断器初始 `_is_open = True` (`:241`), 首次 `health_check()` 成功后才关闭. 这是冷启动安全: 进程刚起时不假定 TEI 一定可用, 一定要探一次.
 
-## 9.6 Dual-Write 阶段: ES 先, Milvus 后
+## 9.9 Dual-Write 阶段: ES 先, Milvus 后
 
 Dual-Write 是整个管线最容易出错的地方. Lumio 选择 **ES 先, Milvus 后**, 不是没有理由. ES 写入是单文档 `index()` 调用, 失败可以精确定位到 chunk_id; Milvus 是批量 `insert()`, 失败时只能回滚整批. 顺序反过来如果 Milvus 失败, 已经写入 ES 的 chunk 没法追溯是哪些 (因为还没回填 doc_group), 会出现"ES 有文档但用户搜不到" 的鬼影数据.
 
@@ -169,7 +276,7 @@ sequenceDiagram
     I->>DB: kb_ingestion_log(MILVUS_WRITE, FAILED)
 ```
 
-## 9.7 摄入日志: 7 阶段流水
+## 9.10 摄入日志: 7 阶段流水
 
 `kb_ingestion_log` 表在 `shared/orm_models.py:412`, 配合 `KbIngestionStage` 枚举 (`:93`) 提供 7 个固定阶段:
 
@@ -179,7 +286,7 @@ sequenceDiagram
 
 每行写 (stage, status, duration_ms, step_detail), 其中 `step_detail` 是 JSON 字段, 容纳阶段特定的元数据. 例如 CHUNK 阶段写 `{"chunk_count": N}` (`:594`), EMBED 阶段写 `{"embedding_dim": 1024}` (`:606`), ES_WRITE 阶段写 `{"success_count": M, "total": N}` (`:660`). 这种"通用字段 + JSON 详情" 的设计避免了阶段专属列膨胀.
 
-## 9.8 增量摄入与版本管理
+## 9.11 增量摄入与版本管理
 
 企业知识库是持续演化的, 同一份产品手册会有 v1.0 / v1.1 / v2.0 多个版本. Lumio 的版本模型不靠"先删后写", 而是靠 PostgreSQL 的 **部分唯一索引**:
 
@@ -196,29 +303,7 @@ Index(
 
 ES 和 Milvus 在检索时会带上 `approval_status=PUBLISHED AND is_current_version=true` 的过滤 (`ingestion.py:409-411`), 旧版本 chunk 物理上还在索引里, 但永远不会被召回, 既保证可回滚又保证检索不返祖.
 
-## 9.9 测试覆盖
-
-`agent/tests/test_ingestion.py` 覆盖三个核心场景类:
-
-- **TestCleanText** (`:18`): 页眉页脚清除 / 多空格合并 / 控制字符清理
-- **TestChunkText** (`:58`): 短文本直通 / 长文本分块 / 中文句末边界优先
-- **TestParse** (`:95`): Markdown token 树 / TXT 直通
-
-其中 `test_chunk_respects_chinese_sentence_boundary` (`:81`) 是最关键的一条: 它构造一段长文本断言 chunk 边界落在 `。` 而非中段, 直接锁定了第 9.4 节的优先级约定. Milvus 写入和 ES 回滚走集成测试 (需要真集群), 不在单测范围.
-
-## 9.9.1 上传入口:从 HTTP 文件到 5 阶段管线的"最后一公里"
-
-摄入管线的上游是 `upload_document` 端点 (`bot/router.py:1443`), 这一段的职责不是"解析文档", 而是**在文件进管线之前把一切可预判的失败挡掉**。三个检查按成本从低到高排列:
-
-1. **扩展名白名单** (`_ALLOWED_EXTENSIONS`): `.pdf/.docx/.html/.md/.txt/.xlsx` 六个后缀, 其余一律 400 (`DocumentFormatError` 2010)。白名单比黑名单安全——`.exe`/`.sh` 这类可执行文件连进入对象存储的机会都没有。
-2. **文件大小上限 50MB**: 优先读 `Content-Length` header (不读 body 就能拒绝), header 缺失时才读完整内容后按 `len(content_bytes)` 判定。50MB 是经验值: 银行 PDF 章程通常 5-20MB, 批量上传峰值留 2-3 倍冗余; 再大就应走对象存储分片上传, 不应塞 HTTP body。
-3. **SHA-256 内容哈希**: `content_hash` 写入 `kb_document`, 同一份文件重复上传时可按哈希识别去重, 也是将来做"内容变更检测" (内容变但文件名没变) 的锚点。
-
-三个检查过后, 文件才进 MinIO (`{category}/{filename}` 二级 key), 再创建 `KbDocument` 记录 (status=`PENDING`), 最后调用 `ingest_document()` 触发 5 阶段管线并回写最终状态 (`COMPLETED` / `FAILED`)。**注意端点的返回不阻塞在摄入完成**: `ingest_document` 是 await 的, 但状态字段 (`doc.status`) 的最终值由摄入结果回填, 客户端可以通过 `GET /kb/documents/{doc_id}/status` 轮询——上传接口永远先返回, 长耗时在后台完成。
-
-**为什么摄入异常不向上抛?** `upload_document` 里对 `ingest_document` 的调用包在 `try/except` 里, 异常时只把 `kb_doc.status` 置为 `FAILED`。这样"文件已收、摄入失败"不会让客户端拿到 500 重试上传——重试摄入比重传文件便宜得多 (MinIO 里已经有原件了)。
-
-## 9.9.2 元数据如何影响检索:过滤不是检索后做的
+## 9.12 元数据如何影响检索: 过滤不是检索后做的
 
 `DocumentMetadata` 是摄入时写入、检索时消费的"契约"。它携带 8 个字段, 其中 5 个是检索过滤键:
 
@@ -234,7 +319,7 @@ ES 和 Milvus 在检索时会带上 `approval_status=PUBLISHED AND is_current_ve
 
 `keywords` 的拆分逻辑 (`[k.strip() for k in keywords.split(",") if k.strip()]`) 有一个边界: 全角逗号 `，` 不会被拆分——上传文档的人用中文输入法很容易踩中, 表现为"关键词只有一个超长串"。这是刻意保持的简单行为, 因为自动做全角归一化会引入"关键词被意外合并"的另一个错误方向, 而检索端对空关键词有兜底 (退化到纯 BM25 全文匹配)。
 
-## 9.9.3 摄入失败后怎么重试:PARTIAL 索引 + 幂等重建
+## 9.13 摄入失败后怎么重试: PARTIAL 索引 + 幂等重建
 
 摄入失败 (ES 或 Milvus 写入异常) 后, 重试不是"重新上传一遍", 而是**用相同的 `chunk_id` 重建索引**:
 
@@ -244,11 +329,105 @@ ES 和 Milvus 在检索时会带上 `approval_status=PUBLISHED AND is_current_ve
 
 这个设计的巧妙之处在第 12 章的 `es_indexed` / `milvus_indexed` 状态字段: **PG 是真相之源, ES/Milvus 只是投影**。即使两个检索引擎的数据短暂不一致, worker 也能从 PG 的 PARTIAL 索引精确知道"哪些 chunk 缺哪个引擎", 不需要去对账两个外部系统。这也是为什么第 12.7 节的降级路由 (单路召回) 能成立——降级前先看 PG 状态, 而不是试错。
 
-## 9.10 小结
+## 9.14 FAQ 结构化知识库
 
-Lumio 的摄入管线把" 让 ES 和 Milvus 数据一致" 这个难题拆成 5 个串行阶段 + 1 个对账回滚路径. Parse 阶段屏蔽 6 种格式差异, Clean 阶段用 5 步正则清洗噪声, Chunk 阶段在中文句末优先断点, Embed 阶段走 128 批 TEI + 3/2/30s 熔断器, Dual-Write 阶段用 ES 先 / Milvus 后 + `_rollback_es_docs` 保证原子性. 7 阶段 `kb_ingestion_log` 是出问题时的第一现场, 部分唯一索引让版本管理不依赖应用层逻辑.
+文档摄入适合处理长文档 (章程/手册), 但银行客服有大量**高频短问答** ("年费怎么免?""账单日是哪天?"), 这类问题用文档检索反而低效——要检索、分块、命中的是一条长文档的片段, 慢且可能答不准。Lumio 用 `KbFaq` 结构化表单独存这类问答对, 走独立的检索路径。
+
+### 9.14.1 KbFaq 表结构
+
+`KbFaq` 在 `shared/orm_models.py:729`, 每条记录是一个独立的 Q&A 检索单元, 不需要分块:
+
+| 字段 | 含义 | 关键点 |
+|------|------|--------|
+| `question` | 标准问题 | `"白金卡年费多少?"` |
+| `answer` | 标准答案 (Markdown) | 可直接展示给客户 |
+| `variant_questions` | 同义问句列表 | `["年费能省吗", "年费怎么退"]` |
+| `category` | 分类 | 年费/积分/账单/... |
+| `card_types` | 适用卡种 | 空=通用 |
+| `customer_tiers` | 适用客户层级 | 空=通用 |
+| `keywords` | 检索关键词 | 检索加权 |
+| `approval_status` | 审批状态 | DRAFT/IN_REVIEW/PUBLISHED/... |
+| `version` / `doc_group` | 版本控制 | 同文档模型 |
+
+**`variant_questions` 是 FAQ 的核心设计**。它把"客户可能问的多种说法"预存起来, 让精确匹配能覆盖口语变体——"年费怎么退"和"年费能省吗"是同一个答案, 不需要等语义检索去猜, 提前在创建时写死。
+
+### 9.14.2 三级检索路径
+
+`search_faq` (`faq_service.py:346`) 是 FAQ 检索总入口, 三级串行短路, 返回 `{"match_type": "exact"|"semantic"|"miss", "results": [...]}`:
+
+1. **精确匹配 (Redis 缓存)** (`:367-384`): 用归一化后的 query (`_normalize_query` L32, NFKC+小写+压缩空格) 取 md5 作为 key, 查 `lumio:faq:exact:{md5}`。命中后做权限/卡种过滤, 通过则直接返回 `match_type="exact"`。这是最快路径, 一次 Redis GET, 无 LLM 无向量。
+2. **语义匹配 (Milvus)** (`:386-429`): 精确 miss 后, `embed_query` 生成查询向量, 直接调 `milvus_collection.search` (COSINE, nprobe=16, top_k×2), 过滤 `chunk_type=="faq_qa" AND approval_status=="PUBLISHED" AND is_current_version==true`。注意 FAQ 语义检索**内联**在 faq_service 里, 不走通用文档检索的 `search_vector` (那是 5 章讲的路径)。
+3. **降级 miss** (`:433-435`): 前两级都未命中, 返回 `match_type="miss"`, 由上层落到通用文档检索。
+
+**FAQ embedding 的组织**: 发布时 (`_index_faq_to_search` L441) 把 `question` + 每个 `variant_questions` 各作为一条 `chunk_type="faq_qa"` 的独立 embedding 条目写入索引。这样"年费怎么退"这条 variant 有自己的向量, 语义检索能直接命中它, 而不需要先命中标准问题再映射。
+
+### 9.14.3 发布、预热与去重
+
+- **发布时写索引 + 预热缓存** (`transition_faq_approval` L238): FAQ 从 DRAFT 走到 PUBLISHED 时, 才调用 `_index_faq_to_search` (L285) 写索引, 并用 `_warm_exact_match_cache` (L288) 对 question + 所有 variant 分别 setex 预热精确缓存。未发布的 FAQ 不占索引、不进缓存。
+- **下线时清缓存** (`_remove_faq_from_cache` L494): 删除 FAQ 时同步清掉精确缓存, 避免死数据命中。
+- **语义去重** (`check_faq_duplicate` L303): 创建前用 Milvus 语义相似度检测, threshold 默认 0.92, 重复返回 409。防止"同一条知识以不同问法建两份"。
+- **过期自动下线** (`expire_overdue_faqs` L538): 定时任务把超过 `expiry_date` 的 PUBLISHED FAQ 自动下线, 保证不再召回已失效的答案。
+
+### 9.14.4 FAQ 与文档检索怎么选
+
+| 维度 | 文档检索 (5 章) | FAQ (本节) |
+|------|----------------|------------|
+| 数据形态 | 长文档分块 | 结构化问答对 |
+| 匹配方式 | BM25 + 向量 RRF 融合 | 精确缓存 → 向量 COSINE |
+| 适用问法 | 开放式 / 长句 / 需要上下文 | 高频短问答 / 口语变体多 |
+| 答得准 | 需检索片段拼装 | 标准答案直接返回 |
+| 延迟 | 文档检索 + RRF | 最快可一次 Redis 命中 |
+
+**实际分工**: 客户问"白金卡年费多少?" 这种高频标准问题, FAQ 一次 Redis 命中直接给标准答案; 问"我上次刷了 5800 块还没出账单, 这笔什么时候记账?" 这种带具体上下文的, 走文档检索。Flash 的 `match_type` 字段让上层能观测到"这次是 FAQ 答的还是文档答的", 用于调优两套库的比例。
+
+## 9.15 搭建后验证
+
+知识库搭完, 不能假设"能跑就完了"——要确认两件事: **中间件都连通** + **检索真能召回**。
+
+### 9.15.1 `verify_all.py` — 中间件连通性
+
+`agent/scripts/verify_all.py` 一键验证 9 项中间件 (`main` L177-222), 通过 `make verify` 触发:
+
+| 检查函数 | 行号 | 验证什么 |
+|---------|------|---------|
+| `check_postgresql` | L18 | PostgreSQL 16 (asyncpg SELECT 1) |
+| `check_redis` | L46 | Redis 7.2 (ping + server version) |
+| `check_elasticsearch` | L59 | Elasticsearch 8.19 (es.info 版本) |
+| `check_milvus` | L71 | Milvus 2.4 (connect + server version) |
+| `check_minio` | L83 | MinIO (列 buckets) |
+| `check_kafka` | L100 | Kafka (消费 topics 数量) |
+| `check_ollama` | L123 | Ollama (GET /api/tags 列模型) |
+| `check_nacos` | L142 | Nacos (MCP 关闭时跳过, 默认视为通过) |
+| `check_higress` | L158 | Higress 网关 (同上) |
+
+每条 check 返回 `(ok, 详情)`, 输出用 ✅/❌ 标记, 只要有失败就 `sys.exit(1)` (`:216`), 适合做 CI gate。Nacos/Higress 两项由 `_mcp_enabled()` (L137) 决定是否校验——MCP 工具关闭时默认跳过, 保证 `make verify` 在默认环境全绿。
+
+### 9.15.2 检索验收 — 知识库"真的能用"吗
+
+中间件连通只证明"服务活着", 不证明"知识库能答对"。搭建后的验收应包括:
+
+1. **跑一遍 seed**: `poetry run python scripts/seed_knowledge.py --dry-run` 确认扫描结果正确, 再正式入库。
+2. **FAQ 检索验收**: 用 `POST /kb/faq/search` (`faq_router.py:246`) 逐个测核心 FAQ, 确认 `match_type` 是 `exact` 或 `semantic`, 而不是 `miss`。精确命中说明缓存预热成功, 语义命中说明向量索引正常。
+3. **文档召回验收**: 对一个已知文档里的问题跑检索, 确认能召回对应 chunk。召回率低时排查 Chunk 边界 (9.7) / 元数据过滤 (9.12) / Embedding 模型 (9.8)。
+4. **版本验收**: 更新一份文档触发新版本, 确认旧版本不再被召回 (9.11)。
+
+## 9.16 测试覆盖
+
+`agent/tests/test_ingestion.py` 覆盖三个核心场景类:
+
+- **TestCleanText** (`:18`): 页眉页脚清除 / 多空格合并 / 控制字符清理
+- **TestChunkText** (`:58`): 短文本直通 / 长文本分块 / 中文句末边界优先
+- **TestParse** (`:95`): Markdown token 树 / TXT 直通
+
+其中 `test_chunk_respects_chinese_sentence_boundary` (`:81`) 是最关键的一条: 它构造一段长文本断言 chunk 边界落在 `。` 而非中段, 直接锁定了第 9.7 节的优先级约定. Milvus 写入和 ES 回滚走集成测试 (需要真集群), 不在单测范围.
+
+## 9.17 小结
+
+搭建一个知识库, 从操作视角看是 5 个环节的串联: **知识源组织** (目录 + frontmatter 决定分类和过滤) → **上传建档** (白名单/大小/哈希三检查) → **摄入管线** (Parse 屏蔽 6 种格式, Clean 5 步清洗, Chunk 中文句末断点, Embed 128 批 + 熔断, Dual-Write ES 先 Milvus 后 + 回滚保证原子性) → **FAQ 结构化库** (精确缓存 → 语义 COSINE 三级检索) → **验证** (verify_all 连通性 + 检索验收).
+
+贯穿始终的两个设计原则: **PG 是真相之源, ES/Milvus 只是投影** (重试靠 PARTIAL 索引对账, 不靠外部系统对账); **过滤在摄入时就要写对, 检索时只能消费** (元数据契约). 7 阶段 `kb_ingestion_log` 是出问题时的第一现场, 部分唯一索引让版本管理不依赖应用层逻辑.
 
 > **延伸阅读**:
-> - [第 5 章 RAG 检索全链路](../05-rag-pipeline.md) — 检索端细节
-> - [第 12 章 数据层](12-data-layer.md) — ES/Milvus 索引设计
+> - [第 5 章 RAG 检索全链路](../05-rag-pipeline.md) — 文档检索端细节
+> - [第 12 章 数据层](12-data-layer.md) — ES/Milvus 索引设计 + 降级路由
 > - [附录 A 术语表](../appendix/A-glossary.md#a6-rag-检索术语) — RAG 术语速查

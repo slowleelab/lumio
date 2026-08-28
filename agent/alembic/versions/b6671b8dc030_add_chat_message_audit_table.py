@@ -10,8 +10,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = 'b6671b8dc030'
-down_revision: str | None = 'a918a6a3f1c8'
+revision: str = "b6671b8dc030"
+down_revision: str | None = "a918a6a3f1c8"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -24,20 +24,24 @@ def upgrade() -> None:
 
     # 幂等检查
     from sqlalchemy import inspect
+
     inspector = inspect(conn)
-    if 'chat_message' in inspector.get_table_names():
+    if "chat_message" in inspector.get_table_names():
         return
 
     # 创建 ENUM 类型（幂等）
-    conn.execute(sa.text(f"""
+    conn.execute(
+        sa.text(f"""
         DO $$ BEGIN
             CREATE TYPE {_ENUM_SQL} AS ENUM ({_ENUM_VALUES});
         EXCEPTION WHEN duplicate_object THEN NULL;
         END $$;
-    """))
+    """)
+    )
 
     # 原生 SQL 创建表（避免 SQLAlchemy ENUM listener 重复创建类型）
-    op.execute(sa.text(f"""
+    op.execute(
+        sa.text(f"""
         CREATE TABLE chat_message (
             id UUID PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
@@ -56,22 +60,24 @@ def upgrade() -> None:
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-    """))
+    """)
+    )
 
     # 创建索引
-    op.create_index('ix_chat_message_session', 'chat_message', ['session_id'])
-    op.create_index('ix_chat_message_created', 'chat_message', ['created_at'])
-    op.create_index('ix_chat_message_intent', 'chat_message', ['intent'])
-    op.execute(sa.text(
-        "CREATE INDEX ix_chat_message_content_fts ON chat_message "
-        "USING gin (to_tsvector('simple', content))"
-    ))
+    op.create_index("ix_chat_message_session", "chat_message", ["session_id"])
+    op.create_index("ix_chat_message_created", "chat_message", ["created_at"])
+    op.create_index("ix_chat_message_intent", "chat_message", ["intent"])
+    op.execute(
+        sa.text(
+            "CREATE INDEX ix_chat_message_content_fts ON chat_message " "USING gin (to_tsvector('simple', content))"
+        )
+    )
 
 
 def downgrade() -> None:
-    op.drop_index('ix_chat_message_content_fts', table_name='chat_message')
-    op.drop_index('ix_chat_message_intent', table_name='chat_message')
-    op.drop_index('ix_chat_message_created', table_name='chat_message')
-    op.drop_index('ix_chat_message_session', table_name='chat_message')
-    op.drop_table('chat_message')
+    op.drop_index("ix_chat_message_content_fts", table_name="chat_message")
+    op.drop_index("ix_chat_message_intent", table_name="chat_message")
+    op.drop_index("ix_chat_message_created", table_name="chat_message")
+    op.drop_index("ix_chat_message_session", table_name="chat_message")
+    op.drop_table("chat_message")
     op.execute(sa.text(f"DROP TYPE IF EXISTS {_ENUM_SQL}"))

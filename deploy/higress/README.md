@@ -104,3 +104,62 @@ spec:
             pathType: Prefix
             backend: { service: { name: assist-service, port: { number: 8001 } } }
 ```
+
+---
+
+## 联调实录（2026-08-26，已完成的配置修复 + 剩余一步）
+
+### 已修复并入库的 compose 配置（原配置三处错误）
+
+1. **`MODE=standalone` → `MODE=full`**：standalone 模式 `start-gateway.sh` 直接退出，网关数据面（envoy :80/443）根本不启动。
+2. **端口映射修正**：all-in-one envoy 实际监听 **8080(HTTP)/8443(HTTPS)**，控制台 jar 监听 **8001**（原映射 10000:80 / 8443:443 / 18080:8080 全部错位）→ 改为 `10000:8080`、`8443:8443`、`18080:8001`。
+3. **Nacos 实例 IP 自动探测**：`LUMIO_NACOS_INSTANCE_IP=mcp-server`（主机名）无法被 envoy 解析 → 留空自动探测容器 IP（172.20.0.x，网关直连可达）。
+
+### 控制台 API 全流程（免 UI，curl 可用）
+
+```bash
+# 1) 初始化管理员（system.initialized=false 时）
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"adminUser":{"name":"admin","displayName":"管理员","password":"<密码>"}}' \
+  http://localhost:18080/system/init
+# 2) 登录（cookie 会话）
+curl -c /tmp/hc.txt -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<密码>"}' http://localhost:18080/session/login
+# 3) 下发 DIRECT_ROUTE MCP 服务（⚠️ 2.1.5 SDK 字段是 upstreamPathPrefix，
+#    不是主线分支的 directRouteConfig — 用错字段会被静默丢弃）
+curl -b /tmp/hc.txt -X PUT -H 'Content-Type: application/json' \
+  -d '{"name":"credit-card","description":"Lumio 信用卡工具平面","type":"DIRECT_ROUTE",
+       "upstreamPathPrefix":"/",
+       "services":[{"name":"lumio-mcp-server","port":8090,"weight":100}]}' \
+  http://localhost:18080/v1/mcpServer
+```
+
+### 已验证状态与剩余阻塞
+
+| 环节 | 状态 |
+|---|---|
+| Java MCP Server（容器版）注册 Nacos（22 工具元数据、容器 IP、healthy） | ✅ |
+| 网关数据面 envoy 启动、:10000 HTTP 可达 | ✅ |
+| 控制台初始化 + MCP DIRECT_ROUTE 资源创建 | ✅ |
+| 网关 MCP 过滤器路由（匹配 `/mcp-servers/credit-card`） | ✅ |
+| **envoy 上游 cluster 生成（pilot ServiceEntry push → CDS）** | ❌ **503：controller 已 push ServiceEntry 但 envoy 未生成对应 cluster**（all-in-one 单容器 pilot/gateway 同体，节点身份与端点推送异常）。公开路径 `/mcp/credit-card` 亦未生成（2.1.5 控制台实际以 `/mcp-servers/{name}` 为入口）。 |
+
+剩余一步是 Higress all-in-one 镜像内部（pilot↔gateway 同容器）的端点推送问题，建议：生产用 Helm 部署（`global.mcpRegistry.enabled=true` + Nacos），或向 higress-group 提 issue；开发联调继续用直连方案（见上：参考 Server :8080/mcp 或 Java :8090 SSE）。
+
+### 根因补充（2026-08-26 深挖结论）
+
+排查后确定是两个 **all-in-one standalone 镜像内部缺陷**（非本项目配置问题），均有完整证据：
+
+1. **key-auth WASM 插件 schema 不兼容**：创建 MCP 路由时，控制端自动生成内部插件实例 `key-auth.internal`（`global_auth:false` 旧字段），被官方 registry 的 key-auth:1.0.0 插件严格模式拒绝 → envoy NACK 整次 xDS 推送 → 数据面无监听器/cluster。
+   - **workaround（已验证有效）**：删除该实例（`DELETE /apis/extensions.higress.io/v1alpha1/namespaces/higress-system/wasmplugins/key-auth.internal`）→ envoy 立即恢复收配置、clusters 生成。
+2. **standalone 控制器 ServiceEntry 节点身份错误**：控制器把 ServiceEntry push 到不存在的节点 `higress-pilot`（二进制内定，`POD_NAME` env 无法覆盖，已实测），网关代理（`higress-gateway`）永远收不到 → 上游 cluster 缺失 → `503 cluster_not_found`。K8s/Helm 部署下控制器写 CRD、pilot informer fan-out，无此问题。
+
+**结论**：本地开发联调用直连方案（参考 Server :8080/mcp 或 Java :8090 SSE）；生产走 Helm；该两缺陷建议向 higress-group 提 issue（证据链完整可复现）。
+
+### 开发直连方案补充（2026-08-26，SSE 直连 Java 已实现并验证）
+
+Python 侧 MCP 客户端（`lumio/services/common/mcp_client.py`）现已支持双传输：
+- `MCP_TRANSPORT=streamable-http`（默认）：经 Higress 网关（生产/治理链路）；
+- `MCP_TRANSPORT=sse`：**直连 SSE 后端，无需 Higress**——开发联调可直接用容器版 Java MCP Server 的 22 个工具：
+  `.env` 配 `MCP_ENDPOINT=http://127.0.0.1:8090/sse`（SDK 把 url 视为 SSE 端点本身，须含 /sse）+ `MCP_TRANSPORT=sse`。
+  已验证：握手/工具目录/工具编排对话/敏感卡号豁免重路由/防死循环兜底全链正常（工具循环受本地 Ollama 容量约束）。

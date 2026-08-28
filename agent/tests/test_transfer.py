@@ -103,6 +103,44 @@ def test_l2_negative_sentiment_low_confidence_no_trigger() -> None:
     assert triggered is False
 
 
+def test_l2_transfer_agent_low_confidence_no_trigger() -> None:
+    """低置信 transfer_agent 不触发 L2: 乱码/连续低置信被判成转人工(把握不足)不得据此拉真人."""
+    checker = TransferChecker()
+    intent = IntentResult(primary_intent=IntentLabel.TRANSFER_AGENT, primary_confidence=0.22)
+
+    triggered, level, reason = checker.check("fe", intent)
+    assert triggered is False
+    assert level is None
+
+
+def test_l2_sensitive_alternative_low_confidence_no_trigger() -> None:
+    """敏感写仅作候补 + 低置信 → 不触发 L2 (会话4d22穿透路径, 分类器对乱码幻觉出 complaint 候补)."""
+    checker = TransferChecker()
+    intent = IntentResult(
+        primary_intent=IntentLabel.TRANSFER_AGENT,
+        primary_confidence=0.24,
+        alternatives=[IntentLabel.COMPLAINT],
+    )
+
+    triggered, level, reason = checker.check("fvdfvd", intent)
+    assert triggered is False
+    assert level is None
+
+
+def test_l2_sensitive_alternative_high_confidence_trigger() -> None:
+    """敏感写作候补 + 高置信(卡丢了顺便查一笔) → 仍触发 L2, 多意图里的敏感诉求不误伤."""
+    checker = TransferChecker()
+    intent = IntentResult(
+        primary_intent=IntentLabel.TRANSFER_AGENT,
+        primary_confidence=0.9,
+        alternatives=[IntentLabel.CARD_LOSS],
+    )
+
+    triggered, level, reason = checker.check("卡丢了顺便查最后一笔消费", intent)
+    assert triggered is True
+    assert level == TransferTriggerLevel.L2
+
+
 # ── L3 累计触发 ──
 
 

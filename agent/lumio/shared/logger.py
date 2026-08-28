@@ -76,6 +76,16 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log_entry, ensure_ascii=False)
 
 
+def _silence_third_party_noise() -> None:
+    """三方 SDK 裸堆栈降噪 (会话 48882b05): mcp SDK 的 SSE 读协程在服务端不发
+    keepalive 时空闲 25s 即 ReadTimeout, 经 logging.lastResort 以裸消息+完整堆栈
+    刷屏 (mcp.client.sse 无 handler, 我们的格式化器接不住)。真实调用失败不受影响
+    —— 异常会 send 进 session 读流, 由业务层捕获并记录 (工具编排失败回落知识问答)。
+    """
+    logging.getLogger("mcp.client.sse").setLevel(logging.CRITICAL)
+    logging.getLogger("mcp.client.streamable_http").setLevel(logging.CRITICAL)
+
+
 def setup_logger(name: str, level: str = "INFO", *, json_format: bool = False) -> logging.Logger:
     """创建标准化 logger
 
@@ -84,6 +94,7 @@ def setup_logger(name: str, level: str = "INFO", *, json_format: bool = False) -
         level: 日志级别
         json_format: 是否使用 JSON 格式输出（生产环境推荐）
     """
+    _silence_third_party_noise()
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger

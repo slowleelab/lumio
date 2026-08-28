@@ -1,0 +1,127 @@
+{
+  "meta": {
+    "version": "1.0.0",
+    "purpose": "energy-OOD 阈值标定的独立评估池: 封闭10类之外的噪声/乱码/无关问法. 只评测不训练.",
+    "counts": {
+      "examples": 29
+    }
+  },
+  "examples": [
+    {
+      "text": "hjfw",
+      "type": "latin_noise"
+    },
+    {
+      "text": "YRNN",
+      "type": "latin_noise"
+    },
+    {
+      "text": "HTY",
+      "type": "latin_noise"
+    },
+    {
+      "text": "jdfkl",
+      "type": "latin_noise"
+    },
+    {
+      "text": "HWS46",
+      "type": "latin_noise"
+    },
+    {
+      "text": "adbcdef",
+      "type": "latin_noise"
+    },
+    {
+      "text": "qwxz",
+      "type": "latin_noise"
+    },
+    {
+      "text": "zzzzzzzz",
+      "type": "latin_noise"
+    },
+    {
+      "text": "gqrty",
+      "type": "latin_noise"
+    },
+    {
+      "text": "8888",
+      "type": "digit"
+    },
+    {
+      "text": "22",
+      "type": "digit"
+    },
+    {
+      "text": "1234567",
+      "type": "digit"
+    },
+    {
+      "text": "###",
+      "type": "punct"
+    },
+    {
+      "text": "哦哦哦",
+      "type": "char_repeat"
+    },
+    {
+      "text": "嗯嗯嗯嗯嗯",
+      "type": "char_repeat"
+    },
+    {
+      "text": "你好你好你好你好你好",
+      "type": "char_repeat"
+    },
+    {
+      "text": "今天天气怎么样",
+      "type": "unrelated"
+    },
+    {
+      "text": "帮我叫个外卖",
+      "type": "unrelated"
+    },
+    {
+      "text": "机票怎么订",
+      "type": "unrelated"
+    },
+    {
+      "text": "python 里面的字典怎么用",
+      "type": "unrelated"
+    },
+    {
+      "text": "docker 容器怎么启动",
+      "type": "unrelated"
+    },
+    {
+      "text": "明天那只股票会涨吗",
+      "type": "unrelated"
+    },
+    {
+      "text": "帮我订个酒店",
+      "type": "unrelated"
+    },
+    {
+      "text": "附近有什么好吃的",
+      "type": "unrelated"
+    },
+    {
+      "text": "苹果手机多少钱一台",
+      "type": "unrelated"
+    },
+    {
+      "text": "房贷的利率现在多少",
+      "type": "unrelated"
+    },
+    {
+      "text": "公积金怎么提取",
+      "type": "unrelated"
+    },
+    {
+      "text": "社保断缴有什么影响",
+      "type": "unrelated"
+    },
+    {
+      "text": "帮我百度一下某某",
+      "type": "unrelated"
+    }
+  ]
+}

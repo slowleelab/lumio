@@ -26,12 +26,17 @@ def init_kafka():
     try:
         result = subprocess.run(
             [
-                "docker", "exec", "lumio-kafka",
+                "docker",
+                "exec",
+                "lumio-kafka",
                 "/opt/kafka/bin/kafka-topics.sh",
-                "--bootstrap-server", "localhost:9092",
+                "--bootstrap-server",
+                "localhost:9092",
                 "--list",
             ],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         existing = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
     except Exception as e:
@@ -47,14 +52,23 @@ def init_kafka():
         else:
             result = subprocess.run(
                 [
-                    "docker", "exec", "lumio-kafka",
+                    "docker",
+                    "exec",
+                    "lumio-kafka",
                     "/opt/kafka/bin/kafka-topics.sh",
-                    "--bootstrap-server", "localhost:9092",
-                    "--create", "--topic", topic_name,
-                    "--partitions", partitions,
-                    "--replication-factor", "1",
+                    "--bootstrap-server",
+                    "localhost:9092",
+                    "--create",
+                    "--topic",
+                    topic_name,
+                    "--partitions",
+                    partitions,
+                    "--replication-factor",
+                    "1",
                 ],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             if result.returncode == 0:
                 print(f"   ✅ {topic_name} (partitions={partitions})")
@@ -65,12 +79,17 @@ def init_kafka():
     # 列出所有 lumio topic
     result = subprocess.run(
         [
-            "docker", "exec", "lumio-kafka",
+            "docker",
+            "exec",
+            "lumio-kafka",
             "/opt/kafka/bin/kafka-topics.sh",
-            "--bootstrap-server", "localhost:9092",
+            "--bootstrap-server",
+            "localhost:9092",
             "--list",
         ],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True,
+        text=True,
+        timeout=15,
     )
     lumio_topics = [t for t in result.stdout.strip().split("\n") if t.startswith("lumio.")]
     print("\n📋 当前 lumio topic 列表:")

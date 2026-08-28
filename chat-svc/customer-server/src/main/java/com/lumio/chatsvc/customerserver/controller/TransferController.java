@@ -53,11 +53,13 @@ public class TransferController {
         // 使用 SessionManager 创建会话（自动触发坐席分配）
         CustomerInfo customerInfo = new CustomerInfo(
             request.getCustomerId() != null ? request.getCustomerId() : "cust-" + lumioSessionId.substring(0, 8),
-            "客户"
+            request.getCustomerName() != null && !request.getCustomerName().isEmpty() ? request.getCustomerName() : "客户"
         );
         customerInfo.setSource("LUMIO_BOT");
 
         Session session = sessionManager.createSession(customerInfo);
+        // 留存来源 Lumio 会话 id, 供追溯两套命名空间的对应关系
+        session.setSourceSessionId(lumioSessionId);
 
         String status = session.getStatus() == SessionStatus.ACTIVE ? "ACTIVE" : "WAITING";
         String agentName = session.getAgentId() != null ? "坐席" : null;

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from lumio.shared.config import (
     CircuitBreakerConfigSettings,
     OrchestrationSettings,
@@ -12,7 +14,12 @@ from lumio.shared.config import (
 
 
 class TestOrchestrationSettings:
-    def test_defaults(self) -> None:
+    def test_defaults(self, monkeypatch) -> None:
+        # 封闭化: config.py 启动时 load_dotenv 会把仓库根 .env 的 ORCH_* 注入 os.environ,
+        # 覆盖代码级默认值(本机常设 ORCH_GLOBAL_TIMEOUT_MS=60000). 测试只验代码默认,
+        # 故清除所有 ORCH_ 覆盖. pytest teardown 会自动还原.
+        for key in [k for k in os.environ if k.startswith("ORCH_")]:
+            monkeypatch.delenv(key, raising=False)
         s = OrchestrationSettings()
         # 评估器冷却轮数
         assert s.d1_cooldown_turns == 2
@@ -22,7 +29,7 @@ class TestOrchestrationSettings:
         assert s.d1_intent_confidence_threshold == 0.5
         assert s.d2_emotion_score_threshold == 0.3
         # 全局超时
-        assert s.global_timeout_ms == 5000
+        assert s.global_timeout_ms == 20000
         # 执行器 SLA
         assert s.e1_sla_ms == 3000
         assert s.e2_sla_ms == 500

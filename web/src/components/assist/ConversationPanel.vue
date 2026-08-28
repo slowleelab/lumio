@@ -62,8 +62,6 @@ import { ChatDotRound, Promotion } from "@element-plus/icons-vue"
 import { useAssistStore } from "@/stores/assist"
 import { useWebSocket } from "@/composables/useWebSocket"
 import { useDraftText } from "@/composables/useDraftText"
-import { useChatSvcPoll } from "@/composables/useChatSvcPoll"
-import { sendChatSvcMessage } from "@/api/chat-svc"
 import MessageBubble from "@/components/chat/MessageBubble.vue"
 import type { SessionPhase } from "@/api/types"
 
@@ -71,9 +69,12 @@ const assistStore = useAssistStore()
 
 // v2.0: per-agent WS, 坐席登录时建连, 不再按会话
 const agentId = computed(() => assistStore.currentAgentId)
-const { activateSession, notifyAgentMessage } = useWebSocket(agentId)
+const { connect, activateSession, notifyAgentMessage } = useWebSocket(agentId)
 
-// 坐席激活会话时通知 Assist
+// 坐席身份确定后建立 Assist WebSocket (agentId 由登录/坐席选择写入 store)
+watch(agentId, (v) => { if (v) connect() }, { immediate: true })
+
+// 坐席激活会话时通知 Assist, 触发实时辅助生成
 watch(() => assistStore.activeSessionId, (newSid, oldSid) => {
   if (newSid && newSid !== oldSid) {
     activateSession(newSid)
@@ -120,16 +121,13 @@ async function handleSend() {
   if (!inputText.value.trim() || !assistStore.activeSessionId) return
   const sid = assistStore.activeSessionId
   const text = inputText.value.trim()
-  assistStore.addMessage(sid, "agent", text)
+
+  // 发送坐席消息: 本地乐观落消息 + 经坐席实时通道 (WS) 上行到 chat-svc
+  assistStore.sendAgentMessage(sid, text)
   inputText.value = ""
 
   // 通知 Assist：坐席已回复（合规检测 + 隐式反馈推断）
   notifyAgentMessage(sid, text)
-
-  // 发送坐席消息到 chat-svc (走 axios 包装, 自动 Bearer + 错误拦截)
-  try {
-    await sendChatSvcMessage(sid, { sender: "agent", content: text })
-  } catch { /* chat-svc 不可用时静默; 错误已 ElMessage 提示 */ }
 
   scrollToBottom()
 }
@@ -141,15 +139,8 @@ async function scrollToBottom() {
   }
 }
 
-// HTTP 长轮询 chat-svc: 抽出到 useChatSvcPoll (B3 拆组件)
-useChatSvcPoll({
-  sessionId: computed(() => assistStore.activeSessionId),
-  onMessage: (m) => {
-    const sid = assistStore.activeSessionId
-    if (!sid) return
-    assistStore.addMessage(sid, m.sender === "agent" ? "agent" : "customer", m.content)
-  },
-})
+// 客户消息接收: 由 assist store 的坐席实时通道 (WS) 统一派发写入 activeMessages,
+// 会话激活时 store 自动 loadHistory 载入存量, 无需此处再长轮询。
 
 // 监听 AssistPanel 通过 store 推过来的草稿片段（如 ScriptCard 采纳）
 watch(() => assistStore.pendingInsert, (p) => {

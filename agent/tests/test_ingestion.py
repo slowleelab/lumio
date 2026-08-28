@@ -220,10 +220,13 @@ class TestEmbedWrite:
         from lumio.services.common.ingestion import write_to_es
 
         es = AsyncMock()
-        chunk = {"chunk_id": "c1", "doc_id": "d1", "content": "内容"}
+        chunk = {"chunk_id": "c1", "doc_id": "d1", "content": "内容", "title": "信用卡年费减免政策"}
         count = await write_to_es([chunk], es, index_name="idx")
         assert count == 1
         assert es.index.await_count == 1
+        # 修复回归: title 必须随 chunk 写入 ES (此前缺失, 检索无法按文档定位)
+        written_doc = es.index.await_args.kwargs["document"]
+        assert written_doc["title"] == "信用卡年费减免政策"
 
         es2 = AsyncMock()
         es2.index.side_effect = RuntimeError("down")

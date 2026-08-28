@@ -284,20 +284,27 @@ async def test_get_status_no_redis(monkeypatch):
 
 
 async def test_delete_redis_by_customer_match():
-    """SCAN 匹配 customer_id 的 session 删除 (meta+history+slot)"""
+    """SCAN 匹配 customer_id 的 session 删除 (meta+history; 槽位已填值随 meta 一并删除)"""
     service = GDPRService()
     fake = _FakeRedis()
-    fake._set_raw("lumio:session:s1:meta", json.dumps({"customer_id": "c1", "session_id": "s1"}))
+    fake._set_raw(
+        "lumio:session:s1:meta",
+        json.dumps(
+            {
+                "customer_id": "c1",
+                "session_id": "s1",
+                "slot_values": {"card_tail": {"name": "card_tail", "value": "1234", "source": "entity"}},
+            }
+        ),
+    )
     fake._set_raw("lumio:session:s2:meta", json.dumps({"customer_id": "c2", "session_id": "s2"}))
     fake._set_raw("lumio:session:s1:history", json.dumps(["msg"]))
-    fake._set_raw("lumio:slot:s1", "{}")
     service._redis = fake
 
     deleted = await service._delete_redis_by_customer("c1")
     assert deleted == 1
     assert "lumio:session:s1:meta" not in fake.data
     assert "lumio:session:s1:history" not in fake.data
-    assert "lumio:slot:s1" not in fake.data
     assert "lumio:session:s2:meta" in fake.data  # 其他客户保留
 
 
@@ -346,11 +353,11 @@ class _FakePgSession:
 
 
 async def test_delete_postgres_injected_factory():
-    """已注入 db factory 时正常删除三张表"""
+    """已注入 db factory 时正常删除四张表"""
     service = GDPRService()
     service._db_session_factory = lambda: _FakePgSession()
     deleted = await service._delete_postgres("c1")
-    assert deleted == 6  # 3 张表 × rowcount 2
+    assert deleted == 8  # 4 张表 × rowcount 2 (dialogue/decision/chat_message/classifier_sample)
 
 
 async def test_delete_postgres_no_factory(monkeypatch):

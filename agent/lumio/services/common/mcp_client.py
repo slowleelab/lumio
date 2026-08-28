@@ -14,18 +14,49 @@ import json
 import logging
 import time
 from collections.abc import Collection
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
 from mcp import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from lumio.shared.config import MCPBackend, MCPSettings, get_settings
 from lumio.shared.tracing import _TRACING_ENABLED
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _client_context(
+    transport: str,
+    endpoint: str,
+    timeout_seconds: float,
+) -> Any:
+    """按传输协议返回对应 MCP 客户端上下文 (streamable-http / sse)，统一产出 (read, write, info)。
+
+    streamable-http: 经 Higress 网关的统一入口 (治理/桥接);
+    sse: 直连 SSE 后端 (endpoint 须含 /sse 路径, 如 http://127.0.0.1:8090/sse —
+         SDK 将 url 视为 SSE 端点本身, 不自动追加), 开发联调无需网关。
+    timeout 语义按 SDK 约定: streamable-http 收 timedelta, sse 收秒数。
+    """
+    if transport == "sse":
+        async with sse_client(
+            url=endpoint, timeout=timeout_seconds, sse_read_timeout=max(timeout_seconds * 10, 300)
+        ) as (read, write):
+            yield read, write, None
+        return
+    if transport == "streamable-http":
+        async with streamablehttp_client(url=endpoint, timeout=timedelta(seconds=timeout_seconds)) as (
+            read,
+            write,
+            info,
+        ):
+            yield read, write, info
+        return
+    raise ValueError(f"不支持的 MCP 传输协议: {transport} (支持: streamable-http, sse)")
 
 
 @dataclass
@@ -113,7 +144,12 @@ class MCPToolClient:
             return
 
         backends_cfg = self._settings.backends or [
-            MCPBackend(name="default", endpoint=self._settings.endpoint, prefix="")
+            MCPBackend(
+                name="default",
+                endpoint=self._settings.endpoint,
+                prefix="",
+                transport=self._settings.transport,
+            )
         ]
 
         stack = AsyncExitStack()
@@ -121,9 +157,10 @@ class MCPToolClient:
         for cfg in backends_cfg:
             try:
                 read, write, _ = await stack.enter_async_context(
-                    streamablehttp_client(
-                        url=cfg.endpoint,
-                        timeout=timedelta(seconds=self._settings.timeout_seconds),
+                    _client_context(
+                        transport=cfg.transport,
+                        endpoint=cfg.endpoint,
+                        timeout_seconds=self._settings.timeout_seconds,
                     )
                 )
                 session = await stack.enter_async_context(ClientSession(read, write))

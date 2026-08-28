@@ -43,7 +43,9 @@ def init_elasticsearch():
         print(f"   ik_max_word 分词结果: {tokens}")
     except Exception as e:
         print(f"⚠️  IK 分词器未安装: {e}")
-        print("   安装方法: docker exec -it lumio-elasticsearch elasticsearch-plugin install https://get.infini.cloud/elasticsearch/analysis-ik/8.19.9")
+        print(
+            "   安装方法: docker exec -it lumio-elasticsearch elasticsearch-plugin install https://get.infini.cloud/elasticsearch/analysis-ik/8.19.9"
+        )
         print("   安装后需重启 ES 容器: docker-compose restart elasticsearch")
 
     # 创建索引
@@ -87,6 +89,8 @@ def init_elasticsearch():
                     "customer_tier": {"type": "keyword"},
                     "effective_date": {"type": "date", "format": "epoch_second"},
                     "expiry_date": {"type": "date", "format": "epoch_second"},
+                    "approval_status": {"type": "keyword"},
+                    "is_current_version": {"type": "boolean"},
                     "security_level": {"type": "keyword"},
                     "version": {"type": "keyword"},
                     "chunk_type": {"type": "keyword"},

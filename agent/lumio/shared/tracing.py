@@ -12,6 +12,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,27 @@ def _load_tracing_config() -> tuple[bool, str, str | None]:
         return False, "localhost", None
 
 
+def _collector_reachable(endpoint: str, timeout: float = 1.0) -> bool:
+    """探测 OTLP HTTP 端点 host:port 是否可达
+
+    若 collector 未启动, OTLPSpanExporter 的 BatchSpanProcessor 会对每个 span 批次
+    无限重试并刷 "failed to establish connection" 日志. 初始化前做一次短探测:
+    不可达则跳过挂载网络 exporter (provider 仍初始化), 彻底消除连接风暴噪声.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(endpoint)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 80
+        import socket
+
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 def _init_tracing(app_name: str = "lumio") -> None:
     """初始化全局 TracerProvider（只执行一次）
 
@@ -116,7 +138,14 @@ def _init_tracing(app_name: str = "lumio") -> None:
         sampler = ParentBasedTraceIdRatio(sampling_ratio)
         provider = TracerProvider(resource=resource, sampler=sampler)
         endpoint = otlp_endpoint or f"http://{jaeger_host}:4318/v1/traces"
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+        if _collector_reachable(endpoint):
+            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+        else:
+            logger.warning(
+                "OTLP collector %s 不可达, 跳过网络导出 (免连接风暴); 组件探针仍安装, "
+                "待 collector 起来后重启即可接入链路",
+                endpoint,
+            )
         trace.set_tracer_provider(provider)
         _provider_initialized = True
         logger.info(
@@ -133,7 +162,7 @@ def _init_tracing(app_name: str = "lumio") -> None:
         logger.warning("追踪初始化失败: %s", e)
 
 
-def instrument_app(app, app_name: str) -> None:
+def instrument_app(app: Any, app_name: str) -> None:
     """安装 FastAPI + Redis 自动探针（只执行一次）"""
     global _instrumented
     enabled, _, _ = _load_tracing_config()
@@ -164,7 +193,29 @@ def instrument_app(app, app_name: str) -> None:
 # ── 业务代码使用的装饰器 ──
 
 
-def traced(name: str | None = None, attrs_fn: Callable | None = None):
+def _get_tracer() -> Any | None:
+    """在 OTel 已挂载真实 provider 时返回 tracer，否则返回 None。
+
+    OTel 的 ``ProxyTracerProvider`` 在未调用 ``set_tracer_provider`` 时仍占据
+    全局而存在——此时对 ``get_tracer`` 的调用会无限自递归直至 RecursionError。
+    业务进程启动时会经 ``_init_tracing`` 挂载真实 provider；但在测试或冷启动等
+    未初始化场景下，``traced()`` 借此降级为空操作可避免爆栈。
+    """
+    try:
+        from opentelemetry import trace as _otel_trace
+
+        provider = _otel_trace.get_tracer_provider()
+        if type(provider).__name__ == "ProxyTracerProvider":
+            return None
+        return _otel_trace.get_tracer("lumio")
+    except Exception:
+        return None
+
+
+def traced(
+    name: str | None = None,
+    attrs_fn: Callable[..., Any] | None = None,
+) -> Callable[..., Callable[..., Any]]:
     """异步函数追踪装饰器。
 
     用法:
@@ -177,19 +228,16 @@ def traced(name: str | None = None, attrs_fn: Callable | None = None):
     追踪未启用时为零开销空操作。
     """
 
-    def decorator(func):
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
             if not _TRACING_ENABLED:
                 return await func(*args, **kwargs)
 
-            try:
-                from opentelemetry import trace as otel_trace
-            except ImportError:
-                return await func(*args, **kwargs)
-
             span_name = name or func.__name__
-            tracer = otel_trace.get_tracer("lumio")
+            tracer = _get_tracer()
+            if tracer is None:
+                return await func(*args, **kwargs)
 
             with tracer.start_as_current_span(span_name) as span:
                 if attrs_fn:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -123,6 +124,26 @@ async def test_chat_send_success(app: FastAPI, setup_state) -> None:
     assert data["accepted"] is True
     assert data["session_id"] == "s1"
     redis.xadd.assert_awaited_once()
+
+
+async def test_chat_send_verification_result_allows_empty_message(app: FastAPI, setup_state) -> None:
+    """身份核验回传: message 可为空, 核验结果序列化进 Stream 字段 (会话 564db34d)"""
+    redis = setup_state["redis"]
+    vr = {"token": "vr_abc123", "status": "success"}
+    async with await _client(app) as c:
+        resp = await c.post(
+            "/api/chat/send",
+            json={"session_id": "s1", "message": "", "verification_result": vr},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["accepted"] is True
+    # XADD 字段里核验结果以 JSON 字符串带出 (xadd 位置参数: (key, fields))
+    args = redis.xadd.await_args.args
+    stream_fields = args[1] if len(args) > 1 else {}
+    assert stream_fields.get("verification_result") is not None
+    parsed = json.loads(stream_fields["verification_result"])
+    assert parsed["token"] == "vr_abc123"
+    assert parsed["status"] == "success"
 
 
 async def test_chat_send_client_idempotency(app: FastAPI, setup_state) -> None:
@@ -370,6 +391,72 @@ async def test_get_session_messages_customer_meta_invalid(app: FastAPI, setup_st
     async with await _client(app) as c:
         resp = await c.get("/api/sessions/s1/messages")
     assert resp.status_code == 200
+
+
+async def test_get_session_messages_prefers_pg(app: FastAPI, setup_state, monkeypatch) -> None:
+    """对话历史持久化: 已有 PG dialogue_log 记录时优先从 PG 读取(跨 TTL/重启可查)."""
+    from datetime import datetime
+
+    import lumio.services.bot.router as router
+    from lumio.shared.orm_models import DialogueLog
+
+    rows = [
+        DialogueLog(
+            session_id="s1",
+            turn_id="T1",
+            speaker="customer",
+            content="你好",
+            intent="faq",
+            confidence=0.9,
+            response_source="llm",
+            timestamp=datetime.now(UTC),
+        ),
+        DialogueLog(
+            session_id="s1",
+            turn_id="T2",
+            speaker="bot",
+            content="您好",
+            intent="faq",
+            confidence=0.9,
+            response_source="llm",
+            timestamp=datetime.now(UTC),
+        ),
+    ]
+
+    class _Res:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return rows
+
+    class _FakeDb:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, stmt):
+            return _Res()
+
+    def _factory():
+        return _FakeDb()
+
+    monkeypatch.setattr(router, "_db_session_factory", _factory)
+    redis = setup_state["redis"]
+    redis.get = AsyncMock(return_value=None)  # 无 meta, customer 放行
+    redis.lrange = AsyncMock(return_value=[])
+
+    async with await _client(app) as c:
+        resp = await c.get("/api/sessions/s1/messages")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["count"] == 2
+    assert data["messages"][0]["content"] == "你好"
+    assert data["messages"][0]["speaker"] == "customer"
+    # 命中 PG 即返回, 不再读 Redis 历史
+    redis.lrange.assert_not_awaited()
 
 
 async def test_get_session_messages_admin_skips_owner_check(app: FastAPI, setup_state) -> None:

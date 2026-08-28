@@ -36,42 +36,55 @@ def init_milvus():
     print(f"🔧 创建 Collection '{collection_name}'...")
 
     fields = [
-        FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=64,
-                    is_primary=True, description="知识块唯一标识"),
-        FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=64,
-                    description="源文档 ID"),
-        FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535,
-                    description="知识块内容"),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024,
-                    description="文本向量 (1024 维)"),
-        FieldSchema(name="category", dtype=DataType.VARCHAR, max_length=32,
-                    description="业务分类"),
-        FieldSchema(name="doc_type", dtype=DataType.VARCHAR, max_length=32,
-                    description="文档类型: faq/rule/rate/activity/product"),
+        FieldSchema(
+            name="chunk_id", dtype=DataType.VARCHAR, max_length=64, is_primary=True, description="知识块唯一标识"
+        ),
+        FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=64, description="源文档 ID"),
+        FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535, description="知识块内容"),
+        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1024, description="文本向量 (1024 维)"),
+        FieldSchema(name="category", dtype=DataType.VARCHAR, max_length=32, description="业务分类"),
+        FieldSchema(
+            name="doc_type",
+            dtype=DataType.VARCHAR,
+            max_length=32,
+            description="文档类型: faq/rule/rate/activity/product",
+        ),
         # v2.1: keywords 改为 ARRAY 类型，支持 ARRAY_CONTAINS 精确过滤
-        FieldSchema(name="keywords", dtype=DataType.ARRAY, element_type=DataType.VARCHAR,
-                    max_capacity=32, max_length=32,
-                    description="关键词列表"),
-        FieldSchema(name="card_type", dtype=DataType.VARCHAR, max_length=32,
-                    description="卡种: 普卡/金卡/白金卡/钻石卡"),
-        FieldSchema(name="customer_tier", dtype=DataType.VARCHAR, max_length=32,
-                    description="客户等级: 普通/银卡/金卡/白金"),
-        FieldSchema(name="security_level", dtype=DataType.VARCHAR, max_length=16,
-                    description="安全级别: public/internal/confidential"),
-        FieldSchema(name="effective_date", dtype=DataType.INT64,
-                    description="生效日期（epoch 秒）"),
-        FieldSchema(name="expiry_date", dtype=DataType.INT64,
-                    description="失效日期（epoch 秒）"),
-        FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=16,
-                    description="分块结构类型: parent/child"),
-        FieldSchema(name="parent_chunk_id", dtype=DataType.VARCHAR, max_length=64,
-                    description="父块 ID"),
+        FieldSchema(
+            name="keywords",
+            dtype=DataType.ARRAY,
+            element_type=DataType.VARCHAR,
+            max_capacity=32,
+            max_length=32,
+            description="关键词列表",
+        ),
+        FieldSchema(
+            name="card_type", dtype=DataType.VARCHAR, max_length=32, description="卡种: 普卡/金卡/白金卡/钻石卡"
+        ),
+        FieldSchema(
+            name="customer_tier", dtype=DataType.VARCHAR, max_length=32, description="客户等级: 普通/银卡/金卡/白金"
+        ),
+        FieldSchema(
+            name="security_level",
+            dtype=DataType.VARCHAR,
+            max_length=16,
+            description="安全级别: public/internal/confidential",
+        ),
+        FieldSchema(name="effective_date", dtype=DataType.INT64, description="生效日期（epoch 秒）"),
+        FieldSchema(name="expiry_date", dtype=DataType.INT64, description="失效日期（epoch 秒）"),
+        FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=16, description="分块结构类型: parent/child"),
+        FieldSchema(name="parent_chunk_id", dtype=DataType.VARCHAR, max_length=64, description="父块 ID"),
         # S4 第五轮修复: 合规过滤字段 (检索侧 term 过滤依赖, 此前 Milvus 无此字段 →
         # 未审批/非当前版本文档经向量检索泄露)
-        FieldSchema(name="approval_status", dtype=DataType.VARCHAR, max_length=16,
-                    description="审批状态: PUBLISHED/DRAFT/REJECTED"),
-        FieldSchema(name="is_current_version", dtype=DataType.VARCHAR, max_length=8,
-                    description="是否当前版本: true/false"),
+        FieldSchema(
+            name="approval_status",
+            dtype=DataType.VARCHAR,
+            max_length=16,
+            description="审批状态: PUBLISHED/DRAFT/REJECTED",
+        ),
+        FieldSchema(
+            name="is_current_version", dtype=DataType.VARCHAR, max_length=8, description="是否当前版本: true/false"
+        ),
     ]
 
     schema = CollectionSchema(fields=fields, description="智能客服知识库向量索引 v2.1")

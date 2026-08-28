@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,15 +15,19 @@ from lumio.shared.models import (
     DialogueTurn,
     IntentLabel,
     IntentResult,
+    PendingAction,
     SessionPhase,
+    SessionState,
     SessionSubPhase,
 )
 
 
-def _make_turn(session_id: str, speaker: str = "customer", content: str = "test") -> DialogueTurn:
+def _make_turn(
+    session_id: str, speaker: str = "customer", content: str = "test", turn_id: str = "test-turn-id"
+) -> DialogueTurn:
     """构造测试用对话轮次"""
     return DialogueTurn(
-        turn_id="test-turn-id",
+        turn_id=turn_id,
         session_id=session_id,
         speaker=speaker,
         content=content,
@@ -129,6 +133,87 @@ async def test_get_session_exists() -> None:
     assert state.current_phase == SessionPhase.BOT
 
 
+@pytest.mark.asyncio
+async def test_get_session_parses_pending_action() -> None:
+    """P0 修复: get_session 必须解析 pending_action。
+
+    此前 patch_state 写入成功(版本递增)但读回时字段被丢弃 —— L3 转人工确认
+    ("是/需要")与敏感工具确认的状态机整条失效, 客户回复"是"永远进不了确认路由。
+    """
+    redis = _mock_redis()
+    meta = json.dumps(
+        {
+            "session_id": "test-session",
+            "customer_id": None,
+            "channel_type": "web",
+            "current_phase": "bot",
+            "sub_phase": "bot:active",
+            "end_reason": None,
+            "vip_level": "普通",
+            "card_types": [],
+            "risk_tolerance": "R2",
+            "turn_count": 0,
+            "last_intent": None,
+            "last_entities": [],
+            "confidence_history": [],
+            "low_confidence_streak": 0,
+            "human_request_score": 0,
+            "agent_id": None,
+            "transfer_reason": None,
+            "transfer_summary": None,
+            "created_at": datetime.now().isoformat(),
+            "last_active_at": datetime.now().isoformat(),
+            "version": 9,
+            "pending_action": {
+                "tool_name": "TRANSFER_OFFER",
+                "confirm_prompt": "这几次似乎还没能帮您解决问题，需要为您转接人工客服吗？",
+                "expires_at": (datetime.now() + timedelta(seconds=120)).isoformat(),
+                "arguments": {"transfer_reason": "累计低置信"},
+            },
+        },
+        ensure_ascii=False,
+    )
+    redis.get = AsyncMock(return_value=meta)
+    redis.lrange = AsyncMock(return_value=[])
+
+    manager = SessionManager(redis)
+    state = await manager.get_session("test-session")
+    assert state is not None
+    assert state.pending_action is not None
+    assert state.pending_action.tool_name == "TRANSFER_OFFER"
+    assert state.pending_action.expires_at is not None
+    assert state.pending_action.arguments.get("transfer_reason") == "累计低置信"
+
+
+@pytest.mark.asyncio
+async def test_get_session_pending_action_invalid_falls_back_none() -> None:
+    """pending_action 数据损坏时按 None 处理, 不崩解析。"""
+    redis = _mock_redis()
+    meta = json.dumps(
+        {
+            "session_id": "test-session",
+            "channel_type": "web",
+            "current_phase": "bot",
+            "sub_phase": "bot:active",
+            "card_types": [],
+            "last_entities": [],
+            "confidence_history": [],
+            "created_at": datetime.now().isoformat(),
+            "last_active_at": datetime.now().isoformat(),
+            "version": 3,
+            "pending_action": {"tool_name": 12345},
+        },
+        ensure_ascii=False,
+    )
+    redis.get = AsyncMock(return_value=meta)
+    redis.lrange = AsyncMock(return_value=[])
+
+    manager = SessionManager(redis)
+    state = await manager.get_session("test-session")
+    assert state is not None
+    assert state.pending_action is None
+
+
 # ── 追加对话 ──
 
 
@@ -222,6 +307,37 @@ async def test_add_turn_low_confidence_increments_streak() -> None:
     updated = await manager.add_turn(state.session_id, turn, intent=intent)
 
     assert updated.low_confidence_streak == 1
+
+
+@pytest.mark.asyncio
+async def test_add_turn_bot_turn_counts_once_per_exchange() -> None:
+    """一次交换只记一次账: bot 轮不带 intent, streak/confidence_history 不双计.
+
+    回归: router 曾对 customer/bot 两轮 add_turn 都传同一 intent, streak 每次交换 +2
+    (会话 178351b41: 15 次交换 streak=30), L3 越线阈值实际被减半.
+    """
+    redis = _mock_redis()
+    store: dict[str, str] = {}
+
+    async def _cas_eval(script, numkeys, key, expected, meta_json, ttl):
+        store[key] = meta_json
+        return 1
+
+    redis.eval = AsyncMock(side_effect=_cas_eval)
+    redis.get = AsyncMock(side_effect=lambda key: store.get(key))
+
+    manager = SessionManager(redis)
+    state = await manager.create_session()
+    sid = state.session_id
+
+    low_conf = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.3)
+    # 模拟 router 修复后的调用方式: 客户轮带 intent 记账, bot 轮不带
+    await manager.add_turn(sid, _make_turn(sid), intent=low_conf)
+    await manager.add_turn(sid, _make_turn(sid, speaker="bot", turn_id="bot-turn"))
+
+    final = await manager.get_session(sid)
+    assert final.low_confidence_streak == 1
+    assert final.confidence_history == [0.3]
 
 
 # ── 阶段切换 ──
@@ -699,11 +815,69 @@ async def test_persist_dialogue_success() -> None:
         async def commit(self):
             pass
 
+        # 幂等查询: 按需返回已存在的 turn_id 集合
+        async def execute(self, stmt):
+            class _Res:
+                def __init__(self, rows):
+                    self._rows = rows or []
+
+                def all(self):
+                    return self._rows
+
+            return _Res(getattr(self, "existing", []))
+
     db = _FakeDb()
     count = await manager.persist_dialogue("s1", lambda: db)
     assert count == 2
     assert len(db.added) == 2
     assert db.added[0].customer_id == "c1"
+
+
+@pytest.mark.asyncio
+async def test_persist_dialogue_idempotent_skips_existing() -> None:
+    """已实时落库的轮次(turn_id 已存在)会话结束兜底时跳过, 不重复写入."""
+    redis = _mock_redis()
+    # Redis 历史有 2 轮(与实时落库重叠时其中 1 轮已存在)
+    redis.lrange = AsyncMock(
+        return_value=[
+            _make_turn("s1", content="你好", turn_id="T1").model_dump_json(),
+            _make_turn("s1", content="再会", turn_id="T2").model_dump_json(),
+        ]
+    )
+    redis.get = AsyncMock(return_value=None)
+    manager = SessionManager(redis)
+
+    class _FakeDb:
+        def __init__(self):
+            self.added = []
+            self.existing = [(f"T{i}",) for i in range(1, 2)]  # T1 已在 PG
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, stmt):
+            class _Res:
+                def __init__(self, rows):
+                    self._rows = rows or []
+
+                def all(self):
+                    return self._rows
+
+            return _Res(self.existing)
+
+        def add(self, obj):
+            self.added.append(obj)
+
+        async def commit(self):
+            pass
+
+    db = _FakeDb()
+    count = await manager.persist_dialogue("s1", lambda: db)
+    assert count == 2  # 返回 Redis 轮次数
+    assert [t.turn_id for t in db.added] == ["T2"]  # 仅补写缺失轮次
 
 
 @pytest.mark.asyncio
@@ -721,10 +895,86 @@ async def test_persist_dialogue_db_error_soft() -> None:
         async def __aexit__(self, *args):
             return False
 
+        async def execute(self, stmt):
+            class _Res:
+                def all(self):
+                    return []
+
+            return _Res()
+
         async def commit(self):
             raise RuntimeError("db down")
 
     assert await manager.persist_dialogue("s1", lambda: _BoomDb()) == 0
+
+
+@pytest.mark.asyncio
+async def test_add_turn_persists_realtime() -> None:
+    """对话轮次实时落库: add_turn 追加即后台写入 dialogue_log, 不依赖会话走到 ENDED."""
+    redis = _mock_redis()
+    manager = SessionManager(redis)
+
+    class _FakeDb:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def add(self, obj):
+            self.added.append(obj)
+
+        async def commit(self):
+            pass
+
+    db = _FakeDb()
+    manager.set_db_session_factory(lambda: db)
+
+    state = await manager.create_session()
+    # 与既有 add_turn 测试一致: get_session 依赖 redis.get 返回完整 meta
+    redis.get = AsyncMock(
+        return_value=json.dumps(
+            {
+                "session_id": state.session_id,
+                "customer_id": "c9",
+                "channel_type": "web",
+                "current_phase": "bot",
+                "sub_phase": "bot:active",
+                "end_reason": None,
+                "vip_level": "普通",
+                "card_types": [],
+                "risk_tolerance": "R2",
+                "turn_count": 0,
+                "last_intent": None,
+                "last_entities": [],
+                "confidence_history": [],
+                "low_confidence_streak": 0,
+                "human_request_score": 0,
+                "agent_id": None,
+                "transfer_reason": None,
+                "transfer_summary": None,
+                "created_at": datetime.now().isoformat(),
+                "last_active_at": datetime.now().isoformat(),
+                "version": 1,
+            },
+            ensure_ascii=False,
+        )
+    )
+    redis.lrange = AsyncMock(return_value=[])
+
+    turn = _make_turn(state.session_id, speaker="customer", content="你好", turn_id="RT-1")
+    await manager.add_turn(state.session_id, turn)
+    await manager.flush_pending_persists()  # 等后台落库任务完成
+
+    assert len(db.added) == 1
+    row = db.added[0]
+    assert row.turn_id == "RT-1"
+    assert row.content == "你好"
+    assert row.speaker == "customer"
+    assert row.customer_id == "c9"
 
 
 # ── _load_history ──
@@ -809,3 +1059,125 @@ def test_apply_merge_entity_pool_dedup() -> None:
         {"entity_pool": [{"entity_type": "card_type", "value": "platinum"}, {"entity_type": "city", "value": "北京"}]},
     )
     assert len(merged["entity_pool"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_save_meta_persists_pending_action() -> None:
+    """P0 修复: _save_meta 全量序列化必须包含 pending_action。
+
+    此前 _save_meta 的 meta 字典漏掉该字段, 每次 add_turn 全量 SET 都把
+    patch_state 刚写入的待确认操作整体擦除 —— L3 转人工"是/需要"确认与
+    敏感工具确认的状态机形同虚设 (实测: pending 写入后立刻被路由层覆盖)。
+    """
+    redis = _mock_redis()
+    manager = SessionManager(redis)
+
+    state = SessionState(
+        session_id="s-pending",
+        current_phase=SessionPhase.BOT,
+        sub_phase=SessionSubPhase.BOT_ACTIVE,
+    )
+    state.pending_action = PendingAction(
+        tool_name="TRANSFER_OFFER",
+        confirm_prompt="要转人工吗？",
+        arguments={"transfer_reason": "low_conf"},
+    )
+
+    captured: dict[str, dict] = {}
+
+    async def fake_eval(script: str, numkeys: int, key: str, expected: str, new_value: str, ttl: str) -> int:
+        captured["meta"] = json.loads(new_value)
+        return 1
+
+    redis.eval = AsyncMock(side_effect=fake_eval)
+
+    await manager._save_meta(state)
+    saved = captured["meta"]["pending_action"]
+    assert saved is not None
+    assert saved["tool_name"] == "TRANSFER_OFFER"
+    assert saved["confirm_prompt"] == "要转人工吗？"
+    assert saved["arguments"] == {"transfer_reason": "low_conf"}
+
+
+@pytest.mark.asyncio
+async def test_save_meta_pending_none_serializes_null() -> None:
+    """无 pending 时序列化为 null (不写脏值)。"""
+    redis = _mock_redis()
+    manager = SessionManager(redis)
+
+    state = SessionState(
+        session_id="s-empty",
+        current_phase=SessionPhase.BOT,
+        sub_phase=SessionSubPhase.BOT_ACTIVE,
+    )
+
+    captured: dict[str, dict] = {}
+
+    async def fake_eval(script: str, numkeys: int, key: str, expected: str, new_value: str, ttl: str) -> int:
+        captured["meta"] = json.loads(new_value)
+        return 1
+
+    redis.eval = AsyncMock(side_effect=fake_eval)
+
+    await manager._save_meta(state)
+    assert captured["meta"]["pending_action"] is None
+
+
+@pytest.mark.asyncio
+async def test_add_turn_masks_pan_in_persisted_history() -> None:
+    """P1a: 落库轮次里明文 PAN 必须掩码、实体只留尾四位 (会话 1fb54681 复盘).
+
+    客户贴 16 位卡号后, Redis 历史 + 实体池 + PG 审计三层都不得出现明文全号;
+    明文只允许存活于内存中的当次工具调用参数。
+    """
+    from lumio.shared.models import Entity
+
+    redis = _mock_redis()
+    manager = SessionManager(redis)
+    state = await manager.create_session()
+
+    meta = json.dumps(
+        {
+            "session_id": state.session_id,
+            "customer_id": None,
+            "channel_type": "web",
+            "current_phase": "bot",
+            "sub_phase": "bot:active",
+            "end_reason": None,
+            "vip_level": "普通",
+            "card_types": [],
+            "risk_tolerance": "R2",
+            "turn_count": 0,
+            "last_intent": None,
+            "last_entities": [],
+            "confidence_history": [],
+            "low_confidence_streak": 0,
+            "human_request_score": 0,
+            "agent_id": None,
+            "transfer_reason": None,
+            "transfer_summary": None,
+            "created_at": datetime.now().isoformat(),
+            "last_active_at": datetime.now().isoformat(),
+            "version": 1,
+        },
+        ensure_ascii=False,
+    )
+    redis.get = AsyncMock(return_value=meta)
+    redis.lrange = AsyncMock(return_value=[])
+
+    pan = "6225880012346780"
+    turn = _make_turn(state.session_id, speaker="customer", content=f"我的卡号是{pan}，帮我查一下", turn_id="t-pan")
+    turn.entities = [Entity(entity_type="CARD_NUMBER", value=pan)]
+
+    updated = await manager.add_turn(state.session_id, turn)
+
+    persisted = redis.rpush.call_args.args[1]
+    assert pan not in persisted
+    assert "6225****6780" in persisted  # 消息文本掩码 (前4后4)
+    assert "****6780" in persisted  # 实体值折叠尾四位
+    # 会话态实体池同样只见尾四位
+    assert all(e.value != pan for e in updated.last_entities)
+    assert any(e.value == "****6780" for e in updated.last_entities)
+    # 调用方原始 turn 不被修改 (router 后续仍读原始值做转人工桥接)
+    assert turn.content == f"我的卡号是{pan}，帮我查一下"
+    assert turn.entities[0].value == pan

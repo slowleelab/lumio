@@ -84,7 +84,7 @@ class TestRunConversation:
         mcp.call_tool.assert_awaited_once()
 
     async def test_sensitive_tool_short_circuits_to_pending(self):
-        """敏感工具：不执行，返回待确认"""
+        """敏感工具：不执行，先发身份核验信号"""
         mcp = MagicMock()
         mcp.to_openai_tools.return_value = [{"type": "function", "function": {"name": "card_loss"}}]
         mcp.is_sensitive.return_value = True
@@ -105,7 +105,10 @@ class TestRunConversation:
         )
         assert result.pending_action is not None
         assert result.pending_action.tool_name == "card_loss"
-        assert "确认" in result.content
+        # 会话 564db34d: 敏感工具短路先进核验态, 不发确认话术
+        assert result.pending_action.verification_state == "pending"
+        assert result.verification is not None
+        assert "确认" not in result.content
         mcp.call_tool.assert_not_awaited()  # 敏感工具未执行
 
     async def test_loop_guard_raises(self):
@@ -222,3 +225,74 @@ def test_tool_execution_result_defaults():
     r = ToolExecutionResult(content="x", source="llm")
     assert r.pending_action is None
     assert r.executed_tools == []
+
+
+# ── card_no 注入 (会话 1efbd1ad 排查: 工具要求完整卡号, 红线禁止对话索要) ──
+
+
+def _card_tool_spec() -> MagicMock:
+    """构造声明 card_no 参数的工具 spec"""
+    spec = MagicMock()
+    spec.input_schema = {"type": "object", "properties": {"card_no": {"type": "string"}, "month": {"type": "string"}}}
+    return spec
+
+
+@pytest.mark.asyncio
+async def test_execute_injects_card_no_when_missing() -> None:
+    """LLM 未给 card_no -> 按 actor_id 注入绑定卡号"""
+    mcp = MagicMock()
+    mcp.get_tool = MagicMock(return_value=_card_tool_spec())
+    mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "ok"})
+    ex = _make_executor(mcp=mcp)
+
+    await ex._execute_and_audit(
+        ToolCall(id="t1", name="query_card_bill", arguments={"month": "2026-07"}),
+        session_id="s1",
+        actor_id="cust-1",
+        actor_role="customer",
+    )
+
+    args = mcp.call_tool.await_args.args[1]
+    assert args["card_no"] == "6225880012346780"
+
+
+@pytest.mark.asyncio
+async def test_execute_overrides_tail_card_no() -> None:
+    """LLM 给了后四位(红线只能问后四位) -> 注入覆盖为完整卡号"""
+    mcp = MagicMock()
+    mcp.get_tool = MagicMock(return_value=_card_tool_spec())
+    mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "ok"})
+    ex = _make_executor(mcp=mcp)
+
+    await ex._execute_and_audit(
+        ToolCall(id="t2", name="query_card_bill", arguments={"card_no": "4879", "month": "2026-07"}),
+        session_id="s1",
+        actor_id="cust-1",
+        actor_role="customer",
+    )
+
+    args = mcp.call_tool.await_args.args[1]
+    assert args["card_no"] == "6225880012346780"
+
+
+@pytest.mark.asyncio
+async def test_execute_keeps_full_card_no() -> None:
+    """LLM 已给完整卡号(核验弹框路径) -> 不覆盖"""
+    mcp = MagicMock()
+    mcp.get_tool = MagicMock(return_value=_card_tool_spec())
+    mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "ok"})
+    ex = _make_executor(mcp=mcp)
+
+    await ex._execute_and_audit(
+        ToolCall(
+            id="t3",
+            name="apply_bill_installment",
+            arguments={"card_no": "6222021234567890", "amount": 3000, "periods": 6},
+        ),
+        session_id="s1",
+        actor_id="cust-1",
+        actor_role="customer",
+    )
+
+    args = mcp.call_tool.await_args.args[1]
+    assert args["card_no"] == "6222021234567890"  # 完整卡号保留原值

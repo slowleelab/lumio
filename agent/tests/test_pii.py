@@ -72,3 +72,18 @@ def test_mask_pii_no_pii():
     """无 PII 文本不变"""
     text = "信用卡年费减免政策"
     assert mask_pii(text) == text
+
+
+def test_pan_to_tail():
+    """P1a: 完整卡号折叠尾四位 (会话 1fb54681: 明文 PAN 落库合规隐患)"""
+    from lumio.shared.pii import pan_to_tail
+
+    assert pan_to_tail("1234567890000000") == "****0000"
+    assert pan_to_tail("6222 8800 6666 0000") == "****0000"  # 去分隔符
+    assert pan_to_tail("6222-8800-6666-0000") == "****0000"
+    # 短值/非 PAN 原样返回 (卡尾/金额不受影响)
+    assert pan_to_tail("0000") == "0000"
+    assert pan_to_tail("3000") == "3000"
+    assert pan_to_tail("") == ""
+    # 已掩码值幂等
+    assert pan_to_tail("****0000") == "****0000"

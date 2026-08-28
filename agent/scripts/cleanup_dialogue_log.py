@@ -65,10 +65,6 @@ async def cleanup_dialogue_log(
     result = CleanupResult()
 
     try:
-        from lumio.shared.config import get_settings
-        from lumio.shared.orm_models import DialogueLog
-        from sqlalchemy import delete, select
-
         # 实际实现需要 db_session_factory
         # 此处占位: 返回 0, 等接入 ORM 后启用
         logger.info(
@@ -77,30 +73,30 @@ async def cleanup_dialogue_log(
             delete_after_days,
         )
         # 1. 归档 (5-7 年)
-        archive_threshold = time.time() - archive_after_days * 86400
-        delete_threshold = time.time() - delete_after_days * 86400
+        _archive_threshold = time.time() - archive_after_days * 86400
+        _delete_threshold = time.time() - delete_after_days * 86400
 
-        # 占位: 实际执行需要 db_session
-        # async with session_factory() as session:
-        #     # 归档
-        #     archive_stmt = select(DialogueLog).where(
-        #         DialogueLog.created_at < archive_threshold,
-        #         DialogueLog.created_at > delete_threshold,
-        #         DialogueLog.archived == False,
-        #     ).limit(batch_size)
-        #     rows = (await session.execute(archive_stmt)).scalars().all()
-        #     for row in rows:
-        #         await _archive_to_s3(row)
-        #         row.archived = True
-        #         result.archived += 1
-        #     await session.commit()
-        #
-        #     # 硬删除
-        #     delete_stmt = delete(DialogueLog).where(
-        #         DialogueLog.created_at < delete_threshold
-        #     )
-        #     result.hard_deleted = (await session.execute(delete_stmt)).rowcount
-        #     await session.commit()
+    # 占位: 实际执行需要 db_session
+    # async with session_factory() as session:
+    #     # 归档
+    #     archive_stmt = select(DialogueLog).where(
+    #         DialogueLog.created_at < _archive_threshold,
+    #         DialogueLog.created_at > _delete_threshold,
+    #         DialogueLog.archived == False,
+    #     ).limit(batch_size)
+    #     rows = (await session.execute(archive_stmt)).scalars().all()
+    #     for row in rows:
+    #         await _archive_to_s3(row)
+    #         row.archived = True
+    #         result.archived += 1
+    #     await session.commit()
+    #
+    #     # 硬删除
+    #     delete_stmt = delete(DialogueLog).where(
+    #         DialogueLog.created_at < _delete_threshold
+    #     )
+    #     result.hard_deleted = (await session.execute(delete_stmt)).rowcount
+    #     await session.commit()
 
     except Exception as exc:
         logger.error("对话日志清理失败: %s", exc)

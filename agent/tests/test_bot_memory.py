@@ -113,11 +113,21 @@ class TestSlotTracker:
         assert period_slot.filled
 
     def test_missing_required_after_partial_fill(self) -> None:
-        tracker = SlotTracker.for_intent(IntentLabel.INSTALLMENT_INQUIRY)
+        # 分期查询(INST_PARAM_QUERY)槽位已降 optional (会话 48882b05: 走知识问答不反问参数),
+        # 必填缺口语义改用试算 INST_CALC 验证 (business 域, 金额/期数仍必填)
+        tracker = SlotTracker.for_intent(IntentLabel.INST_CALC)
         tracker.fill_from_entities([{"entity_type": "amount", "value": "5000"}])
         missing = tracker.missing_required
         assert len(missing) == 1
         assert missing[0].name == "period"
+
+    def test_installment_query_slots_optional(self) -> None:
+        """分期查询槽位 optional: 有定义、可填充, 但不驱动追问 (会话 48882b05)"""
+        tracker = SlotTracker.for_intent(IntentLabel.INSTALLMENT_INQUIRY)
+        assert tracker.has_slots
+        assert not tracker.missing_required  # 无必填缺口 → 不追问
+        tracker.fill_from_entities([{"entity_type": "amount", "value": "5000"}])
+        assert tracker.missing_required == []
 
     def test_all_required_filled(self) -> None:
         tracker = SlotTracker.for_intent(IntentLabel.INSTALLMENT_INQUIRY)
@@ -144,7 +154,7 @@ class TestSlotTracker:
         assert "5000" in prompt
 
     def test_roundtrip_serialization(self) -> None:
-        tracker = SlotTracker.for_intent(IntentLabel.INSTALLMENT_INQUIRY)
+        tracker = SlotTracker.for_intent(IntentLabel.INST_CALC)
         tracker.fill_from_entities([{"entity_type": "amount", "value": "5000"}])
         data = tracker.to_dict()
         restored = SlotTracker.from_dict(data)
@@ -158,7 +168,7 @@ class TestSlotTracker:
         # 模拟意图切换：from_dict 读回旧意图数据，调用方应新建
         old_data = tracker1.to_dict()
         # 新意图不是 installment → 调用方不应使用旧 tracker
-        assert old_data["intent"] == "installment_inquiry"
+        assert old_data["intent"] == "inst_param_query"  # 归一化主名 (draft-0.3)
 
         # 新建 card_loss tracker 应独立
         tracker2 = SlotTracker.for_intent(IntentLabel.CARD_LOSS)

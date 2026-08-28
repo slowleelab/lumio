@@ -1105,3 +1105,62 @@ class DecisionLog(Base):
         # 监管审计: 按 action 类型 + 时间范围
         Index("ix_decision_log_action_created", "action", "created_at"),
     )
+
+
+class ClassifierSample(Base):
+    """分类样本表 (闭环 P1 感知层)
+
+    记录被"感知采样"捕获的分类样本 (低置信/贴近阈值/规则-BERT 分歧/慢路径),
+    用于:
+    1. 失败样本回流: 每天聚合导出 seed_dataset 增量
+    2. 漂移监控: 按 intent+时间窗口统计分布变化
+    3. 有界留存: 超过 retention_days 的采样按时间清档
+
+    PII 处理: 文本入库前已 mask 至后四位 (见 trap_collector.mask_pii);
+    customer_id 保留原始值以支撑 GDPR 客户级删除 + 归属审计.
+    """
+
+    __tablename__ = "classifier_sample"
+
+    # created_at 需在 `text` 列之前声明: 列名 `text` 会遮蔽 orm_models 里导入的
+    # sqlalchemy.text 函数, 故 server_default=text("now()") 不能出现在其后.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.now,
+        server_default=text("now()"),
+    )
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    customer_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 已打码文本 (保留后四位)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 快路径 (bert|rule)
+    fast_source: Mapped[str] = mapped_column(String(16), nullable=False)
+    fast_intent: Mapped[str] = mapped_column(String(32), nullable=False)
+    fast_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    # 规则通道结果 (用于规则-BERT 分歧检测; 仅 BERT 快路径时填充)
+    rule_intent: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 最终路径 (fast|llm|fallback)
+    final_source: Mapped[str] = mapped_column(String(16), nullable=False)
+    final_intent: Mapped[str] = mapped_column(String(32), nullable=False)
+    final_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    # 与决策边界 (intent_threshold) 的距离
+    margin: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # 触发采样原因: slow_path | near_threshold | rule_bert_divergence | ambient
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    divergence: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        # GDPR 客户级删除 + 时间范围清理
+        Index("ix_classifier_sample_customer_created", "customer_id", "created_at"),
+        # 漂移聚合: 按意图 + 时间窗口
+        Index("ix_classifier_sample_intent_created", "final_intent", "created_at"),
+        # 有界留存清理: 按创建时间
+        Index("ix_classifier_sample_created", "created_at"),
+    )

@@ -12,6 +12,18 @@ public class SessionInfo {
     private String backendId;
     private long createTime;
     private long updateTime;
+    /**
+     * 会话当前最大消息 seq（坐席重连离线补发/未读数游标）
+     */
+    private long lastSeq;
+
+    public long getLastSeq() {
+        return lastSeq;
+    }
+
+    public void setLastSeq(long lastSeq) {
+        this.lastSeq = lastSeq;
+    }
 
     public String getSessionId() {
         return sessionId;

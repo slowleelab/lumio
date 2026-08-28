@@ -51,7 +51,9 @@ public class LumioClient {
             String response = restTemplate.postForObject(url, request, String.class);
             log.debug("Lumio analyze success: session={}", sessionId);
         } catch (Exception e) {
-            log.warn("Lumio analyze callback failed: session={} error={}", sessionId, e.getMessage());
+            // 回调失败不再静默: 显式记录, 便于发现两栈同步断点
+            log.error("Lumio analyze callback failed: session={} error={}",
+                    sessionId, e.getMessage(), e);
         }
     }
 
@@ -97,8 +99,9 @@ public class LumioClient {
             String response = restTemplate.postForObject(url, request, String.class);
             log.debug("Lumio session update success: session={} phase={}:{}", sessionId, phase, subPhase);
         } catch (Exception e) {
-            log.warn("Lumio session update callback failed: session={} phase={}:{} error={}",
-                    sessionId, phase, subPhase, e.getMessage());
+            // 回调失败不再静默: 显式记录, 便于发现两栈同步断点
+            log.error("Lumio session update callback failed: session={} phase={}:{} error={}",
+                    sessionId, phase, subPhase, e.getMessage(), e);
         }
     }
 }

@@ -1069,7 +1069,7 @@ async def test_wait_for_response_message_ready():
     pubsub = _FakePubSub([{"type": "message"}])
     redis = _make_pubsub_redis(pubsub)
     redis.get = AsyncMock(return_value=json.dumps({"status": "done", "reply": "hi"}))
-    result = await bot_router._wait_for_response(redis, "k", "ch", 10)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 10)
     assert result.status_code == 200
     assert json.loads(result.body)["reply"] == "hi"
     redis.delete.assert_awaited()
@@ -1081,18 +1081,47 @@ async def test_wait_for_response_message_late_ready():
     pubsub = _FakePubSub([{"type": "message"}])
     redis = _make_pubsub_redis(pubsub)
     redis.get = AsyncMock(side_effect=[None, json.dumps({"status": "done", "reply": "晚到"})])
-    result = await bot_router._wait_for_response(redis, "k", "ch", 10)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 10)
     assert json.loads(result.body)["reply"] == "晚到"
 
 
 async def test_wait_for_response_message_never_ready():
-    """message 通知后 key 始终未就绪 → 超时 JSON"""
+    """message 通知后 key 始终未就绪 → 超时 JSON（不提前判 queued, 单次 poll 可等 done）"""
     pubsub = _FakePubSub([{"type": "message"}])
     redis = _make_pubsub_redis(pubsub)
     redis.get = AsyncMock(return_value=None)
-    result = await bot_router._wait_for_response(redis, "k", "ch", 10)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 10)
     assert result.status_code == 200
     assert json.loads(result.body)["status"] == "timeout"
+
+
+async def test_wait_for_response_elapsed_with_pending_session_returns_queued():
+    """窗口耗尽且会话仍在排队/处理中 → 返回 queued + 位置（前端续轮询）"""
+    pubsub = _FakePubSub([])
+    session_id = "sess-inflight"
+    # 会话仍在活跃队列中（前端据此知道继续轮询而非判死）
+    bot_router._session_active[session_id] = True
+    session_q = asyncio.Queue()
+    for _ in range(2):
+        session_q.put_nowait((f"m{_}", {}))
+    bot_router._session_queues[session_id] = session_q
+
+    async def gen():
+        await asyncio.sleep(1.1)
+        yield {"type": "message"}
+
+    pubsub._messages = []
+    pubsub._listen_value = gen()
+    redis = _make_pubsub_redis(pubsub)
+    redis.get = AsyncMock(return_value=None)
+    try:
+        result = await bot_router._wait_for_response(redis, session_id, "k", "ch", 1)
+        body = json.loads(result.body)
+        assert body["status"] == "queued"
+        assert body["position"] == 2
+    finally:
+        bot_router._session_active.pop(session_id, None)
+        bot_router._session_queues.pop(session_id, None)
 
 
 async def test_wait_for_response_subscribe_ready():
@@ -1100,7 +1129,7 @@ async def test_wait_for_response_subscribe_ready():
     pubsub = _FakePubSub([{"type": "subscribe"}])
     redis = _make_pubsub_redis(pubsub)
     redis.get = AsyncMock(return_value=json.dumps({"status": "done", "reply": "x"}))
-    result = await bot_router._wait_for_response(redis, "k", "ch", 10)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 10)
     assert json.loads(result.body)["reply"] == "x"
 
 
@@ -1116,7 +1145,7 @@ async def test_wait_for_response_elapsed_timeout():
     pubsub._listen_value = gen()
     redis = _make_pubsub_redis(pubsub)
     redis.get = AsyncMock(return_value=None)
-    result = await bot_router._wait_for_response(redis, "k", "ch", 1)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 1)
     assert json.loads(result.body)["status"] == "timeout"
 
 
@@ -1131,7 +1160,7 @@ async def test_wait_for_response_elapsed_ready():
     pubsub._listen_value = gen()
     redis = _make_pubsub_redis(pubsub)
     redis.get = AsyncMock(return_value=json.dumps({"status": "done", "reply": "慢回复"}))
-    result = await bot_router._wait_for_response(redis, "k", "ch", 1)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 1)
     assert json.loads(result.body)["reply"] == "慢回复"
 
 
@@ -1139,7 +1168,7 @@ async def test_wait_for_response_listener_not_iterable():
     """listen() 不支持异步迭代 (异常环境) → 降级超时"""
     pubsub = _FakePubSub(listen_value=12345)
     redis = _make_pubsub_redis(pubsub)
-    result = await bot_router._wait_for_response(redis, "k", "ch", 10)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 10)
     assert json.loads(result.body)["status"] == "timeout"
     assert pubsub.aclosed  # 资源仍释放
 
@@ -1151,5 +1180,5 @@ async def test_wait_for_response_pubsub_coroutine():
     redis.pubsub = AsyncMock(return_value=pubsub)  # 返回协程, 触发 await 分支
     redis.get = AsyncMock(return_value=json.dumps({"status": "done", "reply": "x"}))
     redis.delete = AsyncMock()
-    result = await bot_router._wait_for_response(redis, "k", "ch", 10)
+    result = await bot_router._wait_for_response(redis, "s", "k", "ch", 10)
     assert json.loads(result.body)["reply"] == "x"

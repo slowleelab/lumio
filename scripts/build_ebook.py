@@ -31,7 +31,7 @@ CHAPTERS: list[tuple[str, str, bool]] = [
     ("06 会话状态机", "06-session-state-machine.md", False),
     ("07 MCP 工具集成", "07-mcp-tool-integration.md", False),
     ("08 错误处理", "chapters/08-error-handling.md", True),
-    ("09 RAG 摄入管线", "chapters/09-rag-ingestion.md", False),
+    ("09 知识库搭建", "chapters/09-rag-ingestion.md", False),
     ("10 可观测性", "chapters/10-observability.md", False),
     ("11 安全合规", "chapters/11-security-compliance.md", False),
     ("12 数据层", "chapters/12-data-layer.md", False),

@@ -25,7 +25,7 @@
           <div v-for="msg in msgs" :key="msg.id" class="msg-row" :class="msg.role">
             <div class="msg-wrapper">
               <div class="msg-bubble">{{ msg.content }}</div>
-              <div class="msg-time">{{ new Date(msg.time).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'}) }}</div>
+              <div class="msg-time">{{ new Date(msg.time).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit',second:'2-digit'}) }}</div>
             </div>
           </div>
           <div v-if="msgs.length === 0" class="empty-chat">发送消息开始咨询</div>
@@ -65,7 +65,9 @@ import { useCustomerChat } from "@/composables/useCustomerChat"
 const chat = useCustomerChat()
 
 const loggedIn = ref(false)
-const customerId = ref("customer-001")
+// 每次登录生成唯一客户ID，避免多个"顾客"共用 customer-001 导致
+// chat-svc 按 customerId 复用同一会话、历史串台。顾客也可手改。
+const customerId = ref(`cust-${crypto.randomUUID().slice(0, 8)}`)
 const customerName = ref("")
 const inputText = ref("")
 const msgList = ref<HTMLElement>()
@@ -78,6 +80,7 @@ const sid = computed(() => chat.sessionId.value)
 
 function login() {
   if (!customerId.value.trim() || !customerName.value.trim()) return
+  chat.setCustomer(customerId.value.trim(), customerName.value.trim())
   loggedIn.value = true
   chat.addMsg("system", `您好 ${customerName.value}，请问有什么可以帮您？`)
 }
@@ -93,8 +96,9 @@ async function handleSend() {
 }
 
 function endSession() {
-  chat.clearChat()
-  loggedIn.value = false
+  void chat.endSession().then(() => {
+    loggedIn.value = false
+  })
 }
 
 watch(() => msgs.value.length, () => nextTick(() => scrollBottom()))

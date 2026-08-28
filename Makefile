@@ -1,7 +1,7 @@
 # Lumio / 灵智 Makefile — 标准化开发命令
 # 使用: make <target>
 
-.PHONY: help install dev mcp-ref mcp-server-build mcp-server-test mcp-server-run gateway-up gateway-down test test-cov lint format type-check build up down init init-minio seed seed-dry verify clean migrate migrate-create pre-commit verify-ollama verify-observability
+.PHONY: help install dev mcp-ref mcp-server-build mcp-server-test mcp-server-run rerank-up rerank-down rerank-log gateway-up gateway-down test test-cov lint format type-check build up down init init-minio seed seed-dry verify clean migrate migrate-create pre-commit verify-ollama verify-observability
 
 # ── 默认 ──
 help: ## 显示帮助信息
@@ -29,8 +29,22 @@ mcp-server-test: ## 运行 Java MCP Server 单元测试
 mcp-server-run: ## 启动 Java MCP Server（SSE :8090，返回 mock 数据，不接真实银行系统）
 	cd mcp-server && mvn -B spring-boot:run
 
+rerank-up: ## 启动 cross-encoder 重排服务（:8080，需先建 .rerank-venv，模型经 hf-mirror 拉取）
+	cd agent && HF_ENDPOINT=https://hf-mirror.com nohup .rerank-venv/bin/python scripts/rerank_service.py --model BAAI/bge-reranker-v2-m3 --port 8080 >> /tmp/rerank.log 2>&1 &
+
+rerank-setup: ## 初始化独立重排 venv 并安装依赖（torch/sentence-transformers，走 pypi 镜像）
+	cd agent && python3 -m venv .rerank-venv && .rerank-venv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple sentence-transformers fastapi uvicorn
+
+rerank-down: ## 停止 cross-encoder 重排服务
+	@-pkill -f "scripts/rerank_service.py" 2>/dev/null; echo "rerank service stopped"
+
+rerank-log: ## 查看 cross-encoder 重排服务日志
+	@tail -f /tmp/rerank.log
+
 test: ## 运行测试
-	cd agent && poetry run pytest -v
+# 测试套件与 MCP 联调环境隔离: .env 打开 MCP_ENABLED 会让依赖 app fixture 的用例
+# 尝试直连工具层(本地联调参考 Server/Higress 不在 CI), 此处显式关闭保证确定性。
+	cd agent && MCP_ENABLED=false MCP_PROGRESSIVE_DISCLOSURE_ENABLED=false poetry run pytest -v
 
 test-cov: ## 运行测试并生成覆盖率报告
 	cd agent && poetry run pytest --cov=lumio --cov-report=term-missing --cov-report=html

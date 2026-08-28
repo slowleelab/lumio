@@ -127,3 +127,72 @@ class TestCallTool:
         client = MCPToolClient(settings=MCPSettings(enabled=True))
         with pytest.raises(RuntimeError, match="未连接"):
             await client.call_tool("query_balance", {})
+
+
+class TestSseTransport:
+    """SSE 传输选择: 直连 SSE 后端 (如 Java MCP Server) 无需 Higress 桥接."""
+
+    async def test_sse_transport_uses_sse_client(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from lumio.services.common.mcp_client import MCPToolClient
+
+        fake_cm = MagicMock()
+        fake_cm.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock(), None))
+        fake_cm.__aexit__ = AsyncMock(return_value=None)
+        session_init = AsyncMock()
+        with (
+            patch("lumio.services.common.mcp_client.sse_client", return_value=fake_cm) as sse_patch,
+            patch(
+                "lumio.services.common.mcp_client.ClientSession",
+                return_value=MagicMock(initialize=session_init),
+            ),
+            patch("lumio.services.common.mcp_client.streamablehttp_client") as streamable_patch,
+        ):
+            client = MCPToolClient(
+                settings=MCPSettings(enabled=True, endpoint="http://127.0.0.1:8090", transport="sse")
+            )
+            await client.connect()
+
+        sse_patch.assert_called_once()
+        streamable_patch.assert_not_called()
+        # sse_client 收到秒级超时 (SDK 约定) + 端点原样
+        call_kwargs = sse_patch.call_args.kwargs
+        assert call_kwargs["url"] == "http://127.0.0.1:8090"
+        assert isinstance(call_kwargs["timeout"], float)
+
+    async def test_default_transport_stays_streamable(self):
+        """默认 transport=streamable-http → 行为与旧版一致 (零回归)."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from lumio.services.common.mcp_client import MCPToolClient
+
+        fake_cm = MagicMock()
+        fake_cm.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock(), None))
+        fake_cm.__aexit__ = AsyncMock(return_value=None)
+        with (
+            patch("lumio.services.common.mcp_client.streamablehttp_client", return_value=fake_cm) as sh_patch,
+            patch(
+                "lumio.services.common.mcp_client.ClientSession",
+                return_value=MagicMock(initialize=AsyncMock()),
+            ),
+            patch("lumio.services.common.mcp_client.sse_client") as sse_patch,
+        ):
+            client = MCPToolClient(
+                settings=MCPSettings(enabled=True, endpoint="http://gw/mcp", transport="streamable-http")
+            )
+            await client.connect()
+
+        sh_patch.assert_called_once()
+        sse_patch.assert_not_called()
+
+    async def test_invalid_transport_raises(self):
+        from unittest.mock import patch
+
+        from lumio.services.common.mcp_client import MCPToolClient
+
+        client = MCPToolClient(settings=MCPSettings(enabled=True, endpoint="http://x", transport="websocket"))
+        with patch("lumio.services.common.mcp_client.streamablehttp_client"):
+            await client.connect()  # 连接异常被吞 → 降级无工具, 不抛到上层
+        assert client.connected is False
+        assert await client.list_tools() == []

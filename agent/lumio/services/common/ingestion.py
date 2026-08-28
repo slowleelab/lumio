@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+import uuid_utils
 from markdown_it import MarkdownIt
 
 if TYPE_CHECKING:
@@ -51,11 +52,18 @@ _PHRASE_ENDINGS = "，、：\u201c\u201d）】》"
 # ══════════════════════════════════════════════════════════════
 
 
+# YAML frontmatter: title/keywords 等元数据非正文, 留在 chunk 里会污染检索
+# (BM25 对元数据词打分) 与提示词 (RAG 参考段开头是 "title: ... doc_type: ...")
+_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n.*?\n---[ \t]*\n?", re.DOTALL)
+
+
 def parse_markdown(content: str) -> str:
     """从 Markdown 文本中提取纯文本
 
     使用 markdown-it-py 解析 token 树，提取 inline/text 节点内容。
+    入口先剥离 YAML frontmatter (markdown-it 不识别它会当普通段落输出)。
     """
+    content = _FRONTMATTER_RE.sub("", content, count=1)
     md = MarkdownIt()
     tokens = md.parse(content)
     parts: list[str] = []
@@ -396,6 +404,7 @@ async def write_to_es(
                     "chunk_id": chunk["chunk_id"],
                     "doc_id": chunk["doc_id"],
                     "content": chunk["content"],
+                    "title": chunk.get("title", ""),
                     "category": chunk.get("category", ""),
                     "doc_type": chunk.get("doc_type", ""),
                     "keywords": chunk.get("keywords", []),
@@ -481,6 +490,47 @@ async def _rollback_es_docs(es_client: Any, es_ids: list[str]) -> None:
             await es_client.delete(index=index_name, id=es_id)
         except Exception:
             logger.debug("ES 回滚删除失败（可能不存在）: id=%s", es_id)
+
+
+async def _clear_es_docs_for_document(es_client: Any, doc_id: Any) -> int:
+    """摄入前删除该文档的旧 chunk（幂等重灌）.
+
+    修复: 此前写 ES 不清理旧 chunk, 重复 seed/ingest 会累积残留数据
+    (评测发现 lumio_kb_chunks 里 58 个重复 ANNUAL_FEE chunk)。按 doc_id 删干净再写。
+    """
+    settings = get_settings()
+    index_name = f"{settings.elasticsearch.index_prefix}_kb_chunks"
+    try:
+        resp = await es_client.delete_by_query(
+            index=index_name,
+            query={"term": {"doc_id": str(doc_id)}},
+            refresh=True,
+            conflicts="proceed",
+        )
+        deleted = int(resp.get("deleted", 0)) if isinstance(resp, dict) else 0
+        if deleted:
+            logger.info("摄入前清理旧 chunk: doc_id=%s deleted=%d", doc_id, deleted)
+        return deleted
+    except Exception:
+        logger.warning("清理旧 chunk 失败(不阻断): doc_id=%s", doc_id)
+        return 0
+
+
+async def _clear_milvus_docs_for_document(collection: Any, doc_id: Any) -> int:
+    """摄入前删除该文档在 Milvus 的旧实体（幂等重灌）.
+
+    Milvus 主键是 chunk_id (内容变则新 ID), 不清理则重灌后新旧实体并存,
+    向量检索会召回陈旧内容 (评测发现残留 chunk 仍带已剥离的 YAML frontmatter)。
+    """
+    try:
+        expr = f'doc_id == "{doc_id}"'
+        collection.delete(expr=expr)
+        collection.flush()
+        logger.info("摄入前清理 Milvus 旧实体: doc_id=%s", doc_id)
+        return 1
+    except Exception:
+        logger.warning("清理 Milvus 旧实体失败(不阻断): doc_id=%s", doc_id)
+        return 0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -626,12 +676,13 @@ async def ingest_document(
 
         chunk_records: list[dict] = []
         for _idx, (chunk_text_str, embedding) in enumerate(zip(chunks, embeddings, strict=True)):
-            chunk_id = str(KbIngestionLog.id.default.arg())  # 使用 UUID v7 生成
+            chunk_id = str(uuid_utils.uuid7())  # UUID v7
             chunk_records.append(
                 {
                     "chunk_id": chunk_id,
                     "doc_id": str(doc_id),
                     "content": chunk_text_str,
+                    "title": doc.title,  # 修复: title 随 chunk 落 ES, 供检索定位/评测
                     "embedding": embedding,
                     "category": metadata.category,
                     "doc_type": metadata.doc_type,
@@ -652,6 +703,8 @@ async def ingest_document(
         es_ok = True
         if es_client is not None:
             t0 = time.perf_counter()
+            # 幂等重灌: 先清该文档旧 chunk, 再写新 chunk, 避免重复 run 累积残留
+            await _clear_es_docs_for_document(es_client, doc_id)
             es_count = await write_to_es(chunk_records, es_client)
             es_ok = es_count == len(chunk_records)
             await _log_stage(
@@ -672,6 +725,9 @@ async def ingest_document(
         # 5b. Milvus 后写
         milvus_ok = True
         if milvus_collection is not None:
+            # 幂等重灌 (与 ES 同理): Milvus 主键是 chunk_id (内容变则新 ID),
+            # 不清理旧实体则重灌后新旧 chunk 并存, 向量检索会召回带陈旧内容的残留
+            await _clear_milvus_docs_for_document(milvus_collection, doc_id)
             t0 = time.perf_counter()
             milvus_count = await write_to_milvus(chunk_records, milvus_collection)
             milvus_ok = milvus_count == len(chunk_records)
@@ -700,7 +756,7 @@ async def ingest_document(
         # ── 保存 KbChunk 到 DB ──
         for idx, record in enumerate(chunk_records):
             chunk = KbChunk(
-                id=record["chunk_id"],
+                id=uuid_utils.UUID(record["chunk_id"]),
                 document_id=doc_id,
                 chunk_index=idx,
                 content=record["content"],
