@@ -6,6 +6,9 @@ import AdminDashboard from "@/views/admin/AdminDashboard.vue"
 import DocumentList from "@/views/admin/DocumentList.vue"
 import FaqManager from "@/views/admin/FaqManager.vue"
 import IngestionMonitor from "@/views/admin/IngestionMonitor.vue"
+import AuditConversations from "@/views/admin/AuditConversations.vue"
+import OperationLogs from "@/views/admin/OperationLogs.vue"
+import RagMetrics from "@/views/admin/RagMetrics.vue"
 
 const router = createRouter({
   history: createWebHistory(),
@@ -21,6 +24,9 @@ const router = createRouter({
         { path: "documents", name: "admin-documents", component: DocumentList },
         { path: "faq", name: "admin-faq", component: FaqManager },
         { path: "monitor", name: "admin-monitor", component: IngestionMonitor },
+        { path: "audit", name: "admin-audit", component: AuditConversations },
+        { path: "ops-logs", name: "admin-ops-logs", component: OperationLogs },
+        { path: "rag-metrics", name: "admin-rag-metrics", component: RagMetrics },
       ],
     },
   ],
