@@ -12,7 +12,7 @@ from lumio.services.common.classifier import (
     RuleClassifier,
     get_domain,
 )
-from lumio.shared.models import IntentLabel, IntentResult, SentimentLabel
+from lumio.shared.models import Entity, IntentLabel, IntentResult, SentimentLabel
 
 # ── RuleClassifier ──
 
@@ -37,7 +37,9 @@ def test_rule_classify_card_loss() -> None:
     classifier = RuleClassifier()
     result = classifier.classify("信用卡丢了要挂失")
     assert result.primary_intent == IntentLabel.CARD_LOSS
-    assert result.primary_confidence >= 0.8
+    # 2026-08-25 标定: 置信度 = seed 实测命中率 (0.56, 原拍脑袋常数 0.9 虚高放行误判),
+    # 低于快路径阈值 0.7 → 规则命中后改走 BERT/LLM, 不再直接放行
+    assert result.primary_confidence == 0.56
 
 
 def test_rule_classify_transfer_agent() -> None:
@@ -290,21 +292,36 @@ async def test_bert_error_falls_back_to_rule() -> None:
 
 
 def test_get_domain_knowledge() -> None:
-    """知识类意图应路由到 knowledge 域"""
-    assert get_domain(IntentLabel.BILL_QUERY) == "knowledge"
-    assert get_domain(IntentLabel.LIMIT_QUERY) == "knowledge"
-    assert get_domain(IntentLabel.REWARD_QUERY) == "knowledge"
+    """知识/政策类意图应路由到 knowledge 域"""
+    assert get_domain(IntentLabel.FAQ) == "knowledge"
+    assert get_domain(IntentLabel.REPAY_METHOD_QUERY) == "knowledge"
+    assert get_domain(IntentLabel.FEE_ANNUAL) == "knowledge"
+    assert get_domain(IntentLabel.INST_PARAM_QUERY) == "knowledge"
 
 
 def test_get_domain_business() -> None:
-    """业务类意图应路由到 business 域"""
-    assert get_domain(IntentLabel.CARD_LOSS) == "business"
-    assert get_domain(IntentLabel.COMPLAINT) == "business"
+    """业务类意图应路由到 business 域 (draft-0.3 §4.2: 查询类已翻 business 主路径)"""
+    assert get_domain(IntentLabel.BILL_QUERY) == "business"  # 旧 flat → account_bill_query
+    assert get_domain(IntentLabel.ACCOUNT_BILL_QUERY) == "business"
+    assert get_domain(IntentLabel.TXN_QUERY) == "business"
+    assert get_domain(IntentLabel.LIMIT_QUERY) == "business"
 
 
 def test_get_domain_fallback() -> None:
     """闲聊/未知意图应路由到 fallback 域"""
-    assert get_domain(IntentLabel.CHITCHAT) == "fallback"
+    assert get_domain(IntentLabel.CHITCHAT) == "fallback"  # 旧 flat → nb_chitchat
+    assert get_domain(IntentLabel.NB_CHITCHAT) == "fallback"
+    assert get_domain(IntentLabel.HANDOFF_END) == "fallback"
+
+
+def test_get_domain_sensitive_and_handoff() -> None:
+    """risk/complain/transfer 域映射 (派发层与 business 同走 _handle_business)"""
+    assert get_domain(IntentLabel.CARD_LOSS) == "risk"  # 旧 flat → card_loss_report
+    assert get_domain(IntentLabel.CARD_LOSS_REPORT) == "risk"
+    assert get_domain(IntentLabel.COMPLAINT) == "complain"  # 旧 flat → dispute_submit
+    assert get_domain(IntentLabel.DISPUTE_SUBMIT) == "complain"
+    assert get_domain(IntentLabel.TRANSFER_AGENT) == "transfer"
+    assert get_domain(IntentLabel.RISK_FRAUD_REPORT) == "risk"
 
 
 # ── 多轮上下文透传 (draft-0.2 第一批) ──
@@ -365,8 +382,16 @@ def test_bert_build_dialog_input_keeps_latest() -> None:
 def test_normalize_intent_identity_and_fallback() -> None:
     from lumio.shared.models import normalize_intent
 
-    assert normalize_intent("bill_query") == IntentLabel.BILL_QUERY
-    assert normalize_intent("card_loss") == IntentLabel.CARD_LOSS
+    # 旧 flat 值 → 归一化主名 (draft-0.3 §3.1)
+    assert normalize_intent("bill_query") == IntentLabel.ACCOUNT_BILL_QUERY
+    assert normalize_intent("card_loss") == IntentLabel.CARD_LOSS_REPORT
+    assert normalize_intent("complaint") == IntentLabel.DISPUTE_SUBMIT
+    assert normalize_intent("chitchat") == IntentLabel.NB_CHITCHAT
+    assert normalize_intent("faq") == IntentLabel.FAQ_PRODUCT
+    # 主名/identity 值原样返回
+    assert normalize_intent("limit_query") == IntentLabel.LIMIT_QUERY
+    assert normalize_intent("transfer_agent") == IntentLabel.TRANSFER_AGENT
+    assert normalize_intent("account_bill_query") == IntentLabel.ACCOUNT_BILL_QUERY
     # 未知旧值兜底 FAQ, 不抛异常 (存量 ReadIsolation 兼容)
     assert normalize_intent("some_old_unknown_label") == IntentLabel.FAQ
 
@@ -490,3 +515,301 @@ def test_bert_build_dialog_input_keeps_turns_without_source_marker() -> None:
     assert "我想分期" in inp
     assert "请问要分几期呢" in inp
     assert inp.endswith("手续费怎么收")
+
+
+# ── 标签映射从训练产物读取 (防 _CLASSES/训练 IDX 手工同步漂移) ──
+
+
+class _FakeModelConfig:
+    """桩对象: 仅带 config.id2label, 模拟 transformers 保存的标签映射 (键为字符串)."""
+
+    def __init__(self, id2label: dict | None) -> None:
+        self.config = type("C", (), {"id2label": id2label})()
+
+
+def test_labels_from_model_config_reads_training_order() -> None:
+    from lumio.services.common.bert_classifier import _CLASSES, _labels_from_model_config
+
+    # 训练侧 id2label 只含 10 个训练类 (枚举现为 149+10 全集, 训练集仍是 10 类)
+    classes = [c.value for c in _CLASSES]
+    labels = _labels_from_model_config(_FakeModelConfig({str(i): c for i, c in enumerate(classes)}))
+    assert labels == [IntentLabel(c) for c in classes]
+
+
+def test_labels_from_model_config_falls_back_when_missing() -> None:
+    from lumio.services.common.bert_classifier import _CLASSES, _labels_from_model_config
+
+    assert _labels_from_model_config(_FakeModelConfig(None)) == _CLASSES
+    assert _labels_from_model_config(type("M", (), {"config": None})()) == _CLASSES
+
+
+def test_labels_from_model_config_falls_back_on_bad_labels() -> None:
+    from lumio.services.common.bert_classifier import _CLASSES, _labels_from_model_config
+
+    # 未知标签 → 回退
+    assert _labels_from_model_config(_FakeModelConfig({"0": "not_a_real_intent"})) == _CLASSES
+    # 标签集不全 (缺类) → 回退, 不静默用错 IDX
+    partial = {str(i): c for i, c in enumerate(IntentLabel)}
+    del partial["9"]
+    assert _labels_from_model_config(_FakeModelConfig(partial)) == _CLASSES
+
+
+# ── 温度来源优先级: 显式入参 > 训练产物 config.temperature ──
+
+
+def test_resolve_temperature_explicit_wins() -> None:
+    from lumio.services.common.bert_classifier import _resolve_temperature
+
+    assert _resolve_temperature(0.8, 1.5) == 0.8
+    assert _resolve_temperature(1.0, 1.5) == 1.0  # 显式 1.0 表示"禁用缩放", 尊重调用方
+
+
+def test_resolve_temperature_from_config() -> None:
+    from lumio.services.common.bert_classifier import _resolve_temperature
+
+    assert _resolve_temperature(None, 1.35) == 1.35
+    assert _resolve_temperature(None, "1.35") == 1.35  # json 数字/字符串兼容
+
+
+def test_resolve_temperature_invalid_falls_back_to_none() -> None:
+    from lumio.services.common.bert_classifier import _resolve_temperature
+
+    assert _resolve_temperature(None, None) is None
+    assert _resolve_temperature(None, 0.0) is None  # 非法温度 → 不缩放
+    assert _resolve_temperature(None, -1.0) is None
+    assert _resolve_temperature(None, "not_a_number") is None
+
+
+# ── 多轮输入格式契约 (训练/推理分布一致性) ──
+
+
+def test_bert_build_dialog_input_format_contract() -> None:
+    """冻结 _build_dialog_input 的输出格式: 老→新顺序、段间无分隔、换行接当前句。
+
+    这是 spike 脚本 _HISTORY_TPL 多轮合成样本必须对齐的契约 — 若此快照被改,
+    必须同步更新 scripts/intent_classifier_spike.py 的 gen_history_samples,
+    否则训练/推理输入格式再次漂移 (历史侧分布不一致)。
+    """
+    from lumio.services.common.bert_classifier import BertIntentClassifier
+
+    out = BertIntentClassifier._build_dialog_input(
+        "分一万二",
+        [
+            {"speaker": "customer", "content": "我想分期"},
+            {"speaker": "bot", "content": "请问您想分期的金额是多少?"},
+        ],
+    )
+    assert out == "用户:我想分期客服:请问您想分期的金额是多少?\n分一万二"
+
+
+def test_bert_build_dialog_input_no_history_is_plain_text() -> None:
+    """无历史时输出即当前句本身 (单句训练样本与运行时单句路径一致)."""
+    from lumio.services.common.bert_classifier import BertIntentClassifier
+
+    assert BertIntentClassifier._build_dialog_input("查账单", None) == "查账单"
+    assert BertIntentClassifier._build_dialog_input("查账单", []) == "查账单"
+
+
+# ── #7 LLM 分类缓存 (慢路径降本第一段) ──
+
+
+def _llm_settings(enabled: bool = True, ttl: int = 60, max_entries: int = 8):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        llm=SimpleNamespace(
+            classify_cache_enabled=enabled,
+            classify_cache_ttl_seconds=ttl,
+            classify_cache_max_entries=max_entries,
+            classify_timeout=3.0,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_cache_hit_skips_second_call() -> None:
+    """相同输入在 TTL 内复用分类结果, LLM 只被调用一次."""
+    from unittest.mock import patch
+
+    llm = MagicMock()
+    llm.classify = AsyncMock(
+        return_value={"intent": "bill_query", "confidence": 0.8, "entities": [], "sentiment": "neutral"}
+    )
+    clf = LLMClassifier(llm)
+    with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings()):
+        r1 = await clf.classify("帮我查账单")
+        r2 = await clf.classify("帮我查账单")
+    assert r1[0].primary_intent == r2[0].primary_intent == IntentLabel.BILL_QUERY
+    llm.classify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_cache_returns_deep_copy() -> None:
+    """缓存返回深拷贝: 调用方对结果的突变不得污染后续命中."""
+    from unittest.mock import patch
+
+    llm = MagicMock()
+    llm.classify = AsyncMock(
+        return_value={"intent": "bill_query", "confidence": 0.8, "entities": [], "sentiment": "neutral"}
+    )
+    clf = LLMClassifier(llm)
+    with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings()):
+        first = await clf.classify("查账单")
+        first[0].energy = -99.0  # 模拟上层透传 mutation
+        first[1].append(Entity(entity_type="period", value="本月"))
+        second = await clf.classify("查账单")
+    assert second[0].energy is None
+    assert second[1] == []
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_cache_different_text_and_ttl_expiry() -> None:
+    """不同文本不命中; TTL 过期后重新调用 LLM."""
+    from unittest.mock import patch
+
+    llm = MagicMock()
+    llm.classify = AsyncMock(return_value={"intent": "faq", "confidence": 0.6, "entities": [], "sentiment": "neutral"})
+    clf = LLMClassifier(llm)
+    with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings(ttl=0)):
+        await clf.classify("问题一")
+        await clf.classify("问题一")  # TTL=0 → 视为过期, 重新调用
+    assert llm.classify.await_count == 2
+
+    llm.classify.reset_mock()
+    clf2 = LLMClassifier(llm)  # 新实例: 隔离上一 phase 的缓存, 只验不同文本不命中
+    with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings()):
+        await clf2.classify("问题一")
+        await clf2.classify("问题二")
+    assert llm.classify.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_cache_disabled_and_failure_not_cached() -> None:
+    """开关关闭不走缓存; 失败兜底不缓存 (下次重试仍调 LLM)."""
+    from unittest.mock import patch
+
+    llm = MagicMock()
+    clf = LLMClassifier(llm)
+    with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings(enabled=False)):
+        llm.classify = AsyncMock(
+            return_value={"intent": "faq", "confidence": 0.6, "entities": [], "sentiment": "neutral"}
+        )
+        await clf.classify("同一句")
+        await clf.classify("同一句")
+        assert llm.classify.await_count == 2
+
+    llm.classify = AsyncMock(side_effect=TimeoutError("boom"))
+    clf2 = LLMClassifier(llm)
+    with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings()):
+        r1 = await clf2.classify("会失败的句子")
+        r2 = await clf2.classify("会失败的句子")
+    assert r1[0].primary_confidence == 0.0 and r2[0].primary_confidence == 0.0
+    assert llm.classify.await_count == 2  # 失败不缓存
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_cache_lru_eviction() -> None:
+    """缓存超过上限时淘汰最旧条目."""
+    from unittest.mock import patch
+
+    llm = MagicMock()
+    llm.classify = AsyncMock(return_value={"intent": "faq", "confidence": 0.6, "entities": [], "sentiment": "neutral"})
+    clf = LLMClassifier(llm)
+    with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings(max_entries=2)):
+        await clf.classify("句一")
+        await clf.classify("句二")
+        await clf.classify("句三")  # 淘汰句一
+        await clf.classify("句一")  # 未命中 → 重调
+    assert llm.classify.await_count == 4
+    assert len(clf._cache) == 2
+
+
+@pytest.mark.asyncio
+async def test_slow_path_faq_does_not_override_business_fast_path() -> None:
+    """P0 (会话 0681c635): LLM 慢路径兜底 FAQ@0.0 不应覆盖快路径已识别的业务意图.
+
+    BERT 识别 installment_inquiry@0.5 (落在 0.3~0.7 中间区间), 慢路径超时兜底
+    FAQ@0.0 -- 此前 FAQ@0.0 覆盖快路径, 噪声门按 low_confidence 误杀明确业务诉求.
+    """
+    fake = _fake_bert(IntentLabel.INSTALLMENT_INQUIRY, 0.5)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0), [], SentimentLabel.NEUTRAL)
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, fast_threshold=0.7, bert_classifier=fake
+    )
+    intent, _entities, _sentiment, source = await classifier.classify("我要办分期")
+
+    assert intent.primary_intent == IntentLabel.INSTALLMENT_INQUIRY  # 回退快路径, 而非 FAQ
+    assert source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_slow_path_lower_confidence_falls_back_to_fast_path() -> None:
+    """P0: 慢路径置信低于快路径时, 信任快路径 (即便慢路径是另一个业务意图)."""
+    fake = _fake_bert(IntentLabel.BILL_QUERY, 0.6)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.4), [], SentimentLabel.NEUTRAL)
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, fast_threshold=0.7, bert_classifier=fake
+    )
+    intent, _entities, _sentiment, source = await classifier.classify("查一下我的账单")
+
+    assert intent.primary_intent == IntentLabel.BILL_QUERY
+    assert source == "fallback"
+
+
+def test_parse_intent_chinese_alias() -> None:
+    """LLM 输出中文意图 (如"办理分期") 经别名映射兜底, 而非解析失败退化为 FAQ."""
+    from lumio.services.common.classifier import _parse_intent
+
+    assert _parse_intent("办理分期") == IntentLabel.INSTALLMENT_INQUIRY
+    assert _parse_intent("分期咨询") == IntentLabel.INSTALLMENT_INQUIRY
+    assert _parse_intent("账单查询") == IntentLabel.BILL_QUERY
+    assert _parse_intent("转人工") == IntentLabel.TRANSFER_AGENT
+    # 枚举值优先
+    assert _parse_intent("installment_inquiry") == IntentLabel.INSTALLMENT_INQUIRY
+    # 未知中文 -> FAQ
+    assert _parse_intent("胡言乱语") == IntentLabel.FAQ
+
+
+# ── 办理词规则覆盖 (会话 48882b05 同型消歧) ──
+
+
+@pytest.mark.asyncio
+async def test_bert_limit_query_overridden_by_apply_rule() -> None:
+    """BERT 旧标签空间把"我要提额"判 limit_query → 规则层 limit_apply_increase@0.96 覆盖"""
+    fake = _fake_bert(IntentLabel.LIMIT_QUERY, 0.81)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("我要提额")
+
+    assert intent.primary_intent == IntentLabel.LIMIT_APPLY_INCREASE
+    assert intent.primary_confidence == 0.96
+    assert source == "rule"
+    # 审计留痕: BERT 原始判定保留在 fast_intent/fast_conf
+    assert intent.fast_intent == IntentLabel.LIMIT_QUERY
+    assert intent.fast_conf == 0.81
+
+
+@pytest.mark.asyncio
+async def test_bert_limit_query_decrease_overridden() -> None:
+    fake = _fake_bert(IntentLabel.LIMIT_QUERY, 0.8)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("我想降额")
+
+    assert intent.primary_intent == IntentLabel.LIMIT_APPLY_DECREASE
+    assert source == "rule"
+
+
+@pytest.mark.asyncio
+async def test_non_apply_bert_result_not_overridden() -> None:
+    """非办理词不被覆盖: BERT 判 limit_query@0.95 (纯查询句) 保持原样"""
+    fake = _fake_bert(IntentLabel.LIMIT_QUERY, 0.95)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("我的可用额度是多少")
+
+    assert intent.primary_intent == IntentLabel.LIMIT_QUERY
+    assert source == "bert"

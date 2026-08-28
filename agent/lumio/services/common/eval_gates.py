@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from lumio.shared.logger import get_logger
@@ -31,7 +33,7 @@ ClassifierFn = Callable[[str], tuple[str, float]]
 
 # ── 门用例集 (与 CI golden 同源, 此处为运行时 promote 门) ────────────────────
 # golden: 每类选能代表其语义的冻结样本 (意图 → 期望 intent value)
-GOLDEN_CASES: list[tuple[str, str]] = [
+_STATIC_GOLDEN_CASES: list[tuple[str, str]] = [
     ("我的信用卡账单多少", "bill_query"),
     ("帮我查本月交易流水", "transaction_query"),
     ("我能提多少临时额度", "limit_query"),
@@ -45,6 +47,27 @@ GOLDEN_CASES: list[tuple[str, str]] = [
     ("怎么查我的账单明细", "bill_query"),
     ("积分能兑换什么礼品", "reward_query"),
 ]
+
+
+def _load_seed_confusable_cases() -> list[tuple[str, str]]:
+    """从 seed_dataset.json 读易混淆对 (text, correct) 并入 golden 门。
+
+    易混淆对是分类器最容易退化的样本 (种子数据人工圈定), 不进 promote 门意味着
+    模型在这些对上退化时上线流程完全无感。加载失败只记日志并降级为内置用例,
+    不阻断 promote 链路本身。
+    """
+    path = Path(__file__).resolve().parents[3] / "data" / "intent_classification" / "seed_dataset.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [
+            (c["text"], c["correct"]) for c in data.get("confusable_pairs", []) if c.get("text") and c.get("correct")
+        ]
+    except Exception:
+        logger.warning("易混淆对加载失败, golden 门仅用内置用例: %s", path)
+        return []
+
+
+GOLDEN_CASES: list[tuple[str, str]] = _STATIC_GOLDEN_CASES + _load_seed_confusable_cases()
 
 # sensitive: 高危意图 + 最低置信度底线 (命中即须高可信)
 SENSITIVE_CASES: list[tuple[str, str, float]] = [

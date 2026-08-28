@@ -29,7 +29,9 @@ from lumio.shared.models import IntentLabel, IntentResult
 
 logger = logging.getLogger(__name__)
 
-# 与训练脚本 intent_classifier_spike.py 的 IDX 顺序严格一致 —— 标签序号 -> IntentLabel
+# 与训练脚本 intent_classifier_spike.py 的 IDX 顺序严格一致 —— 标签序号 -> IntentLabel。
+# 仅作**回退基线**: 模型 config.json 带 id2label 时(训练脚本已随权重落盘), 推理侧直接
+# 读训练产物的标签顺序, 两处不再靠人工同步; 无 id2label 的旧权重/测试桩回退到本表。
 _CLASSES: list[IntentLabel] = [
     IntentLabel.FAQ,
     IntentLabel.BILL_QUERY,
@@ -43,6 +45,42 @@ _CLASSES: list[IntentLabel] = [
     IntentLabel.CHITCHAT,
 ]
 _IDX_TO_LABEL: dict[int, IntentLabel] = {i: lbl for i, lbl in enumerate(_CLASSES)}
+
+
+def _resolve_temperature(explicit: float | None, config_temperature: Any) -> float | None:
+    """温度来源优先级: 显式入参 > 训练产物 config.temperature (校准值)。
+
+    训练脚本把 dev NLL 最小化标定的温度写进 config.json; 推理侧加载时自动采用,
+    不再依赖调用方手工传参。config 缺失/非法 (<=0) 时返回 None (等价不缩放)。
+    """
+    if explicit is not None:
+        return explicit
+    try:
+        t = float(config_temperature)
+    except (TypeError, ValueError):
+        return None
+    return t if t > 0.0 else None
+
+
+def _labels_from_model_config(model: Any) -> list[IntentLabel]:
+    """从模型 config.id2label 还原训练时的标签顺序; 缺失/非法/与线上枚举不一致 → 回退 _CLASSES。
+
+    纯函数不碰 torch: 传入任何带 .config.id2label 的对象即可单测 (transformers 配置里
+    id2label 的键是字符串 "0"/"1"/..., 兼容 int 键)。
+    """
+    raw = getattr(getattr(model, "config", None), "id2label", None)
+    if not raw:
+        return list(_CLASSES)
+    try:
+        labels = [IntentLabel(str(raw[str(i)])) for i in range(len(raw))]
+    except (KeyError, ValueError):
+        logger.warning("模型 id2label 与 IntentLabel 不一致, 回退硬编码 _CLASSES")
+        return list(_CLASSES)
+    if set(labels) != set(_CLASSES):
+        logger.warning("模型标签集与线上 IntentLabel 不一致 (got=%s), 回退硬编码 _CLASSES", set(labels))
+        return list(_CLASSES)
+    return labels
+
 
 # 单个 softmax 解码时作为"次意图"带出的 top-K (多意图). 1 即只出主意图(旧行为).
 _TOP_K = 3
@@ -102,9 +140,10 @@ def ood_verdict(
     - energy > threshold + band → unknown (OOD/噪声)
     band 用于"模糊带宽仲裁": 在阈值两侧各留一段给"吃不准"的样本。
     """
-    if energy < threshold - ambiguous_band:
+    band = ambiguous_band if ambiguous_band is not None else 0.0
+    if energy < threshold - band:
         return "known"
-    if energy <= threshold + ambiguous_band:
+    if energy <= threshold + band:
         return "ambiguous"
     return "unknown"
 
@@ -119,6 +158,9 @@ class BertIntentClassifier:
         self._tokenizer: Any = None
         self._device: str = "cpu"
         self._lock = asyncio.Lock()
+        # 标签映射: 加载后从训练产物 id2label 还原; 加载前/失败时用硬编码基线。
+        self._labels: list[IntentLabel] = list(_CLASSES)
+        self._idx_to_label: dict[int, IntentLabel] = _IDX_TO_LABEL
 
     async def classify(self, text: str, history: list[dict[str, str]] | None = None) -> IntentResult:
         """对单条文本分类, 返回含 softmax 置信度的 IntentResult + 次意图 alternatives。
@@ -211,8 +253,19 @@ class BertIntentClassifier:
             if self._model is not None:
                 return
             try:
-                self._model, self._tokenizer, self._device = await asyncio.to_thread(self._load_sync)
-                logger.info("BERT 意图分类器加载完成 model=%s device=%s", self._model_path, self._device)
+                self._model, self._tokenizer, self._device, labels, temperature = await asyncio.to_thread(
+                    self._load_sync
+                )
+                self._labels = labels
+                self._idx_to_label = {i: lbl for i, lbl in enumerate(labels)}
+                self._temperature = temperature
+                logger.info(
+                    "BERT 意图分类器加载完成 model=%s device=%s labels=%d temperature=%s",
+                    self._model_path,
+                    self._device,
+                    len(labels),
+                    self._temperature,
+                )
             except Exception:
                 logger.exception("BERT 意图分类器加载失败 model=%s (上层将回退规则)", self._model_path)
                 raise
@@ -232,7 +285,8 @@ class BertIntentClassifier:
         device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
         tokenizer = AutoTokenizer.from_pretrained(self._model_path)
         model = AutoModelForSequenceClassification.from_pretrained(self._model_path).to(device).eval()
-        return model, tokenizer, device
+        temperature = _resolve_temperature(self._temperature, getattr(model.config, "temperature", None))
+        return model, tokenizer, device, _labels_from_model_config(model), temperature
 
     def _predict(self, dialog_input: str) -> IntentResult:
         import torch
@@ -247,7 +301,7 @@ class BertIntentClassifier:
             logits = logits / self._temperature
         probs = torch.softmax(logits, dim=-1)
         top_idx = probs.topk(min(_TOP_K, len(probs))).indices.tolist()
-        labels = [_IDX_TO_LABEL[int(i)] for i in top_idx]
+        labels = [self._idx_to_label[int(i)] for i in top_idx]
         conf = float(probs[top_idx[0]])
         return IntentResult(
             primary_intent=labels[0],

@@ -150,7 +150,9 @@ _INTENT_GOLDEN = [
     ("信用卡是不是都有免费接送机服务", "faq"),
     ("你们是不是新推出了海洋主题联名卡", "faq"),
     ("听说你们有张不公开的黑金卡，额度上不封顶", "faq"),
-    ("怎么申请提额", "limit_query"),
+    # BERT 标签空间仍是旧扁平 10 类 (发不出 limit_apply_increase), 此处钉纯查询例;
+    # "提额"办理词的消歧在规则层 (见 _RULE_INTENT_GOLDEN), BERT 重训前由慢路径/规则覆盖
+    ("我的可用额度是多少", "limit_query"),
     ("这个月总消费多少", "bill_query"),
     ("账单能分期吗", "installment_inquiry"),
     ("积分能兑换什么", "reward_query"),
@@ -165,11 +167,15 @@ _INTENT_GOLDEN = [
 #   - 含「信用卡/卡+额度」的词 → 触发 limit_query（如"免费接送机服务""黑金卡额度"）
 #   - "账单能分期吗" 的"账单"与"分期"置信并列，规则取首个 → bill_query
 #   - "信用卡年费怎么减免" 因"信用"关键词 → limit_query
-# 故规则黄金只钉这 8 条当前即正确的行作为回归门；BERT 用全量 12 条。
+# 故规则黄金只钉当前即正确的行作为回归门；BERT 用全量 12 条。
+# 会话 48882b05: "提额/降额"办理词消歧 — 走 limit_apply_increase/decrease (knowledge
+# 办理介绍), 不再落 limit_query (工具编排)。置信 0.96 > limit_query 0.95。
 _RULE_INTENT_GOLDEN = [
     ("我的卡是不是终身免年费还带接送机", "faq"),
     ("你们是不是新推出了海洋主题联名卡", "faq"),
-    ("怎么申请提额", "limit_query"),
+    ("怎么申请提额", "limit_apply_increase"),
+    ("我想降额", "limit_apply_decrease"),
+    ("我的可用额度是多少", "limit_query"),
     ("这个月总消费多少", "bill_query"),
     ("积分能兑换什么", "reward_query"),
     ("我的卡丢了帮我挂失", "card_loss"),

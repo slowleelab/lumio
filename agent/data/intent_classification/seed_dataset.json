@@ -1,9 +1,9 @@
 {
   "meta": {
     "taxonomy": "IntentLabel (封闭 10 类单标签分类)",
-    "version": "0.3.1",
+    "version": "0.3.2",
     "domain": "银行信用卡客服",
-    "purpose": "BERT 系轻量意图分类器微调的首批种子数据；标签口径与 RuleClassifier(_RULES) 对齐",
+    "purpose": "BERT 系轻量意图分类器微调的首批种子数据；标签口径与 RuleClassifier(_RULES) 对齐; decision_path 与运行时 INTENT_DOMAINS 降级路由对齐(查询类=knowledge)",
     "source": "rule-aligned seeds + 人工撰写",
     "counts": {
       "examples": 191,
@@ -22,35 +22,35 @@
       "id": "bill_query",
       "name_zh": "账单查询",
       "definition": "针对账单整体或还款额的查询（本期/历史账单、应还/最低还款、欠款总额）。",
-      "decision_path": "business",
+      "decision_path": "knowledge (RAG 降级路由; progressive_disclosure 开启且有工具时改走 MCP 工具编排)",
       "note": "问\"总额/还款额\"归此；问\"逐笔明细\"归 transaction_query。"
     },
     {
       "id": "transaction_query",
       "name_zh": "交易明细查询",
       "definition": "针对具体逐笔消费/扣款/流水的查询（某笔金额、时间、商户、入账状态）。",
-      "decision_path": "business",
+      "decision_path": "knowledge (RAG 降级路由; progressive_disclosure 开启且有工具时改走 MCP 工具编排)",
       "note": "与 bill_query 是头号易混淆对，靠\"总额 vs 逐笔\"区分。"
     },
     {
       "id": "limit_query",
       "name_zh": "额度查询/额度管理",
       "definition": "额度相关查询或操作诉求（当前/可用/临时额度、提额/降额）。",
-      "decision_path": "business",
+      "decision_path": "knowledge (RAG 降级路由; progressive_disclosure 开启且有工具时改走 MCP 工具编排)",
       "note": "仅做意图识别；提额/降额属敏感操作走确认状态机。"
     },
     {
       "id": "installment_inquiry",
       "name_zh": "分期咨询/办理",
       "definition": "分期相关咨询或办理（账单/消费分期、期数、手续费率、提前还款）。",
-      "decision_path": "business",
+      "decision_path": "knowledge (RAG 降级路由; progressive_disclosure 开启且有工具时改走 MCP 工具编排)",
       "note": "问\"手续费怎么收\"倾向此意图，即便含\"费率\"措辞。"
     },
     {
       "id": "reward_query",
       "name_zh": "积分/权益查询",
       "definition": "信用卡积分或权益相关（积分余额/兑换/过期、积分商城、权益到账）。",
-      "decision_path": "business",
+      "decision_path": "knowledge (RAG 降级路由; progressive_disclosure 开启且有工具时改走 MCP 工具编排)",
       "note": "涉及积分的时效/兑换均归此，非通用 FAQ。"
     },
     {

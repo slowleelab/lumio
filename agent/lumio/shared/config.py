@@ -193,6 +193,11 @@ class LLMSettings(BaseSettings):
     # 现由 classifier 的 asyncio.wait_for 强制总 deadline, 故设 3s: 拖慢的 8s+ 分类被
     # 封顶, 正常分类(热机 ~1-2s)不受影响. 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清.
     classify_timeout: float = 3.0
+    # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
+    # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
+    classify_cache_enabled: bool = True
+    classify_cache_ttl_seconds: int = 300
+    classify_cache_max_entries: int = 512
     # 生成独立超时: 15s 对热机 qwen2.5:7b 足够, 但在健康探测或其他渲染抢占 GPU 时,
     # 慢而成功的调用可能顶破 15s → 触发"超时→重试"把一轮翻倍 (实测 24.5s 尖峰)。
     # 抬到 20s: 让慢一点但能成功的单次调用一次走完(20s<25s 长轮询窗口), 避免重试翻倍。
@@ -364,6 +369,9 @@ class ClassificationSettings(BaseSettings):
     # ── 闭环 P1 提纯"认不认": energy-OOD + 温度校准 + LLM 模糊仲裁 ──
     # energy ("不认"通道): -logsumexp(logits) —— 封闭意图集外输入该值显著更"负"(分散).
     # BERT 快路径产生该分数; LLM 慢路径/无 torch 环境不产生, 由上层走置信度 + 更多信号.
+    # 实测标注 (2026-08, closed_loop.json switch_rationale): 乱码样本 energy 反而更低
+    # (-2.55 vs 阈值 -3.4) 被判"认得", 无区分度 → 默认关, 只作观测位; 开启前必须在
+    # 部署环境用真实噪声/真实业务样本重新标定阈值, 否则是"假开关"。
     ood_enabled: bool = False  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
     # energy 阈值: energy 高于此 → 认为"认识"可用(信任 BERT); 低于 → "不认"倾向 OOD/噪声.
     # energy 数值尺度取决于 logits 绝对值, 需在部署环境用验证集标定, 这里给保守初值.
@@ -378,7 +386,10 @@ class ClassificationSettings(BaseSettings):
     ood_ambiguous_band: float = 1.0
 
     # ── 闭环 P2 中英多信号噪声闸 (InputGate) ──
-    # 打开后由 InputGate 在噪声门内额外做惊讶度(中/英)多信号投票; 默认关(观测/需标定).
+    # 打开后由 InputGate 在噪声门内额外做惊讶度(中/英)多信号投票; 默认关。
+    # 实测标注 (2026-08, closed_loop.json switch_rationale): 惊讶度无区分度
+    # (乱码 7.2-8.3 vs 真实 6.9-8.3 区间重叠), 只作观测/框架预留, 不建议开启;
+    # 未来若要启用需先回流标定分段阈值。
     noise_gate_enabled: bool = False
 
     # ── 多轮指代消解 (回指落实体) ──
