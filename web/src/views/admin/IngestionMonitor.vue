@@ -27,9 +27,27 @@
           <el-option label="全部" value="" />
           <el-option v-for="c in categoryOptions" :key="c" :label="c" :value="c" />
         </el-select>
+        <el-button
+          :loading="rebuildingAll"
+          :disabled="pendingCount === 0"
+          type="warning"
+          plain
+          @click="rebuildAllPending"
+        >
+          重建全部待处理 ({{ pendingCount }})
+        </el-button>
         <el-button :loading="monitor.loading.value" @click="monitor.refresh">刷新</el-button>
       </div>
     </div>
+
+    <el-row :gutter="12" class="stat-row">
+      <el-col :span="6" v-for="st in statusStats" :key="st.label">
+        <div class="mini-stat" :class="st.cls">
+          <span class="mini-num">{{ st.value }}</span>
+          <span class="mini-label">{{ st.label }}</span>
+        </div>
+      </el-col>
+    </el-row>
 
     <el-table :data="documents" v-loading="monitor.loading.value" stripe style="margin-top: 16px" data-testid="ingestion-table">
       <el-table-column prop="title" label="文档" min-width="200" show-overflow-tooltip />
@@ -55,13 +73,13 @@
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click="viewDetail(row)">详情</el-button>
           <el-popconfirm
-            v-if="row.status === 'failed'"
-            title="确认重新摄入此文档？"
-            confirm-button-text="重试"
+            v-if="norm(row.status) === 'failed' || norm(row.status) === 'pending'"
+            :title="norm(row.status) === 'failed' ? '确认重新摄入此文档？' : '该文档尚未走管道摄入, 确认重建索引？'"
+            confirm-button-text="重建"
             @confirm="onRetry(row)"
           >
             <template #reference>
-              <el-button link type="warning" size="small" data-testid="retry-btn">重试</el-button>
+              <el-button link type="warning" size="small" data-testid="retry-btn">重建索引</el-button>
             </template>
           </el-popconfirm>
         </template>
@@ -77,6 +95,11 @@
           <span v-if="totalDuration > 0" class="total-duration">总耗时 {{ totalDuration }}ms</span>
         </p>
 
+        <el-empty
+          v-if="stages.length === 0"
+          description="无管道摄入记录（该文档由脚本直接导入, 或尚未摄入）。点「重建索引」可走完整管道。"
+          :image-size="72"
+        />
         <!-- 时间线视图: 7 阶段顺序展示 -->
         <h4 class="timeline-title">处理时间线</h4>
         <el-timeline v-if="stages.length > 0" class="stage-timeline">
@@ -124,7 +147,45 @@ const filterCategory = ref("")
 
 const categoryOptions = ["faq", "信用卡", "贷款", "理财", "投诉处理", "通用知识"]
 
-const ingestingCount = computed(() => documents.value.filter((d) => d.status === "ingesting").length)
+const ingestingCount = computed(() => documents.value.filter((d) => norm(d.status) === "ingesting").length)
+
+// 后端状态枚举是大写 (PENDING/COMPLETED/...), 前端文案映射表全是小写 → 统一归一
+function norm(s: string | null | undefined) {
+  return (s ?? "").toLowerCase()
+}
+
+const pendingCount = computed(() => documents.value.filter((d) => norm(d.status) === "pending").length)
+
+const statusStats = computed(() => {
+  const by = (k: string) => documents.value.filter((d) => norm(d.status) === k).length
+  const total = documents.value.length
+  const done = by("ingested") + by("completed")
+  const fail = by("failed")
+  return [
+    { label: "总文档", value: total, cls: "" },
+    { label: "已就绪", value: done, cls: "stat-ok" },
+    { label: "待处理", value: pendingCount.value, cls: pendingCount.value > 0 ? "stat-warn" : "" },
+    { label: "失败", value: fail, cls: fail > 0 ? "stat-bad" : "" },
+  ]
+})
+
+const rebuildingAll = ref(false)
+async function rebuildAllPending() {
+  rebuildingAll.value = true
+  try {
+    for (const d of documents.value.filter((x) => norm(x.status) === "pending")) {
+      try {
+        await retryIngestion(d.doc_id)
+      } catch {
+        /* 单篇失败不阻断后续 */
+      }
+    }
+    ElMessage.success("全部待处理文档已提交重建")
+    monitor.refresh()
+  } finally {
+    rebuildingAll.value = false
+  }
+}
 
 async function load() {
   const res = await listDocuments({
@@ -185,12 +246,14 @@ function timelineType(s: string): "primary" | "success" | "warning" | "danger" |
   return "info"
 }
 function statusType(s: string) {
-  const m: Record<string, string> = { ingested: "success", ingesting: "warning", failed: "danger", pending: "info" }
-  return m[s] ?? "info"
+  const m: Record<string, string> = { ingested: "success", completed: "success", ingesting: "warning", failed: "danger", pending: "info" }
+  return m[norm(s)] ?? "info"
 }
 function statusText(s: string) {
-  const m: Record<string, string> = { ingested: "已就绪", ingesting: "摄入中", failed: "失败", pending: "待处理" }
-  return m[s] ?? s
+  const m: Record<string, string> = {
+    ingested: "已就绪", completed: "已就绪", ingesting: "摄入中", failed: "失败", pending: "待处理",
+  }
+  return m[norm(s)] ?? norm(s)
 }
 function rowStatusTag(s: string) {
   return s === "completed" ? "success" : s === "failed" ? "danger" : "info"
@@ -201,6 +264,20 @@ function formatTime(s: string | null) {
 </script>
 
 <style scoped>
+.stat-row { margin-top: 12px; }
+.mini-stat {
+  background: var(--color-bg-page, #f5f7fa);
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.mini-num { font-size: 20px; font-weight: 600; }
+.mini-label { font-size: 12px; color: var(--color-text-secondary, #909399); }
+.stat-ok .mini-num { color: var(--color-success, #67c23a); }
+.stat-warn .mini-num { color: var(--color-warning, #e6a23c); }
+.stat-bad .mini-num { color: var(--color-danger, #f56c6c); }
 .monitor-page { max-width: 1200px; }
 .page-header { display: flex; align-items: center; justify-content: space-between; }
 .page-header h2 { margin: 0; font-size: var(--fs-2xl); }
