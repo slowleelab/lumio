@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+- **管理控制台一期**（对话审计 + RAG 指标监控）
+  - `console_router.py` 挂 `/api/admin/*`：会话审计列表（dialogue_log 聚合 + chat_message 统计，支持意图/来源/时间过滤与分页）、会话回放（对话轮次 + 决策链 + 处理记录三段结构，retrieval_context 默认脱敏）、操作审计（audit_log 分页查询）、RAG 质量聚合（响应来源/FAQ 命中/意图 TOP/低置信占比/决策延迟 P95，按天 date_trunc）、RAG 实时指标（进程内 Prometheus REGISTRY 直读）
+  - 4 个观测埋点：`lumio_rag_cache_ops_total`（检索缓存命中/未命中）、`lumio_rerank_degradation_total`（重排降级按原因）、`lumio_faq_match_total`（FAQ 命中分布）、`lumio_circuit_breaker_state`（熔断器状态 Gauge）
+  - web 前端三页：对话审计（列表+回放抽屉：气泡时间线/决策链/处理记录）、操作审计、RAG 指标看板（ECharts，新增依赖；指标卡 30s 轮询）
+  - Grafana 新增 `lumio-rag` 看板（14 面板）+ 4 条 RAG 告警（检索 P95/持续降级/FAQ 命中率/缓存命中率）；prometheus 增加 kb-service scrape target
+  - nginx 补 `/api/admin`、`/api/auth`、`/api/bot/chat`、`/api/chat-svc` 代理（与 dev 代理对齐的存量缺口）
+
 ### Changed
 - 修正文档中 LangGraph/LangChain 的错误声称，改为如实描述"asyncio + 规则路由"
 - 坐席辅助引擎收敛为单一编排路径（删除旧 AssistOrchestrator 双轨）

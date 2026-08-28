@@ -75,3 +75,55 @@ groups:
         annotations:
           summary: "会话超时事件激增"
           description: "近 5 分钟会话超时速率超过 1 次/秒，可能存在坐席/处理瓶颈。"
+
+  - name: lumio-rag
+    rules:
+      # 检索 p95 > 4s（bucket 阈值 4s 处的分位数，10 分钟窗口）
+      - alert: RAGRetrievalP95High
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum(rate(lumio_retrieval_duration_seconds_bucket[10m])) by (le, search_type)
+          ) > 4
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG 检索 p95 延迟偏高 ({{ $labels.search_type }})"
+          description: "{{ $labels.search_type }} 检索 p95 延迟超过 4 秒持续 10 分钟。"
+
+      # 系统持续降级（degradation_level >= 1）超过 5 分钟
+      - alert: RAGDegradationSustained
+        expr: max(lumio_degradation_level) >= 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "系统持续处于降级状态"
+          description: "降级等级 {{ $value }} 已持续 5 分钟以上（1=degraded, 2=fallback）。"
+
+      # FAQ 命中率跌破 50%（10 次以上检索的窗口内）
+      - alert: FAQHitRateDrop
+        expr: >-
+          sum(rate(lumio_faq_match_total{match_type!="miss"}[15m]))
+          /
+          clamp_min(sum(rate(lumio_faq_match_total[15m])), 1e-9) < 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FAQ 命中率跌破 50%"
+          description: "近 15 分钟 FAQ 精确+语义命中率低于 50%，检查知识库/FAQ 发布状态。"
+
+      # 检索缓存命中率低于 10%（说明缓存几乎不生效, 或查询模式极度分散）
+      - alert: RAGCacheHitRateLow
+        expr: >-
+          sum(rate(lumio_rag_cache_ops_total{result="hit"}[30m]))
+          /
+          clamp_min(sum(rate(lumio_rag_cache_ops_total[30m])), 1e-9) < 0.1
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "RAG 检索缓存命中率偏低"
+          description: "近 30 分钟检索缓存命中率不足 10%。"

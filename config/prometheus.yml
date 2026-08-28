@@ -29,6 +29,14 @@ scrape_configs:
       - targets: ["host.docker.internal:8090"]
     scrape_interval: 15s
 
+  # kb-service（独立 Python 部署，不在 compose 内；默认端口 8100，见 kb/config.py service_port。
+  # 部署端口不同时改这里。未启动时该 target 显示 down，不影响其余采集。）
+  - job_name: "kb-service"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8100"]
+    scrape_interval: 15s
+
   # ── 中间件 Exporter ──
   - job_name: "redis"
     static_configs:
