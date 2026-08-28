@@ -14,7 +14,6 @@ seed_knowledge.py 只创建 KbDocument 记录 (status=PENDING) 并上传到 MinI
 from __future__ import annotations
 
 import argparse
-import contextlib
 import logging
 import sys
 
@@ -63,7 +62,6 @@ def _embedding_provider(settings):
 
 
 def _fetch_minio_text(settings, object_key: str) -> str:
-    from io import BytesIO
     from minio import Minio
 
     client = Minio(
@@ -108,7 +106,6 @@ async def run(limit: int | None, dry_run: bool) -> None:
         return
 
     # 2. 组装下游依赖
-    import asyncio
 
     from lumio.services.common.ingestion import ingest_document
     from lumio.shared.models import DocumentMetadata
@@ -118,7 +115,6 @@ async def run(limit: int | None, dry_run: bool) -> None:
     milvus_collection = _connect_milvus(settings)
 
     from lumio.services.common.database import init_global_session_factory
-    from lumio.shared.models import DocumentMetadata
 
     factory = init_global_session_factory()
     async with factory() as db:

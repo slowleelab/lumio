@@ -593,7 +593,6 @@ class TestSearchVectorExtended:
         assert elapsed < 5, f"超时兜底未生效: {elapsed:.1f}s"
 
 
-
 class TestDateToEpoch:
     def test_valid(self):
         from lumio.services.common.retrieval import _date_to_epoch

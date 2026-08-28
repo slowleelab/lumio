@@ -99,10 +99,7 @@ async def rerank(req: RerankRequest) -> list[dict]:
     scores = [float(s) for s in scores]
     order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
     out_scores = [scores[i] for i in order] if req.raw_scores else _minmax([scores[i] for i in order])
-    return [
-        {"index": i, "score": round(s, 6), "text": req.texts[i]}
-        for i, s in zip(order, out_scores, strict=True)
-    ]
+    return [{"index": i, "score": round(s, 6), "text": req.texts[i]} for i, s in zip(order, out_scores, strict=True)]
 
 
 @app.get("/health")

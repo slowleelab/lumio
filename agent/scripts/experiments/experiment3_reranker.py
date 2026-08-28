@@ -54,10 +54,12 @@ def main() -> None:
         }
         print(f"  MRR={metrics['mrr']:.4f}, P@3={metrics['p@3']:.4f}, 延迟={metrics['avg_latency_ms']}ms")
 
-        results.append({
-            "params": {"Reranker": "开启" if rerank else "关闭"},
-            "metrics": metrics,
-        })
+        results.append(
+            {
+                "params": {"Reranker": "开启" if rerank else "关闭"},
+                "metrics": metrics,
+            }
+        )
 
     # 输出对比表
     table = format_results_table(results)

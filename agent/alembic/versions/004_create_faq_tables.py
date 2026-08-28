@@ -50,8 +50,11 @@ def upgrade() -> None:
     op.create_index("ix_kb_faq_approval_status", "kb_faq", ["approval_status"])
     op.create_index("ix_kb_fqa_published", "kb_faq", ["approval_status", "is_current_version", "is_deleted"])
     op.create_index(
-        "ix_kb_faq_current_version", "kb_faq", ["doc_group"],
-        unique=True, postgresql_where=sa.text("is_current_version = true AND is_deleted = false"),
+        "ix_kb_faq_current_version",
+        "kb_faq",
+        ["doc_group"],
+        unique=True,
+        postgresql_where=sa.text("is_current_version = true AND is_deleted = false"),
     )
 
     # kb_faq_search_log

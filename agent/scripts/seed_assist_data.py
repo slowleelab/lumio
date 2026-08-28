@@ -23,23 +23,23 @@ async def seed_scripts(db: AsyncSession) -> None:
 
     count = 0
     for s in _SEED_SCRIPTS:
-        exists = await db.execute(
-            select(ScriptTemplate).where(ScriptTemplate.script_id == s["script_id"])
-        )
+        exists = await db.execute(select(ScriptTemplate).where(ScriptTemplate.script_id == s["script_id"]))
         if exists.scalar_one_or_none():
             continue
-        db.add(ScriptTemplate(
-            script_id=s["script_id"],
-            category=s["category"],
-            tags=s.get("tags", []),
-            title=s.get("title", ""),
-            content=s["content"],
-            variables=s.get("variables", []),
-            priority=s.get("priority", 5),
-            status=ScriptStatus.ACTIVE,
-            version=1,
-            created_by="seed",
-        ))
+        db.add(
+            ScriptTemplate(
+                script_id=s["script_id"],
+                category=s["category"],
+                tags=s.get("tags", []),
+                title=s.get("title", ""),
+                content=s["content"],
+                variables=s.get("variables", []),
+                priority=s.get("priority", 5),
+                status=ScriptStatus.ACTIVE,
+                version=1,
+                created_by="seed",
+            )
+        )
         count += 1
     await db.commit()
     print(f"Seeded {count} scripts ({len(_SEED_SCRIPTS)} total, {len(_SEED_SCRIPTS) - count} skipped)")
@@ -51,22 +51,22 @@ async def seed_rules(db: AsyncSession) -> None:
 
     count = 0
     for r in _SEED_RULES:
-        exists = await db.execute(
-            select(AlertRule).where(AlertRule.rule_id == r["rule_id"])
-        )
+        exists = await db.execute(select(AlertRule).where(AlertRule.rule_id == r["rule_id"]))
         if exists.scalar_one_or_none():
             continue
-        db.add(AlertRule(
-            rule_id=r["rule_id"],
-            category=AlertRuleCategory[r["category"].upper()],
-            level=AlertRuleLevel[r["level"].upper()],
-            pattern=r["pattern"],
-            message=r["message"],
-            suggestion=r.get("suggestion", ""),
-            priority=r.get("priority", 5),
-            status=ScriptStatus.ACTIVE,
-            created_by="seed",
-        ))
+        db.add(
+            AlertRule(
+                rule_id=r["rule_id"],
+                category=AlertRuleCategory[r["category"].upper()],
+                level=AlertRuleLevel[r["level"].upper()],
+                pattern=r["pattern"],
+                message=r["message"],
+                suggestion=r.get("suggestion", ""),
+                priority=r.get("priority", 5),
+                status=ScriptStatus.ACTIVE,
+                created_by="seed",
+            )
+        )
         count += 1
     await db.commit()
     print(f"Seeded {count} alert rules ({len(_SEED_RULES)} total, {len(_SEED_RULES) - count} skipped)")

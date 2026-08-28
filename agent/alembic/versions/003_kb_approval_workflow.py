@@ -60,7 +60,12 @@ def upgrade() -> None:
     op.create_table(
         "kb_document_approval",
         sa.Column("id", sa.Uuid(native_uuid=False), primary_key=True),
-        sa.Column("document_id", sa.Uuid(native_uuid=False), sa.ForeignKey("kb_document.id", ondelete="CASCADE"), nullable=False),
+        sa.Column(
+            "document_id",
+            sa.Uuid(native_uuid=False),
+            sa.ForeignKey("kb_document.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("action", sa.String(32), nullable=False),
         sa.Column("from_status", sa.String(32), nullable=True),
         sa.Column("to_status", sa.String(32), nullable=False),

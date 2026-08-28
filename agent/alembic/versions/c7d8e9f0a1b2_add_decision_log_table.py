@@ -10,6 +10,7 @@ Create Date: 2026-08-04 12:00:00.000000
 
 D2 GDPR 删除: customer_id 索引用于批量删除 + decision_id 索引用于单条回溯.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence

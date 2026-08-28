@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -82,10 +83,8 @@ class FeedbackDrainer:
     async def stop(self) -> None:
         self._running = False
         if self._producer:
-            try:
+            with contextlib.suppress(Exception):
                 await self._producer.stop()
-            except Exception:
-                pass
 
     async def drain_once(self, batch_size: int = 100) -> int:
         """单次 drain: 从 Redis Stream 拉取 → 推 Kafka → ACK."""
@@ -94,15 +93,13 @@ class FeedbackDrainer:
             return 0
 
         # 1. 创建 consumer group (一次性)
-        try:
+        with contextlib.suppress(Exception):  # group 已存在
             await redis.xgroup_create(
                 FEEDBACK_STREAM_KEY,
                 FEEDBACK_CONSUMER_GROUP,
                 id="0",
                 mkstream=True,
             )
-        except Exception:
-            pass  # group 已存在
 
         # 2. 读取消息
         try:
@@ -190,6 +187,7 @@ class FeedbackDrainer:
 
 
 # ── bad case 标记器 (坐席端) ──
+
 
 class BadCaseMarker:
     """坐席标记差评案例 → 入 Golden Set 候选池."""

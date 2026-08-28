@@ -39,8 +39,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("ALTER TABLE kb_document ALTER COLUMN approval_status DROP DEFAULT")
     op.execute(
-        "ALTER TABLE kb_document ALTER COLUMN approval_status TYPE character varying(32) "
-        "USING approval_status::text"
+        "ALTER TABLE kb_document ALTER COLUMN approval_status TYPE character varying(32) " "USING approval_status::text"
     )
     op.execute("ALTER TABLE kb_document ALTER COLUMN approval_status SET DEFAULT 'DRAFT'")
     op.execute("DROP TYPE kb_approval_status")

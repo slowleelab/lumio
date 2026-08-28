@@ -43,12 +43,14 @@ def check_model_available(model_name: str = "qwen2.5:7b") -> bool:
 def test_openai_api() -> bool:
     """测试 OpenAI 兼容 API"""
     try:
-        payload = json.dumps({
-            "model": "qwen2.5:7b",
-            "messages": [{"role": "user", "content": "你好，请用一句话介绍自己"}],
-            "max_tokens": 100,
-            "temperature": 0.1,
-        }).encode("utf-8")
+        payload = json.dumps(
+            {
+                "model": "qwen2.5:7b",
+                "messages": [{"role": "user", "content": "你好，请用一句话介绍自己"}],
+                "max_tokens": 100,
+                "temperature": 0.1,
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(
             "http://localhost:11434/v1/chat/completions",

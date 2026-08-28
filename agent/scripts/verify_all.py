@@ -6,6 +6,7 @@
     poetry run python scripts/verify_all.py
 """
 
+import contextlib
 import os
 import sys
 
@@ -47,6 +48,7 @@ def check_redis() -> tuple[bool, str]:
     """检查 Redis"""
     try:
         import redis
+
         r = redis.Redis(host="localhost", port=6379, decode_responses=True)
         r.ping()
         info = r.info("server")
@@ -60,6 +62,7 @@ def check_elasticsearch() -> tuple[bool, str]:
     """检查 Elasticsearch"""
     try:
         from elasticsearch import Elasticsearch
+
         es = Elasticsearch(["http://localhost:9200"])
         info = es.info()
         es.close()
@@ -72,6 +75,7 @@ def check_milvus() -> tuple[bool, str]:
     """检查 Milvus"""
     try:
         from pymilvus import connections, utility
+
         connections.connect(host="localhost", port="19530")
         version = utility.get_server_version()
         connections.disconnect("default")
@@ -108,10 +112,9 @@ def check_kafka() -> tuple[bool, str]:
             consumer = AIOKafkaConsumer(bootstrap_servers="localhost:9094")
             await consumer.start()
             topics = await consumer.topics()
-            try:
+            # aiokafka stop 时可能抛 CancelledError，不影响连通性判断
+            with contextlib.suppress(Exception):
                 await consumer.stop()
-            except Exception:
-                pass  # aiokafka stop 时可能抛 CancelledError，不影响连通性判断
             return len(topics)
 
         count = asyncio.run(_check())
@@ -125,6 +128,7 @@ def check_ollama() -> tuple[bool, str]:
     try:
         import json
         import urllib.request
+
         req = urllib.request.Request("http://localhost:11434/api/tags")
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
