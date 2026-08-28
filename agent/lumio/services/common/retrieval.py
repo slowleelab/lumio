@@ -351,7 +351,12 @@ async def search_vector(
                 metadata: dict[str, Any] = {}
                 for field_name in output_fields:
                     if field_name not in ("chunk_id", "content", "doc_id") and entity.get(field_name) is not None:
-                        metadata[field_name] = entity.get(field_name)
+                        value = entity.get(field_name)
+                        # Milvus ARRAY 字段(keywords)返回 protobuf RepeatedScalarContainer,
+                        # 原样落 metadata 会让响应模型 JSON 序列化失败 (PydanticSerializationError)
+                        metadata[field_name] = (
+                            list(value) if not isinstance(value, (str, int, float, bool, bytes)) else value
+                        )
                 if parent_chunk_id and parent_chunk_id in parent_contents:
                     metadata["parent_content"] = parent_contents[parent_chunk_id]
 
