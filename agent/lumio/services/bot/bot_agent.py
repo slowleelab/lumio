@@ -305,6 +305,54 @@ class LumioAgent:
                 except Exception as exc:
                     logger.debug("告别结束会话失败 (不阻断回复): session=%s err=%s", session_id, exc)
             return self._build_result(session_id, user_input, FAREWELL_RESPONSE, "template", "chitchat")
+        # ── FAQ 三路匹配优先 (精确 Redis / 语义 Milvus faq_qa) ──
+        # 命中直接返回标准答案, 免意图分类/检索/LLM; 检索日志落 kb_faq_search_log
+        # (控制台 FAQ 命中率指标数据源)。此前客户链路从不调 search_faq, 发布的
+        # FAQ 实际不参与应答 (语义索引写入也是桩函数, 一并修复)。
+        # 位置: 危机/护栏/问候告别之后、意图分类之前 —— 业务域问题 (如积分有效期)
+        # 会被路由进工具编排, 埋在 _retrieve 内永远走不到。
+        try:
+            from lumio.services.common.faq_service import get_faq, search_faq
+
+            session_manager = self._session_manager
+            faq_embedding = (
+                self._embedding_breaker.provider
+                if self._embedding_breaker and self._embedding_breaker.is_available
+                else None
+            )
+            faq_res = await search_faq(
+                query=user_input,
+                redis_client=session_manager._redis if session_manager else None,
+                embedding_provider=faq_embedding,
+                milvus_collection=self._milvus_collection,
+                user_role="customer",
+                session_factory=(
+                    session_manager._resolve_factory()
+                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                    else None
+                ),
+                session_id=session_id,
+            )
+            if faq_res["match_type"] in ("exact", "semantic") and faq_res["results"]:
+                top = faq_res["results"][0]
+                answer = top.get("answer")
+                if not answer and top.get("faq_id"):
+                    from lumio.services.common.faq_service import get_faq
+
+                    faq_sf = (
+                        session_manager._resolve_factory()
+                        if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                        else None
+                    )
+                    # chunk_id 带变体序号后缀 (faqid#0), 回查前剥离取真实 FAQ UUID
+                    real_id = top["faq_id"].split("#", 1)[0]
+                    detail = await get_faq(faq_sf, real_id) if faq_sf else None
+                    answer = detail.get("answer") if detail else None
+                if answer:
+                    logger.info("FAQ 短路命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
+                    return self._build_result(session_id, user_input, answer, "faq", "faq")
+        except Exception as faq_err:
+            logger.warning("FAQ 优先匹配失败, 走常规流程: %s", faq_err)
 
         try:
             # 闭环 P1 感知缝: 提供会话/客户归属 (采样器被动读取, 业务不感知采样逻辑)
@@ -1861,6 +1909,7 @@ class LumioAgent:
                 if self._embedding_breaker and self._embedding_breaker.is_available
                 else None
             )
+
             resp: RetrieveResponse = await do_retrieve(
                 request=RetrieveRequest(query=query, top_k=settings.rag.top_k, rerank=True),
                 es_client=self._es_client,

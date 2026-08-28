@@ -175,7 +175,7 @@ const statCards = computed(() => {
     {
       label: "检索缓存命中",
       value: fmtPct(cacheRate),
-      sub: `hit ${fmtInt(hit)} / miss ${fmtInt(miss)}`,
+      sub: `hit ${fmtInt(hit)} / miss ${fmtInt(miss)}（进程启动后累计）`,
     },
     {
       label: "低置信占比",

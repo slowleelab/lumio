@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -224,8 +225,10 @@ async def update_faq(
 async def delete_faq(
     session_factory: async_sessionmaker[AsyncSession],
     faq_id: str,
+    redis_client: aioredis.Redis | None = None,
+    milvus_collection: Any = None,
 ) -> bool:
-    """软删除 FAQ"""
+    """软删除 FAQ (同时清精确缓存 + 删语义向量, 防删除后仍被命中)"""
     async with session_factory() as session:
         result = await session.execute(select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id)))
         faq = result.scalar_one_or_none()
@@ -235,6 +238,8 @@ async def delete_faq(
         faq.is_current_version = False
         faq.approval_status = "ARCHIVED"
         await session.commit()
+    await _remove_faq_from_cache(faq, redis_client)
+    await _remove_faq_vectors(milvus_collection, faq.doc_group or str(faq.id))
     return True
 
 
@@ -263,6 +268,8 @@ async def transition_faq_approval(
     actor_role: str,
     comment: str = "",
     redis_client: aioredis.Redis | None = None,
+    embedding_provider: Any = None,
+    milvus_collection: Any = None,
 ) -> dict:
     """执行 FAQ 审批状态转换"""
     async with session_factory() as session:
@@ -300,15 +307,16 @@ async def transition_faq_approval(
 
             faq.is_current_version = True
 
-            # 写入 ES + Milvus 索引
-            await _index_faq_to_search(faq, redis_client)
+            # 写入 Milvus 语义索引 (chunk_type=faq_qa)
+            await _index_faq_to_search(faq, redis_client, embedding_provider, milvus_collection)
 
             # 预热精确匹配缓存
             await _warm_exact_match_cache(faq, redis_client)
 
-        # 下线时: 清除缓存 + 删除索引
+        # 下线时: 清除缓存 + 删除语义向量
         if target_status in ("SUPERSEDED", "ARCHIVED"):
             await _remove_faq_from_cache(faq, redis_client)
+            await _remove_faq_vectors(milvus_collection, faq.doc_group or str(faq.id))
 
         await session.commit()
 
@@ -371,6 +379,7 @@ async def search_faq(
     user_role: str | None = None,
     card_type: str | None = None,
     top_k: int = 5,
+    min_score: float = 0.75,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     session_id: str | None = None,
 ) -> dict:
@@ -411,18 +420,20 @@ async def search_faq(
                 anns_field="embedding",
                 param={"metric_type": "COSINE", "params": {"nprobe": 16}},
                 limit=top_k * 2,
-                expr='chunk_type == "faq_qa" and approval_status == "PUBLISHED" and is_current_version == true',
-                output_fields=["chunk_id", "content", "category", "card_types", "keywords"],
+                expr='chunk_type == "faq_qa" and approval_status == "PUBLISHED" and is_current_version == "true"',
+                output_fields=["chunk_id", "content", "category", "card_type", "keywords"],
             )
 
             faq_results = []
             for hit in results[0]:
                 entity = hit.entity
                 # 卡种过滤
-                card_types = entity.get("card_types", "")
+                card_types = entity.get("card_type", "")
                 if card_type and card_types and card_type not in card_types:
                     continue
 
+                if hit.score < min_score:
+                    continue  # 低分 nearest 不是"命中", 闲聊/离题必须放行走常规流程
                 faq_results.append(
                     {
                         "faq_id": entity.get("chunk_id", ""),
@@ -436,11 +447,13 @@ async def search_faq(
                     break
 
             if faq_results:
+                # chunk_id 可能带变体序号后缀 (faqid#0), 落库前剥离取真实 FAQ UUID
+                faq_uuid = faq_results[0]["faq_id"].split("#", 1)[0]
                 await _log_search(
                     session_factory,
                     query,
                     "semantic",
-                    faq_results[0]["faq_id"],
+                    faq_uuid,
                     faq_results[0]["score"],
                     user_role,
                     session_id,
@@ -457,33 +470,77 @@ async def search_faq(
 # ── 索引 ──
 
 
-async def _index_faq_to_search(faq: KbFaq, redis_client: aioredis.Redis | None) -> None:
-    """将已发布 FAQ 索引到 ES + Milvus（发布时调用）
+async def _index_faq_to_search(
+    faq: KbFaq,
+    redis_client: aioredis.Redis | None,
+    embedding_provider: Any = None,
+    milvus_collection: Any = None,
+) -> int:
+    """将已发布 FAQ 写入 Milvus (chunk_type=faq_qa)，供 search_faq 语义匹配。
 
-    FAQ 不走分块管道，直接将 question + variants 作为独立条目写入索引。
+    FAQ 不走分块管道：question + 每条 variant 各成一条向量，answer 经 PG 回查。
+    此前是只打日志的桩函数 —— 发布后语义检索无数据、FAQ 命中率指标恒空
+    (2026-08-29 修复)。失败不阻断发布主流程，返回实际写入条数。
     """
+    all_questions = [faq.question, *(faq.variant_questions or [])]
+    if not embedding_provider or not milvus_collection:
+        logger.warning(
+            "FAQ 索引缺依赖 (embedding=%s milvus=%s), 仅预热精确缓存: id=%s",
+            embedding_provider is not None,
+            milvus_collection is not None,
+            faq.id,
+        )
+        return 0
 
-    # 构建索引文档
-    all_questions = [faq.question, *faq.variant_questions]
-    for q in all_questions:
-        {
-            "chunk_id": str(faq.id),
-            "doc_id": faq.doc_group or str(faq.id),
-            "content": q,
-            "answer": faq.answer,
-            "category": faq.category,
-            "card_types": ",".join(faq.card_types) if faq.card_types else "",
-            "keywords": ",".join(faq.keywords) if faq.keywords else "",
-            "chunk_type": "faq_qa",
-            "approval_status": "PUBLISHED",
-            "is_current_version": True,
-            "effective_date": faq.effective_date.isoformat() if faq.effective_date else "",
-            "expiry_date": faq.expiry_date.isoformat() if faq.expiry_date else "",
-        }
+    doc_group = faq.doc_group or str(faq.id)
 
-    # 注意: 实际 ES + Milvus 写入需要 embedding_provider 和 es_client
-    # 这里仅记录日志，实际索引在发布 API 中通过依赖注入完成
-    logger.info("FAQ 索引就绪: id=%s question=%s variants=%d", faq.id, faq.question[:50], len(faq.variant_questions))
+    def _sync_write(rows: list[dict]) -> None:
+        # 同组旧向量先清 (改版重发布防重复命中)
+        milvus_collection.delete(expr=f'doc_id == "{doc_group}"')
+        milvus_collection.insert(rows)
+
+    try:
+        rows = []
+        for i, q in enumerate(all_questions):
+            emb = await embedding_provider.embed_query(q)
+            rows.append(
+                {
+                    "chunk_id": f"{faq.id}#{i}",
+                    "doc_id": doc_group,
+                    "content": q,
+                    "embedding": emb,
+                    "category": faq.category,
+                    "doc_type": "faq",
+                    "keywords": list(faq.keywords or []),
+                    "card_type": ",".join(faq.card_types or []),
+                    "customer_tier": "",
+                    "security_level": "internal",
+                    "effective_date": 0,
+                    "expiry_date": 0,
+                    "chunk_type": "faq_qa",
+                    "parent_chunk_id": "",
+                    "approval_status": "PUBLISHED",
+                    "is_current_version": "true",
+                }
+            )
+        await asyncio.to_thread(_sync_write, rows)
+        logger.info("FAQ 索引写入 Milvus: id=%s 条数=%d", faq.id, len(rows))
+        return len(rows)
+    except Exception:
+        logger.exception("FAQ 索引写入失败 (不阻断发布): id=%s", faq.id)
+        return 0
+
+
+async def _remove_faq_vectors(milvus_collection: Any, doc_group: str) -> int:
+    """下线 (归档/被替代) 时清理该 FAQ 组的语义向量"""
+    if not milvus_collection:
+        return 0
+    try:
+        await asyncio.to_thread(milvus_collection.delete, expr=f'doc_id == "{doc_group}"')
+        return 1
+    except Exception:
+        logger.warning("FAQ 向量清理失败: doc_group=%s", doc_group)
+        return 0
 
 
 async def _warm_exact_match_cache(faq: KbFaq, redis_client: aioredis.Redis | None) -> None:
