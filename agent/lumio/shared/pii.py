@@ -63,7 +63,7 @@ def mask_sensitive_fields(text: str) -> str:
 def mask_pii(text: str) -> str:
     """一键脱敏所有已知 PII 类型
 
-    按顺序: 敏感字段 → 邮箱 → 身份证 → 银行卡 → 手机号
+    按顺序: 敏感字段 -> 邮箱 -> 身份证 -> 银行卡 -> 手机号
     （身份证/银行卡优先于手机号，避免 11 位数字被误判为手机号）
     """
     if not text:
@@ -74,3 +74,17 @@ def mask_pii(text: str) -> str:
     result = mask_bank_card(result)
     result = mask_phone(result)
     return result
+
+
+def pan_to_tail(value: str) -> str:
+    """把完整卡号(PAN)折叠为尾四位 (P1a, 会话 1fb54681 复盘: PAN 落库/入池).
+
+    实体池/槽位/对话消息里的明文 PAN 是 PCI 合规隐患 -- 明文全号只允许出现在
+    内存中的当次工具调用参数里, 任何持久化(Redis 历史/meta/PG 审计)一律折叠。
+    非 12-19 位数字原样返回(卡尾/短值不受影响); 不足 4 位取全值。
+    """
+    text = re.sub(r"[\s\- ]", "", (value or ""))
+    if not text.isdigit() or not (12 <= len(text) <= 19):
+        return value or ""
+    tail = text[-4:]
+    return f"****{tail}"

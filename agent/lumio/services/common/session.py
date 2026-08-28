@@ -32,6 +32,7 @@ from lumio.shared.models import (
     normalize_intent,
     validate_transition,
 )
+from lumio.shared.pii import mask_bank_card, pan_to_tail
 
 logger = setup_logger(__name__)
 
@@ -111,6 +112,26 @@ return cjson.encode({ok = true, new_version = current.version})
 # 增量合并字段（Python 侧处理，Lua 侧不感知）
 _INCREMENTAL_FIELDS = {"intent_stack", "entity_pool"}
 _ONE_WAY_GATE_FIELDS = {"suppress_flag"}
+
+
+def _mask_turn_pan(turn: DialogueTurn) -> DialogueTurn:
+    """返回脱敏后的轮次深拷贝 (P1a): 消息文本 PAN 掩码 + CARD_NUMBER 实体折叠尾四位.
+
+    明文全号只允许存在于内存中的当次工具调用参数; Redis 历史 / 实体池 / PG 审计
+    一律只见掩码 (会话 1fb54681 复盘: "1234567890000000" 明文进了三层持久化)。
+    """
+    masked = turn.model_copy(deep=True)
+    masked.content = mask_bank_card(turn.content)
+    if turn.entities:
+        masked.entities = [
+            (
+                e.model_copy(update={"value": pan_to_tail(e.value)})
+                if str(getattr(e, "entity_type", "") or "").strip().lower() in ("card_number", "cardnumber")
+                else e
+            )
+            for e in turn.entities
+        ]
+    return masked
 
 
 class SessionManager:
@@ -277,6 +298,7 @@ class SessionManager:
             last_intent=normalize_intent(meta["last_intent"]) if meta.get("last_intent") else None,
             last_entities=[Entity(**e) for e in _as_list(meta.get("last_entities"))],
             slot_values=_load_slot_values(meta.get("slot_values")),
+            awaiting_slots=meta.get("awaiting_slots") or {},
             confidence_history=[float(x) for x in _as_list(meta.get("confidence_history"))],
             low_confidence_streak=meta.get("low_confidence_streak", 0),
             human_request_score=meta.get("human_request_score", 0),
@@ -325,6 +347,11 @@ class SessionManager:
         state = await self.get_session(session_id)
         if state is None:
             raise SessionNotFoundError(session_id)
+
+        # P1a PAN 落库脱敏 (会话 1fb54681 复盘: 16 位明文卡号进了 Redis 历史 + 实体池 + PG 审计):
+        # 任何持久化点只存尾四位掩码, 明文全号仅允许存活于内存中的当次工具调用参数。
+        # 深拷贝脱敏副本落库, 不修改调用方持有的原始 turn (router 后续仍读原始值做转人工桥接)。
+        turn = _mask_turn_pan(turn)
 
         # 追加对话历史到 Redis List
         turn_json = turn.model_dump_json()
@@ -727,6 +754,7 @@ class SessionManager:
             "last_intent": state.last_intent.value if state.last_intent else None,
             "last_entities": [e.model_dump() for e in state.last_entities],
             "slot_values": {k: v.model_dump() for k, v in state.slot_values.items()},
+            "awaiting_slots": state.awaiting_slots,
             "confidence_history": state.confidence_history,
             "low_confidence_streak": state.low_confidence_streak,
             "human_request_score": state.human_request_score,

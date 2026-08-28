@@ -1121,3 +1121,63 @@ async def test_save_meta_pending_none_serializes_null() -> None:
 
     await manager._save_meta(state)
     assert captured["meta"]["pending_action"] is None
+
+
+@pytest.mark.asyncio
+async def test_add_turn_masks_pan_in_persisted_history() -> None:
+    """P1a: 落库轮次里明文 PAN 必须掩码、实体只留尾四位 (会话 1fb54681 复盘).
+
+    客户贴 16 位卡号后, Redis 历史 + 实体池 + PG 审计三层都不得出现明文全号;
+    明文只允许存活于内存中的当次工具调用参数。
+    """
+    from lumio.shared.models import Entity
+
+    redis = _mock_redis()
+    manager = SessionManager(redis)
+    state = await manager.create_session()
+
+    meta = json.dumps(
+        {
+            "session_id": state.session_id,
+            "customer_id": None,
+            "channel_type": "web",
+            "current_phase": "bot",
+            "sub_phase": "bot:active",
+            "end_reason": None,
+            "vip_level": "普通",
+            "card_types": [],
+            "risk_tolerance": "R2",
+            "turn_count": 0,
+            "last_intent": None,
+            "last_entities": [],
+            "confidence_history": [],
+            "low_confidence_streak": 0,
+            "human_request_score": 0,
+            "agent_id": None,
+            "transfer_reason": None,
+            "transfer_summary": None,
+            "created_at": datetime.now().isoformat(),
+            "last_active_at": datetime.now().isoformat(),
+            "version": 1,
+        },
+        ensure_ascii=False,
+    )
+    redis.get = AsyncMock(return_value=meta)
+    redis.lrange = AsyncMock(return_value=[])
+
+    pan = "6225880012346780"
+    turn = _make_turn(state.session_id, speaker="customer", content=f"我的卡号是{pan}，帮我查一下", turn_id="t-pan")
+    turn.entities = [Entity(entity_type="CARD_NUMBER", value=pan)]
+
+    updated = await manager.add_turn(state.session_id, turn)
+
+    persisted = redis.rpush.call_args.args[1]
+    assert pan not in persisted
+    assert "6225****6780" in persisted  # 消息文本掩码 (前4后4)
+    assert "****6780" in persisted  # 实体值折叠尾四位
+    # 会话态实体池同样只见尾四位
+    assert all(e.value != pan for e in updated.last_entities)
+    assert any(e.value == "****6780" for e in updated.last_entities)
+    # 调用方原始 turn 不被修改 (router 后续仍读原始值做转人工桥接)
+    assert turn.content == f"我的卡号是{pan}，帮我查一下"
+    assert turn.entities[0].value == pan
