@@ -119,6 +119,25 @@ def _check_middleware_ready() -> bool:
 # ── Fixtures ──
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _clear_tool_quota() -> None:
+    """清理 Redis 里的工具配额计数 (ToolQuotaGuard 持久化在 Redis, 跨运行累积).
+
+    工具配额 key ``lumio:tool:quota:*`` 带 1 小时 TTL, 反复跑测试会把计数累积超限,
+    导致 tool_executor 的"非敏感工具执行"测试被配额误拒。会话级清一次即可。
+    """
+    try:
+        import redis as redis_sync
+
+        client = redis_sync.Redis(host="127.0.0.1", port=6379, decode_responses=True)
+        keys = client.keys("lumio:tool:quota:*")
+        if keys:
+            client.delete(*keys)
+        client.close()
+    except Exception:
+        pass  # Redis 不可达/无 key 时静默跳过, 不影响测试
+
+
 @pytest.fixture(scope="session")
 def bot_server():
     """Session-scoped: 启动机器人服务 uvicorn 子进程"""

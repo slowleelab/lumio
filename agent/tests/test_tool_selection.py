@@ -74,17 +74,32 @@ class TestSelectToolsForIntent:
 
 
 class TestToolIntents:
-    def test_tool_intents_are_five_query_intents(self) -> None:
-        expected = frozenset(
+    def test_tool_intents_are_four_query_intents(self) -> None:
+        """工具编排白名单 = 4 个查询类 (旧 flat 别名 + 主名双世界, 归一化后集合为 4 类).
+
+        会话 48882b05 决策: 分期(INST_PARAM_QUERY/INSTALLMENT_INQUIRY)移出 —— 裸"分期"
+        是歧义输入, 走知识问答给分期介绍, 不再被工具编排反问参数。
+        """
+        from lumio.shared.models import normalize_intent
+
+        expected_canonical = frozenset(
             {
-                IntentLabel.BILL_QUERY,
-                IntentLabel.TRANSACTION_QUERY,
+                IntentLabel.ACCOUNT_BILL_QUERY,
+                IntentLabel.TXN_QUERY,
                 IntentLabel.LIMIT_QUERY,
-                IntentLabel.INSTALLMENT_INQUIRY,
-                IntentLabel.REWARD_QUERY,
+                IntentLabel.POINTS_BALANCE_QUERY,
             }
         )
-        assert expected == TOOL_INTENTS
+        normalized = frozenset(normalize_intent(i.value) for i in TOOL_INTENTS)
+        assert expected_canonical == normalized
+        # 旧别名与主名都在白名单里 (分类器批 2 重训前输出旧值, 之后输出主名)
+        assert IntentLabel.BILL_QUERY in TOOL_INTENTS
+        assert IntentLabel.ACCOUNT_BILL_QUERY in TOOL_INTENTS
+
+    def test_installment_intents_excluded(self) -> None:
+        """分期意图不再触发工具编排拦截 (会话 48882b05)"""
+        assert IntentLabel.INSTALLMENT_INQUIRY not in TOOL_INTENTS
+        assert IntentLabel.INST_PARAM_QUERY not in TOOL_INTENTS
 
     def test_transfer_intents_excluded(self) -> None:
         assert IntentLabel.CARD_LOSS not in TOOL_INTENTS

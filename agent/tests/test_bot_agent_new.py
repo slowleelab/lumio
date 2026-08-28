@@ -10,6 +10,7 @@ import pytest
 from lumio.services.bot.bot_agent import (
     _TRANSFER_OFFER_PROMPT,
     LumioAgent,
+    _asks_for_parameters,
     _has_grounding,
     _is_farewell,
     _is_greeting,
@@ -21,7 +22,7 @@ from lumio.services.bot.input_guard import (
     ROLE_OVERRIDE_RESPONSE,
     THIRD_PARTY_QUERY_RESPONSE,
 )
-from lumio.services.bot.prompts import CLARIFY_RESPONSE
+from lumio.services.bot.prompts import CLARIFY_RESPONSE, CLARIFY_RESPONSES
 from lumio.shared.models import (
     Entity,
     IntentLabel,
@@ -552,16 +553,19 @@ class TestProgressiveDisclosureRouting:
         assert result["response_source"] == "tool"
 
     @pytest.mark.asyncio
-    async def test_flag_off_keeps_knowledge_routing(self, mock_deps: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-        """开关关闭 → 不进入工具编排，BILL_QUERY 仍走 knowledge/RAG（路由同现状）"""
+    async def test_flag_off_queries_still_reach_tools_via_business(
+        self, mock_deps: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """开关关闭 → 无渐进披露, 但查询类已翻 business 主路径 (draft-0.3 §4.2):
+        工具可用时仍走 business 路径的工具编排; 无工具时才落 RAG 兜底。"""
         self._patch_flag(monkeypatch, False)
         te = self._tool_executor()
         agent = LumioAgent(**mock_deps, tool_executor=te)
 
         result = await agent.run("s1", "帮我查账单")
 
-        te.run_conversation.assert_not_awaited()
-        assert result["response"] == "RAG 知识回复"
+        te.run_conversation.assert_awaited_once()
+        assert result["response"] == "您本期账单 8650 元"
 
     @pytest.mark.asyncio
     async def test_tool_failure_falls_back_to_knowledge(self, mock_deps: dict, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1325,13 +1329,13 @@ class TestTransferOfferFlow:
         agent._clear_pending_action.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_transfer_offer_unclear_no_dispatch(self) -> None:
-        """未明确回复 (不回是/否) → 不派真人, 清除邀请避免困住客户, 提示如何转."""
+    async def test_transfer_offer_unclear_releases_for_normal_flow(self) -> None:
+        """未明确回复的无关输入 → 不派真人, 清邀请并放行正常流程 (会话 956a5fd2 复盘:
+        "办理账单f分期"曾被过期邀约吞掉只回超时模板, 真实业务根本没进分类器)."""
         pending = self._make_offer_pending()
         agent = self._make_agent(pending)
         result = await agent._handle_transfer_offer("s1", "我还有别的问题", agent._state)
-        assert result["should_transfer"] in (False, None)
-        assert "回复“转人工”" in result["response"]
+        assert result == {"pending_released": True}
         agent._clear_pending_action.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1413,7 +1417,8 @@ class TestTransferOfferFlow:
         """streak 未到阈值仍是普通澄清, 不挂邀请."""
         agent, save_pending = self._make_stuck_agent(streak=2)
         result = await agent.run("s1", "fe")
-        assert result["response"] == CLARIFY_RESPONSE
+        # 澄清话术按 streak 轮换 (会话 bcf51ded 生硬话术复盘), 断言落在澄清库内即可
+        assert result["response"] in (*CLARIFY_RESPONSES, CLARIFY_RESPONSE)
         save_pending.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1421,7 +1426,7 @@ class TestTransferOfferFlow:
         """streak 已越过阈值不再重复邀请 (越线轮只邀请一次, 不刷屏)."""
         agent, save_pending = self._make_stuck_agent(streak=7)
         result = await agent.run("s1", "fe")
-        assert result["response"] == CLARIFY_RESPONSE
+        assert result["response"] in (*CLARIFY_RESPONSES, CLARIFY_RESPONSE)
         save_pending.assert_not_awaited()
 
 
@@ -1947,3 +1952,34 @@ class TestFallbackConfidenceAccounting:
         assert result["response_source"] == "llm"
         assert result["intent"].primary_intent == IntentLabel.CHITCHAT
         assert result["intent"].primary_confidence == 0.9
+
+
+class TestAsksForParameters:
+    """参数索取话术识别 (会话 48882b05: LLM 说"请告诉我", 等待快照没落上)"""
+
+    def test_colloquial_tell_me_verb(self) -> None:
+        # 会话 48882b05 第二轮工具编排的真实回复措辞
+        content = (
+            "好的，您想了解关于信用卡分期的相关信息吗？请告诉我更多细节，"
+            "例如您希望分几期？3、6 还是 12 期？或者您有具体的卡号后四位吗？"
+        )
+        assert _asks_for_parameters(content) is True
+
+    def test_qing_wen_with_period_noun(self) -> None:
+        assert _asks_for_parameters("请问您希望分几期？") is True
+
+    def test_qing_wen_with_month_noun(self) -> None:
+        assert _asks_for_parameters("请问您要查哪个月的账单？") is True
+
+    def test_classic_provide_verb_regression(self) -> None:
+        assert _asks_for_parameters("请提供您信用卡的后四位以便验证身份") is True
+
+    def test_statement_without_verb_not_matched(self) -> None:
+        # 陈述式回答 (含参数名词但无索取动词) 不算索取
+        assert _asks_for_parameters("分期的期数有 3、6、12 期，卡号后四位用于验证。") is False
+
+    def test_verb_without_param_noun_not_matched(self) -> None:
+        assert _asks_for_parameters("请提供一下您的宝贵意见") is False
+
+    def test_empty_content(self) -> None:
+        assert _asks_for_parameters("") is False

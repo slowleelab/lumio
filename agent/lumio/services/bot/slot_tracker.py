@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from lumio.shared.models import IntentLabel, SlotValue
+from lumio.shared.models import IntentLabel, SlotValue, normalize_intent
 
 # ── 槽位定义 ──
 
@@ -30,8 +30,11 @@ class SlotDef:
     ask_prompt: str = ""  # 追问话术模板
 
 
-# 各意图的槽位定义
+# 各意图的槽位定义 (draft-0.3 主表槽位清单)。键为**主名** (for_intent 入口归一化,
+# 旧 flat 值自动落到主名); 已启用意图沿用旧 schema 保行为不变, 新增意图按主表登记。
+# 咨询类槽位 optional(不问断追问), 办理/申请类必填槽 required(缺口驱动追问)。
 _INTENT_SLOTS: dict[IntentLabel, list[SlotDef]] = {
+    # 旧 flat 键 (兼容直接字典访问的存量调用; for_intent 不再经由这些键)
     IntentLabel.INSTALLMENT_INQUIRY: [
         SlotDef("amount", "分期金额", True, "请问您想分期的金额是多少？"),
         SlotDef("period", "分期期数", True, "您希望分几期？"),
@@ -56,6 +59,56 @@ _INTENT_SLOTS: dict[IntentLabel, list[SlotDef]] = {
     ],
     IntentLabel.REWARD_QUERY: [
         SlotDef("card_type", "卡种", False, "请问您持有的是哪种卡？"),
+    ],
+    # ── draft-0.3 主名键 ──
+    IntentLabel.ACCOUNT_BILL_QUERY: [
+        SlotDef("period", "账单周期", False, "请问您要查哪个月的账单？"),
+        SlotDef("card_type", "卡种", False, "请问您持有的是哪种卡？"),
+    ],
+    IntentLabel.TXN_QUERY: [
+        SlotDef("period", "查询时段", False, "请问您要查哪个时间段的交易？"),
+        SlotDef("amount", "交易金额", False, "请问您要查的是哪笔金额的交易？"),
+    ],
+    # 会话 48882b05 决策: 分期查询改走知识问答 (不再进工具编排反问参数),
+    # 槽位降为 optional —— 咨询类槽位按本文件口径不驱动追问;
+    # 试算(INST_CALC)/办理(INST_APPLY)仍 required (没有金额期数无法试算/办理)。
+    IntentLabel.INST_PARAM_QUERY: [
+        SlotDef("amount", "分期金额", False, "请问您想分期的金额是多少？"),
+        SlotDef("period", "分期期数", False, "您希望分几期？"),
+    ],
+    IntentLabel.INST_APPLY: [
+        SlotDef("amount", "分期金额", True, "请问您想分期的金额是多少？"),
+        SlotDef("period", "分期期数", True, "您希望分几期？"),
+    ],
+    IntentLabel.INST_CALC: [
+        SlotDef("amount", "分期金额", True, "请问您想分期的金额是多少？"),
+        SlotDef("period", "分期期数", True, "您希望分几期？"),
+    ],
+    IntentLabel.POINTS_BALANCE_QUERY: [
+        SlotDef("card_type", "卡种", False, "请问您持有的是哪种卡？"),
+    ],
+    IntentLabel.POINTS_REDEEM: [
+        SlotDef("card_type", "卡种", False, "请问您持有的是哪种卡？"),
+    ],
+    IntentLabel.BENEFIT_QUERY: [
+        SlotDef("card_type", "卡种", False, "请问您持有的是哪种卡？"),
+    ],
+    IntentLabel.CARD_LOSS_REPORT: [
+        SlotDef("card_tail", "卡号后四位", True, "请提供您信用卡的后四位以便验证身份"),
+        SlotDef("phone_number", "预留手机号", False, "请确认您的预留手机号"),
+        SlotDef("card_number", "卡号全号", False, "请提供完整卡号"),
+    ],
+    IntentLabel.CARD_FREEZE: [
+        SlotDef("card_tail", "卡号后四位", True, "请提供您信用卡的后四位以便验证身份"),
+    ],
+    IntentLabel.DISPUTE_SUBMIT: [
+        SlotDef("issue_detail", "问题详情", True, "请详细描述您遇到的问题"),
+    ],
+    IntentLabel.TXN_AUTO_DEBIT_SET: [
+        SlotDef("card_number", "卡号全号", False, "请提供完整卡号"),
+    ],
+    IntentLabel.TRANSFER_AGENT: [
+        SlotDef("issue_detail", "转接原因", False, "请问您需要办理什么业务？"),
     ],
 }
 
@@ -98,12 +151,8 @@ class SlotTracker:
 
     @classmethod
     def for_intent(cls, intent: IntentLabel | str) -> SlotTracker:
-        """按意图创建槽位追踪器"""
-        if isinstance(intent, str):
-            try:
-                intent = IntentLabel(intent)
-            except ValueError:
-                intent = IntentLabel.FAQ
+        """按意图创建槽位追踪器。入口归一化: 旧 flat 值自动落到主名 (draft-0.3 兼容映射)。"""
+        intent = normalize_intent(intent) if isinstance(intent, str) else normalize_intent(intent.value)
 
         slot_defs = _INTENT_SLOTS.get(intent, _FALLBACK_SLOTS)
         return cls(

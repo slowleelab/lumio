@@ -161,7 +161,7 @@ class TestToolLayerE2E:
             await session.initialize()
             client = await _make_client(session)
 
-            # 第一轮：LLM 请求敏感工具 → 应短路为 pending（不执行）
+            # 第一轮：LLM 请求敏感工具 → 应短路为核验态 pending（不执行，发核验信号）
             llm = _ScriptedLLM(
                 [
                     _tool_call_result(
@@ -180,10 +180,22 @@ class TestToolLayerE2E:
             )
             assert res.pending_action is not None
             assert res.pending_action.tool_name == "apply_bill_installment"
-            assert "确认" in res.pending_action.confirm_prompt
+            # 会话 564db34d: 敏感工具短路先发身份核验信号, 不进 confirm
+            assert res.pending_action.verification_state == "pending"
+            assert res.verification is not None
+            assert res.verification.token == res.pending_action.verification_token
+            assert "确认" not in res.pending_action.confirm_prompt
             assert "apply_bill_installment" not in res.executed_tools  # 未执行
 
-            # 第二轮：用户确认 → 真实执行敏感工具 → 生成最终答复
+            # 核验通过后：pending 进入 verified 态，确认话术带具体参数
+            res.pending_action.verification_state = "verified"
+            res.pending_action.confirm_prompt = ToolCallingExecutor.format_confirm_prompt(
+                res.pending_action.tool_name, res.pending_action.arguments
+            )
+            assert "3000" in res.pending_action.confirm_prompt
+            assert "6 期" in res.pending_action.confirm_prompt
+
+            # 用户确认 → 真实执行敏感工具 → 生成最终答复
             confirm_llm = _ScriptedLLM([_final_answer("已为您办理 6 期账单分期，受理成功。")])
             confirm_exec = ToolCallingExecutor(client, confirm_llm, None, client._settings)  # type: ignore[arg-type]
             confirmed = await confirm_exec.execute_confirmed_action(
@@ -196,6 +208,21 @@ class TestToolLayerE2E:
             assert confirmed.pending_action is None
             assert "apply_bill_installment" in confirmed.executed_tools
             assert "分期" in confirmed.content
+
+    def test_format_confirm_prompt_with_arguments(self) -> None:
+        """P1-1: 确认话术带具体参数, 而非工具 description 硬塞"""
+        from lumio.services.bot.tool_executor import ToolCallingExecutor
+
+        prompt = ToolCallingExecutor.format_confirm_prompt(
+            "apply_bill_installment", {"amount": 8000, "periods": 3, "card_no": "6225880012346780"}
+        )
+        assert "8000" in prompt
+        assert "3 期" in prompt
+        assert "6780" in prompt  # 卡尾
+        # 缺参时自动省略
+        sparse = ToolCallingExecutor.format_confirm_prompt("apply_bill_installment", {"amount": 1000})
+        assert "1000" in sparse
+        assert "期" not in sparse
 
     async def test_disabled_client_has_no_tools(self) -> None:
         # MCP 关闭时：即便未连接，list/to_openai_tools 为空 → 编排层回落（零回归契约）

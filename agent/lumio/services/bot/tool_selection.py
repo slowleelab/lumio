@@ -14,20 +14,29 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from lumio.shared.models import IntentLabel
+from lumio.shared.models import IntentLabel, normalize_intent
 
 if TYPE_CHECKING:
     from lumio.shared.config import MCPSettings
 
-# 允许进入工具编排路径的「查询类工具意图」集合。
-# 仅这些意图会尝试打通 MCP 工具；挂失/投诉/转人工仍直接转人工，闲聊/FAQ 仍走知识问答。
+# 允许进入工具编排路径的「查询类工具意图」集合 (draft-0.3 主表 business 查询类)。
+# 挂失/投诉/转人工仍直接转人工，闲聊/FAQ 仍走知识问答。
+# 含旧 flat 别名与主名双世界: 分类器重训(批 2)前输出旧值, 之后输出主名;
+# 调用方统一先 normalize_intent 再判成员 (见 bot_agent.run 与 select_tools_for_intent)。
+# 会话 48882b05 决策: INST_PARAM_QUERY/INSTALLMENT_INQUIRY (分期) 移出本集合 ——
+# 裸"分期"是歧义输入, 分类器无法区分办理/查费率, 与其让工具编排反问"金额/期数/卡号后四位",
+# 不如按行业共识直接给分期知识介绍 (INTENT_DOMAINS 本就映射 knowledge, 此前被本拦截短路架空)。
 TOOL_INTENTS: frozenset[IntentLabel] = frozenset(
     {
+        # 旧 flat 别名
         IntentLabel.BILL_QUERY,
         IntentLabel.TRANSACTION_QUERY,
         IntentLabel.LIMIT_QUERY,
-        IntentLabel.INSTALLMENT_INQUIRY,
         IntentLabel.REWARD_QUERY,
+        # 主名
+        IntentLabel.ACCOUNT_BILL_QUERY,
+        IntentLabel.TXN_QUERY,
+        IntentLabel.POINTS_BALANCE_QUERY,
     }
 )
 
@@ -48,8 +57,11 @@ def select_tools_for_intent(
     if not settings.progressive_disclosure_enabled:
         return None
 
-    key = intent.value if isinstance(intent, IntentLabel) else str(intent)
-    names = settings.intent_tool_map.get(key)
+    # 键兼容双世界: 配置 intent_tool_map 目前以旧 flat 值为键 ("bill_query"),
+    # 归一化后的主名 ("account_bill_query") 优先, 缺失时回退旧键 (批 2 切主名后反向兼容)。
+    raw_key = intent.value if isinstance(intent, IntentLabel) else str(intent)
+    key = normalize_intent(raw_key).value
+    names = settings.intent_tool_map.get(key) or settings.intent_tool_map.get(raw_key)
     # 未配置该意图或子集为空 → 暴露全量交 LLM 判断
     if not names:
         return None

@@ -18,12 +18,14 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
+from uuid import uuid4
 
 from lumio.services.bot.tool_guard import GuardDecision
 from lumio.services.common.audit import write_audit_log
+from lumio.services.common.card_binding import is_full_card_no, resolve_card_no, schema_declares_card_no
 from lumio.services.common.llm import ToolCall
 from lumio.shared.metrics import TOOL_CALLS, TOOL_CONFIRMATIONS, TOOL_GUARD_DENIALS
-from lumio.shared.models import PendingAction
+from lumio.shared.models import PendingAction, VerificationRequest
 from lumio.shared.pii import mask_pii
 
 if TYPE_CHECKING:
@@ -107,6 +109,21 @@ class ToolLoopTimeoutError(RuntimeError):
     """工具编排循环整体预算耗尽（tool_loop_timeout_ms）。由调用方回落降级链。"""
 
 
+def _summarize_business(tool_name: str, arguments: dict) -> str:
+    """把工具名 + 参数压缩成一句业务摘要, 用于身份核验弹框的 description.
+
+    只取金额/期数等非敏感参数; 卡号/手机号等敏感值绝不出现在核验弹框文案里。
+    """
+    amount = arguments.get("amount")
+    periods = arguments.get("periods")
+    bits: list[str] = []
+    if amount is not None:
+        bits.append(f"金额 {amount} 元")
+    if periods is not None:
+        bits.append(f"{periods} 期")
+    return f"办理 {tool_name}（{'，'.join(bits)}）" if bits else f"办理 {tool_name}"
+
+
 @dataclass
 class ToolExecutionResult:
     """工具循环产出
@@ -122,6 +139,8 @@ class ToolExecutionResult:
     # P2-19: 护栏拒绝/配额超限时置 True — 触发真实转人工 (此前只文案引导)
     should_transfer: bool = False
     transfer_reason: str = ""
+    # 身份核验弹框信号 (会话 564db34d): 敏感写工具短路时置非空, 前端据此弹核验框
+    verification: VerificationRequest | None = None
 
 
 class ToolCallingExecutor:
@@ -312,15 +331,16 @@ class ToolCallingExecutor:
                             transfer_reason=f"tool_guard_refused: {tool_call.name} ({guard_decision.reason})",
                         )
 
-                    # 敏感工具 → 短路，写待确认（不执行）
+                    # 敏感工具 → 短路，先发身份核验信号，不执行
                     if self._mcp.is_sensitive(tool_call.name):
-                        pending = self._build_pending_action(tool_call, trace_id=trace_id)
+                        pending, verification = self._build_pending_action(tool_call, trace_id=trace_id)
                         TOOL_CONFIRMATIONS.labels(decision="pending").inc()
                         return ToolExecutionResult(
                             content=pending.confirm_prompt,
                             source="tool",
                             pending_action=pending,
                             executed_tools=executed,
+                            verification=verification,
                         )
 
                     # 非敏感工具 → 执行 + 脱敏 + 审计 + 回喂
@@ -359,6 +379,17 @@ class ToolCallingExecutor:
         actor_role: str,
     ) -> dict:
         """执行工具 → 出参脱敏 → 写审计 → 返回 tool message"""
+        # 注入绑定卡号 (会话 1efbd1ad 排查): 工具要求完整 card_no(13-19位), 红线禁止
+        # 对话索要完整卡号, 故按 actor_id(customer_id) 从实名绑定关系注入, 不依赖 LLM
+        # 从对话收集。仅对 schema 声明了 card_no 参数的工具注入; LLM 已给出完整卡号时
+        # 不覆盖 (如核验弹框路径已注入的 card_no)。
+        spec = self._mcp.get_tool(tool_call.name)
+        if (
+            spec is not None
+            and schema_declares_card_no(spec.input_schema)
+            and not is_full_card_no(tool_call.arguments.get("card_no"))
+        ):
+            tool_call.arguments["card_no"] = resolve_card_no(actor_id)
         masked_args = mask_pii(json.dumps(tool_call.arguments, ensure_ascii=False))
         # P2-7 第五轮修复: 配额检查接线 — tool_robustness.ToolQuotaGuard 此前生产零调用,
         # TOOL_QUOTA_EXCEEDED 指标永不产生; 超配额直接拒绝, 不进 MCP
@@ -420,21 +451,58 @@ class ToolCallingExecutor:
             "content": masked_content or "（工具无返回内容）",
         }
 
-    def _build_pending_action(self, tool_call: ToolCall, *, trace_id: str) -> PendingAction:
-        """构造待确认操作，生成确认话术"""
-        spec = self._mcp.get_tool(tool_call.name)
-        friendly = (spec.description if spec and spec.description else tool_call.name).strip()
-        prompt = f"您确认要办理「{friendly}」吗？回复『确认』继续办理，回复『取消』放弃。"
+    def _build_pending_action(
+        self, tool_call: ToolCall, *, trace_id: str
+    ) -> tuple[PendingAction, VerificationRequest | None]:
+        """构造待确认操作 + 身份核验信号 (会话 564db34d 复盘).
+
+        敏感写工具短路后不再直接进 confirm/cancel, 而是先发身份核验弹框信号:
+        - ``verification_state="pending"`` 等前端核验回传; 核验通过后才进入确认态。
+        - ``confirm_prompt`` 此时是"请完成身份核验"引导语, 具体参数确认话术在核验
+          通过后由 ``format_confirm_prompt`` 生成 (那时 amount/periods/card_no 齐全)。
+        """
         now = datetime.now(UTC)
-        return PendingAction(
+        token = f"vr_{uuid4().hex}"
+        pending = PendingAction(
             tool_name=tool_call.name,
             arguments=tool_call.arguments,
             tool_call_id=tool_call.id,
-            confirm_prompt=prompt,
+            confirm_prompt=("为保证您的资金与账户安全，办理前需先完成身份核验，请在弹窗中完成验证。"),
             created_at=now,
             expires_at=now + timedelta(seconds=self._settings.confirmation_ttl_seconds),
             trace_id=trace_id,
+            verification_state="pending",
+            verification_token=token,
         )
+        verification = VerificationRequest(
+            token=token,
+            type="sms",
+            title="身份核验",
+            description=_summarize_business(tool_call.name, tool_call.arguments),
+            business=tool_call.name,
+        )
+        return pending, verification
+
+    @staticmethod
+    def format_confirm_prompt(tool_name: str, arguments: dict) -> str:
+        """生成带具体参数的确认话术 (P1-1, 会话 564db34d 复盘).
+
+        替代此前拿工具 description 硬塞的话术, 让客户明确知道在确认什么
+        (金额/期数/卡尾等)。参数缺失的项自动省略, 不罗列空值。
+        """
+        parts: list[str] = []
+        amount = arguments.get("amount")
+        if amount is not None:
+            parts.append(f"金额 {amount} 元")
+        periods = arguments.get("periods")
+        if periods is not None:
+            parts.append(f"{periods} 期")
+        card_no = arguments.get("card_no") or arguments.get("card_tail")
+        if card_no:
+            tail = str(card_no)[-4:]
+            parts.append(f"卡号尾号 {tail}")
+        summary = "、".join(parts) if parts else tool_name
+        return f"您确认办理「{tool_name}」（{summary}）吗？回复『确认』继续办理，回复『取消』放弃。"
 
     async def _audit(
         self,

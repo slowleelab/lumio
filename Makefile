@@ -42,7 +42,9 @@ rerank-log: ## 查看 cross-encoder 重排服务日志
 	@tail -f /tmp/rerank.log
 
 test: ## 运行测试
-	cd agent && poetry run pytest -v
+# 测试套件与 MCP 联调环境隔离: .env 打开 MCP_ENABLED 会让依赖 app fixture 的用例
+# 尝试直连工具层(本地联调参考 Server/Higress 不在 CI), 此处显式关闭保证确定性。
+	cd agent && MCP_ENABLED=false MCP_PROGRESSIVE_DISCLOSURE_ENABLED=false poetry run pytest -v
 
 test-cov: ## 运行测试并生成覆盖率报告
 	cd agent && poetry run pytest --cov=lumio --cov-report=term-missing --cov-report=html

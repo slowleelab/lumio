@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from lumio.services.common.eval_gates import EvalGates
+from lumio.services.common.eval_gates import GOLDEN_CASES, EvalGates
 from lumio.services.common.model_registry import ModelRegistry
 from lumio.services.common.sample_backflow import (
     BackflowCandidate,
@@ -25,20 +25,13 @@ from lumio.services.common.trap_eval import AttribSample, AttributeEngine, EvalL
 
 class TestEvalGates:
     def _good(self, text: str) -> tuple[str, float]:
-        """按黄金集/敏感集正确分类的恒真模型 (用于 golden/sensitive 全过)."""
-        map_ = {
-            "我的信用卡账单多少": "bill_query",
-            "帮我查本月交易流水": "transaction_query",
-            "我能提多少临时额度": "limit_query",
-            "办个分期要什么条件": "installment_inquiry",
-            "信用卡积分有什么活动": "reward_query",
-            "银行的营业时间是几点": "faq",
-            "我的卡丢了怎么办": "card_loss",
-            "我要投诉你们的服务": "complaint",
-            "把电话转给人工坐席": "transfer_agent",
-            "你好呀今天天气不错": "chitchat",
-            "怎么查我的账单明细": "bill_query",
-            "积分能兑换什么礼品": "reward_query",
+        """按黄金集/敏感集正确分类的恒真模型 (用于 golden/sensitive 全过).
+
+        golden 真值直接来自 GOLDEN_CASES (内置用例 + seed 易混淆对), 真值集扩容时
+        本桩自动跟随, 不会因新增门用例而失效。
+        """
+        map_: dict[str, str] = {
+            **dict(GOLDEN_CASES),
             "我的信用卡被盗刷了，马上冻结": "card_loss",
             "我要投诉你们银行乱扣费": "complaint",
             "帮我转接人工客服": "transfer_agent",
@@ -212,8 +205,14 @@ class TestSampleBackflow:
     def test_staging_and_finalize(self, tmp_path: Path) -> None:
         review = str(tmp_path / "review.jsonl")
         seed_path = tmp_path / "seed.json"
+        # 真实 seed schema: 计数在 meta.counts.examples, 不在 meta.examples (回流若写错键,
+        # 官方计数口径会过期 — 见 sample_backflow.finalize_confirmed 注释)
         seed_path.write_text(
-            json.dumps({"meta": {"version": "0.2.0", "examples": 0}, "examples": []}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"meta": {"version": "0.2.0", "counts": {"examples": 0, "confusable_pairs": 15}}, "examples": []},
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
         cands = [BackflowCandidate("a", "这是样例", "faq", "classification", "failure", 0.3, 0.1, "reason")]
@@ -232,6 +231,9 @@ class TestSampleBackflow:
         added, version = finalize_confirmed(review, str(seed_path))
         assert added == 1
         assert version.startswith("0.2.")
+        merged = _j.loads(seed_path.read_text(encoding="utf-8"))
+        assert merged["meta"]["counts"]["examples"] == 1
+        assert "examples" not in merged["meta"]  # 不允许写错键
 
     def test_finalize_skips_invalid_intent(self, tmp_path: Path) -> None:
         review = str(tmp_path / "r.jsonl")

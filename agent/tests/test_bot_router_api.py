@@ -126,6 +126,26 @@ async def test_chat_send_success(app: FastAPI, setup_state) -> None:
     redis.xadd.assert_awaited_once()
 
 
+async def test_chat_send_verification_result_allows_empty_message(app: FastAPI, setup_state) -> None:
+    """身份核验回传: message 可为空, 核验结果序列化进 Stream 字段 (会话 564db34d)"""
+    redis = setup_state["redis"]
+    vr = {"token": "vr_abc123", "status": "success"}
+    async with await _client(app) as c:
+        resp = await c.post(
+            "/api/chat/send",
+            json={"session_id": "s1", "message": "", "verification_result": vr},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["accepted"] is True
+    # XADD 字段里核验结果以 JSON 字符串带出 (xadd 位置参数: (key, fields))
+    args = redis.xadd.await_args.args
+    stream_fields = args[1] if len(args) > 1 else {}
+    assert stream_fields.get("verification_result") is not None
+    parsed = json.loads(stream_fields["verification_result"])
+    assert parsed["token"] == "vr_abc123"
+    assert parsed["status"] == "success"
+
+
 async def test_chat_send_client_idempotency(app: FastAPI, setup_state) -> None:
     """client_message_id 幂等: 已处理 → 直接 accepted"""
     redis = setup_state["redis"]

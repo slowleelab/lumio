@@ -127,9 +127,9 @@ class TestCardNumberAndDerived:
             "s1", IntentLabel.CARD_LOSS, [_ent("CARD_NUMBER", "6222 0000 0000 1234")]
         )
         patch = sm.patch_state.await_args.args[2]["slot_values"]
-        # 值归一: 去空格
-        assert patch["card_number"]["value"] == "6222000000001234"
-        # 派生尾号
+        # P1a: 完整卡号槽位只落尾四位掩码 (明文 PAN 不入会话态, 会话 1fb54681 复盘)
+        assert patch["card_number"]["value"] == "****1234"
+        # 派生尾号 (从掩码尾部提取)
         assert patch["card_tail"]["value"] == "1234"
         assert patch["card_tail"]["source"] == "derived"
         assert "1234" in prompt

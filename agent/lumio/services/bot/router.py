@@ -58,6 +58,7 @@ from lumio.shared.models import (
     RetrieveResponse,
     SessionPhase,
     SessionSubPhase,
+    VerificationResult,
 )
 from lumio.shared.orm_models import ChatMessageStatus, KbDocStatus, KbDocument, KbSourceType
 from lumio.shared.rate_limit import get_limiter
@@ -394,6 +395,21 @@ async def _session_worker(
             trace_raw = fields.get("_trace_context", "")
             trace_id = trace_raw.split(":")[0] if trace_raw else None
 
+            # ── 身份核验结果回传 (前端弹框完成) —— 专用路径, 不进 agent.run 完整流程 ──
+            # 核验结果是结构化回传, 不是客户自然语言: 不做意图分类/噪声门/工具编排,
+            # 也不作为对话轮次落历史; 直接推进 pending 核验状态机。
+            verification_raw = fields.get("verification_result", "")
+            if verification_raw:
+                await _run_verification(
+                    redis_client,
+                    agent,
+                    session_id,
+                    verification_raw,
+                    msg_id,
+                    client_message_id,
+                )
+                continue
+
             # ── 审计落库：记录消息到达 ──
             if _db_session_factory and client_message_id:
                 quick_intent = _quick_intent_match(message)
@@ -656,6 +672,54 @@ async def _session_worker(
         _session_queues.pop(session_id, None)
 
 
+async def _run_verification(
+    redis_client,
+    agent,
+    session_id: str,
+    verification_raw: str,
+    msg_id: str,
+    client_message_id: str,
+) -> None:
+    """身份核验结果回传专用处理路径 (会话 564db34d 复盘).
+
+    核验结果是结构化回传, 不跑意图分类/噪声门/工具编排, 也不落对话历史;
+    直接推进 pending 的核验状态机, 结果经 _finish_message 写回轮询。
+    """
+    try:
+        result_obj = VerificationResult.model_validate_json(verification_raw)
+    except Exception as exc:
+        logger.warning("核验结果解析失败: session=%s err=%s", session_id, exc)
+        await _finish_message(redis_client, session_id, "核验回传格式错误，请重新发起办理。", source="error_fallback")
+        await redis_client.xack(CHAT_STREAM_KEY, CONSUMER_GROUP, msg_id)
+        await _mark_processed(redis_client, client_message_id)
+        return
+
+    try:
+        result = await agent.handle_verification_result(session_id, result_obj)
+    except Exception:
+        logger.exception("核验结果处理异常: session=%s", session_id)
+        await _finish_message(
+            redis_client, session_id, "系统处理您的请求时出现错误，请稍后再试。", source="error_fallback"
+        )
+        await redis_client.xack(CHAT_STREAM_KEY, CONSUMER_GROUP, msg_id)
+        await _mark_processed(redis_client, client_message_id)
+        return
+
+    reply = result.get("response", "身份核验已处理。")
+    source = result.get("response_source", "template")
+    verification = result.get("verification")
+    extra = {"verification": verification} if verification else None
+    await _finish_message(
+        redis_client,
+        session_id,
+        reply,
+        source=source,
+        extra=extra,
+    )
+    await redis_client.xack(CHAT_STREAM_KEY, CONSUMER_GROUP, msg_id)
+    await _mark_processed(redis_client, client_message_id)
+
+
 async def _run_agent(
     redis_client,
     agent,
@@ -749,6 +813,7 @@ async def _run_agent(
     reply = result.get("response", "抱歉，我暂时无法处理您的请求。")
     source = result.get("response_source", "fallback")
     entities = result.get("entities", [])
+    verification = result.get("verification")  # 身份核验弹框信号 (会话 564db34d)
     BOT_AGENT_RESPONSES.labels(source=source).inc()
 
     # ── 保存对话历史（客户消息 + Bot 回复）──
@@ -911,6 +976,7 @@ async def _run_agent(
         intent=str(primary_intent.value) if primary_intent else None,
         confidence=primary_confidence,
         source=source,
+        extra={"verification": verification} if verification else None,
     )
     # 审计更新：处理完成
     if _db_session_factory and orig_message_id:
@@ -1203,13 +1269,14 @@ async def chat_send(body: ChatSendRequest, request: Request, user: CurrentUser):
 
         raise ServiceOverloadedError("Redis 未就绪, 无法接收消息")
 
-    # 输入校验: 拒绝空消息 (含全角空格/零宽字符)
+    # 输入校验: 拒绝空消息 (含全角空格/零宽字符); 身份核验回传允许空 message
     from lumio.shared.exceptions import IntentUnrecognizedError
 
+    verification_result = body.verification_result
     msg = (
         (body.message or "").replace("　", " ").replace("", "").replace("‌", "").replace("‍", "").replace("﻿", "").strip()
     )
-    if not msg:
+    if not msg and verification_result is None:
         # P3-4 整改: 走统一错误体 (IntentUnrecognizedError → 400)
         raise IntentUnrecognizedError("消息内容不能为空")
 
@@ -1303,6 +1370,7 @@ async def chat_send(body: ChatSendRequest, request: Request, user: CurrentUser):
             "session_id": session_id,
             "message_id": message_id,
             "message": body.message,
+            "verification_result": verification_result.model_dump_json() if verification_result else "",
             "_trace_context": trace_ctx,
             "customer_id": body.customer_id or "",
             "customer_name": body.customer_name or "",
