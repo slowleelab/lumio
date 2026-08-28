@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -273,3 +273,60 @@ def _async_raise(exc: Exception):
         raise exc
 
     return _raiser
+
+
+# ── _check_mcp (会话 1efbd1ad 复盘: MCP 工具断了 health 要显式报警) ──
+
+
+def _mcp_settings(enabled: bool) -> MagicMock:
+    settings = MagicMock()
+    settings.mcp.enabled = enabled
+    return settings
+
+
+@pytest.mark.asyncio
+async def test_check_mcp_disabled_is_skip(monkeypatch) -> None:
+    from lumio.shared import health as health_mod
+
+    monkeypatch.setattr(health_mod, "get_settings", lambda: _mcp_settings(False))
+    app = MagicMock()
+    result = await health_mod._check_mcp(app)
+    assert result["status"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_check_mcp_not_initialized_is_down(monkeypatch) -> None:
+    from lumio.shared import health as health_mod
+
+    monkeypatch.setattr(health_mod, "get_settings", lambda: _mcp_settings(True))
+    app = MagicMock()
+    app.state.mcp_client = None
+    result = await health_mod._check_mcp(app)
+    assert result["status"] == "down"
+    assert result["reason"] == "not_initialized"
+
+
+@pytest.mark.asyncio
+async def test_check_mcp_not_connected_is_down(monkeypatch) -> None:
+    from lumio.shared import health as health_mod
+
+    monkeypatch.setattr(health_mod, "get_settings", lambda: _mcp_settings(True))
+    app = MagicMock()
+    app.state.mcp_client = MagicMock(connected=False)
+    result = await health_mod._check_mcp(app)
+    assert result["status"] == "down"
+    assert result["reason"] == "not_connected"
+
+
+@pytest.mark.asyncio
+async def test_check_mcp_connected_is_up(monkeypatch) -> None:
+    from lumio.shared import health as health_mod
+
+    monkeypatch.setattr(health_mod, "get_settings", lambda: _mcp_settings(True))
+    app = MagicMock()
+    client = MagicMock(connected=True)
+    client.list_tools = AsyncMock(return_value=[1, 2, 3])
+    app.state.mcp_client = client
+    result = await health_mod._check_mcp(app)
+    assert result["status"] == "up"
+    assert result["tool_count"] == 3

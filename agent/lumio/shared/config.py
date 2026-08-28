@@ -638,8 +638,10 @@ class MCPBackend(BaseModel):
 
     # 后端逻辑名（用于分发索引与日志，不进入 host-facing 工具名）
     name: str
-    # 后端 MCP 入口 URL（streamable-http）
+    # 后端 MCP 入口 URL（streamable-http 或 SSE 基址）
     endpoint: str
+    # 传输协议: streamable-http(默认, 经 Higress 网关) | sse(直连 SSE 后端, 如 Java MCP Server)
+    transport: str = "streamable-http"
     # host-facing 工具名前缀（域命名空间，如 "card."）；单后端留空即原名
     prefix: str = ""
     # 该后端的敏感工具原名白名单（与工具注解、全局 sensitive_tools 取并集）
@@ -656,6 +658,8 @@ class MCPSettings(BaseSettings):
 
     # 总开关：关闭时不加载任何工具，bot 走原有 RAG/LLM 生成路径
     enabled: bool = False
+    # 单后端传输协议: streamable-http(默认, 经 Higress) | sse(直连 Java MCP Server :8090)
+    transport: str = "streamable-http"
     # Higress MCP 入口 URL（经 Nacos MCP Registry 发现的工具经此暴露）。
     # 默认指向 Higress AI 网关统一 MCP 入口（streamable-http）；本地联调可改指参考 Server（:8080/mcp）。
     endpoint: str = "http://localhost:10000/mcp/credit-card"

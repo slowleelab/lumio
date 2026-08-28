@@ -349,16 +349,17 @@ services:
     profiles: ["gateway"]
     restart: unless-stopped
     environment:
-      - MODE=standalone
+      # full = apiserver+controller+pilot+gateway+console 全组件; standalone 不启动网关数据面
+      - MODE=full
       # 复用上面的 Nacos 作为配置与注册中心
       - NACOS_SERVER_URL=http://nacos:8848
       - CONFIG_STORAGE=nacos
       # 允许网关通过宿主机访问以 make mcp-server-run 方式运行的 Java MCP Server(:8090)
       - HIGRESS_CONSOLE_PORT=8080
     ports:
-      - "10000:80"     # 网关数据面：Python 大脑经此调用 MCP（/mcp/...）
-      - "8443:443"     # 网关数据面（HTTPS）
-      - "18080:8080"   # Higress 控制台
+      - "10000:8080"   # 网关数据面 HTTP（all-in-one envoy 实际监听 8080/8443）
+      - "8443:8443"    # 网关数据面 HTTPS
+      - "18080:8001"   # Higress 控制台（jar 实际监听 8001）
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -388,7 +389,8 @@ services:
       - LUMIO_NACOS_SERVER_ADDR=nacos:8848
       - LUMIO_NACOS_SERVICE_NAME=lumio-mcp-server
       # 注册到 Nacos 的实例 IP 用容器服务名，便于 Higress 经网络路由
-      - LUMIO_NACOS_INSTANCE_IP=mcp-server
+      # 留空自动探测容器 IP: 网关经 ServiceEntry 直连该 IP, 主机名形式无法被 envoy 解析
+      - LUMIO_NACOS_INSTANCE_IP=
       # 全链路追踪：向 Jaeger 导出 span（缺省关，设端点即启用）
       - MANAGEMENT_TRACING_SAMPLING_PROBABILITY=${MCP_TRACING_SAMPLE:-0.1}
       - MANAGEMENT_OTLP_TRACING_ENDPOINT=http://jaeger:4318/v1/traces

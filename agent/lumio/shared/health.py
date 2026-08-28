@@ -13,6 +13,8 @@ import asyncio
 import logging
 from typing import Any
 
+from lumio.shared.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 # 依赖名 → 错误分类码 (写入 health 响应, 不含 PII/IP/驱动细节)
@@ -23,6 +25,7 @@ _ERROR_CODE_BY_DEP = {
     "elasticsearch": "elasticsearch_unreachable",
     "llm": "llm_unreachable",
     "embedding": "embedding_unavailable",
+    "mcp": "mcp_unavailable",
 }
 
 
@@ -112,6 +115,28 @@ async def _check_milvus(app: Any) -> dict[str, Any]:
         return _error_response("milvus", e)
 
 
+async def _check_mcp(app: Any) -> dict[str, Any]:
+    """检查 MCP 工具连接状态 (会话 1efbd1ad 复盘: MCP 工具断了 /health 仍全绿, 掩盖故障).
+
+    - 未启用 -> skip
+    - 客户端未初始化/未连接 -> down (显式报警, 而非静默降级)
+    - 已连接 -> up, 附带工具数
+    """
+    settings = get_settings()
+    if not settings.mcp.enabled:
+        return {"status": "skip", "reason": "disabled"}
+    client = getattr(app.state, "mcp_client", None)
+    if client is None:
+        return {"status": "down", "reason": "not_initialized"}
+    if not client.connected:
+        return {"status": "down", "reason": "not_connected"}
+    try:
+        tools = await asyncio.wait_for(client.list_tools(), timeout=5.0)
+    except Exception as e:
+        return _error_response("mcp", e)
+    return {"status": "up", "tool_count": len(tools)}
+
+
 async def check_all_dependencies(app: Any) -> dict[str, dict[str, Any]]:
     """并行检查所有依赖组件"""
     results = await asyncio.gather(
@@ -121,6 +146,7 @@ async def check_all_dependencies(app: Any) -> dict[str, dict[str, Any]]:
         _check_llm(app),
         _check_embedding(app),
         _check_milvus(app),
+        _check_mcp(app),
     )
     return {
         "redis": results[0],
@@ -129,6 +155,7 @@ async def check_all_dependencies(app: Any) -> dict[str, dict[str, Any]]:
         "llm": results[3],
         "embedding": results[4],
         "milvus": results[5],
+        "mcp": results[6],
     }
 
 
