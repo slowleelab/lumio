@@ -1697,12 +1697,23 @@ async def upload_document(
 
     embedding_provider = embedding_breaker.provider if embedding_breaker.is_available else None
 
-    text_content = content_bytes.decode("utf-8") if source_type_str in ("MARKDOWN", "TXT", "HTML") else minio_object_key
+    # 文本类型直接传内容; 二进制 (PDF/DOCX/XLSX) 解析器吃磁盘路径 —— 此前传的是
+    # MinIO 对象键, fitz/Document 打不开必挂, 二进制上传从未成功过 (2026-08-29 修复)
+    if source_type_str in ("MARKDOWN", "TXT", "HTML"):
+        parse_input = content_bytes.decode("utf-8")
+    else:
+        import tempfile
+        from pathlib import Path as _Path
+
+        suffix = _Path(filename).suffix or ".bin"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content_bytes)
+        parse_input = tmp.name
 
     try:
         final_status = await ingest_document(
             doc_id=kb_doc.id,
-            file_path=text_content,
+            file_path=parse_input,
             source_type=KbSourceType[source_type_str],
             metadata=doc_metadata,
             embedding_provider=embedding_provider,
@@ -1717,6 +1728,14 @@ async def upload_document(
     # P0: get_db 收尾只 rollback 不 commit —— 不显式提交, kb_document/kb_chunk/
     # kb_ingestion_log 全部随请求回滚, 文档"上传成功却在管理页消失"
     await db.commit()
+
+    if parse_input != content_bytes.decode("utf-8", errors="ignore"):
+        try:
+            import os as _os
+
+            _os.unlink(parse_input)
+        except Exception:
+            pass
 
     return {
         "doc_id": str(kb_doc.id),
@@ -2318,7 +2337,6 @@ async def reindex_document(
         security_level=row.security_level,
         version=row.version,
     )
-
 
     try:
         final_status = await ingest_document(
