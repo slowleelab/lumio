@@ -187,6 +187,21 @@ class LumioAgent:
         self._embedding_breaker = embedding_breaker
         # 工具执行器（MCP_ENABLED=False 时为 None，走原有降级链，零回归）
         self._tool_executor = tool_executor
+
+        # 目标架构 v2: 链 B 查询轻链路 + ⑦ 出站合规闸门 + ⑥ 引用标题缓存
+        from lumio.services.bot.outbound_guard import OutboundGuard
+        from lumio.services.bot.query_chain import QueryChain
+
+        self._query_chain = QueryChain(
+            mcp_client=getattr(tool_executor, "_mcp", None),
+            redis_client=session_manager._redis if session_manager else None,
+            degradation_mgr=degradation_mgr,
+        )
+        from lumio.shared.safety import safety_filter as _safety_filter
+
+        self._outbound_guard = OutboundGuard(_safety_filter, CLARIFY_RESPONSE)
+        self._citation_title_cache: dict[str, str] = {}
+        self._last_citation_docids: list[str] = []
         # P0-3: 精排器 (loss-in-middle 缓解 + 相关性阈值过滤)
         self._reranker = reranker
         # P1-13: ES/Milvus 熔断器 — 检索前先查熔断状态, 避免双挂时被动靠异常降级
@@ -416,7 +431,21 @@ class LumioAgent:
             # 此前各 handler 调 _build_result 时不传 entities, 落库实体恒空,
             # 历史实体池(last_entities)从不累积, 指代消解与"[已知实体]"内存全部空转.
             result = None
-            if (
+            routing_v2 = get_settings().bot.routing_v2_enabled
+            if routing_v2:
+                # 目标架构 ④ 两级路由决策: 决策一交易性质 / 决策二只读四分流。
+                # 既有闸门 (噪声门/敏感回话/等待快照) 均在 handler 内部, 位置不动。
+                result = await self._dispatch_v2(
+                    session_id,
+                    user_input,
+                    intent_result,
+                    history,
+                    entities,
+                    sentiment,
+                    domain,
+                    customer_id,
+                )
+            elif (
                 get_settings().mcp.progressive_disclosure_enabled
                 and self._tool_executor is not None
                 and self._tool_executor.has_tools()
@@ -484,6 +513,17 @@ class LumioAgent:
             # 统一把增强后的实体写回 result, 保证 slot 填充/噪声门/持久化共用同一份数据
             if result and entities:
                 result["entities"] = entities
+
+            # ⑦ 出站合规闸门 (v2): 生成类回复过敏感词/幻觉检查, 拦截替换为澄清话术
+            if result is not None and routing_v2 and result.get("response_source") in ("knowledge", "llm"):
+                verdict = self._outbound_guard.check(
+                    str(result.get("response", "")),
+                    grounding_source=str(result.get("retrieval_context", "") or ""),
+                )
+                if not verdict.passed:
+                    logger.warning("出站闸门拦截(%s): session=%s", verdict.reason, session_id)
+                    result["response"] = verdict.reply
+                    result["response_source"] = "clarify"
 
             # P0 等待快照维护 (会话 1fb54681 复盘): 本轮回复若在"等客户补充参数/槽位"
             # (槽位追问/工具参数索取), 把缺槽快照落盘 -- 下一轮短回复无论被分类成什么,
@@ -628,6 +668,245 @@ class LumioAgent:
             if t.speaker in ("customer", "bot") and t.content
         ][-6:]
 
+    # ── 目标架构 v2 两级路由: 决策一/二 与四条执行链 ──
+
+    async def _dispatch_v2(
+        self,
+        session_id: str,
+        user_input: str,
+        intent_result: IntentResult,
+        history: list[dict[str, str]],
+        entities: list[Entity] | None,
+        sentiment: SentimentLabel,
+        domain: str,
+        customer_id: str | None,
+    ) -> dict[str, Any]:
+        """④ 两级路由决策
+
+        决策一: 交易性质三分流 (高风险转人工 / 金融交易链 A / 查询链 B);
+        决策二: 只读咨询四分流 (并行竞速 / 复合意图 / RAG 链路)。
+        任何链内部失败均回落既有知识/业务路径, 不产生无回复出口。
+        """
+        from lumio.services.bot.routing import (
+            TrafficClass,
+            classify_traffic,
+            decision_two,
+            detect_composite,
+        )
+
+        intent = intent_result.primary_intent
+        confidence = intent_result.primary_confidence
+        traffic = classify_traffic(intent)
+        composite = detect_composite(intent, list(intent_result.alternatives or []), user_input)
+        try:
+            log_decision(
+                session_id=session_id,
+                agent_name="bot_agent",
+                action=DecisionAction.TOOL_CALL
+                if traffic != TrafficClass.CONSULTING
+                else DecisionAction.INTENT_CLASSIFY,
+                reasoning=f"v2 路由: 决策一={traffic.value} 决策二预备 composite={composite}",
+                evidence={
+                    "traffic_class": traffic.value,
+                    "confidence": confidence,
+                    "composite": composite,
+                    "alternatives": [a.value for a in (intent_result.alternatives or [])],
+                },
+                turn_id=uuid_module.uuid4().hex[:16],
+                customer_id=customer_id,
+            )
+        except Exception:
+            logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+
+        # ── 决策一 ──
+        if traffic == TrafficClass.HIGH_RISK:
+            # 投诉/争议/转人工诉求: 保留 _handle_business 既有语义 (高置信敏感直转人工
+            # + 建工单; 低置信走内部噪声门澄清), 决策留痕已声明分类依据
+            return await self._handle_business(
+                session_id, user_input, intent_result, history, entities, sentiment, customer_id
+            )
+        if traffic == TrafficClass.FINANCIAL_TRANSACTION:
+            # 链 A · 交易链路: 工具编排 + 敏感确认状态机; 无工具回落知识
+            if self._tool_executor is not None and self._tool_executor.has_tools():
+                return await self._handle_tool(
+                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                )
+            return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
+        if traffic == TrafficClass.READ_ONLY_QUERY:
+            # 链 B · 查询轻链路: 直连工具 + 缓存; 无工具/链失败回落
+            if self._tool_executor is not None and self._tool_executor.has_tools():
+                qc = await self._handle_query_chain(
+                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                )
+                if qc is not None:
+                    return qc
+            return await self._handle_tool(
+                session_id, user_input, intent_result, history, entities, sentiment, customer_id
+            )
+
+        # ── 决策二 (CONSULTING) ──
+        route = decision_two(confidence, composite)
+        if route.value == "parallel_race":
+            return await self._handle_parallel_race(session_id, user_input, intent_result, history, entities, sentiment)
+        if route.value == "composite":
+            comp = await self._handle_composite(
+                session_id, user_input, intent_result, history, entities, sentiment, customer_id
+            )
+            if comp is not None:
+                return comp
+        return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
+
+    async def _handle_query_chain(
+        self,
+        session_id: str,
+        user_input: str,
+        intent_result: IntentResult,
+        history: list[dict[str, str]],
+        entities: list[Entity] | None,
+        sentiment: SentimentLabel,
+        customer_id: str | None,
+    ) -> dict[str, Any] | None:
+        """链 B · 查询轻链路: 槽位参数 → 直连工具 → 单次摘要。
+
+        Returns: None = 链路不适用 (无工具/失败), 调用方回落; 非 None = 已产出回复。
+        """
+        from lumio.services.bot.tool_selection import select_tools_for_intent
+
+        # 填槽并持久化 (跨轮继承/历史反填复用既有机制), 再读回槽位值
+        await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
+        slot_values: dict = {}
+        if self._session_manager is not None:
+            try:
+                state = await self._session_manager.get_session(session_id)
+                for k, v in (getattr(state, "slot_values", None) or {}).items():
+                    slot_values[k] = getattr(v, "value", v)
+            except Exception:
+                pass
+
+        tool_names = select_tools_for_intent(
+            intent_result.primary_intent, intent_result.primary_confidence, get_settings().mcp
+        )
+        qc = await self._query_chain.run(
+            intent_label=intent_result.primary_intent.value,
+            user_input=user_input,
+            tool_names=tool_names,
+            slot_values=slot_values,
+            customer_id=customer_id,
+            history=history,
+        )
+        if qc.error:
+            logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
+            return None
+        if qc.missing_params:
+            # 反问澄清 (TW6→S1 补槽回流): 复用槽位 prompt, 无则通用澄清
+            prompt = await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
+            return self._build_result(
+                session_id,
+                user_input,
+                prompt or CLARIFY_RESPONSE,
+                "slot_hint",
+                intent_result.primary_intent.value,
+                intent_result.primary_confidence,
+                entities=entities,
+                sentiment=sentiment,
+            )
+        return self._build_result(
+            session_id,
+            user_input,
+            qc.content,
+            "tool",
+            intent_result.primary_intent.value,
+            intent_result.primary_confidence,
+            entities=entities,
+            sentiment=sentiment,
+        )
+
+    async def _handle_parallel_race(
+        self,
+        session_id: str,
+        user_input: str,
+        intent_result: IntentResult,
+        history: list[dict[str, str]],
+        entities: list[Entity] | None,
+        sentiment: SentimentLabel,
+    ) -> dict[str, Any]:
+        """链 D · 低置信并行竞速: FAQ 与 RAG 双路并发, 归并取高分。"""
+        from lumio.services.bot.parallel_race import race
+
+        embedding_provider = (
+            self._embedding_breaker.provider
+            if self._embedding_breaker and self._embedding_breaker.is_available
+            else None
+        )
+        session_manager = self._session_manager
+
+        async def _faq_fn():
+            from lumio.services.common.faq_service import search_faq
+
+            return await search_faq(
+                query=user_input,
+                redis_client=session_manager._redis if session_manager else None,
+                embedding_provider=embedding_provider,
+                milvus_collection=self._milvus_collection,
+                user_role="customer",
+                session_factory=(
+                    session_manager._resolve_factory()
+                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                    else None
+                ),
+                session_id=session_id,
+            )
+
+        async def _rag_fn():
+            return await self._retrieve(user_input)
+
+        outcome = await race(_faq_fn, _rag_fn)
+        if outcome.winner == "faq" and outcome.faq_answer:
+            return self._build_result(
+                session_id,
+                user_input,
+                outcome.faq_answer,
+                "faq",
+                intent_result.primary_intent.value,
+                intent_result.primary_confidence,
+                entities=entities,
+                sentiment=sentiment,
+            )
+        # RAG 有据 → 知识路径 (内部含门控与引用标注); 双路皆空同样交其澄清
+        return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
+
+    async def _handle_composite(
+        self,
+        session_id: str,
+        user_input: str,
+        intent_result: IntentResult,
+        history: list[dict[str, str]],
+        entities: list[Entity] | None,
+        sentiment: SentimentLabel,
+        customer_id: str | None,
+    ) -> dict[str, Any] | None:
+        """链 C · 复合意图: 查询取数 → 数据注入 RAG → 联合生成。
+
+        Returns: None = 查询链不适用 (无工具/缺参数), 调用方回落纯知识路径。
+        """
+        qc = await self._handle_query_chain(
+            session_id, user_input, intent_result, history, entities, sentiment, customer_id
+        )
+        if qc is None or qc.get("response_source") != "tool":
+            return None
+        extra = qc.get("retrieval_context") or ""
+        if not extra:
+            return None
+        return await self._handle_knowledge(
+            session_id,
+            user_input,
+            intent_result,
+            history,
+            entities,
+            sentiment,
+            extra_context=extra,
+        )
+
     async def _handle_knowledge(
         self,
         session_id: str,
@@ -638,6 +917,7 @@ class LumioAgent:
         sentiment: SentimentLabel = SentimentLabel.NEUTRAL,
         missing_slots: list[tuple[str, str]] | None = None,
         _sensitive_rerouted: bool = False,
+        extra_context: str = "",
     ) -> dict[str, Any]:
         """知识问答: RAG 检索 + LLM 生成.
 
@@ -809,6 +1089,8 @@ class LumioAgent:
             )
         _rag_t0 = time.monotonic()
         context = await self._retrieve(user_input)
+        if extra_context:
+            context = f"{extra_context}\n\n{context}" if context else extra_context
         # E2 决策可解释: 记录 RAG 检索决策 (命中与否)
         try:
             log_decision(
@@ -973,10 +1255,17 @@ class LumioAgent:
         if result.source in ("template", "fallback") and not should_transfer:
             should_transfer = True
             transfer_reason = f"degraded_{result.source}: LLM 不可用, 降级回复"
+        # ⑥ 引用来源标注: 知识生成回复尾部附《文档标题》(doc_id → 标题, 带缓存)
+        reply = result.content
+        if context and result.source in ("llm", "retrieval"):
+            footer = await self._citation_footer()
+            if footer:
+                reply = f"{reply}{footer}"
+
         return self._build_result(
             session_id,
             user_input,
-            result.content,
+            reply,
             _effective_knowledge_source(result.source, context),
             intent.primary_intent.value,
             intent.primary_confidence,
@@ -986,6 +1275,44 @@ class LumioAgent:
             sentiment,
             retrieval_context=context,
         )
+
+    async def _citation_footer(self) -> str:
+        """⑥ 引用来源: 本轮检索 chunk 的 source_doc → kb_document 标题 (带缓存)"""
+        docids = [d for d in dict.fromkeys(getattr(self, "_last_citation_docids", None) or []) if d]
+        if not docids:
+            return ""
+        sf = (
+            self._session_manager._resolve_factory()
+            if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
+            else None
+        )
+        if sf is None:
+            return ""
+        import uuid_utils
+        from sqlalchemy import select
+
+        from lumio.shared.orm_models import KbDocument
+
+        titles: list[str] = []
+        try:
+            async with sf() as db:
+                for d in docids:
+                    if d in self._citation_title_cache:
+                        titles.append(self._citation_title_cache[d])
+                        continue
+                    try:
+                        u = uuid_utils.UUID(d)
+                    except ValueError:
+                        continue
+                    row = (await db.execute(select(KbDocument.title).where(KbDocument.id == u))).first()
+                    if row and row.title:
+                        self._citation_title_cache[d] = row.title
+                        titles.append(row.title)
+        except Exception as exc:
+            logger.debug("引用标题查询失败(不阻断): %s", exc)
+            return ""
+        unique = list(dict.fromkeys(titles))
+        return ("\n\n来源：" + "、".join(f"《{t}》" for t in unique)) if unique else ""
 
     async def _handle_business(
         self,
@@ -1133,7 +1460,7 @@ class LumioAgent:
         # 必须带 RAG 兜底, 否则查询类意图翻到 business 主路径后, 个人账户数据查询
         # ("我欠多少") 会零上下文硬编。检索不中时由噪声门 grounding 兜底回澄清。
         try:
-            context = await self._retrieve(user_input) or ""
+            context = await self._retrieve(user_input)
         except Exception:
             logger.debug("business 路径 RAG 兜底检索失败(不阻断): session=%s", session_id)
             context = ""
@@ -1234,11 +1561,7 @@ class LumioAgent:
         # (如"信用额度是什么")被 TOOL_INTENTS 路由进来, LLM 判断无需调工具直接回答,
         # 结果零 RAG —— 审计上就是"RAG 没搜到"(会话 9d64b59 复盘)。有知识可依时
         # 交由知识路径带 RAG 重新生成, 保证 grounding 与检索证据落库。
-        if (
-            tool_result.pending_action is None
-            and tool_result.source == "llm"
-            and not tool_result.executed_tools
-        ):
+        if tool_result.pending_action is None and tool_result.source == "llm" and not tool_result.executed_tools:
             try:
                 rag_context = await self._retrieve(user_input)
             except Exception:
@@ -1951,6 +2274,7 @@ class LumioAgent:
                 # 缓存是死代码, 相同问题 5 分钟内重复问 = 重复打 ES/Milvus + embedding + rerank
                 redis_client=self._session_manager._redis if self._session_manager else None,
             )
+            self._last_citation_docids = [r.source_doc for r in (resp.results or [])]
             if resp.results:
                 # P0-3 首尾重排 (LongLLMLingua reorder_context="sort"):
                 # lost-in-middle — 模型对中段注意力最弱, 相关性最高的文档放最前,

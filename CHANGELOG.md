@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ## [Unreleased]
 
 ### Added
+- **目标架构 v2：两级路由决策 + 四条执行链 + 出站合规闸门**（BOT_ROUTING_V2_ENABLED，默认关）
+  - ④ 决策一交易性质三分流（金融交易/只读查询/高风险转人工/咨询）+ 决策二只读四分流（FAQ/RAG/复合/低置信竞速），分类表以 INTENT_DOMAINS+SENSITIVE_INTENTS 归并生成
+  - ⑤B 查询轻链路：槽位参数→直连 MCP 工具（绕过 LLM 循环）→Redis 结果缓存（5min）→单次摘要；缺槽反问
+  - ⑤C 复合意图：查询取数→数据注入 RAG→联合生成；⑤D 低置信(0.4~0.6) FAQ/RAG 并行竞速取高分
+  - ⑥ 引用来源标注：知识回复尾部附《文档标题》；⑦ 出站闸门：敏感词+幻觉数字 v1 检测，拦截替换澄清
+
+### Added
 - **管理控制台一期**（对话审计 + RAG 指标监控）
   - `console_router.py` 挂 `/api/admin/*`：会话审计列表（dialogue_log 聚合 + chat_message 统计，支持意图/来源/时间过滤与分页）、会话回放（对话轮次 + 决策链 + 处理记录三段结构，retrieval_context 默认脱敏）、操作审计（audit_log 分页查询）、RAG 质量聚合（响应来源/FAQ 命中/意图 TOP/低置信占比/决策延迟 P95，按天 date_trunc）、RAG 实时指标（进程内 Prometheus REGISTRY 直读）
   - 4 个观测埋点：`lumio_rag_cache_ops_total`（检索缓存命中/未命中）、`lumio_rerank_degradation_total`（重排降级按原因）、`lumio_faq_match_total`（FAQ 命中分布）、`lumio_circuit_breaker_state`（熔断器状态 Gauge）
