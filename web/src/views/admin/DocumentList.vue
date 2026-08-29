@@ -10,6 +10,12 @@
           style="width: 200px"
           @change="load"
         />
+        <el-select v-model="searchStatus" placeholder="按状态筛选" clearable style="width: 140px" @change="load">
+          <el-option label="待处理" value="PENDING" />
+          <el-option label="已就绪" value="COMPLETED" />
+          <el-option label="摄入中" value="INGESTING" />
+          <el-option label="失败" value="FAILED" />
+        </el-select>
         <el-upload
           :auto-upload="false"
           :limit="1"
@@ -171,6 +177,7 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = ref(20)
 const searchCategory = ref("")
+const searchStatus = ref("")
 
 const uploadVisible = ref(false)
 const uploading = ref(false)
@@ -202,6 +209,7 @@ async function load() {
   try {
     const res = await listDocuments({
       category: searchCategory.value || undefined,
+      status: searchStatus.value || undefined,
       limit: pageSize.value,
       offset: (page.value - 1) * pageSize.value,
     })

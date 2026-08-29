@@ -13,6 +13,7 @@ import type {
 
 export function listDocuments(params?: {
   category?: string
+  status?: string
   limit?: number
   offset?: number
 }): Promise<KbDocumentListResponse> {

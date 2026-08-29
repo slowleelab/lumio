@@ -86,6 +86,17 @@
       </el-table-column>
     </el-table>
 
+    <el-pagination
+      v-model:current-page="page"
+      v-model:page-size="pageSize"
+      :total="total"
+      :page-sizes="[20, 50, 100]"
+      layout="total, sizes, prev, pager, next"
+      style="margin-top: 16px; justify-content: flex-end"
+      @current-change="monitor.refresh"
+      @size-change="onSizeChange"
+    />
+
     <el-dialog v-model="detailVisible" title="摄入详情" width="680px" data-testid="ingestion-detail">
       <div v-if="detail">
         <p><strong>文档：</strong>{{ detail.title }}</p>
@@ -187,12 +198,23 @@ async function rebuildAllPending() {
   }
 }
 
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
+
+function onSizeChange() {
+  page.value = 1
+  monitor.refresh()
+}
+
 async function load() {
   const res = await listDocuments({
-    limit: 50,
+    limit: pageSize.value,
+    offset: (page.value - 1) * pageSize.value,
     category: filterCategory.value || undefined,
   })
   documents.value = res.documents
+  total.value = res.total
 }
 
 const monitor = useIngestionMonitor({ loader: load, intervalMs: 3000, autoStart: true })
