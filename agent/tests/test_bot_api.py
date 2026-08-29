@@ -330,3 +330,9 @@ async def test_kb_documents_upload_markdown(bot_client: httpx.AsyncClient):
         if search_data["total_candidates"] > 0:
             found = any("年费" in r.get("content", "") for r in search_data["results"])
             assert found, "Uploaded doc not found in search results"
+
+    # 自清理: 真链路上传会写入 ES/Milvus/PG, 不清理则反复跑测试在知识库累积
+    # 测试残留 (曾累积 3 份 annual_fee_test.md 污染检索评测)。软删端点会同步
+    # 清理 ES/Milvus (B4 修复链路), 顺带覆盖 DELETE 端点的真链路。
+    cleanup = await bot_client.delete(f"/api/kb/documents/{data['doc_id']}")
+    assert cleanup.status_code == 200, f"cleanup failed: {cleanup.text}"

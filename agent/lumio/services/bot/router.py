@@ -2096,6 +2096,7 @@ async def delete_document(
             await es_client.delete_by_query(
                 index=index_name,
                 body={"query": {"term": {"doc_id": str(doc_id)}}},
+                refresh=True,  # 即时可见, 否则 refresh 窗口内已删 chunk 仍可被检索
             )
             logger.info("ES 索引清理完成: doc_id=%s", doc_id)
         except Exception as e:

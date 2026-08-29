@@ -336,8 +336,9 @@ async def test_upload_document_success_txt(monkeypatch):
     assert args.kwargs["file_path"] == "文本内容"
 
 
-async def test_upload_document_pdf_uses_object_key(monkeypatch):
-    """PDF → 摄入用 MinIO object key 而非内容"""
+async def test_upload_document_pdf_uses_temp_file(monkeypatch):
+    """PDF → 二进制解析器吃磁盘路径, 摄入入参为临时文件 (2026-08-29 修复:
+    此前传 MinIO object key, fitz 打不开, 二进制上传从未成功)"""
     import lumio.services.common.ingestion as ingestion
 
     deps = _upload_deps()
@@ -363,7 +364,8 @@ async def test_upload_document_pdf_uses_object_key(monkeypatch):
         )
     assert result["status"] == "COMPLETED"
     args = mock_ingest.await_args
-    assert args.kwargs["file_path"] == "fee/年费说明.pdf"
+    # 二进制走临时文件路径 (解析器 fitz/pdfplumber 需磁盘路径), 以 .pdf 结尾
+    assert args.kwargs["file_path"].endswith(".pdf")
     assert args.kwargs["source_type"].value == "PDF"
 
 

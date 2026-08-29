@@ -21,6 +21,7 @@ def _make_db(doc: object) -> MagicMock:
     db = MagicMock()
     db.execute = AsyncMock(return_value=result)
     db.flush = AsyncMock()
+    db.commit = AsyncMock()
     return db
 
 
@@ -50,7 +51,7 @@ class TestDeleteDocument:
         await delete_document(doc_id="doc-1", db=db, user=_make_user(), es_client=None, milvus_collection=None)
         assert doc.is_deleted is True
         assert doc.deleted_at is not None
-        db.flush.assert_awaited_once()
+        db.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cleans_es_index(self) -> None:
