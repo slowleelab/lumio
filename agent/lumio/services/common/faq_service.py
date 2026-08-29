@@ -31,9 +31,15 @@ _FAQ_CACHE_TTL = 3600  # 1 小时
 
 
 def _normalize_query(text: str) -> str:
-    """查询归一化: NFKC + 小写 + 去首尾空格 + 压缩中间空格"""
-    text = unicodedata.normalize("NFKC", text).lower().strip()
-    return re.sub(r"\s+", " ", text)
+    """查询归一化: NFKC + 小写 + 去全部标点 + 压缩空格
+
+    客户问 "账单日和还款日是什么" 与 "账单日和还款日是什么？" 应命中同一条
+    精确缓存 —— 标点差异不该击穿精确匹配 (语义路兜底延迟高得多)。
+    """
+    text = unicodedata.normalize("NFKC", text).lower()
+    # Python re 不支持 \p{P}: 显式枚举空白 + ASCII 标点 + CJK 标点区
+    text = re.sub(r"[\s\u3000-\u303f\uff00-\uffef!-/:-@\[-`{-~]+", "", text)
+    return text
 
 
 def _cache_key(query: str) -> str:

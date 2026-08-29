@@ -15,6 +15,7 @@ from sqlalchemy import select
 
 from lumio.services.common.faq_service import (
     _index_faq_to_search,
+    _warm_exact_match_cache,
     check_faq_duplicate,
     create_faq,
     delete_faq,
@@ -287,6 +288,7 @@ async def reindex_all_faqs(request: Request, user: CurrentUser):
         if not faq:
             continue
         indexed += await _index_faq_to_search(faq, None, embedding_provider, milvus_collection)
+        await _warm_exact_match_cache(faq, getattr(request.app.state, "redis_client", None))
     return {"total": total, "indexed": indexed}
 
 
