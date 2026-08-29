@@ -13,6 +13,7 @@ import type {
 
 export function listDocuments(params?: {
   category?: string
+  status?: string
   limit?: number
   offset?: number
 }): Promise<KbDocumentListResponse> {
@@ -35,6 +36,19 @@ export function uploadDocument(
 
 export function deleteDocument(docId: string): Promise<{ status: string; doc_id: string }> {
   return client.delete(`/kb/documents/${docId}`)
+}
+
+export interface DocumentSource {
+  doc_id: string
+  title: string
+  file_path: string
+  kind: "text" | "binary"
+  content?: string
+  download_url?: string
+}
+
+export function getDocumentSource(docId: string): Promise<DocumentSource> {
+  return client.get(`/kb/documents/${docId}/source`)
 }
 
 export function getDocumentStatus(docId: string): Promise<KbDocumentStatus> {
@@ -93,4 +107,8 @@ export function publishFaq(faqId: string, comment = ""): Promise<FaqApprovalResu
 
 export function archiveFaq(faqId: string, comment = ""): Promise<FaqApprovalResult> {
   return client.post(`/kb/faq/${faqId}/archive`, { comment })
+}
+
+export function restoreFaq(faqId: string, comment = ""): Promise<FaqApprovalResult> {
+  return client.post(`/kb/faq/${faqId}/restore`, { comment })
 }

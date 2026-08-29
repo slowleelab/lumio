@@ -77,7 +77,7 @@
 import { onMounted, ref } from "vue"
 import { ElMessage } from "element-plus"
 import { Plus } from "@element-plus/icons-vue"
-import { getFaq, updateFaq, createFaq as doCreateFaq } from "@/api/admin"
+import { getFaq, updateFaq, createFaq as doCreateFaq, deleteFaq } from "@/api/admin"
 import { useFaqAdmin } from "@/composables/useFaqAdmin"
 import type { FaqItem, FaqDetail } from "@/api/types"
 import FaqTable from "@/components/admin/FaqTable.vue"
@@ -87,7 +87,7 @@ import FaqCreateDialog from "@/components/admin/FaqCreateDialog.vue"
 const {
   faqs, total, loading, page, pageSize, filterStatus, filterCategory, pendingCount,
   load, loadPendingCount, reset,
-  submit, approve, reject, publish, archive,
+  submit, approve, reject, publish, archive, restore,
 } = useFaqAdmin()
 
 // ── 详情 / 编辑 ──
@@ -146,14 +146,25 @@ async function doCreate(payload: { question: string; answer: string; category: s
 }
 
 // ── 表格 action 路由 ──
-type FaqAction = "submit" | "approve" | "reject" | "publish" | "archive" | "edit"
+type FaqAction = "submit" | "approve" | "reject" | "publish" | "archive" | "restore" | "delete" | "edit"
 async function onAction(action: FaqAction, row: FaqItem) {
   switch (action) {
     case "submit":  await submit(row.id);  break
     case "approve": await approve(row.id); break
-    case "reject":  await reject(row.id);  break
+    case "reject":  await reject(row.id); break
     case "publish": await publish(row.id); break
     case "archive": await archive(row.id); break
+    case "restore": await restore(row.id); break
+    case "delete":
+      try {
+        await deleteFaq(row.id)
+        ElMessage.success("已删除")
+        load()
+        loadPendingCount()
+      } catch {
+        /* handled */
+      }
+      break
     case "edit":
       detail.value = await getFaq(row.id)
       editing.value = true

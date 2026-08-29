@@ -27,7 +27,8 @@ class TestNormalizeQuery:
         assert _normalize_query("HELLO") == "hello"
 
     def test_trim_and_collapse_spaces(self) -> None:
-        assert _normalize_query("  你好   世界  ") == "你好 世界"
+        # 2026-08-29: 归一化加强为去全部空白与标点 (精确缓存 key 一致性)
+        assert _normalize_query("  你好   世界  ") == "你好世界"
 
     def test_nfkc_fullwidth_to_ascii(self) -> None:
         """全角字符→半角（NFKC）"""

@@ -250,11 +250,13 @@ class CircuitBreaker:
         self._state = CircuitState.OPEN
         self._opened_at = time.monotonic()
         self._reset_half_open_counts()
+        self._report_state()
 
     def _transition_to_half_open(self) -> None:
         """转换到 HALF_OPEN 状态"""
         self._state = CircuitState.HALF_OPEN
         self._reset_half_open_counts()
+        self._report_state()
         logger.info("熔断器 [%s] OPEN→HALF_OPEN，恢复超时已到，开始探测", self._name)
 
     def _transition_to_closed(self) -> None:
@@ -263,6 +265,14 @@ class CircuitBreaker:
         self._reset_half_open_counts()
         self._window.clear()
         self._slow_window.clear()
+        self._report_state()
+
+    def _report_state(self) -> None:
+        """状态变更上报 Prometheus (0=closed, 1=half_open, 2=open)"""
+        from lumio.shared.metrics import CIRCUIT_BREAKER_STATE
+
+        state_value = {"closed": 0, "half_open": 1, "open": 2}.get(self._state.value, 0)
+        CIRCUIT_BREAKER_STATE.labels(name=self._name).set(state_value)
 
     def _reset_half_open_counts(self) -> None:
         """重置 HALF_OPEN 计数器"""

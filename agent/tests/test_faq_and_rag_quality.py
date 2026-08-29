@@ -27,7 +27,8 @@ def _faq_hit(chunk_id: str, content: str, category: str, score: float, card_type
         "chunk_id": chunk_id,
         "content": content,
         "category": category,
-        "card_types": card_types,
+        # schema 实际字段名是 card_type (单数), 2026-08-29 与 search_faq 读取处对齐
+        "card_type": card_types,
         "keywords": [],
     }
     hit.score = score

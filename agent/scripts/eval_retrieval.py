@@ -64,14 +64,31 @@ CASES: list[Case] = [
 ]
 
 
-def _bm25_search(es: Elasticsearch, query: str, top_k: int) -> list[tuple[str, float]]:
-    """BM25 检索, 返回 [(content, score)]"""
+def _bm25_search(es: Elasticsearch, query: str, top_k: int) -> list[tuple[str, str, float]]:
+    """BM25 检索, 返回 [(title, content, score)]"""
     resp = es.search(
         index=INDEX,
         query={"match": {"content": {"query": query, "analyzer": "ik_smart"}}},
         size=top_k,
     )
-    return [(h["_source"].get("content", ""), h["_score"] or 0.0) for h in resp["hits"]["hits"]]
+    return [
+        (h["_source"].get("title", ""), h["_source"].get("content", ""), h["_score"] or 0.0)
+        for h in resp["hits"]["hits"]
+    ]
+
+
+def _hit(case: Case, results: list[tuple[str, str, float]]) -> int | None:
+    """命中判定: title 含期望文档名, 或 content 含特征短语。
+
+    title 判定为主 (ingestion 已落 title 字段, PDF 类文档正文无旧版特征短语);
+    特征短语兜底 (title 被截断/英文名时仍可判定)。
+    """
+    for i, (title, content, _) in enumerate(results):
+        if case.expected_doc and case.expected_doc in title:
+            return i
+        if case.phrase in content:
+            return i
+    return None
 
 
 def main() -> None:
@@ -86,11 +103,7 @@ def main() -> None:
 
     for case in CASES:
         results = _bm25_search(es, case.query, TOP_K)
-        # 找到特征短语命中的排名 (0-based)
-        rank = next(
-            (i for i, (content, _) in enumerate(results) if case.phrase in content),
-            None,
-        )
+        rank = _hit(case, results)
         if rank is None:
             details.append(f"✗ {case.query} -> 未命中「{case.expected_doc}」")
             reciprocal_ranks.append(0.0)
@@ -104,7 +117,7 @@ def main() -> None:
 
     total = len(CASES)
     print("=" * 70)
-    print("RAG 检索质量评测报告 (BM25, ik_smart, 22 个标注案例)")
+    print(f"RAG 检索质量评测报告 (BM25, ik_smart, {total} 个标注案例)")
     print("=" * 70)
     print(f"案例总数: {total}")
     print(f"Hit@1: {hits_at_k[1]}/{total} = {hits_at_k[1] / total:.1%}")

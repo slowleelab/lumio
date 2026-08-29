@@ -11,8 +11,11 @@ from datetime import date
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from lumio.services.common.faq_service import (
+    _index_faq_to_search,
+    _warm_exact_match_cache,
     check_faq_duplicate,
     create_faq,
     delete_faq,
@@ -24,6 +27,7 @@ from lumio.services.common.faq_service import (
 )
 from lumio.shared.auth import CurrentUser
 from lumio.shared.exceptions import LumioError
+from lumio.shared.orm_models import KbFaq
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +188,12 @@ async def delete_faq_endpoint(faq_id: str, request: Request, user: CurrentUser):
     if not session_factory:
         raise LumioError(code=5001, message="数据库未就绪")
 
-    deleted = await delete_faq(session_factory, faq_id)
+    deleted = await delete_faq(
+        session_factory,
+        faq_id,
+        redis_client=getattr(request.app.state, "redis_client", None),
+        milvus_collection=getattr(request.app.state, "milvus_collection", None),
+    )
     if not deleted:
         raise LumioError(code=2001, message=f"FAQ 不存在: {faq_id}")
     return {"status": "ok"}
@@ -223,12 +232,20 @@ async def archive_faq(faq_id: str, body: FaqApprovalRequest, request: Request, u
     return await _do_approval(faq_id, "ARCHIVED", body.comment, request, user)
 
 
+@router.post("/kb/faq/{faq_id}/restore")
+async def restore_faq(faq_id: str, body: FaqApprovalRequest, request: Request, user: CurrentUser):
+    """恢复草稿 (ARCHIVED → DRAFT): 归档内容改版后重新走审批链, 不必删除重建"""
+    return await _do_approval(faq_id, "DRAFT", body.comment, request, user)
+
+
 async def _do_approval(faq_id: str, target: str, comment: str, request: Request, user: CurrentUser):
     session_factory = getattr(request.app.state, "db_session_factory", None)
     redis_client = getattr(request.app.state, "redis_client", None)
     if not session_factory:
         raise LumioError(code=5001, message="数据库未就绪")
 
+    embedding_breaker = getattr(request.app.state, "embedding_breaker", None)
+    embedding_provider = embedding_breaker.provider if embedding_breaker and embedding_breaker.is_available else None
     return await transition_faq_approval(
         session_factory,
         faq_id,
@@ -237,7 +254,50 @@ async def _do_approval(faq_id: str, target: str, comment: str, request: Request,
         actor_role=user.role,
         comment=comment,
         redis_client=redis_client,
+        embedding_provider=embedding_provider,
+        milvus_collection=getattr(request.app.state, "milvus_collection", None),
     )
+
+
+@router.post("/kb/faq/reindex-all")
+async def reindex_all_faqs(request: Request, user: CurrentUser):
+    """回填: 将全部已发布 FAQ 重写 Milvus 语义索引 (admin/agent)
+
+    用于存量 FAQ 补索引 (索引写入实现前发布的 FAQ 无向量)。
+    """
+    if user.role not in ("admin", "agent"):
+        from lumio.shared.auth import AuthorizationError
+
+        raise AuthorizationError("仅 admin/agent 可回填 FAQ 索引")
+
+    session_factory = getattr(request.app.state, "db_session_factory", None)
+    if not session_factory:
+        raise LumioError(code=5001, message="数据库未就绪")
+
+    embedding_breaker = getattr(request.app.state, "embedding_breaker", None)
+    embedding_provider = embedding_breaker.provider if embedding_breaker and embedding_breaker.is_available else None
+    milvus_collection = getattr(request.app.state, "milvus_collection", None)
+
+    faqs, total = await list_faqs(session_factory, approval_status="PUBLISHED", limit=500)
+    indexed = 0
+    for f in faqs:
+        detail = await get_faq(session_factory, f["id"])
+        if not detail:
+            continue
+        faq = await _load_faq_orm(session_factory, f["id"])
+        if not faq:
+            continue
+        indexed += await _index_faq_to_search(faq, None, embedding_provider, milvus_collection)
+        await _warm_exact_match_cache(faq, getattr(request.app.state, "redis_client", None))
+    return {"total": total, "indexed": indexed}
+
+
+async def _load_faq_orm(session_factory, faq_id: str):
+    from lumio.services.common.faq_service import _coerce_faq_id
+
+    async with session_factory() as session:
+        result = await session.execute(select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id)))
+        return result.scalar_one_or_none()
 
 
 # ── 检索 ──

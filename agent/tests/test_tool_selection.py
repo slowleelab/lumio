@@ -12,7 +12,10 @@ from lumio.shared.models import IntentLabel
 class TestConfigDefaults:
     """MCPSettings 渐进式暴露相关默认值（零回归）"""
 
-    def test_disabled_by_default(self) -> None:
+    def test_disabled_by_default(self, monkeypatch) -> None:
+        # config 导入时 load_dotenv 已把 .env 灌进 os.environ (本地联调常开 MCP),
+        # 断言代码默认值前需摘掉对应环境变量
+        monkeypatch.delenv("MCP_PROGRESSIVE_DISCLOSURE_ENABLED", raising=False)
         m = MCPSettings()
         assert m.progressive_disclosure_enabled is False
         assert m.pd_confidence_threshold == 0.7

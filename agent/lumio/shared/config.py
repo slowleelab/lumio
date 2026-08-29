@@ -436,7 +436,8 @@ class RAGSettings(BaseSettings):
     embedding_dim: int = 1024
     embedding_batch_size: int = 128  # TEI 批量大小
     tei_base_url: str = "http://localhost:8080"  # TEI 服务地址
-    embedding_timeout: float = 10.0  # 嵌入请求超时（秒）
+    # 摄入批量向量化受 GPU 抢占影响大, 10s 在本地 Ollama + LLM 并发时偶发超时
+    embedding_timeout: float = 30.0  # 嵌入请求超时（秒）
     embedding_max_retries: int = 2  # 最大重试次数
     # 分块参数
     chunk_size: int = 1500  # 字符数，约 750 中文字 ≈ 1000+ tokens
@@ -498,6 +499,9 @@ class BotSettings(BaseSettings):
     max_session_queue: int = 20
     # P2-16: 同一客户同时进行的活跃会话数上限 (多设备/多标签页防资源耗尽)
     max_sessions_per_customer: int = 3
+    # 目标架构 v2 两级路由决策 (决策一交易性质 / 决策二只读四分流)。
+    # 默认关: 开启需显式 BOT_ROUTING_V2_ENABLED=true (灰度开关, 关闭时走旧链路回滚保底)。
+    routing_v2_enabled: bool = False
 
 
 class AssistSettings(BaseSettings):

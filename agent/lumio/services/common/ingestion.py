@@ -352,11 +352,13 @@ def chunk_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> list[st
 async def embed_chunks(
     chunks: list[str],
     provider: EmbeddingProvider,
-    batch_size: int = 128,
+    batch_size: int = 16,
 ) -> list[list[float]]:
     """批量嵌入文本块
 
-    按 batch_size 分批调用 EmbeddingProvider.embed()。
+    按 batch_size 分批调用 EmbeddingProvider.embed()。批大小取小值 +
+    超时重试: provider 单次 HTTP 超时 10s, 128 块一大批在本地 Ollama 被
+    LLM 抢占 GPU 时必超时 (347KB PDF 摄入实测); 小批 + 重试稳定得多。
 
     Args:
         chunks: 待嵌入文本块列表
@@ -369,7 +371,19 @@ async def embed_chunks(
     all_embeddings: list[list[float]] = []
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
-        embeddings = await provider.embed(batch)
+        embeddings = None
+        for attempt in range(3):
+            try:
+                embeddings = await provider.embed(batch)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    "批量嵌入第 %s 批失败 (attempt %s), 重试: %s", i // batch_size + 1, attempt + 1, exc
+                )
+                await asyncio.sleep(2 * (attempt + 1))
+        assert embeddings is not None
         all_embeddings.extend(embeddings)
     return all_embeddings
 

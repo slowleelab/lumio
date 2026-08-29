@@ -2,7 +2,7 @@ import { ref } from "vue"
 import { ElMessage } from "element-plus"
 import {
   listFaqs,
-  submitFaq, approveFaq, rejectFaq, publishFaq, archiveFaq,
+  submitFaq, approveFaq, rejectFaq, publishFaq, archiveFaq, restoreFaq,
 } from "@/api/admin"
 import type { FaqItem } from "@/api/types"
 
@@ -57,10 +57,11 @@ export function useFaqAdmin() {
   async function reject(id: string)  { await rejectFaq(id);  ElMessage.success("已驳回");     await load() }
   async function publish(id: string) { await publishFaq(id); ElMessage.success("已发布");     await load() }
   async function archive(id: string) { await archiveFaq(id); ElMessage.success("已归档");     await load() }
+  async function restore(id: string) { await restoreFaq(id); ElMessage.success("已恢复为草稿"); await load() }
 
   return {
     faqs, total, loading, page, pageSize, filterStatus, filterCategory, pendingCount,
     load, loadPendingCount, reset,
-    submit, approve, reject, publish, archive,
+    submit, approve, reject, publish, archive, restore,
   }
 }

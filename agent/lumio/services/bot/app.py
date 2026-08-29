@@ -78,6 +78,11 @@ def create_bot_app(lifespan: Callable | None = None) -> FastAPI:
 
     app.include_router(faq_router, prefix="/api")
 
+    # 管理控制台路由（对话审计 + RAG 指标监控）
+    from lumio.services.common.console_router import router as console_router
+
+    app.include_router(console_router, prefix="/api")
+
     # 审计日志中间件
     from lumio.shared.audit_middleware import register_audit_middleware
 

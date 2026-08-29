@@ -1697,12 +1697,23 @@ async def upload_document(
 
     embedding_provider = embedding_breaker.provider if embedding_breaker.is_available else None
 
-    text_content = content_bytes.decode("utf-8") if source_type_str in ("MARKDOWN", "TXT", "HTML") else minio_object_key
+    # 文本类型直接传内容; 二进制 (PDF/DOCX/XLSX) 解析器吃磁盘路径 —— 此前传的是
+    # MinIO 对象键, fitz/Document 打不开必挂, 二进制上传从未成功过 (2026-08-29 修复)
+    if source_type_str in ("MARKDOWN", "TXT", "HTML"):
+        parse_input = content_bytes.decode("utf-8")
+    else:
+        import tempfile
+        from pathlib import Path as _Path
+
+        suffix = _Path(filename).suffix or ".bin"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content_bytes)
+        parse_input = tmp.name
 
     try:
         final_status = await ingest_document(
             doc_id=kb_doc.id,
-            file_path=text_content,
+            file_path=parse_input,
             source_type=KbSourceType[source_type_str],
             metadata=doc_metadata,
             embedding_provider=embedding_provider,
@@ -1714,7 +1725,17 @@ async def upload_document(
     except Exception:
         kb_doc.status = KbDocStatus.FAILED
 
-    await db.flush()
+    # P0: get_db 收尾只 rollback 不 commit —— 不显式提交, kb_document/kb_chunk/
+    # kb_ingestion_log 全部随请求回滚, 文档"上传成功却在管理页消失"
+    await db.commit()
+
+    if parse_input != content_bytes.decode("utf-8", errors="ignore"):
+        try:
+            import os as _os
+
+            _os.unlink(parse_input)
+        except Exception:
+            pass
 
     return {
         "doc_id": str(kb_doc.id),
@@ -2055,7 +2076,7 @@ async def delete_document(
     """
     from sqlalchemy import select
 
-    result = await db.execute(select(KbDocument).where(KbDocument.id == doc_id))
+    result = await db.execute(select(KbDocument).where(KbDocument.id == _coerce_doc_id(doc_id)))
     doc = result.scalar_one_or_none()
     if not doc:
         from lumio.shared.exceptions import LumioError
@@ -2064,7 +2085,7 @@ async def delete_document(
 
     doc.is_deleted = True
     doc.deleted_at = datetime.now()
-    await db.flush()
+    await db.commit()
 
     # ── 同步清理 ES 索引（按 doc_id 删除该文档的所有分块）──
     if es_client is not None:
@@ -2075,6 +2096,7 @@ async def delete_document(
             await es_client.delete_by_query(
                 index=index_name,
                 body={"query": {"term": {"doc_id": str(doc_id)}}},
+                refresh=True,  # 即时可见, 否则 refresh 窗口内已删 chunk 仍可被检索
             )
             logger.info("ES 索引清理完成: doc_id=%s", doc_id)
         except Exception as e:
@@ -2093,28 +2115,45 @@ async def delete_document(
 
 @router.get("/kb/documents/{doc_id}/status")
 async def get_document_status(doc_id: str, db: DbSession, user: CurrentUser):
-    """查看文档摄入状态"""
+    """查看文档摄入状态
+
+    只选业务列: 物化 KbDocument 实体会触发 Uuid(native_uuid=False) 的
+    asyncpg 'pgproto.UUID' 反序列化报错 (会话 48882b05 同源坑)。
+    """
     from sqlalchemy import select
 
     from lumio.shared.orm_models import KbIngestionLog
 
-    result = await db.execute(select(KbDocument).where(KbDocument.id == doc_id))
-    doc = result.scalar_one_or_none()
-    if not doc:
+    result = await db.execute(
+        select(
+            KbDocument.title,
+            KbDocument.status,
+            KbDocument.chunk_count,
+        ).where(KbDocument.id == _coerce_doc_id(doc_id))
+    )
+    row = result.first()
+    if not row:
         from lumio.shared.exceptions import LumioError
 
         raise LumioError(code=2001, message=f"文档不存在: {doc_id}")
 
     logs_result = await db.execute(
-        select(KbIngestionLog).where(KbIngestionLog.document_id == doc_id).order_by(KbIngestionLog.created_at)
+        select(
+            KbIngestionLog.stage,
+            KbIngestionLog.status,
+            KbIngestionLog.duration_ms,
+            KbIngestionLog.error_message,
+        )
+        .where(KbIngestionLog.document_id == _coerce_doc_id(doc_id))
+        .order_by(KbIngestionLog.created_at)
     )
-    logs = logs_result.scalars().all()
+    logs = logs_result.all()
 
     return {
         "doc_id": doc_id,
-        "title": doc.title,
-        "status": doc.status,
-        "chunk_count": doc.chunk_count,
+        "title": row.title,
+        "status": row.status,
+        "chunk_count": row.chunk_count,
         "stages": [
             {
                 "stage": log.stage,
@@ -2124,6 +2163,206 @@ async def get_document_status(doc_id: str, db: DbSession, user: CurrentUser):
             }
             for log in logs
         ],
+    }
+
+
+def _coerce_doc_id(doc_id: str):
+    """字符串 ID → uuid_utils.UUID (非法字符串原样透传, 交由"不存在"语义处理)。
+
+    KbDocument.id 是 Uuid(native_uuid=False), 字符串直比会在 bind 阶段抛 StatementError。
+    """
+    import uuid_utils
+
+    try:
+        return uuid_utils.UUID(str(doc_id))
+    except ValueError:
+        return str(doc_id)
+
+
+@router.get("/kb/documents/{doc_id}/source")
+async def get_document_source(doc_id: str, request: Request, db: DbSession, user: CurrentUser):
+    """查看原始文档
+
+    文本类 (MARKDOWN/TXT/HTML) 直接返回内容供控制台预览;
+    二进制类 (PDF/DOCX/XLSX) 返回 MinIO 预签名下载 URL (1 小时有效)。
+    """
+    from sqlalchemy import select
+
+    from lumio.shared.exceptions import LumioError
+
+    result = await db.execute(
+        select(KbDocument.title, KbDocument.source_type, KbDocument.file_path).where(
+            KbDocument.id == _coerce_doc_id(doc_id)
+        )
+    )
+    row = result.first()
+    if not row:
+        raise LumioError(code=2001, message=f"文档不存在: {doc_id}")
+
+    minio_client = getattr(request.app.state, "minio_client", None)
+    if not minio_client:
+        raise LumioError(code=5001, message="MinIO 未就绪")
+
+    settings = get_settings()
+    bucket = settings.minio.bucket
+
+    if row.source_type in (KbSourceType.MARKDOWN, KbSourceType.TXT, KbSourceType.HTML):
+        import asyncio
+
+        resp = None
+        try:
+            resp = await asyncio.to_thread(minio_client.get_object, bucket, row.file_path)
+            raw = await asyncio.to_thread(resp.read)
+        except Exception as exc:
+            raise LumioError(code=2001, message=f"源文件不存在: {row.file_path}") from exc
+        finally:
+            if resp is not None:
+                try:
+                    await asyncio.to_thread(resp.close)
+                    await asyncio.to_thread(resp.release_conn)
+                except Exception:
+                    pass
+        return {
+            "doc_id": doc_id,
+            "title": row.title,
+            "file_path": row.file_path,
+            "kind": "text",
+            "content": raw.decode("utf-8", errors="replace"),
+        }
+
+    import asyncio
+    from datetime import timedelta
+
+    try:
+        url = await asyncio.to_thread(
+            minio_client.presigned_get_object, bucket, row.file_path, expires=timedelta(hours=1)
+        )
+    except Exception as exc:
+        raise LumioError(code=2001, message=f"源文件不存在: {row.file_path}") from exc
+    return {
+        "doc_id": doc_id,
+        "title": row.title,
+        "file_path": row.file_path,
+        "kind": "binary",
+        "download_url": url,
+    }
+
+
+@router.post("/kb/documents/{doc_id}/reindex")
+async def reindex_document(
+    doc_id: str,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+    es_client: ESClientDep,
+    milvus_collection: MilvusCollectionDep,
+    embedding_breaker: EmbeddingBreakerDep,
+    minio_client: MinioClientDep,
+):
+    """本地重建索引
+
+    从 MinIO 拉取源文件, 走完整 Parse→Clean→Chunk→Embed→Dual-Write 管线,
+    不依赖 kb-service (此前该路径不存在, 前端重试按钮一直打空)。
+    """
+    from sqlalchemy import select
+
+    from lumio.shared.exceptions import LumioError
+
+    result = await db.execute(
+        select(
+            KbDocument.id,
+            KbDocument.title,
+            KbDocument.source_type,
+            KbDocument.file_path,
+            KbDocument.category,
+            KbDocument.doc_type,
+            KbDocument.card_type,
+            KbDocument.customer_tier,
+            KbDocument.security_level,
+            KbDocument.version,
+            KbDocument.effective_date,
+            KbDocument.expiry_date,
+        ).where(KbDocument.id == _coerce_doc_id(doc_id))
+    )
+    row = result.first()
+    if not row:
+        raise LumioError(code=2001, message=f"文档不存在: {doc_id}")
+
+    if not minio_client:
+        raise LumioError(code=5001, message="MinIO 未就绪")
+    embedding_provider = embedding_breaker.provider if embedding_breaker.is_available else None
+
+    settings = get_settings()
+    bucket = settings.minio.bucket
+    import asyncio
+
+    resp = None
+    try:
+        resp = await asyncio.to_thread(minio_client.get_object, bucket, row.file_path)
+        raw = await asyncio.to_thread(resp.read)
+    except Exception as exc:
+        raise LumioError(code=2001, message=f"源文件不存在: {row.file_path}") from exc
+    finally:
+        if resp is not None:
+            try:
+                await asyncio.to_thread(resp.close)
+                await asyncio.to_thread(resp.release_conn)
+            except Exception:
+                pass
+
+    from lumio.services.common.ingestion import ingest_document
+    from lumio.shared.models import DocumentMetadata
+
+    text_like = row.source_type in (KbSourceType.MARKDOWN, KbSourceType.TXT, KbSourceType.HTML)
+    if text_like:
+        parse_input = raw.decode("utf-8", errors="replace")
+    else:
+        # 二进制 (PDF/DOCX/XLSX) 解析器吃本地文件路径, 落临时文件
+        import tempfile
+        from pathlib import Path as _Path
+
+        suffix = _Path(row.file_path).suffix or ".bin"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(raw)
+        parse_input = tmp.name
+
+    doc_metadata = DocumentMetadata(
+        doc_id=str(row.id),
+        category=row.category,
+        doc_type=row.doc_type,
+        keywords=[],
+        card_type=row.card_type,
+        customer_tier=row.customer_tier,
+        effective_date=row.effective_date.isoformat() if row.effective_date else None,
+        expiry_date=row.expiry_date.isoformat() if row.expiry_date else None,
+        security_level=row.security_level,
+        version=row.version,
+    )
+
+    try:
+        final_status = await ingest_document(
+            doc_id=row.id,
+            file_path=parse_input,
+            source_type=row.source_type,
+            metadata=doc_metadata,
+            embedding_provider=embedding_provider,
+            db_session=db,
+            es_client=es_client,
+            milvus_collection=milvus_collection,
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        raise LumioError(code=5000, message=f"重建索引失败: {exc}") from exc
+
+    status_row = (
+        await db.execute(select(KbDocument.status, KbDocument.chunk_count).where(KbDocument.id == row.id))
+    ).first()
+
+    return {
+        "doc_id": str(row.id),
+        "status": status_row.status.value if status_row and status_row.status else final_status,
+        "chunk_count": status_row.chunk_count if status_row else None,
     }
 
 

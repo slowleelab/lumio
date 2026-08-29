@@ -10,6 +10,12 @@
           style="width: 200px"
           @change="load"
         />
+        <el-select v-model="searchStatus" placeholder="按状态筛选" clearable style="width: 140px" @change="load">
+          <el-option label="待处理" value="PENDING" />
+          <el-option label="摄入中" value="PROCESSING" />
+          <el-option label="已入库" value="COMPLETED" />
+          <el-option label="失败" value="FAILED" />
+        </el-select>
         <el-upload
           :auto-upload="false"
           :limit="1"
@@ -63,6 +69,21 @@
       </template>
     </el-dialog>
 
+    <!-- 原始文档预览 -->
+    <el-dialog v-model="sourceVisible" :title="`原始文档 — ${source?.title ?? ''}`" width="760px" top="6vh">
+      <div v-loading="sourceLoading">
+        <template v-if="source">
+          <div class="source-meta">{{ source.file_path }}</div>
+          <pre v-if="source.kind === 'text'" class="source-block">{{ source.content }}</pre>
+          <div v-else class="source-binary">
+            该格式不支持在线预览，
+            <el-link type="primary" :href="source.download_url" target="_blank">点击下载原文件</el-link>
+            （链接 1 小时内有效）
+          </div>
+        </template>
+      </div>
+    </el-dialog>
+
     <!-- 文档表格 -->
     <el-table :data="documents" v-loading="loading" stripe style="margin-top: 16px">
       <el-table-column prop="title" label="文档标题" min-width="200" />
@@ -81,8 +102,9 @@
           {{ row.created_at?.slice(0, 16).replace("T", " ") || "-" }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="140" fixed="right">
+      <el-table-column label="操作" width="180" fixed="right">
         <template #default="{ row }">
+          <el-button link type="primary" size="small" @click="viewSource(row)">查看</el-button>
           <el-button link type="primary" size="small" @click="viewStatus(row)">状态</el-button>
           <el-popconfirm title="确定删除此文档？" @confirm="handleDelete(row.doc_id)">
             <template #reference>
@@ -129,8 +151,25 @@
 import { ref, reactive } from "vue"
 import { ElMessage } from "element-plus"
 import { Upload } from "@element-plus/icons-vue"
-import { listDocuments, uploadDocument, deleteDocument, getDocumentStatus } from "@/api/admin"
+import { listDocuments, uploadDocument, deleteDocument, getDocumentStatus, getDocumentSource, type DocumentSource } from "@/api/admin"
 import type { KbDocument, KbDocumentStatus } from "@/api/types"
+
+const sourceVisible = ref(false)
+const sourceLoading = ref(false)
+const source = ref<DocumentSource | null>(null)
+
+async function viewSource(row: KbDocument) {
+  sourceVisible.value = true
+  sourceLoading.value = true
+  source.value = null
+  try {
+    source.value = await getDocumentSource(row.doc_id)
+  } catch {
+    sourceVisible.value = false
+  } finally {
+    sourceLoading.value = false
+  }
+}
 
 const documents = ref<KbDocument[]>([])
 const total = ref(0)
@@ -138,6 +177,7 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = ref(20)
 const searchCategory = ref("")
+const searchStatus = ref("")
 
 const uploadVisible = ref(false)
 const uploading = ref(false)
@@ -169,6 +209,7 @@ async function load() {
   try {
     const res = await listDocuments({
       category: searchCategory.value || undefined,
+      status: searchStatus.value || undefined,
       limit: pageSize.value,
       offset: (page.value - 1) * pageSize.value,
     })
@@ -203,19 +244,25 @@ async function viewStatus(row: KbDocument) {
   }
 }
 
+// 后端枚举是大写 (PENDING/PROCESSING/COMPLETED/FAILED), 统一归一后映射;
+// COMPLETED 用"已入库"表述 —— 管道是同步的, 上传完成即处理完毕,
+// "已就绪"容易被误读成"准备好但还没开始处理"
+function normStatus(s: string | null | undefined) {
+  return (s ?? "").toLowerCase()
+}
 function statusType(s: string) {
   const m: Record<string, string> = {
-    ingested: "success", ingesting: "warning", failed: "danger",
-    pending: "info", deleted: "info",
+    completed: "success", processing: "warning", failed: "danger",
+    pending: "info", archived: "info",
   }
-  return m[s] ?? "info"
+  return m[normStatus(s)] ?? "info"
 }
 function statusText(s: string) {
   const m: Record<string, string> = {
-    ingested: "已就绪", ingesting: "摄入中", failed: "失败",
-    pending: "待处理", deleted: "已删除",
+    completed: "已入库", processing: "摄入中", failed: "失败",
+    pending: "待处理", archived: "已归档",
   }
-  return m[s] ?? s
+  return m[normStatus(s)] ?? normStatus(s)
 }
 
 load()
@@ -227,4 +274,19 @@ load()
 .page-header h2 { margin: 0; font-size: 20px; }
 .header-actions { display: flex; gap: 12px; }
 .pagination-wrap { margin-top: 16px; display: flex; justify-content: flex-end; }
+.source-meta { font-size: 12px; color: #909399; margin-bottom: 8px; word-break: break-all; }
+.source-block {
+  margin: 0;
+  max-height: 62vh;
+  overflow: auto;
+  padding: 12px;
+  background: var(--color-bg-page, #f5f7fa);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.source-binary { padding: 24px 0; text-align: center; }
 </style>

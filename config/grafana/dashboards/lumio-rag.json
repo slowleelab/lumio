@@ -1,0 +1,427 @@
+{
+  "title": "Lumio RAG 质量监控",
+  "uid": "lumio-rag",
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 13,
+      "title": "系统降级等级",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "max(lumio_degradation_level)"
+        }
+      ],
+      "description": "0=normal, 1=degraded, 2=fallback（DegradationManager 写入）"
+    },
+    {
+      "id": 20,
+      "title": "检索缓存命中率",
+      "type": "stat",
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.1
+              },
+              {
+                "color": "green",
+                "value": 0.3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_rag_cache_ops_total{result=\"hit\"}[15m])) / clamp_min(sum(rate(lumio_rag_cache_ops_total[15m])), 1e-9)"
+        }
+      ],
+      "description": ""
+    },
+    {
+      "id": 26,
+      "title": "FAQ 命中率",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.7
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_faq_match_total{match_type!=\"miss\"}[15m])) / clamp_min(sum(rate(lumio_faq_match_total[15m])), 1e-9)"
+        }
+      ],
+      "description": ""
+    },
+    {
+      "id": 36,
+      "title": "Rerank 降级速率",
+      "type": "stat",
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_rerank_degradation_total[15m]))"
+        }
+      ],
+      "description": ""
+    },
+    {
+      "id": 18,
+      "title": "检索延迟 P50 / P95",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(lumio_retrieval_duration_seconds_bucket[5m])) by (le, search_type))",
+          "legendFormat": "p50 {{search_type}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lumio_retrieval_duration_seconds_bucket[5m])) by (le, search_type))",
+          "legendFormat": "p95 {{search_type}}"
+        }
+      ],
+      "description": "RAG 检索端到端耗时（含 BM25/向量/混合各路径）"
+    },
+    {
+      "id": 22,
+      "title": "检索 QPS",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_retrieval_duration_seconds_count[5m])) by (search_type)",
+          "legendFormat": "{{search_type}}"
+        }
+      ],
+      "description": ""
+    },
+    {
+      "id": 18,
+      "title": "回复来源速率",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_agent_responses_total[5m])) by (source)",
+          "legendFormat": "{{source}}"
+        }
+      ],
+      "description": "source: llm/template/fallback/tool_* 等 — 观察兜底占比是否升高"
+    },
+    {
+      "id": 40,
+      "title": "Rerank 降级速率（按原因）",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_rerank_degradation_total[15m])) by (reason)",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "description": "unavailable=模型不可用 / error=调用异常 / zero_scores=评分全 0"
+    },
+    {
+      "id": 28,
+      "title": "FAQ 命中分布",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_faq_match_total[15m])) by (match_type)",
+          "legendFormat": "{{match_type}}"
+        }
+      ],
+      "description": "exact/semantic/miss — miss 持续偏高说明 FAQ 覆盖不足"
+    },
+    {
+      "id": 50,
+      "title": "Bot 答案延迟 P50 / P95",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(lumio_bot_answer_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lumio_bot_answer_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "description": "单条消息入队到产出答复的处理耗时"
+    },
+    {
+      "id": 33,
+      "title": "熔断器状态",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "lumio_circuit_breaker_state",
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "description": "0=closed, 1=half_open, 2=open"
+    },
+    {
+      "id": 53,
+      "title": "差评标记 / 快答兜底速率",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_bad_case_marked_total[15m]))",
+          "legendFormat": "bad cases"
+        },
+        {
+          "expr": "sum(rate(lumio_fast_reply_total[15m]))",
+          "legendFormat": "fast reply"
+        },
+        {
+          "expr": "sum(rate(lumio_agent_timeouts_total[15m]))",
+          "legendFormat": "timeouts"
+        }
+      ],
+      "description": ""
+    },
+    {
+      "id": 48,
+      "title": "Prompt 回归通过率",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "lumio_eval_regression_pass_rate",
+          "legendFormat": "{{golden_set_version}}"
+        }
+      ],
+      "description": ""
+    },
+    {
+      "id": 54,
+      "title": "注入攻击拦截",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lumio_injection_attempts_total[15m]))",
+          "legendFormat": "attempts"
+        },
+        {
+          "expr": "sum(rate(lumio_injection_blocked_total[15m]))",
+          "legendFormat": "blocked"
+        }
+      ],
+      "description": ""
+    }
+  ]
+}
