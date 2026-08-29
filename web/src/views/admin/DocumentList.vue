@@ -12,8 +12,8 @@
         />
         <el-select v-model="searchStatus" placeholder="按状态筛选" clearable style="width: 140px" @change="load">
           <el-option label="待处理" value="PENDING" />
-          <el-option label="已就绪" value="COMPLETED" />
-          <el-option label="摄入中" value="INGESTING" />
+          <el-option label="摄入中" value="PROCESSING" />
+          <el-option label="已入库" value="COMPLETED" />
           <el-option label="失败" value="FAILED" />
         </el-select>
         <el-upload
@@ -244,19 +244,25 @@ async function viewStatus(row: KbDocument) {
   }
 }
 
+// 后端枚举是大写 (PENDING/PROCESSING/COMPLETED/FAILED), 统一归一后映射;
+// COMPLETED 用"已入库"表述 —— 管道是同步的, 上传完成即处理完毕,
+// "已就绪"容易被误读成"准备好但还没开始处理"
+function normStatus(s: string | null | undefined) {
+  return (s ?? "").toLowerCase()
+}
 function statusType(s: string) {
   const m: Record<string, string> = {
-    ingested: "success", ingesting: "warning", failed: "danger",
-    pending: "info", deleted: "info",
+    completed: "success", processing: "warning", failed: "danger",
+    pending: "info", archived: "info",
   }
-  return m[s] ?? "info"
+  return m[normStatus(s)] ?? "info"
 }
 function statusText(s: string) {
   const m: Record<string, string> = {
-    ingested: "已就绪", ingesting: "摄入中", failed: "失败",
-    pending: "待处理", deleted: "已删除",
+    completed: "已入库", processing: "摄入中", failed: "失败",
+    pending: "待处理", archived: "已归档",
   }
-  return m[s] ?? s
+  return m[normStatus(s)] ?? normStatus(s)
 }
 
 load()

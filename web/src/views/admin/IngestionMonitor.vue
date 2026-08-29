@@ -273,7 +273,7 @@ function statusType(s: string) {
 }
 function statusText(s: string) {
   const m: Record<string, string> = {
-    ingested: "已就绪", completed: "已就绪", ingesting: "摄入中", failed: "失败", pending: "待处理",
+    ingested: "已入库", completed: "已入库", ingesting: "摄入中", processing: "摄入中", failed: "失败", pending: "待处理",
   }
   return m[norm(s)] ?? norm(s)
 }
