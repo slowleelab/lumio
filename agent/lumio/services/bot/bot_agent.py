@@ -66,6 +66,16 @@ from lumio.shared.token_utils import estimate_tokens as _token_estimate  # P1-8 
 from lumio.shared.tracing import traced
 
 
+def _effective_knowledge_source(raw_source: str, context: str) -> str:
+    """回复来源记账: LLM 成功生成且本轮带 RAG 上下文 → knowledge.
+
+    generate_with_fallback 的 source 表达"文本由谁产出"(llm/retrieval/template),
+    但审计与 RAG 看板的口径是"有没有用知识" —— 带上下文的 LLM 生成此前恒记
+    llm, 审计页看起来像"RAG 没搜到"(会话 9d64b59 复盘)。
+    """
+    return "knowledge" if raw_source == "llm" and context else raw_source
+
+
 def _estimate_tokens(text: str) -> int:
     """bot_agent 历史的 token 估算包装, +4 消息格式开销 (role/content 包装).
 
@@ -936,7 +946,7 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"knowledge 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", "")},
+                evidence={"source": getattr(result, "source", ""), "rag_used": bool(context)},
                 latency_ms=_llm_ms,
                 turn_id=uuid_module.uuid4().hex[:16],
             )
@@ -967,13 +977,14 @@ class LumioAgent:
             session_id,
             user_input,
             result.content,
-            result.source,
+            _effective_knowledge_source(result.source, context),
             intent.primary_intent.value,
             intent.primary_confidence,
             should_transfer,
             transfer_reason,
             entities,
             sentiment,
+            retrieval_context=context,
         )
 
     async def _handle_business(
@@ -1142,7 +1153,7 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"business 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", ""), "domain": "business"},
+                evidence={"source": getattr(result, "source", ""), "domain": "business", "rag_used": bool(context)},
                 latency_ms=_llm_ms,
                 turn_id=uuid_module.uuid4().hex[:16],
             )
@@ -1170,13 +1181,14 @@ class LumioAgent:
             session_id,
             user_input,
             result.content,
-            result.source,
+            _effective_knowledge_source(result.source, context),
             intent.primary_intent.value,
             intent.primary_confidence,
             should_transfer,
             transfer_reason,
             entities,
             sentiment,
+            retrieval_context=context,
         )
 
     async def _handle_tool(
@@ -1217,6 +1229,25 @@ class LumioAgent:
             return await self._handle_knowledge(
                 session_id, user_input, intent, history, entities, sentiment, _sensitive_rerouted=True
             )
+
+        # 工具编排无工具被调用时的裸 LLM 直答缺知识 grounding: 查询类问题
+        # (如"信用额度是什么")被 TOOL_INTENTS 路由进来, LLM 判断无需调工具直接回答,
+        # 结果零 RAG —— 审计上就是"RAG 没搜到"(会话 9d64b59 复盘)。有知识可依时
+        # 交由知识路径带 RAG 重新生成, 保证 grounding 与检索证据落库。
+        if (
+            tool_result.pending_action is None
+            and tool_result.source == "llm"
+            and not tool_result.executed_tools
+        ):
+            try:
+                rag_context = await self._retrieve(user_input)
+            except Exception:
+                rag_context = ""
+            if rag_context:
+                logger.info("工具编排无工具调用且检索有据, 转知识路径 grounding: session=%s", session_id)
+                return await self._handle_knowledge(
+                    session_id, user_input, intent, history, entities, sentiment, _sensitive_rerouted=True
+                )
 
         if tool_result.pending_action is not None:
             # 敏感操作：暂存待确认，返回身份核验信号（前端弹框），不执行
@@ -2786,6 +2817,7 @@ class LumioAgent:
         entities: list[Entity] | None = None,
         sentiment: SentimentLabel = SentimentLabel.NEUTRAL,
         verification: VerificationRequest | None = None,
+        retrieval_context: str = "",
     ) -> dict[str, Any]:
         try:
             intent_label = IntentLabel(primary_intent)
@@ -2800,7 +2832,7 @@ class LumioAgent:
             "sentiment": sentiment,
             "classify_source": "",
             "domain": get_domain(intent_label),
-            "retrieval_context": "",
+            "retrieval_context": retrieval_context,
             "response": response,
             "response_source": response_source,
             "should_transfer": should_transfer,

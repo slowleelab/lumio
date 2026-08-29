@@ -150,7 +150,10 @@ class TestBotAgent:
         result = await agent.run("test-session", "帮我查一下我的信用卡账单")
 
         assert result["response"] == "正常应答"
-        assert result["response_source"] == "llm"
+        # 2026-08-29 记账口径: LLM 成功 + 非空 RAG 上下文 → knowledge (会话 9d64b59 复盘)
+        assert result["response_source"] == "knowledge"
+        # knowledge 路径会追加知识图谱补充信息, 用前缀断言
+        assert result["retrieval_context"].startswith("信用卡账单查询 知识片段")
 
     @pytest.mark.asyncio
     async def test_run_farewell_fast_path(self, mock_deps: dict) -> None:
@@ -184,7 +187,19 @@ class TestBotAgent:
         result = await agent.run("test-session", "帮我查一下账单")
 
         assert result["response"] == "这是自动回复"
-        assert result["response_source"] == "llm"
+        assert result["response_source"] == "knowledge"
+        # knowledge 路径会追加知识图谱补充信息, 用前缀断言
+        assert result["retrieval_context"].startswith("信用卡账单查询 知识片段")
+
+    @pytest.mark.asyncio
+    async def test_run_template_source_not_remapped(self, mock_deps: dict) -> None:
+        """模板/兜底来源即使带上下文也不重映射为 knowledge"""
+        from lumio.services.bot.bot_agent import _effective_knowledge_source
+
+        assert _effective_knowledge_source("template", "有上下文") == "template"
+        assert _effective_knowledge_source("fallback", "有上下文") == "fallback"
+        assert _effective_knowledge_source("llm", "") == "llm"
+        assert _effective_knowledge_source("llm", "有上下文") == "knowledge"
 
     @pytest.mark.asyncio
     async def test_run_fresh_garbage_returns_clarify(self, mock_deps: dict) -> None:
@@ -578,6 +593,47 @@ class TestProgressiveDisclosureRouting:
         result = await agent.run("s1", "帮我查账单")
 
         assert result["response"] == "RAG 知识回复"
+
+    @pytest.mark.asyncio
+    async def test_tool_bare_llm_answer_with_rag_hit_falls_back_to_knowledge(
+        self, mock_deps: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """工具编排零工具调用的裸 LLM 直答 + 检索有据 → 转知识路径 grounding (会话 9d64b59)"""
+        from lumio.services.bot.tool_executor import ToolExecutionResult
+
+        self._patch_flag(monkeypatch, True)
+        te = self._tool_executor()
+        te.run_conversation = AsyncMock(
+            return_value=ToolExecutionResult(content="LLM 直答", source="llm", executed_tools=[])
+        )
+        agent = LumioAgent(**mock_deps, tool_executor=te)
+        agent._retrieve = AsyncMock(return_value="知识片段")
+        result = await agent.run("s1", "帮我查账单")
+
+        # 重新走知识路径: 用 mock 的 RAG 知识回复, 来源记 knowledge, 检索上下文落库
+        assert result["response"] == "RAG 知识回复"
+        assert result["response_source"] == "knowledge"
+        assert result["retrieval_context"].startswith("知识片段")
+
+    @pytest.mark.asyncio
+    async def test_tool_bare_llm_answer_without_rag_hit_keeps_llm_answer(
+        self, mock_deps: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """检索无据时不回退, 保留工具编排的 LLM 直答"""
+        from lumio.services.bot.tool_executor import ToolExecutionResult
+
+        self._patch_flag(monkeypatch, True)
+        te = self._tool_executor()
+        te.run_conversation = AsyncMock(
+            return_value=ToolExecutionResult(content="LLM 直答", source="llm", executed_tools=[])
+        )
+        agent = LumioAgent(**mock_deps, tool_executor=te)
+        agent._retrieve = AsyncMock(return_value="")
+        result = await agent.run("s1", "帮我查账单")
+
+        assert result["response"] == "LLM 直答"
+        assert result["response_source"] == "llm"
+        assert result["retrieval_context"] == ""
 
     @pytest.mark.asyncio
     async def test_flag_on_but_no_tools_keeps_knowledge(self, mock_deps: dict, monkeypatch: pytest.MonkeyPatch) -> None:
