@@ -1714,7 +1714,9 @@ async def upload_document(
     except Exception:
         kb_doc.status = KbDocStatus.FAILED
 
-    await db.flush()
+    # P0: get_db 收尾只 rollback 不 commit —— 不显式提交, kb_document/kb_chunk/
+    # kb_ingestion_log 全部随请求回滚, 文档"上传成功却在管理页消失"
+    await db.commit()
 
     return {
         "doc_id": str(kb_doc.id),
@@ -2055,7 +2057,7 @@ async def delete_document(
     """
     from sqlalchemy import select
 
-    result = await db.execute(select(KbDocument).where(KbDocument.id == doc_id))
+    result = await db.execute(select(KbDocument).where(KbDocument.id == _coerce_doc_id(doc_id)))
     doc = result.scalar_one_or_none()
     if not doc:
         from lumio.shared.exceptions import LumioError
@@ -2064,7 +2066,7 @@ async def delete_document(
 
     doc.is_deleted = True
     doc.deleted_at = datetime.now()
-    await db.flush()
+    await db.commit()
 
     # ── 同步清理 ES 索引（按 doc_id 删除该文档的所有分块）──
     if es_client is not None:
