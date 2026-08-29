@@ -81,11 +81,19 @@ class QueryChain:
         for name in properties:
             if name in slot_values and slot_values[name] not in (None, ""):
                 args[name] = slot_values[name]
+        # 智能默认: 账单类查询 "本期" 是自然语义 (会话 chainb 实测: 反问账期体验差),
+        # 缺省填当前 YYYY-MM, 仅当 schema 枚举明确不含该格式时不填
+        if "period" in properties and "period" not in args:
+            from datetime import date as _date
+
+            args["period"] = _date.today().strftime("%Y-%m")
         # card_no 由实名绑定关系注入, 客户只给过后四位也按绑定关系解析完整卡号
         if schema_declares_card_no(input_schema) and "card_no" not in args:
             args["card_no"] = resolve_card_no(customer_id)
 
         missing = [r for r in required if r not in args]
+        if missing:
+            logger.info("查询链路缺参: tool=%s missing=%s", "query", missing)
         return args, missing
 
     # ── 缓存 ──

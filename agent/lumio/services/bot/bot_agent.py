@@ -798,8 +798,12 @@ class LumioAgent:
             logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
             return None
         if qc.missing_params:
-            # 反问澄清 (TW6→S1 补槽回流): 复用槽位 prompt, 无则通用澄清
+            # 反问澄清 (TW6→S1 补槽回流): 槽位 prompt 过弱时用参数中文名直问
+            _PARAM_ZH = {"period": "账期（如 2026-08）", "card_type": "卡种", "amount": "金额", "card_no": "卡号后四位"}
             prompt = await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
+            if not prompt or prompt.strip() == "[槽位状态]":
+                zh = "、".join(_PARAM_ZH.get(m, m) for m in qc.missing_params)
+                prompt = f"请告诉我{zh}，我来为您查询。"
             return self._build_result(
                 session_id,
                 user_input,
