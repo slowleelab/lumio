@@ -178,7 +178,7 @@ class LLMSettings(BaseSettings):
     temperature: float = 0.2
     # 生成输出上限: 实测本地 qwen2.5:7b RAG 答复多为 60~90 token, 2048 上限
     # 不收益且给解码预留过大解码预算; 512 有 6x 余量, 并限制异常长解码拖慢一轮。
-    max_tokens: int = 512
+    max_tokens: int = 256
     timeout_seconds: float = 60.0
 
     # 健康探测

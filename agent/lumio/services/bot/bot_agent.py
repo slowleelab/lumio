@@ -799,7 +799,7 @@ class LumioAgent:
             return None
         if qc.missing_params:
             # 反问澄清 (TW6→S1 补槽回流): 槽位 prompt 过弱时用参数中文名直问
-            param_zh = {"period": "账期（如 2026-08）", "card_type": "卡种", "amount": "金额", "card_no": "卡号后四位"}
+            param_zh = {"period": "账期（如 2026-08）", "card_type": "卡种", "amount": "金额", "card_no": "卡号后四位", "cardNo": "卡号后四位", "card": "卡号后四位", "month": "账期月份"}
             prompt = await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
             if not prompt or prompt.strip() == "[槽位状态]" or "（无所需信息" in prompt:
                 zh = "、".join(param_zh.get(m, m) for m in qc.missing_params)
