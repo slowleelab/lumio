@@ -190,9 +190,11 @@ class LLMSettings(BaseSettings):
     # 各类独立超时
     # 分类独立超时 (LLM 慢路径硬总时长): 既约束慢路径 LLM 分类最坏等待, 又留足正常
     # 分类余量. 此前 1.5s 只是透传 SDK per-read 超时(对流式永不触发), 实为死配置;
-    # 现由 classifier 的 asyncio.wait_for 强制总 deadline, 故设 3s: 拖慢的 8s+ 分类被
-    # 封顶, 正常分类(热机 ~1-2s)不受影响. 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清.
-    classify_timeout: float = 3.0
+    # 现由 classifier 的 asyncio.wait_for 强制总 deadline. 3.0s 在本地 Ollama 被
+    # LLM 对话/嵌入抢占 GPU 时高频超时 (2026-08-30 实测: 149 意图长 prompt 连续
+    # 多轮 >3s → faq@0.0 → 低置信误澄清), 抬到 6s: 慢而成功的分类一次走完,
+    # 仍由 wait_for 封顶, 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清不变.
+    classify_timeout: float = 6.0
     # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
     # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
     classify_cache_enabled: bool = True

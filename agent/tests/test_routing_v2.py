@@ -115,7 +115,11 @@ def _mock_mcp(schema: dict, sensitive: bool = False) -> MagicMock:
 class TestQueryChain:
     @pytest.mark.asyncio
     async def test_missing_params_returns_clarify_signal(self) -> None:
-        schema = {"properties": {"period": {"type": "string"}, "card_no": {"type": "string"}}, "required": ["period"]}
+        # start_date 无智能默认 (period 默认本期), 真缺参才反问
+        schema = {
+            "properties": {"start_date": {"type": "string"}, "card_no": {"type": "string"}},
+            "required": ["start_date"],
+        }
         chain = QueryChain(mcp_client=_mock_mcp(schema), redis_client=None, degradation_mgr=None)
         out = await chain.run(
             intent_label="account_bill_query",
@@ -124,7 +128,7 @@ class TestQueryChain:
             slot_values={},
             customer_id="c1",
         )
-        assert out.missing_params == ["period"] and out.content == ""
+        assert out.missing_params == ["start_date"] and out.content == ""
 
     @pytest.mark.asyncio
     async def test_complete_params_calls_tool_and_summarizes(self) -> None:
