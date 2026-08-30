@@ -799,10 +799,10 @@ class LumioAgent:
             return None
         if qc.missing_params:
             # 反问澄清 (TW6→S1 补槽回流): 槽位 prompt 过弱时用参数中文名直问
-            _PARAM_ZH = {"period": "账期（如 2026-08）", "card_type": "卡种", "amount": "金额", "card_no": "卡号后四位"}
+            param_zh = {"period": "账期（如 2026-08）", "card_type": "卡种", "amount": "金额", "card_no": "卡号后四位"}
             prompt = await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
-            if not prompt or prompt.strip() == "[槽位状态]":
-                zh = "、".join(_PARAM_ZH.get(m, m) for m in qc.missing_params)
+            if not prompt or prompt.strip() == "[槽位状态]" or "（无所需信息" in prompt:
+                zh = "、".join(param_zh.get(m, m) for m in qc.missing_params)
                 prompt = f"请告诉我{zh}，我来为您查询。"
             return self._build_result(
                 session_id,
@@ -3029,12 +3029,23 @@ class LumioAgent:
         if verdict == "unknown":
             return "ood_unknown", evidence
         if low_conf:
+            # 分类器失败兜底 (conf=0.0) 不拦: 放行走 RAG, 由检索 grounding/
+            # 词法证据门决定答还是澄清 —— GPU 争抢下分类高频超时, 一刀切
+            # 澄清把有据可答的真问题全误杀 (会话 f1fec705/9d64b59 实测)。
+            # 真正"不认识"由规则路径给出 0<conf<floor, 仍走澄清。
+            if intent.primary_confidence <= 0.0 and not _is_noise_input(user_input):
+                # 乱码 (噪声字形) 仍拦; 非乱码的真问题放行
+                evidence["classify_fallback_passthrough"] = True
+                return None, evidence
             return "low_confidence", evidence
         if is_noise:
             return "noise", evidence
         # P0 快慢分歧: 慢路径把乱码/含糊输入幻觉成另一意图且置信通胀(最终置信
         # 越过上面所有以它为触发条件的门) -> 拦回确定性澄清 (会话 e33d1fa8).
-        if _fast_slow_disagreement(intent):
+        # 收窄 (会话 9d64b59 复盘): 仅"危险分歧"拦截 —— 慢路径低置信(<0.5) 或
+        # 慢意图属敏感/转人工类; 慢路径强置信的正常业务意图放行, 不再误拦
+        # "信用卡额度是什么"这类真问题。
+        if _fast_slow_disagreement(intent) and _disagreement_is_dangerous(intent):
             return "fast_slow_disagreement", evidence
         # P1: 模糊带宽仲裁 — 语义吃不准(BERT 中段 energy / 低置信但非噪声)时交 LLM 裁决.
         # LLM 结果作为弱信号投票, 不单独放行: 仅当 LLM 明确判 business 时结合实体/槽位放行,
@@ -3282,6 +3293,20 @@ def _is_noise_input(text: str) -> bool:
 # 真值误伤 1 条(0.5%, 代价一轮澄清); 16 条手工乱码拦 12 条.
 _DISAGREEMENT_FAST_FLOOR = 0.5
 _DISAGREEMENT_SLOW_FLOOR = 0.4
+
+
+def _disagreement_is_dangerous(intent: IntentResult) -> bool:
+    """快慢分歧是否值得拦截: 慢路径低置信, 或慢意图属敏感/转人工类 (幻觉成
+    转人工/挂失等才有真实危害; 幻觉成普通业务意图由下游门控兜底)。"""
+    from lumio.shared.models import SENSITIVE_INTENTS
+
+    if intent.primary_confidence < 0.5:
+        return True
+    try:
+        normalized = normalize_intent(intent.primary_intent.value)
+    except Exception:
+        return True
+    return normalized in SENSITIVE_INTENTS or normalized == IntentLabel.TRANSFER_AGENT
 
 
 def _fast_slow_disagreement(intent: IntentResult) -> bool:

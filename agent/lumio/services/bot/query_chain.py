@@ -93,7 +93,7 @@ class QueryChain:
 
         missing = [r for r in required if r not in args]
         if missing:
-            logger.info("查询链路缺参: tool=%s missing=%s", "query", missing)
+            logger.warning("查询链路缺参: tool=%s missing=%s", "query", missing)
         return args, missing
 
     # ── 缓存 ──

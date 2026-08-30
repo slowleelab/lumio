@@ -1519,12 +1519,35 @@ class TestFastSlowDisagreementGate:
 
     @pytest.mark.asyncio
     async def test_noise_gate_blocks_disagreement(self) -> None:
-        """e33d1fa8 复刻: 分歧信号让噪声门给 fast_slow_disagreement, 不再放行 RAG 乱答."""
+        """e33d1fa8 复刻 (2026-08-30 闸门收窄后): 慢路径强置信的正常业务意图分歧不再
+        由噪声门拦截 —— 交知识路径的 RAG grounding/词法证据门兜底 (乱码检索必然无据
+        → 澄清, 真题有据 → 回答); 仅慢路径低置信或敏感/转人工类意图仍拦。"""
         agent = self._make_agent()
         reason, evidence = await agent._evaluate_noise_gate("s1", "额佛呢份", self._hallucinated(), [])
+        assert reason is None  # 不再拦, 交 RAG grounding 兜底
+        assert evidence["fast_slow_disagreement"] is True  # 证据保留供审计
+        assert evidence["fast_conf"] == 0.39
+
+    @pytest.mark.asyncio
+    async def test_noise_gate_still_blocks_sensitive_disagreement(self) -> None:
+        """分歧且慢意图属转人工/敏感类 → 仍拦截 (e33d1fa8 危害场景保留)"""
+        agent = self._make_agent()
+        intent = IntentResult(
+            primary_intent=IntentLabel.TRANSFER_AGENT,
+            primary_confidence=0.7,
+            fast_conf=0.39,
+            fast_intent=IntentLabel.LIMIT_QUERY,
+        )
+        reason, evidence = await agent._evaluate_noise_gate("s1", "额佛呢份", intent, [])
         assert reason == "fast_slow_disagreement"
         assert evidence["fast_slow_disagreement"] is True
-        assert evidence["fast_conf"] == 0.39
+
+    @pytest.mark.asyncio
+    async def test_noise_gate_still_blocks_lowconf_disagreement(self) -> None:
+        """分歧且慢路径低置信 (<0.5) → 仍拦截"""
+        agent = self._make_agent()
+        reason, _ = await agent._evaluate_noise_gate("s1", "额佛呢份", self._hallucinated(conf=0.45), [])
+        assert reason == "fast_slow_disagreement"
 
     @pytest.mark.asyncio
     async def test_noise_gate_agreement_passes(self) -> None:
