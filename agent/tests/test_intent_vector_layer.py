@@ -10,7 +10,7 @@ from lumio.services.common.intent_vector import VectorIntentMatch
 from lumio.shared.models import IntentLabel, IntentResult
 
 
-def _vm(matched=True, intent="query", score=0.72):
+def _vm(matched=True, intent="query", score=0.85):
     return VectorIntentMatch(matched=matched, intent=intent, score=score, exemplar="我的额度是多少")
 
 
@@ -54,7 +54,7 @@ async def test_l2_vector_hit_between_rule_and_llm(classifier_with_vector, monkey
     vec.search.assert_awaited_once()
     # L2 判定五域 query → 域代表叶子 account_bill_query (骨架第一级)
     assert result.primary_intent == IntentLabel.ACCOUNT_BILL_QUERY
-    assert result.primary_confidence == pytest.approx(0.72, abs=1e-3)
+    assert result.primary_confidence == pytest.approx(0.85, abs=1e-3)
     assert source == "vector"
 
 
