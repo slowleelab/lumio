@@ -586,12 +586,12 @@ class LLMClassifier:
                 timeout=timeout,
             )
         except Exception:
-            logger.warning("LLM 分类调用失败/超时(≤%.1fs)，返回兜底结果", llm_settings.classify_timeout)
-            return (
-                IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0),
-                [],
-                SentimentLabel.NEUTRAL,
-            )
+            # 2026-08-30 修复: 此前内部吞异常返回 faq@0.0, IntentClassifier 的
+            # "慢路径失败用 Fast Path 兜底"永远不触发 —— BERT 已认出的 faq@0.446
+            # 被覆写成 0.0, 噪声门 low_conf 误杀真问题 (会话 f1fec705/9d64b59)。
+            # 改为上抛, 由 IntentClassifier except 走 fast_result 兜底。
+            logger.warning("LLM 分类调用失败/超时(≤%.1fs)，上抛交 Fast Path 兜底", llm_settings.classify_timeout)
+            raise
 
         intent_label = _parse_intent(result.get("intent", ""))
         confidence = result.get("confidence", 0.0)

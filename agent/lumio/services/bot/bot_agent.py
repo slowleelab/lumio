@@ -801,7 +801,7 @@ class LumioAgent:
             # 反问澄清 (TW6→S1 补槽回流): 槽位 prompt 过弱时用参数中文名直问
             param_zh = {"period": "账期（如 2026-08）", "card_type": "卡种", "amount": "金额", "card_no": "卡号后四位"}
             prompt = await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
-            if not prompt or prompt.strip() == "[槽位状态]":
+            if not prompt or prompt.strip() == "[槽位状态]" or "（无所需信息" in prompt:
                 zh = "、".join(param_zh.get(m, m) for m in qc.missing_params)
                 prompt = f"请告诉我{zh}，我来为您查询。"
             return self._build_result(
@@ -3029,6 +3029,14 @@ class LumioAgent:
         if verdict == "unknown":
             return "ood_unknown", evidence
         if low_conf:
+            # 分类器失败兜底 (conf=0.0) 不拦: 放行走 RAG, 由检索 grounding/
+            # 词法证据门决定答还是澄清 —— GPU 争抢下分类高频超时, 一刀切
+            # 澄清把有据可答的真问题全误杀 (会话 f1fec705/9d64b59 实测)。
+            # 真正"不认识"由规则路径给出 0<conf<floor, 仍走澄清。
+            if intent.primary_confidence <= 0.0 and not _is_noise_input(user_input):
+                # 乱码 (噪声字形) 仍拦; 非乱码的真问题放行
+                evidence["classify_fallback_passthrough"] = True
+                return None, evidence
             return "low_confidence", evidence
         if is_noise:
             return "noise", evidence

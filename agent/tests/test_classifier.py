@@ -104,17 +104,17 @@ async def test_llm_classify_success() -> None:
 
 @pytest.mark.asyncio
 async def test_llm_classify_fallback_on_error() -> None:
-    """LLM 调用失败时应返回兜底结果"""
+    """LLM 调用失败应上抛 (由 IntentClassifier except 用 Fast Path 结果兜底)。
+
+    2026-08-30 修复: 此前内部吞异常返回 faq@0.0, 外层 Fast Path 兜底永不触发,
+    BERT 已认出的正确结果被覆写成 0.0 → 噪声门误杀 (会话 f1fec705/9d64b59)。
+    """
     mock_llm = MagicMock()
     mock_llm.classify = AsyncMock(side_effect=Exception("LLM 不可用"))
 
     classifier = LLMClassifier(mock_llm)
-    intent, entities, sentiment = await classifier.classify("随便什么")
-
-    assert intent.primary_intent == IntentLabel.FAQ
-    assert intent.primary_confidence == 0.0
-    assert entities == []
-    assert sentiment == SentimentLabel.NEUTRAL
+    with pytest.raises(Exception, match="LLM 不可用"):
+        await classifier.classify("随便什么")
 
 
 # ── IntentClassifier (双通道) ──
@@ -701,9 +701,11 @@ async def test_llm_classify_cache_disabled_and_failure_not_cached() -> None:
     llm.classify = AsyncMock(side_effect=TimeoutError("boom"))
     clf2 = LLMClassifier(llm)
     with patch("lumio.services.common.classifier.get_settings", return_value=_llm_settings()):
-        r1 = await clf2.classify("会失败的句子")
-        r2 = await clf2.classify("会失败的句子")
-    assert r1[0].primary_confidence == 0.0 and r2[0].primary_confidence == 0.0
+        # 2026-08-30: 失败改为上抛 (外层用 Fast Path 兜底), 仍验证失败不缓存
+        with pytest.raises(TimeoutError):
+            await clf2.classify("会失败的句子")
+        with pytest.raises(TimeoutError):
+            await clf2.classify("会失败的句子")
     assert llm.classify.await_count == 2  # 失败不缓存
 
 
