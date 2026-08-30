@@ -677,12 +677,15 @@ class IntentClassifier:
         fast_threshold: float = _FAST_PATH_THRESHOLD,
         bert_classifier: BertIntentClassifier | None = None,
         trap: TrapCollector | None = None,
+        intent_vector=None,
     ) -> None:
         self._rule = rule_classifier or RuleClassifier()
         self._llm = llm_classifier
         self._threshold = fast_threshold
         self._bert = bert_classifier
         self._trap = trap  # P1 感知缝: 被动采样失败/不确定/分歧样本
+        # 目标架构 L2: 向量检索意图 (规则未命中时, 种子语料余弦检索)
+        self._intent_vector = intent_vector
         # P1: 最近一次 BERT 快路径的 energy-OOD 分 (无 BERT/未启用时为 None).
         # 供上层噪声闸读取, 与 classify 主结果解耦, 不改变返回签名。
         self._last_energy: float | None = None
@@ -744,6 +747,51 @@ class IntentClassifier:
         else:
             fast_result = self._rule.classify(text)
             self._last_energy = None
+
+        # ── L2 向量检索意图 (目标架构 ③: L1 规则 → L2 向量 → L3 LLM) ──
+        # L1 未强命中时, 与种子语料余弦检索取意图; 置信不足才落 L3 LLM。
+        # BERT 保留为证据信号 (fast_conf/fast_intent 透传审计), 不再单独定路由。
+        if (
+            fast_result.primary_confidence < self._threshold
+            and self._intent_vector is not None
+            and get_settings().classification.vector_intent_enabled
+        ):
+            try:
+                vm = await self._intent_vector.search(text)
+                if vm.matched and vm.score >= get_settings().classification.vector_intent_threshold:
+                    from lumio.shared.intent_taxonomy import IntentDomain, domain_of
+
+                    # L2 判定五域 (骨架第一级); 叶子优先取快路径同域意图 (更精确),
+                    # 否则用域代表叶子, 保证 v2 路由 TrafficClass 与域一致
+                    domain_rep = {
+                        IntentDomain.QUERY: IntentLabel.ACCOUNT_BILL_QUERY,
+                        IntentDomain.TRANSACTION: IntentLabel.CARD_LOSS_REPORT,
+                        IntentDomain.CONSULTING: IntentLabel.FAQ,
+                        IntentDomain.SERVICE: IntentLabel.TRANSFER_AGENT,
+                        IntentDomain.CHITCHAT: IntentLabel.CHITCHAT,
+                    }
+                    try:
+                        v_domain = IntentDomain(vm.intent)
+                    except ValueError:
+                        v_domain = None
+                    if v_domain is None:
+                        raise ValueError(f"L2 返回未知域: {vm.intent}")
+                    if domain_of(fast_result.primary_intent) == v_domain:
+                        v_leaf = fast_result.primary_intent
+                    else:
+                        v_leaf = domain_rep[v_domain]
+                    logger.info("L2 向量域命中: %s@%.3f → 叶子 %s", v_domain.value, vm.score, v_leaf.value)
+                    fast_result = IntentResult(
+                        primary_intent=v_leaf,
+                        primary_confidence=round(min(vm.score, 0.99), 4),
+                        alternatives=fast_result.alternatives,
+                        energy=fast_result.energy,
+                        fast_conf=fast_result.primary_confidence,
+                        fast_intent=fast_result.primary_intent,
+                    )
+                    fast_source = "vector"
+            except Exception as exc:
+                logger.warning("L2 向量意图检索失败(跳过 L2): %s", exc)
 
         # 办理词确定性修正 (会话 48882b05 同型): BERT 标签空间仍是旧扁平 10 类,
         # 发不出 limit_apply_increase/decrease — "我要提额"被 BERT 判 limit_query

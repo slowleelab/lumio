@@ -374,6 +374,11 @@ class ClassificationSettings(BaseSettings):
     # 实测标注 (2026-08, closed_loop.json switch_rationale): 乱码样本 energy 反而更低
     # (-2.55 vs 阈值 -3.4) 被判"认得", 无区分度 → 默认关, 只作观测位; 开启前必须在
     # 部署环境用真实噪声/真实业务样本重新标定阈值, 否则是"假开关"。
+    # 目标架构 L2: 向量检索意图 (规则未命中 → 种子余弦检索 → 置信不足才 LLM)
+    vector_intent_enabled: bool = True
+    # 五域直测: 0.72 阈值下 2/5 误判 (小样本嵌入的现实约束), 收紧到 0.78
+    # 只放行显著命中, 其余落 L3 LLM 兜底; 种子扩容后可回调
+    vector_intent_threshold: float = 0.78
     ood_enabled: bool = False  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
     # energy 阈值: energy 高于此 → 认为"认识"可用(信任 BERT); 低于 → "不认"倾向 OOD/噪声.
     # energy 数值尺度取决于 logits 绝对值, 需在部署环境用验证集标定, 这里给保守初值.
