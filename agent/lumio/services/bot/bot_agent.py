@@ -781,6 +781,15 @@ class LumioAgent:
                 )
             return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
         if traffic == TrafficClass.READ_ONLY_QUERY:
+            # 复合意图 (查询 + 解释/FAQ 诉求) 优先走链 C: 纯定义类问题会被
+            # 查询链路的缺参反问卡死 (会话 2b3b2613 实测: "信用额度是什么"三连问
+            # 卡号, 用户永远出不去)。链 C 缺参/无工具时自然回落知识路径。
+            if composite:
+                comp = await self._handle_composite(
+                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                )
+                if comp is not None:
+                    return comp
             # 链 B · 查询轻链路: 直连工具 + 缓存; 无工具/链失败回落
             if self._tool_executor is not None and self._tool_executor.has_tools():
                 qc = await self._handle_query_chain(
@@ -846,8 +855,25 @@ class LumioAgent:
             logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
             return None
         if qc.missing_params:
+            # 缺参先探知识 (会话 2b3b2613 复盘: "信用额度是什么"缺卡号被反问,
+            # 但定义类问题知识库可答 —— 反问个人参数前先看 RAG 有据与否)
+            try:
+                probe = await self._retrieve(user_input)
+            except Exception:
+                probe = ""
+            if probe:
+                logger.info("查询链路缺参但 RAG 有据, 转知识路径: session=%s", session_id)
+                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
             # 反问澄清 (TW6→S1 补槽回流): 槽位 prompt 过弱时用参数中文名直问
-            param_zh = {"period": "账期（如 2026-08）", "card_type": "卡种", "amount": "金额", "card_no": "卡号后四位", "cardNo": "卡号后四位", "card": "卡号后四位", "month": "账期月份"}
+            param_zh = {
+                "period": "账期（如 2026-08）",
+                "card_type": "卡种",
+                "amount": "金额",
+                "card_no": "卡号后四位",
+                "cardNo": "卡号后四位",
+                "card": "卡号后四位",
+                "month": "账期月份",
+            }
             prompt = await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
             if not prompt or prompt.strip() == "[槽位状态]" or "（无所需信息" in prompt:
                 zh = "、".join(param_zh.get(m, m) for m in qc.missing_params)
