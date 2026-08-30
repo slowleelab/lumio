@@ -759,20 +759,37 @@ class IntentClassifier:
             try:
                 vm = await self._intent_vector.search(text)
                 if vm.matched and vm.score >= get_settings().classification.vector_intent_threshold:
-                    from lumio.shared.models import normalize_intent as _ni
+                    from lumio.shared.intent_taxonomy import IntentDomain, domain_of
 
-                    v_intent = _ni(vm.intent)  # 未知标签兜底 FAQ, 恒返回 IntentLabel
-                    if True:
-                        logger.info("L2 向量意图命中: %s@%.3f (样例: %s)", v_intent.value, vm.score, vm.exemplar)
-                        fast_result = IntentResult(
-                            primary_intent=v_intent,
-                            primary_confidence=round(min(vm.score, 0.99), 4),
-                            alternatives=fast_result.alternatives,
-                            energy=fast_result.energy,
-                            fast_conf=fast_result.primary_confidence,
-                            fast_intent=fast_result.primary_intent,
-                        )
-                        fast_source = "vector"
+                    # L2 判定五域 (骨架第一级); 叶子优先取快路径同域意图 (更精确),
+                    # 否则用域代表叶子, 保证 v2 路由 TrafficClass 与域一致
+                    domain_rep = {
+                        IntentDomain.QUERY: IntentLabel.ACCOUNT_BILL_QUERY,
+                        IntentDomain.TRANSACTION: IntentLabel.CARD_LOSS_REPORT,
+                        IntentDomain.CONSULTING: IntentLabel.FAQ,
+                        IntentDomain.SERVICE: IntentLabel.TRANSFER_AGENT,
+                        IntentDomain.CHITCHAT: IntentLabel.CHITCHAT,
+                    }
+                    try:
+                        v_domain = IntentDomain(vm.intent)
+                    except ValueError:
+                        v_domain = None
+                    if v_domain is None:
+                        raise ValueError(f"L2 返回未知域: {vm.intent}")
+                    if domain_of(fast_result.primary_intent) == v_domain:
+                        v_leaf = fast_result.primary_intent
+                    else:
+                        v_leaf = domain_rep[v_domain]
+                    logger.info("L2 向量域命中: %s@%.3f → 叶子 %s", v_domain.value, vm.score, v_leaf.value)
+                    fast_result = IntentResult(
+                        primary_intent=v_leaf,
+                        primary_confidence=round(min(vm.score, 0.99), 4),
+                        alternatives=fast_result.alternatives,
+                        energy=fast_result.energy,
+                        fast_conf=fast_result.primary_confidence,
+                        fast_intent=fast_result.primary_intent,
+                    )
+                    fast_source = "vector"
             except Exception as exc:
                 logger.warning("L2 向量意图检索失败(跳过 L2): %s", exc)
 

@@ -18,20 +18,21 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "lumio_intent_vectors"
+COLLECTION_NAME = "lumio_intent_domain_vectors"
 DIM = 1024
 SEED_PATH = Path(__file__).resolve().parents[3] / "data" / "intent_classification" / "seed_dataset.json"
 
 
 @dataclass
 class VectorIntentMatch:
-    """L2 检索结果
+    """L2 检索结果 (五域骨架)
 
+    intent 为五域值 (query/transaction/consulting/service/chitchat);
     score 为余弦相似度 (0~1)；matched=False 表示索引不可用或无候选。
     """
 
     matched: bool
-    intent: str = ""
+    intent: str = ""  # 五域值
     score: float = 0.0
     exemplar: str = ""
 
@@ -48,13 +49,21 @@ class IntentVectorIndex:
     # ── 建库 ──
 
     def _load_seeds(self) -> list[dict]:
+        """种子按五域标注 (骨架第一级, 5 类比 10 叶类检索准得多)"""
+        from lumio.shared.intent_taxonomy import domain_of
+
         with open(SEED_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        return [
-            {"text": ex["text"], "intent": ex["intent"]}
-            for ex in data.get("examples", [])
-            if ex.get("text") and ex.get("intent")
-        ]
+        rows = []
+        for ex in data.get("examples", []):
+            if not (ex.get("text") and ex.get("intent")):
+                continue
+            try:
+                domain = domain_of(ex["intent"]).value
+            except Exception:
+                continue
+            rows.append({"text": ex["text"], "intent": domain})
+        return rows
 
     def _collection_exists(self) -> bool:
         from pymilvus import utility
