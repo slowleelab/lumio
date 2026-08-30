@@ -448,14 +448,24 @@ async def init_classifier(app: FastAPI) -> None:
             settings.classification.trap_ambient_rate,
         )
 
+    # 目标架构 L2: 向量检索意图索引 (种子语料 Milvus 持久化, 惰性建库)
+    from lumio.services.common.intent_vector import IntentVectorIndex
+
+    intent_vector = IntentVectorIndex(
+        milvus_collection=getattr(app.state, "milvus_collection", None),
+        embedding_provider=getattr(app.state, "embedding_provider", None),
+    )
+
     classifier = IntentClassifier(
         rule_classifier=rule_classifier,
         llm_classifier=llm_classifier,
         fast_threshold=settings.classification.intent_threshold + 0.1,
         bert_classifier=bert_classifier,
         trap=trap,
+        intent_vector=intent_vector,
     )
     app.state.classifier = classifier
+    app.state.intent_vector = intent_vector
 
 
 async def close_classifier(app: FastAPI) -> None:
