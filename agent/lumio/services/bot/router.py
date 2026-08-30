@@ -821,13 +821,19 @@ async def _run_agent(
 
     from lumio.shared.models import DialogueTurn
 
+    # 数据标注修正 (审计复查 2026-08-31): 客户行此前复制了 bot 应答的意图/置信,
+    # "我要挂失信用卡"被标成 transfer_agent@0.77 —— 意图是应答侧的分类结果,
+    # 客户消息本身未被分类, 审计上属于错标, 置空。分类失败兜底 (conf=0.0 的
+    # faq) 是无意义标注, bot 行同样置空表示"未识别", 防审计被 52% 的
+    # faq@0.0 污染 (实测 1538 行中 800 行)。
+    classify_failed = not primary_confidence
     customer_turn = DialogueTurn(
         turn_id=_uuid4().hex,
         session_id=session_id,
         speaker="customer",
         content=message,
-        intent=primary_intent,
-        confidence=primary_confidence,
+        intent=None,
+        confidence=None,
         entities=entities if isinstance(entities, list) else [],
     )
     bot_turn = DialogueTurn(
@@ -835,8 +841,8 @@ async def _run_agent(
         session_id=session_id,
         speaker="bot",
         content=reply,
-        intent=primary_intent,
-        confidence=primary_confidence,
+        intent=None if classify_failed else primary_intent,
+        confidence=None if classify_failed else primary_confidence,
         response_source=source,
         retrieval_context=result.get("retrieval_context", ""),
     )
