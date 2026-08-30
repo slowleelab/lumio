@@ -229,6 +229,7 @@ class LumioAgent:
     @traced("Agent: bot_run")
     async def run(self, session_id: str, user_input: str, customer_id: str | None = None) -> dict[str, Any]:
         """运行 Bot Agent，返回与旧版兼容的 dict"""
+        _turn_t0 = time.monotonic()  # 全链路总耗时锚点 (CHAIN_COMPLETE 埋点用)
         # ── 跨会话画像学习（异步，首次对话时从历史推断客户画像）──
         if customer_id and self._session_manager:
             try:
@@ -375,6 +376,19 @@ class LumioAgent:
                     answer = detail.get("answer") if detail else None
                 if answer:
                     logger.info("FAQ 短路命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
+                    try:
+                        log_decision(
+                            session_id=session_id,
+                            agent_name="bot_agent",
+                            action=DecisionAction.FAQ_DIRECT,
+                            reasoning=f"FAQ 直出 ({faq_res['match_type']})",
+                            evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
+                            latency_ms=0.0,
+                            turn_id=uuid_module.uuid4().hex[:16],
+                            customer_id=customer_id,
+                        )
+                    except Exception:
+                        logger.debug("decision_log 记录失败(不阻断)")
                     return self._build_result(session_id, user_input, answer, "faq", "faq")
         except Exception as faq_err:
             logger.warning("FAQ 优先匹配失败, 走常规流程: %s", faq_err)
@@ -524,6 +538,40 @@ class LumioAgent:
                     logger.warning("出站闸门拦截(%s): session=%s", verdict.reason, session_id)
                     result["response"] = verdict.reply
                     result["response_source"] = "clarify"
+                    try:
+                        log_decision(
+                            session_id=session_id,
+                            agent_name="bot_agent",
+                            action=DecisionAction.OUTBOUND_GUARD,
+                            reasoning=f"出站拦截({verdict.reason})",
+                            evidence={"reason": verdict.reason},
+                            latency_ms=0.0,
+                            turn_id=uuid_module.uuid4().hex[:16],
+                            customer_id=customer_id,
+                        )
+                    except Exception:
+                        logger.debug("decision_log 记录失败(不阻断)")
+
+            # 全链路完成埋点: 输入→输出的总耗时 (全链路监控的端到端锚点)
+            if result is not None:
+                total_ms = (time.monotonic() - _turn_t0) * 1000
+                try:
+                    log_decision(
+                        session_id=session_id,
+                        agent_name="bot_agent",
+                        action=DecisionAction.CHAIN_COMPLETE,
+                        reasoning=f"链路完成: source={result.get('response_source')} 总耗时 {total_ms:.0f}ms",
+                        evidence={
+                            "source": result.get("response_source"),
+                            "intent": intent_result.primary_intent.value,
+                            "total_ms": round(total_ms, 1),
+                        },
+                        latency_ms=total_ms,
+                        turn_id=uuid_module.uuid4().hex[:16],
+                        customer_id=customer_id,
+                    )
+                except Exception:
+                    logger.debug("decision_log 记录失败(不阻断)")
 
             # P0 等待快照维护 (会话 1fb54681 复盘): 本轮回复若在"等客户补充参数/槽位"
             # (槽位追问/工具参数索取), 把缺槽快照落盘 -- 下一轮短回复无论被分类成什么,

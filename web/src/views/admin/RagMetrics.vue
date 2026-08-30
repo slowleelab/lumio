@@ -75,15 +75,20 @@
       </el-col>
       <el-col :span="12">
         <el-card shadow="never">
-          <template #header>决策延迟（avg / p95 ms）</template>
-          <el-table :data="summary?.decision_latency ?? []" stripe size="small">
-            <el-table-column prop="agent" label="Agent" min-width="110" />
-            <el-table-column prop="action" label="动作" min-width="110" show-overflow-tooltip />
+          <template #header>全链路关键步骤（输入 → 输出，avg / p95 ms）</template>
+          <el-table :data="orderedStages" stripe size="small">
+            <el-table-column label="#" width="44" align="center">
+              <template #default="{ $index }">{{ $index + 1 }}</template>
+            </el-table-column>
+            <el-table-column label="步骤" min-width="130">
+              <template #default="{ row }">{{ stageLabel(row.action) }}</template>
+            </el-table-column>
+            <el-table-column prop="agent" label="Agent" min-width="90" show-overflow-tooltip />
             <el-table-column prop="count" label="次数" width="80" align="center" />
-            <el-table-column label="平均" width="100" align="right">
+            <el-table-column label="平均" width="90" align="right">
               <template #default="{ row }">{{ fmtMs(row.avg_ms) }}</template>
             </el-table-column>
-            <el-table-column label="P95" width="100" align="right">
+            <el-table-column label="P95" width="90" align="right">
               <template #default="{ row }">{{ fmtMs(row.p95_ms) }}</template>
             </el-table-column>
           </el-table>
@@ -197,6 +202,48 @@ const statCards = computed(() => {
 })
 
 const faqHitRate = computed(() => summary.value?.faq.hit_rate ?? null)
+
+// 全链路关键步骤: 按输入→输出管道顺序排列 (未出现的步骤不显示)
+const STAGE_ORDER = [
+  "guard_denied",
+  "noise_blocked",
+  "context_reply_pass",
+  "faq_direct",
+  "intent_classify",
+  "tool_call",
+  "rag_retrieve",
+  "llm_generate",
+  "outbound_guard",
+  "chain_complete",
+  "injection_blocked",
+  "user_confirm",
+  "transfer_agent",
+]
+const STAGE_LABELS: Record<string, string> = {
+  intent_classify: "① 意图分类",
+  tool_call: "② 路由决策/工具",
+  rag_retrieve: "③ RAG 检索",
+  llm_generate: "④ LLM 生成",
+  faq_direct: "⑤ FAQ 直出",
+  noise_blocked: "① 输入门-拦截",
+  context_reply_pass: "① 输入门-放行",
+  guard_denied: "① 输入护栏拦截",
+  outbound_guard: "⑤ 出站闸门",
+  chain_complete: "⑥ 链路完成(端到端)",
+  injection_blocked: "⑦ 注入拦截",
+  user_confirm: "⑤ 用户确认",
+  transfer_agent: "⑥ 转人工",
+}
+const orderedStages = computed(() => {
+  const rows = summary.value?.decision_latency ?? []
+  return [...rows].sort(
+    (a, b) =>
+      STAGE_ORDER.indexOf(a.action) - STAGE_ORDER.indexOf(b.action) || b.count - a.count,
+  )
+})
+function stageLabel(action: string) {
+  return STAGE_LABELS[action] ?? action
+}
 const faqRateType = computed(() => (faqHitRate.value != null && faqHitRate.value >= 0.6 ? "success" : "warning"))
 
 // ── 图表数据组装 ──

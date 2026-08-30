@@ -44,6 +44,10 @@ class DecisionAction(str, Enum):
     # 多轮噪声/闲聊治理 (P0): 噪声被拦截 / 上下文回应放行
     NOISE_BLOCKED = "noise_blocked"
     CONTEXT_REPLY_PASS = "context_reply_pass"
+    # 全链路监控 (输入→输出关键步骤): FAQ 直出 / 出站闸门 / 链路完成(含总耗时)
+    FAQ_DIRECT = "faq_direct"
+    OUTBOUND_GUARD = "outbound_guard"
+    CHAIN_COMPLETE = "chain_complete"
 
 
 @dataclass
