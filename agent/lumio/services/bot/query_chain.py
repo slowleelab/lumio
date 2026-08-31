@@ -14,6 +14,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from lumio.services.common.card_binding import resolve_card_no, schema_declares_card_no
 
@@ -53,7 +54,7 @@ class QueryChain:
     由 bot_agent 持有并传入。
     """
 
-    def __init__(self, *, mcp_client, redis_client=None, degradation_mgr=None) -> None:
+    def __init__(self, *, mcp_client: Any, redis_client: Any = None, degradation_mgr: Any = None) -> None:
         self._mcp = mcp_client
         self._redis = redis_client
         self._degradation = degradation_mgr
@@ -69,18 +70,21 @@ class QueryChain:
             return spec.name, spec.input_schema
         return None, None
 
-    def build_args(self, input_schema: dict, slot_values: dict, customer_id: str | None) -> tuple[dict, list[str]]:
+    def build_args(
+        self, input_schema: dict, slot_values: dict, customer_id: str | None
+    ) -> tuple[dict, list[str]]:
         """schema 驱动的参数组装: 槽位值按参数名填充 + card_no 绑定卡号自动注入。
 
         Returns: (args, missing_required) — missing 为 schema required 中无法提供的参数名。
         """
+        slots = slot_values or {}
         properties = (input_schema or {}).get("properties") or {}
         required = (input_schema or {}).get("required") or []
         args: dict = {}
 
         for name in properties:
-            if name in slot_values and slot_values[name] not in (None, ""):
-                args[name] = slot_values[name]
+            if name in slots and slots[name] not in (None, ""):
+                args[name] = slots[name]
         # 智能默认: 账单类查询 "本期" 是自然语义 (会话 chainb 实测: 反问账期体验差),
         # 缺省填当前 YYYY-MM, 仅当 schema 枚举明确不含该格式时不填
         if "period" in properties and "period" not in args:
@@ -102,7 +106,8 @@ class QueryChain:
         if not self._redis:
             return None
         try:
-            return await self._redis.get(key)
+            value = await self._redis.get(key)
+            return str(value) if value is not None else None
         except Exception:
             return None
 
@@ -134,7 +139,8 @@ class QueryChain:
         if tool_name is None:
             return QueryChainResult(error="no_query_tool")
 
-        args, missing = self.build_args(schema, slot_values or {}, customer_id)
+        slots: dict = slot_values if slot_values is not None else {}
+        args, missing = self.build_args(schema, slots, customer_id)
         if missing:
             return QueryChainResult(missing_params=missing, tool_name=tool_name)
 
@@ -184,7 +190,7 @@ class QueryChain:
                 context=context,
                 history=history,
             )
-            return result.content
+            return str(result.content)
         except Exception as exc:
             logger.warning("查询链路摘要生成失败, 回落工具原文: %s", exc)
             return raw_result

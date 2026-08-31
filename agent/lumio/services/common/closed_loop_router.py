@@ -6,6 +6,7 @@ import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy import func, select
 
 from lumio.services.common.badcase_loop import (
     BadcaseJudge,
@@ -15,10 +16,9 @@ from lumio.services.common.badcase_loop import (
 from lumio.services.common.badcase_store import (
     attribute_and_save,
     get_badcase,
+    list_badcases,
     update_fix_status,
 )
-from sqlalchemy import func, select
-
 from lumio.services.common.deps import DbSession
 from lumio.shared.auth import AuthUser, require_role
 from lumio.shared.config import get_settings
@@ -93,9 +93,7 @@ async def list_badcases_endpoint(
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """Badcase 列表 (支持按信号/根因层/修复状态过滤)"""
-    from lumio.services.common.badcase_store import list_badcases as _list
-
-    items, total = await _list(
+    items, total = await list_badcases(
         db,
         signal_source=signal_source,
         root_cause_layer=root_cause_layer,
@@ -214,7 +212,7 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
     day_ago = now - timedelta(days=1)
     from sqlalchemy import func, select
 
-    from lumio.shared.orm_models import Badcase, DialogueLog
+    from lumio.shared.orm_models import Badcase
 
     total = (await db.execute(select(func.count()).select_from(Badcase))).scalar() or 0
     pending_review = (
@@ -266,7 +264,6 @@ async def closed_loop_health(user: AdminAgentUser, db: DbSession) -> dict[str, A
 
     now = datetime.now(UTC)
     since = now - timedelta(days=7)
-    week_ago = now - timedelta(days=14)
 
     transfer_count = (
         await db.execute(

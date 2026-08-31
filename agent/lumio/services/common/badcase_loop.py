@@ -145,7 +145,7 @@ class BadcaseJudge:
     - 分流表建议: 归因层 → 默认表映射 (可人工覆盖)
     """
 
-    def __init__(self, llm, model: str = "", *, min_confidence: float = 0.7, samples: int = 3) -> None:
+    def __init__(self, llm: Any, model: str = "", *, min_confidence: float = 0.7, samples: int = 3) -> None:
         self._llm = llm
         self._model = model or "unknown"
         self._min_conf = min_confidence
@@ -154,13 +154,14 @@ class BadcaseJudge:
     async def _one_sample(self, user_prompt: str) -> dict[str, Any] | None:
         # 优先 chat_json (结构化输出, Ollama format=json), 不可用时回落 chat+解析
         try:
-            return await self._llm.chat_json(
+            raw = await self._llm.chat_json(
                 [
                     {"role": "system", "content": _JUDGE_SYSTEM_PROMPT + "\n输出 JSON schema: " + _JUDGE_OUTPUT_SCHEMA},
                     {"role": "user", "content": user_prompt},
                 ],
                 timeout=60,
             )
+            return dict(raw) if isinstance(raw, dict) else None
         except AttributeError:
             resp = await self._llm.chat(
                 [

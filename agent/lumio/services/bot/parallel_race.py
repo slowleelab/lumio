@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,8 @@ class RaceOutcome:
 
 
 async def race(
-    faq_fn,
-    rag_fn,
+    faq_fn: Any,
+    rag_fn: Any,
     *,
     faq_timeout: float = 5.0,
     rag_timeout: float = 10.0,

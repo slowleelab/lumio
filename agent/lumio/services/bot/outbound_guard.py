@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class OutboundGuard:
         clarify_response: 拦截后的替换话术
     """
 
-    def __init__(self, safety_filter, clarify_response: str) -> None:
+    def __init__(self, safety_filter: Any, clarify_response: str) -> None:
         self._safety = safety_filter
         self._clarify = clarify_response
 

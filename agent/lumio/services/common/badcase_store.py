@@ -57,7 +57,7 @@ async def capture_badcase(
 
 
 async def list_badcases(
-    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
     *,
     signal_source: str | None = None,
     root_cause_layer: str | None = None,
@@ -67,28 +67,30 @@ async def list_badcases(
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     """查询 Badcase 列表"""
-    async with session_factory() as session:
-        conds = []
-        if signal_source:
-            conds.append(Badcase.signal_source == signal_source)
-        if root_cause_layer:
-            conds.append(Badcase.root_cause_layer == root_cause_layer)
-        if fix_status:
-            conds.append(Badcase.fix_status == fix_status)
-        if fix_table:
-            conds.append(Badcase.fix_table == fix_table)
-        query = select(Badcase)
-        count_q = select(func.count()).select_from(Badcase)
-        if conds:
-            query = query.where(*conds)
-            count_q = count_q.where(*conds)
-        total = (await session.execute(count_q)).scalar() or 0
-        rows = (
-            (await session.execute(query.order_by(Badcase.created_at.desc()).limit(limit).offset(offset)))
-            .scalars()
-            .all()
-        )
-        return [_to_dict(b) for b in rows], total
+    conds = []
+    if signal_source:
+        conds.append(Badcase.signal_source == signal_source)
+    if root_cause_layer:
+        conds.append(Badcase.root_cause_layer == root_cause_layer)
+    if fix_status:
+        conds.append(Badcase.fix_status == fix_status)
+    if fix_table:
+        conds.append(Badcase.fix_table == fix_table)
+
+    query = select(Badcase)
+    count_q = select(func.count()).select_from(Badcase)
+    if conds:
+        query = query.where(*conds)
+        count_q = count_q.where(*conds)
+
+    total = (await session.execute(count_q)).scalar() or 0
+    rows = (
+        (await session.execute(query.order_by(Badcase.created_at.desc()).limit(limit).offset(offset)))
+        .scalars()
+        .all()
+    )
+    return [_to_dict(b) for b in rows], total
+
 
 
 def _to_dict(b: Badcase) -> dict[str, Any]:
