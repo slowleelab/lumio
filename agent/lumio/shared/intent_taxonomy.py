@@ -104,7 +104,26 @@ _GROUP_OVERRIDES: dict[IntentLabel, str] = {
 
 
 # 域级显式覆盖 (组覆盖但旧域名不一致的意图, 两级保持一致)
+# 定义句式 (概念咨询, 会话 2b3b2613/9d64b59 根治): "X是什么/什么是X/什么叫X"
+# 是概念咨询而非个人账户数据查询 —— L3 LLM 高频把这类误判成 limit_query 进
+# 查询域 → 链 B 反问卡号死循环。句式命中强制咨询域。
+_DEFINITION_SUFFIX = "是什么"
+_DEFINITION_PREFIX = "什么是"
+_DEFINITION_PREFIX_ALT = "什么叫"
+
+
+def is_definition_query(text: str) -> bool:
+    """定义句式判定: 询问概念/规则本身, 而非查询个人账户数据"""
+    t = (text or "").strip().rstrip("？！?!")
+    return (
+        t.endswith(_DEFINITION_SUFFIX)
+        or t.startswith(_DEFINITION_PREFIX)
+        or t.startswith(_DEFINITION_PREFIX_ALT)
+    ) and not any(k in t for k in ("我的", "查一下我的", "帮我看下我的", "帮我查我的"))
+
+
 _DOMAIN_OVERRIDES: dict[IntentLabel, IntentDomain] = {
+    IntentLabel.INST_APPLY: IntentDomain.TRANSACTION,  # B1 资金类 (分期办理, 有交易工具)
     IntentLabel.REPAY_EARLY: IntentDomain.TRANSACTION,  # B1 资金类
     IntentLabel.REPAY_SETTLE: IntentDomain.TRANSACTION,
     IntentLabel.TXN_AUTO_DEBIT_SET: IntentDomain.TRANSACTION,
@@ -122,6 +141,16 @@ def domain_of(intent: IntentLabel | str) -> IntentDomain:
         return override
     legacy = get_domain(intent)
     return _LEGACY_DOMAIN_TO_SKELETON.get(legacy, IntentDomain.CONSULTING)
+
+
+def domain_of_with_text(intent: IntentLabel | str, text: str) -> IntentDomain:
+    """带文本修正的域判定: 定义句式强制咨询域 (优先于其余覆盖/归并)。
+
+    例外: 文本含个人数据诉求词 (我的/帮我查) 时仍按原判定 —— 那是真查询。
+    """
+    if is_definition_query(text):
+        return IntentDomain.CONSULTING
+    return domain_of(intent)
 
 
 def group_of(intent: IntentLabel | str) -> str:

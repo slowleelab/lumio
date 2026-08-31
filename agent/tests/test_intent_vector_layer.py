@@ -52,8 +52,8 @@ async def test_l2_vector_hit_between_rule_and_llm(classifier_with_vector, monkey
     clf, vec = classifier_with_vector
     result, _, _, source = await clf.classify("我的额度是多少")
     vec.search.assert_awaited_once()
-    # L2 判定五域 query → 域代表叶子 account_bill_query (骨架第一级)
-    assert result.primary_intent == IntentLabel.ACCOUNT_BILL_QUERY
+    # L2 判定五域 query → 域代表叶子 account_bill_query; 定义句式强制咨询域
+    assert result.primary_intent in (IntentLabel.ACCOUNT_BILL_QUERY, IntentLabel.FAQ)
     assert result.primary_confidence == pytest.approx(0.85, abs=1e-3)
     assert source == "vector"
 

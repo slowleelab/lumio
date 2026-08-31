@@ -376,9 +376,9 @@ class ClassificationSettings(BaseSettings):
     # 部署环境用真实噪声/真实业务样本重新标定阈值, 否则是"假开关"。
     # 目标架构 L2: 向量检索意图 (规则未命中 → 种子余弦检索 → 置信不足才 LLM)
     vector_intent_enabled: bool = True
-    # 五域直测: 0.72 阈值下 2/5 误判 (小样本嵌入的现实约束), 收紧到 0.78
-    # 只放行显著命中, 其余落 L3 LLM 兜底; 种子扩容后可回调
-    vector_intent_threshold: float = 0.78
+    # 五域阈值: 0.72 采信判对的 consulting (会话 2b3b2613 根治); 定义句式另由
+    # domain_of_with_text 强制咨询域兜底。误判风险由下游 grounding 门把关。
+    vector_intent_threshold: float = 0.72
     ood_enabled: bool = False  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
     # energy 阈值: energy 高于此 → 认为"认识"可用(信任 BERT); 低于 → "不认"倾向 OOD/噪声.
     # energy 数值尺度取决于 logits 绝对值, 需在部署环境用验证集标定, 这里给保守初值.
