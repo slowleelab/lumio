@@ -776,6 +776,9 @@ class IntentClassifier:
                         v_domain = None
                     if v_domain is None:
                         raise ValueError(f"L2 返回未知域: {vm.intent}")
+                    from lumio.shared.intent_taxonomy import domain_of_with_text
+
+                    v_domain = domain_of_with_text(v_domain, text)  # 定义句式强制咨询域
                     if domain_of(fast_result.primary_intent) == v_domain:
                         v_leaf = fast_result.primary_intent
                     else:

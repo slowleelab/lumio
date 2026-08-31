@@ -28,16 +28,23 @@ class TestTrafficClassification:
         from lumio.services.common.classifier import INTENT_DOMAINS
 
         for intent in INTENT_DOMAINS:
-            tc = classify_traffic(intent)
-            assert tc in list(TrafficClass), intent
+            _, traffic = classify_traffic(intent)
+            assert traffic is None or traffic in list(TrafficClass), intent
 
     def test_known_mappings(self) -> None:
-        assert classify_traffic(IntentLabel.ACCOUNT_BILL_QUERY) == TrafficClass.READ_ONLY_QUERY
-        assert classify_traffic(IntentLabel.CARD_LOSS_REPORT) == TrafficClass.FINANCIAL_TRANSACTION
-        assert classify_traffic(IntentLabel.COMPLAINT) == TrafficClass.HIGH_RISK
-        assert classify_traffic(IntentLabel.DISPUTE_CHARGEBACK) == TrafficClass.HIGH_RISK
-        assert classify_traffic(IntentLabel.INST_APPLY) == TrafficClass.FINANCIAL_TRANSACTION
-        assert classify_traffic(IntentLabel.FAQ) == TrafficClass.CONSULTING
+        # classify_traffic 返回 (五域, 交易性质|None); 五域骨架为域权威
+        cases = {
+            IntentLabel.ACCOUNT_BILL_QUERY: ("query", TrafficClass.READ_ONLY_QUERY),
+            IntentLabel.CARD_LOSS_REPORT: ("transaction", TrafficClass.FINANCIAL_TRANSACTION),
+            IntentLabel.COMPLAINT: ("service", TrafficClass.HIGH_RISK),
+            IntentLabel.DISPUTE_CHARGEBACK: ("service", TrafficClass.HIGH_RISK),
+            IntentLabel.INST_APPLY: ("transaction", TrafficClass.FINANCIAL_TRANSACTION),
+        }
+        for intent, (want_domain, want_traffic) in cases.items():
+            domain, traffic = classify_traffic(intent)
+            assert (domain.value, traffic.value if traffic else None) == (want_domain, want_traffic.value if want_traffic else None)
+        # 咨询域无交易性质 → (consulting, None), 进决策二
+        assert classify_traffic(IntentLabel.FAQ) == ("consulting", None)
 
     def test_decision_two_bands(self) -> None:
         assert decision_two(0.5, False) == "parallel_race"

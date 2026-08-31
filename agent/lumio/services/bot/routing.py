@@ -14,17 +14,20 @@ from __future__ import annotations
 from enum import StrEnum
 
 from lumio.services.bot.tool_selection import TOOL_INTENTS
-from lumio.services.common.classifier import get_domain
+from lumio.shared.intent_taxonomy import IntentDomain, domain_of
 from lumio.shared.models import SENSITIVE_INTENTS, IntentLabel
 
 
 class TrafficClass(StrEnum):
-    """决策一 · 交易性质三分流"""
+    """决策一 · 交易性质三分流 (CONSULTING 由五域骨架 IntentDomain.CONSULTING 表达)
+
+    五域骨架 (intent_taxonomy.IntentDomain) 是域判定的唯一权威;
+    本枚举只表达"交易性质"这一个维度: 金融交易 / 只读查询 / 高风险。
+    """
 
     FINANCIAL_TRANSACTION = "financial_transaction"  # 资金变动/账户变更 → 链 A (工具编排+确认状态机)
     READ_ONLY_QUERY = "read_only_query"  # 查余额/明细/进度 → 链 B (轻路径)
     HIGH_RISK = "high_risk"  # 投诉/争议/转人工诉求 → 人工坐席
-    CONSULTING = "consulting"  # 知识咨询 → 决策二四分流
 
 
 class RouteDecision(StrEnum):
@@ -60,22 +63,26 @@ _FINANCIAL_TOOL_OVERRIDES: set[IntentLabel] = {
 }
 
 
-def classify_traffic(intent: IntentLabel) -> TrafficClass:
-    """决策一: 意图 → 交易性质分类"""
+def classify_traffic(intent: IntentLabel) -> tuple[IntentDomain, TrafficClass | None]:
+    """决策一: 意图 → (五域, 交易性质)
+
+    返回 (domain, traffic): domain 恒为五域之一 (骨架权威);
+    traffic 为交易性质 (咨询域无交易性质 → None, 进决策二)。
+    """
+
+    domain = domain_of(intent)
+    if domain == IntentDomain.SERVICE:
+        return domain, TrafficClass.HIGH_RISK
+    if domain == IntentDomain.TRANSACTION or intent in _FINANCIAL_TOOL_OVERRIDES:
+        return domain, TrafficClass.FINANCIAL_TRANSACTION
     if intent in SENSITIVE_INTENTS:
-        domain = get_domain(intent)
-        # 投诉/争议类敏感意图是"人对人"诉求, 不是可自助执行的交易
-        if domain in _HIGH_RISK_DOMAINS:
-            return TrafficClass.HIGH_RISK
-        return TrafficClass.FINANCIAL_TRANSACTION
-    domain = get_domain(intent)
-    if domain in _HIGH_RISK_DOMAINS:
-        return TrafficClass.HIGH_RISK
-    if domain in _FINANCIAL_DOMAINS or intent in _FINANCIAL_TOOL_OVERRIDES:
-        return TrafficClass.FINANCIAL_TRANSACTION
+        # 敏感但域不是 service/transaction (理论上不出现) → 保守按交易
+        return domain, TrafficClass.FINANCIAL_TRANSACTION
     if intent in TOOL_INTENTS or normalize_for_query(intent):
-        return TrafficClass.READ_ONLY_QUERY
-    return TrafficClass.CONSULTING
+        return domain, TrafficClass.READ_ONLY_QUERY
+    if domain == IntentDomain.QUERY:
+        return domain, TrafficClass.READ_ONLY_QUERY
+    return domain, None  # CONSULTING/CHITCHAT → 无交易性质, 进决策二
 
 
 def normalize_for_query(intent: IntentLabel) -> bool:
@@ -118,6 +125,6 @@ def detect_composite(intent: IntentLabel, alternatives: list[IntentLabel], text:
     """
     if not normalize_for_query(intent):
         return False
-    if any(a not in (IntentLabel.FAQ,) and get_domain(a) == "knowledge" for a in alternatives or []):
+    if any(a not in (IntentLabel.FAQ,) and domain_of(a) == IntentDomain.CONSULTING for a in alternatives or []):
         return True
     return any(p in text for p in _EXPLAIN_PATTERNS)
