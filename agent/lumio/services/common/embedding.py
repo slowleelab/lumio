@@ -113,12 +113,15 @@ class OllamaEmbedding:
         dim: int,
         timeout: float = 10.0,
         max_retries: int = 2,
+        num_gpu: int = 0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._dim = dim
         self._timeout = timeout
         self._max_retries = max_retries
+        # 2026-08-31: embed 固定 CPU (num_gpu=0), qwen 独占 GPU
+        self._num_gpu = num_gpu
 
     @property
     def dim(self) -> int:
@@ -160,7 +163,7 @@ class OllamaEmbedding:
                     batch = [s for _, s in seg_plan[k : k + 64]]
                     response = await client.post(
                         f"{self._base_url}/api/embed",
-                        json={"model": self._model, "input": batch},
+                        json={"model": self._model, "input": batch, "options": {"num_gpu": self._num_gpu}},
                     )
                     response.raise_for_status()
                     data = response.json()
@@ -426,6 +429,7 @@ def create_embedding_provider(
     batch_size: int = 128,
     timeout: float = 10.0,
     max_retries: int = 2,
+    num_gpu: int = 0,
 ) -> OllamaEmbedding | TEIEmbedding | FixedEmbedding:
     """嵌入服务工厂函数
 
@@ -449,6 +453,7 @@ def create_embedding_provider(
             dim=dim,
             timeout=timeout,
             max_retries=max_retries,
+            num_gpu=num_gpu,
         )
     if provider_type == "tei":
         return TEIEmbedding(

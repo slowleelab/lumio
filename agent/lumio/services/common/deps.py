@@ -78,6 +78,7 @@ async def init_embedding(app: FastAPI) -> None:
         dim=settings.rag.embedding_dim,
         batch_size=settings.rag.embedding_batch_size,
         timeout=settings.rag.embedding_timeout,
+        num_gpu=settings.rag.embedding_num_gpu,
         max_retries=settings.rag.embedding_max_retries,
     )
     breaker = EmbeddingCircuitBreaker(provider)
@@ -119,6 +120,7 @@ async def init_reranker(app: FastAPI) -> None:
         ollama_model=settings.rag.reranker_model,
         tei_base_url=settings.rag.tei_base_url,
         tei_model=settings.rag.reranker_model,
+        num_gpu=settings.rag.rerank_num_gpu,
     )
     app.state.reranker_provider = provider
 

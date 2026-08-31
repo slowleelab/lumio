@@ -58,10 +58,13 @@ class OllamaReranker:
         base_url: str = "http://localhost:11434",
         model: str = "bge-reranker-v2-m3",
         timeout: float = 30.0,
+        num_gpu: int = 0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        # 2026-08-31: reranker 固定 CPU (num_gpu=0), qwen 独占 GPU
+        self._num_gpu = num_gpu
 
     @property
     def name(self) -> str:
@@ -78,6 +81,7 @@ class OllamaReranker:
                     "model": self.model,
                     "query": query,
                     "documents": documents,
+                    "options": {"num_gpu": self._num_gpu},
                 },
                 timeout=self.timeout,
             )
@@ -180,6 +184,8 @@ class TEIReranker:
 
 
 def create_reranker_provider(
+    *,
+    num_gpu: int = 0,
     provider_type: str = "ollama",
     ollama_base_url: str = "http://localhost:11434",
     ollama_model: str = "bge-reranker-v2-m3",
@@ -204,7 +210,7 @@ def create_reranker_provider(
         ValueError: 不支持的 provider_type
     """
     if provider_type == "ollama":
-        return OllamaReranker(base_url=ollama_base_url, model=ollama_model, timeout=timeout)
+        return OllamaReranker(base_url=ollama_base_url, model=ollama_model, timeout=timeout, num_gpu=num_gpu)
     if provider_type == "tei":
         return TEIReranker(base_url=tei_base_url, model=tei_model, timeout=timeout)
     raise ValueError(f"不支持的重排序提供者类型: {provider_type}")
