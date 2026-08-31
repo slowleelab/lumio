@@ -56,6 +56,7 @@ GROUP_C2_BUSINESS = "C2_business"  # 业务咨询: 怎么开通/怎么取消
 GROUP_C3_DISPUTE = "C3_dispute"  # 争议咨询: 费用异议/扣款质疑
 GROUP_D1_TRANSFER = "D1_transfer"  # 人工转接
 GROUP_D2_COMPLAINT = "D2_complaint"  # 投诉建议
+GROUP_E_CHITCHAT = "E_chitchat"  # 闲聊/兜底 (nb_chitchat/handoff_end/nb_noise)
 
 # 叶子意图 → 子域组 (按旧域名 + 意图名段归组; 未列出的意图沿用域默认组)
 _DOMAIN_DEFAULT_GROUP: dict[IntentDomain, str] = {
@@ -63,7 +64,7 @@ _DOMAIN_DEFAULT_GROUP: dict[IntentDomain, str] = {
     IntentDomain.TRANSACTION: GROUP_B2_ACCOUNT_CHANGE,
     IntentDomain.CONSULTING: GROUP_C2_BUSINESS,
     IntentDomain.SERVICE: GROUP_D1_TRANSFER,
-    IntentDomain.CHITCHAT: "",
+    IntentDomain.CHITCHAT: GROUP_E_CHITCHAT,
 }
 
 # 显式组覆盖 (按骨架树的代表叶子; 其余意图落域默认组, 不逐一枚举 149 个)

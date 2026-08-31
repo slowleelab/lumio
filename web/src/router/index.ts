@@ -10,6 +10,7 @@ import AuditConversations from "@/views/admin/AuditConversations.vue"
 import OperationLogs from "@/views/admin/OperationLogs.vue"
 import RagMetrics from "@/views/admin/RagMetrics.vue"
 import BadcaseWorkbench from "@/views/admin/BadcaseWorkbench.vue"
+import IntentLibrary from "@/views/admin/IntentLibrary.vue"
 
 const router = createRouter({
   history: createWebHistory(),
@@ -29,6 +30,7 @@ const router = createRouter({
         { path: "ops-logs", name: "admin-ops-logs", component: OperationLogs },
         { path: "rag-metrics", name: "admin-rag-metrics", component: RagMetrics },
         { path: "badcase", name: "admin-badcase", component: BadcaseWorkbench },
+        { path: "intent-library", name: "admin-intent-library", component: IntentLibrary },
       ],
     },
   ],

@@ -88,6 +88,11 @@ def create_bot_app(lifespan: Callable | None = None) -> FastAPI:
 
     app.include_router(closed_loop_router, prefix="/api")
 
+    # 意图库管理路由 (意图树/种子样本/属性表)
+    from lumio.services.common.intent_library_router import router as intent_library_router
+
+    app.include_router(intent_library_router, prefix="/api")
+
     # 审计日志中间件
     from lumio.shared.audit_middleware import register_audit_middleware
 
