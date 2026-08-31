@@ -119,10 +119,14 @@ def _to_dict(b: Badcase) -> dict[str, Any]:
 
 
 async def get_badcase(session_factory: async_sessionmaker[AsyncSession], badcase_id: str) -> Badcase | None:
-    from lumio.services.common.classifier import _coerce_doc_id
+    import uuid_utils
 
+    try:
+        pk = uuid_utils.UUID(str(badcase_id))
+    except ValueError:
+        return None
     async with session_factory() as session:
-        result = await session.execute(select(Badcase).where(Badcase.id == _coerce_doc_id(badcase_id)))
+        result = await session.execute(select(Badcase).where(Badcase.id == pk))
         return result.scalar_one_or_none()
 
 

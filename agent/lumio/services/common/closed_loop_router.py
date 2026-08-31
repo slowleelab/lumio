@@ -159,8 +159,11 @@ async def resolve_badcase(
     status = str(body.get("fix_status") or "fixing")
     if status not in _VALID_FIX_STATUS:
         raise LumioError(code=2001, message=f"fix_status 非法: {status}")
+    sf = getattr(request.app.state, "db_session_factory", None)
+    if not sf:
+        raise LumioError(code=5001, message="数据库未就绪")
     ok = await update_fix_status(
-        db,
+        sf,
         badcase_id,
         fix_status=status,
         fix_table=body.get("fix_table"),
