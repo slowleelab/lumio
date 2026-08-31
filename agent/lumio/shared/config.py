@@ -195,6 +195,8 @@ class LLMSettings(BaseSettings):
     # 多轮 >3s → faq@0.0 → 低置信误澄清), 抬到 6s: 慢而成功的分类一次走完,
     # 仍由 wait_for 封顶, 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清不变.
     classify_timeout: float = 6.0
+    # 模块 A 归因 judge 模型 (方案 §9.3: 生产应跨家族选型, 避免自我偏好偏差)
+    judge_model: str = "qwen2.5:7b"
     # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
     # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
     classify_cache_enabled: bool = True

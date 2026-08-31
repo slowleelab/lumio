@@ -83,6 +83,11 @@ def create_bot_app(lifespan: Callable | None = None) -> FastAPI:
 
     app.include_router(console_router, prefix="/api")
 
+    # 闭环管理路由 (Badcase 采集/归因/裁决 + 金标扩充)
+    from lumio.services.common.closed_loop_router import router as closed_loop_router
+
+    app.include_router(closed_loop_router, prefix="/api")
+
     # 审计日志中间件
     from lumio.shared.audit_middleware import register_audit_middleware
 

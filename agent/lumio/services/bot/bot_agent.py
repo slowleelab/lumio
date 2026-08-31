@@ -538,6 +538,29 @@ class LumioAgent:
                     logger.warning("出站闸门拦截(%s): session=%s", verdict.reason, session_id)
                     result["response"] = verdict.reply
                     result["response_source"] = "clarify"
+                    # 合规告警信号 → Badcase 闭环自动采集 (方案 §3.1 第五路)
+                    try:
+                        from lumio.services.common.badcase_store import capture_badcase
+
+                        sf = (
+                            self._session_manager._resolve_factory()
+                            if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
+                            else None
+                        )
+                        if sf:
+                            await capture_badcase(
+                                sf,
+                                trace_id=session_id,
+                                session_id=session_id,
+                                signal_source="compliance_alert",
+                                user_input=user_input,
+                                customer_id=customer_id,
+                                bot_output=str(verdict.reply),
+                                signal_detail={"reason": verdict.reason},
+                                snapshot={"intent": intent_result.primary_intent.value, "response_source": "clarify"},
+                            )
+                    except Exception:
+                        logger.debug("合规 Badcase 采集失败(不阻断)")
                     try:
                         log_decision(
                             session_id=session_id,
@@ -1883,6 +1906,29 @@ class LumioAgent:
                 await self._clear_pending_action(session_id, state.version)
                 reason = (pending.arguments or {}).get("transfer_reason") or "连续多轮未理解后客户确认转人工"
                 logger.info("L3 转人工已确认, 派真人: session=%s reason=%s", session_id, reason)
+                # 转人工信号 (方案 §3.1 第二路, 最强信号) → Badcase 闭环自动采集,
+                # 留存转人工前对话现场供归因 (低置信 streak / 降级 / 主动请求)
+                try:
+                    from lumio.services.common.badcase_store import capture_badcase
+
+                    sf = (
+                        self._session_manager._resolve_factory()
+                        if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
+                        else None
+                    )
+                    if sf:
+                        await capture_badcase(
+                            sf,
+                            trace_id=session_id,
+                            session_id=session_id,
+                            signal_source="transfer",
+                            user_input=user_input,
+                            customer_id=None,
+                            bot_output=BUSINESS_TRANSFER_TEMPLATE.format(reason=reason),
+                            signal_detail={"transfer_reason": reason, "stage": "confirmed"},
+                        )
+                except Exception:
+                    logger.debug("转人工 Badcase 采集失败(不阻断)")
                 return self._build_result(
                     session_id,
                     user_input,

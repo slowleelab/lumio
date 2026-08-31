@@ -1164,3 +1164,69 @@ class ClassifierSample(Base):
         # 有界留存清理: 按创建时间
         Index("ix_classifier_sample_created", "created_at"),
     )
+
+
+class Badcase(Base):
+    """Badcase 资产表 (事后优化闭环 ⑧, 方案 v2.0 §7.4)
+
+    五路信号采集 → 粗筛去重 → LLM 自动归因 (模块A) → 修复策略路由
+    (A 知识库 / B 意图库 / C 规则配置 / D 模型) → 回归评测集 (L2 只增不减)。
+    append-only 语义: 修复状态流转用 update, 记录永不物理删除。
+    """
+
+    __tablename__ = "badcase"
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    trace_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    customer_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    channel: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    signal_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    signal_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    user_input: Mapped[str] = mapped_column(Text, nullable=False)
+    bot_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    root_cause_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    root_cause_category: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    attribution_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attribution_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    attribution_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    needs_human_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    human_confirmed_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    fix_table: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    fix_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    fix_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    input_embedding: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    dedup_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=datetime.now,
+        onupdate=datetime.now,
+        server_default=text("now()"),
+    )
+
+    __table_args__ = (
+        Index("ix_badcase_session", "session_id"),
+        Index("ix_badcase_signal", "signal_source"),
+        Index("ix_badcase_fix_status", "fix_status"),
+        Index("ix_badcase_root_layer", "root_cause_layer"),
+        Index("ix_badcase_created", "created_at"),
+        Index("ix_badcase_trace", "trace_id"),
+    )
