@@ -17,6 +17,8 @@ from lumio.services.common.badcase_store import (
     get_badcase,
     update_fix_status,
 )
+from sqlalchemy import func, select
+
 from lumio.services.common.deps import DbSession
 from lumio.shared.auth import AuthUser, require_role
 from lumio.shared.config import get_settings
@@ -200,3 +202,105 @@ async def expand_golden_set(
         rejected_total.extend(rejected)
         existing.update(passed)
     return {"seed_count": len(seeds), "variants": passed_total, "rejected_count": len(rejected_total)}
+
+
+@router.get("/badcases/stats")
+async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
+    """Badcase 工作台统计: 今日/待复核/已确认/LLM 直通率 (方案 §3.1.6 今日统计)"""
+    from datetime import UTC as _UTC
+    from datetime import datetime, timedelta
+
+    now = datetime.now(_UTC)
+    day_ago = now - timedelta(days=1)
+    from sqlalchemy import func, select
+
+    from lumio.shared.orm_models import Badcase, DialogueLog
+
+    total = (await db.execute(select(func.count()).select_from(Badcase))).scalar() or 0
+    pending_review = (
+        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.needs_human_review.is_(True)))
+    ).scalar() or 0
+    confirmed = (
+        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.needs_human_review.is_(False)))
+    ).scalar() or 0
+    today_new = (
+        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.created_at >= day_ago))
+    ).scalar() or 0
+    deployed = (
+        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.fix_status == "deployed"))
+    ).scalar() or 0
+    llm_auto = (
+        confirmed
+        - (
+            await db.execute(
+                select(func.count())
+                .select_from(Badcase)
+                .where(Badcase.needs_human_review.is_(False) & Badcase.human_confirmed_layer.is_not(None))
+            )
+        ).scalar()
+        or 0
+    )
+    pass_rate = (llm_auto / confirmed) if confirmed else None
+    return {
+        "total": total,
+        "today_new": today_new,
+        "pending_review": pending_review,
+        "confirmed": confirmed,
+        "deployed": deployed,
+        "llm_pass_rate": round(pass_rate, 3) if pass_rate is not None else None,
+    }
+
+
+@router.get("/health-metrics")
+async def closed_loop_health(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
+    """闭环健康度七指标 (方案 §8.1): 转人工率/修复时长/复现率等聚合
+
+    v1 口径说明:
+    - 转人工率: transfer 信号 Badcase 数 / 总会话数 (近期 7 天)
+    - 平均修复时长: deployed 样本 created→resolved 均值
+    - 复现率 v1 需 L2 回归集积累, 暂返回 None
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from lumio.shared.orm_models import Badcase, DialogueLog
+
+    now = datetime.now(UTC)
+    since = now - timedelta(days=7)
+    week_ago = now - timedelta(days=14)
+
+    transfer_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(Badcase)
+            .where(Badcase.signal_source == "transfer", Badcase.created_at >= since)
+        )
+    ).scalar() or 0
+    sessions = (
+        await db.execute(
+            select(func.count(func.distinct(DialogueLog.session_id))).where(DialogueLog.timestamp >= since)
+        )
+    ).scalar() or 0
+    transfer_rate = round(transfer_count / sessions, 4) if sessions else None
+
+    deployed_rows = (
+        await db.execute(
+            select(Badcase.created_at, Badcase.resolved_at).where(
+                Badcase.fix_status == "deployed", Badcase.resolved_at.is_not(None)
+            )
+        )
+    ).all()
+    fix_days = [
+        (r.resolved_at - r.created_at).total_seconds() / 86400 for r in deployed_rows if r.resolved_at and r.created_at
+    ]
+    avg_fix_days = round(sum(fix_days) / len(fix_days), 1) if fix_days else None
+
+    return {
+        "window_days": 7,
+        "transfer_count_7d": transfer_count,
+        "sessions_7d": sessions,
+        "transfer_rate_7d": transfer_rate,
+        "avg_fix_days": avg_fix_days,
+        "badcases_deployed": len(fix_days),
+        "recurrence_rate": None,  # 需 L2 回归集积累后计算
+        "golden_pass_rate": None,  # 由评测流水线回填
+    }

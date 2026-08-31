@@ -23,6 +23,10 @@
           <el-icon><Monitor /></el-icon>
           <span>摄入监控</span>
         </el-menu-item>
+        <el-menu-item index="/admin/badcase">
+          <el-icon><DataAnalysis /></el-icon>
+          <span>Badcase 工作台</span>
+        </el-menu-item>
         <el-menu-item index="/admin/audit">
           <el-icon><ChatDotRound /></el-icon>
           <span>对话审计</span>
@@ -49,7 +53,7 @@
 <script setup lang="ts">
 import { computed } from "vue"
 import { useRoute } from "vue-router"
-import { Document, Collection, Monitor, ChatDotRound, Memo, TrendCharts } from "@element-plus/icons-vue"
+import { Document, Collection, Monitor, ChatDotRound, Memo, TrendCharts, DataAnalysis } from "@element-plus/icons-vue"
 
 const route = useRoute()
 const activeMenu = computed(() => route.path)
