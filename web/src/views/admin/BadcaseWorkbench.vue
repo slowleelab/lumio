@@ -18,9 +18,8 @@
         <el-option label="行为异常" value="behavior_anomaly" />
         <el-option label="合规告警" value="compliance_alert" />
       </el-select>
-      <el-select v-model="filters.root_cause_layer" placeholder="根因层" clearable size="small" style="width: 140px" @change="load">
-        <el-option v-for="l in 7" :key="l" :label="`layer_${l}`" :value="`layer_${l}`" />
-        <el-option label="uncertain" value="uncertain" />
+      <el-select v-model="filters.root_cause_layer" placeholder="根因层" clearable size="small" style="width: 150px" @change="load">
+        <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" />
       </el-select>
       <el-select v-model="filters.fix_status" placeholder="修复状态" clearable size="small" style="width: 130px" @change="load">
         <el-option label="待修" value="pending" />
@@ -40,9 +39,9 @@
           <el-tag size="small" :type="signalType(row.signal_source)">{{ signalLabel(row.signal_source) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="根因层" width="110">
+      <el-table-column label="根因层" width="120">
         <template #default="{ row }">
-          <span v-if="row.root_cause_layer">{{ row.root_cause_layer }}</span>
+          <span v-if="row.root_cause_layer">{{ layerLabel(row.root_cause_layer) }}</span>
           <span v-else class="muted">未归因</span>
         </template>
       </el-table-column>
@@ -57,8 +56,8 @@
           <el-tag v-else size="small" type="success">已确认</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="分流表" width="110">
-        <template #default="{ row }">{{ row.fix_table || "-" }}</template>
+      <el-table-column label="分流表" width="120">
+        <template #default="{ row }">{{ fixTableLabel(row.fix_table) }}</template>
       </el-table-column>
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
@@ -97,9 +96,9 @@
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="会话">{{ detail.session_id }}</el-descriptions-item>
           <el-descriptions-item label="信号源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
-          <el-descriptions-item label="根因层">{{ detail.root_cause_layer || "未归因" }}</el-descriptions-item>
-          <el-descriptions-item label="根因类别">{{ detail.root_cause_category || "-" }}</el-descriptions-item>
-          <el-descriptions-item label="分流表">{{ detail.fix_table || "-" }}</el-descriptions-item>
+            <el-descriptions-item label="根因层">{{ layerLabel(detail.root_cause_layer) || "未归因" }}</el-descriptions-item>
+          <el-descriptions-item label="根因类别">{{ categoryLabel(detail.root_cause_category) || "-" }}</el-descriptions-item>
+          <el-descriptions-item label="分流表">{{ fixTableLabel(detail.fix_table) }}</el-descriptions-item>
           <el-descriptions-item label="修复状态">{{ detail.fix_status }}</el-descriptions-item>
         </el-descriptions>
         <div class="section-title">用户输入</div>
@@ -192,7 +191,7 @@ async function confirmAttribution(row: Badcase) {
 async function runAttribution(row: Badcase) {
   try {
     const r = (await attributeBadcase(row.id)) as { root_cause_layer?: string; needs_human_review?: boolean }
-    ElMessage.success(`归因完成: ${r.root_cause_layer ?? "-"}`)
+    ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
     load()
   } catch {
     /* handled */
@@ -229,6 +228,50 @@ function signalLabel(s: string) {
     compliance_alert: "合规告警",
   }
   return m[s] ?? s
+}
+
+// 根因层 → 中文 (与后端 ROOT_CAUSE_LAYERS 八层管道对应, ⑧监控闭环是发现方不归因)
+const LAYER_LABELS: Record<string, string> = {
+  layer_1: "① 预处理",
+  layer_2: "② 会话管理",
+  layer_3: "③ 意图识别",
+  layer_4: "④ 路由决策",
+  layer_5: "⑤ RAG 检索",
+  layer_6: "⑥ 回复生成",
+  layer_7: "⑦ 风控合规",
+  uncertain: "待人工判定",
+}
+
+function layerLabel(s?: string | null) {
+  if (!s) return ""
+  return LAYER_LABELS[s] ?? s
+}
+
+// 根因类别 (judge 输出的第二维度) 与四张修复分流表
+const CATEGORY_LABELS: Record<string, string> = {
+  semantic: "语义误判",
+  knowledge: "知识缺口",
+  process: "流程缺陷",
+  coverage: "覆盖不足",
+  uncertain: "待定",
+}
+
+const FIX_TABLE_LABELS: Record<string, string> = {
+  A_knowledge: "A · 知识库",
+  B_intent: "B · 意图库",
+  C_rule: "C · 规则",
+  D_model: "D · 模型",
+  none: "无需修复",
+}
+
+function categoryLabel(s?: string | null) {
+  if (!s) return ""
+  return CATEGORY_LABELS[s] ?? s
+}
+
+function fixTableLabel(s?: string | null) {
+  if (!s) return "-"
+  return FIX_TABLE_LABELS[s] ?? s
 }
 
 function fixStatusLabel(s: string) {
