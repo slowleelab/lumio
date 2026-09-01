@@ -149,8 +149,8 @@ const treeFilter = ref("")
 const treeRef = ref()
 
 const DOMAIN_LABELS: Record<string, string> = {
-  query: "查询域（非金融）",
-  transaction: "交易域（金融类）",
+  query: "查询域（只读查询）",
+  transaction: "交易域（资金/账户变更）",
   consulting: "咨询域",
   service: "服务域",
   chitchat: "闲聊域",
@@ -197,6 +197,7 @@ async function loadTree() {
             type: "intent" as const,
           })),
         })
+        domNode.count = (domNode.count ?? 0) + intents.length
       }
       nodes.push(domNode)
     }
