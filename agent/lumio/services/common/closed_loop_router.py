@@ -38,10 +38,9 @@ def _build_judge(request: Request) -> BadcaseJudge:
         raise LumioError(code=5001, message="LLM 未就绪")
     if settings.llm.judge_base_url and settings.llm.judge_api_key:
         judge_llm = RemoteJudgeClient(fallback_llm=llm_client)
-        logger.info("归因裁判: 远程 %s (跨家族, 本地兜底)", settings.llm.judge_model)
-    else:
-        judge_llm = llm_client
-    return BadcaseJudge(judge_llm, model=settings.llm.judge_model, min_confidence=0.7, samples=3)
+        return BadcaseJudge(judge_llm, model=settings.llm.judge_model, min_confidence=0.7, samples=3)
+    # 未配置远程端点: 本地兜底走 primary_model (本地没有 GLM 权重, 不能用 judge_model 名)
+    return BadcaseJudge(llm_client, model=settings.llm.primary_model, min_confidence=0.7, samples=3)
 
 router = APIRouter(prefix="/admin/closed-loop", tags=["closed-loop"])
 

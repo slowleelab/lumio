@@ -195,10 +195,12 @@ class LLMSettings(BaseSettings):
     # 多轮 >3s → faq@0.0 → 低置信误澄清), 抬到 6s: 慢而成功的分类一次走完,
     # 仍由 wait_for 封顶, 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清不变.
     classify_timeout: float = 6.0
-    # 模块 A 归因 judge 模型 (方案 §9.3: 生产应跨家族选型, 避免自我偏好偏差)
-    judge_model: str = "qwen2.5:7b"
+    # 模块 A 归因 judge 模型 — 固定 GLM-5.3-Flash (方案 §9.3 跨家族选型:
+    # 生成 qwen / 裁判 GLM, 消除自我偏好偏差)。远程不可达时的本地兜底
+    # 走 primary_model (本地无 GLM 权重), 审计标记"回退本地"。
+    judge_model: str = "GLM-5.3-Flash"
     # 跨家族远程裁判 (Anthropic Messages 协议, 如 GLM coding plan):
-    # 留空则用本地 base_url 的 judge_model; 配置后归因走远程, 失败自动回退本地。
+    # 留空则用本地 base_url 的 primary_model; 配置后归因走远程, 失败自动回退本地。
     judge_base_url: str = ""
     judge_api_key: str = ""
     judge_timeout: float = 90.0

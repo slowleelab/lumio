@@ -216,7 +216,8 @@ async def attribute_and_save(
         row.root_cause_category = result.root_cause_category
         row.attribution_evidence = result.evidence
         row.attribution_confidence = result.confidence
-        row.attribution_model = judge._model
+        llm_used = getattr(judge, "_llm", None)
+        row.attribution_model = getattr(llm_used, "effective_model", None) or judge._model
         row.needs_human_review = result.needs_human_review
         row.fix_table = result.fix_table
         await session.commit()

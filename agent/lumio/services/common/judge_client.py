@@ -33,10 +33,16 @@ class RemoteJudgeClient:
         self._timeout = settings.judge_timeout
         self._fallback = fallback_llm  # 本地 LLMClient (OpenAI 兼容), 失败兜底
         self._degraded = False  # 连续失败后进入降级, 周期性重试远程
+        self._used_local = False  # 本轮归因是否发生过本地回退 (审计标记)
 
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def effective_model(self) -> str:
+        """审计用: 实际参与判定的模型 (发生过本地回退则如实标记)"""
+        return f"{self._model}+本地回退" if self._used_local else self._model
 
     async def chat(self, messages: list[dict[str, str]], *, timeout: float | None = None, **_: Any) -> str:
         if not (self._base and self._key):
@@ -84,6 +90,7 @@ class RemoteJudgeClient:
     async def _local(self, messages: list[dict[str, str]], timeout: float | None) -> str:
         if self._fallback is None:
             raise RuntimeError("远程裁判失败且无本地兜底")
+        self._used_local = True
         return await self._fallback.chat(messages, timeout=timeout)
 
 
