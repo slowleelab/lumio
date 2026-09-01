@@ -10,6 +10,8 @@ export interface IntentTreeNode {
   definition?: string
   domain: string
   group: string
+  source?: "factory" | "registry"
+  state?: string
 }
 
 export interface IntentTreeResponse {
@@ -33,6 +35,55 @@ export interface AttributeRow {
   group: string
   traffic_class: string | null
   touches_account: boolean
+  source?: "factory" | "registry"
+  state?: string
+}
+
+export interface RegistryHistoryItem {
+  ts: number
+  actor: string
+  action: string
+  from: string | null
+  to: string
+  note?: string
+}
+
+export interface RegistryEntry {
+  slug: string
+  domain: string
+  group: string
+  name_zh: string
+  definition: string
+  traffic_class: string
+  seeds: string[]
+  state: string
+  created_by: string
+  created_at: number
+  updated_at: number
+  history: RegistryHistoryItem[]
+  eval_report?: {
+    passed: boolean
+    overlap?: { max_similarity?: number; warn_count?: number; hard_conflicts?: unknown[] }
+    golden?: { baseline_accuracy?: number; with_candidate_accuracy?: number; drop?: number }
+    error?: string
+  } | null
+  shadow_hits: number
+  active_hits: number
+}
+
+export interface RegistryListResponse {
+  total: number
+  entries: RegistryEntry[]
+}
+
+export interface IndexStatus {
+  running: boolean
+  action: string
+  version: number
+  entities: number
+  error: string
+  started_at: number
+  finished_at: number
 }
 
 export function getIntentTree(): Promise<IntentTreeResponse> {
@@ -53,4 +104,71 @@ export function deleteSeed(intent: string, text: string): Promise<{ removed: num
 
 export function getAttributeTable(): Promise<{ total: number; rows: AttributeRow[] }> {
   return client.get("/admin/intent-library/attributes")
+}
+
+// ── 运营意图注册表 (流派二生命周期) ──
+
+export function listRegistry(state?: string): Promise<RegistryListResponse> {
+  return client.get("/admin/intent-library/registry", { params: state ? { state } : {} })
+}
+
+export function createRegistryIntent(body: {
+  slug: string
+  domain: string
+  name_zh: string
+  definition?: string
+  group?: string
+  traffic_class?: string
+  seeds: string[]
+}): Promise<{ created: boolean; entry: RegistryEntry }> {
+  return client.post("/admin/intent-library/registry", body)
+}
+
+export function updateRegistryIntent(
+  slug: string,
+  body: { seeds?: string[]; name_zh?: string; definition?: string; traffic_class?: string },
+): Promise<{ updated: boolean; entry: RegistryEntry }> {
+  return client.put(`/admin/intent-library/registry/${slug}`, body)
+}
+
+export function submitRegistryIntent(slug: string): Promise<{ entry: RegistryEntry }> {
+  return client.post(`/admin/intent-library/registry/${slug}/submit`)
+}
+
+export function reviewRegistryIntent(
+  slug: string,
+  approve: boolean,
+  note?: string,
+): Promise<{ entry: RegistryEntry | null }> {
+  return client.post(`/admin/intent-library/registry/${slug}/review`, { approve, note })
+}
+
+export function evaluateRegistryIntent(slug: string): Promise<{ evaluating: boolean }> {
+  return client.post(`/admin/intent-library/registry/${slug}/evaluate`)
+}
+
+export function activateRegistryIntent(slug: string): Promise<{ entry: RegistryEntry; rebuild: string }> {
+  return client.post(`/admin/intent-library/registry/${slug}/activate`)
+}
+
+export function deprecateRegistryIntent(slug: string): Promise<{ entry: RegistryEntry }> {
+  return client.post(`/admin/intent-library/registry/${slug}/deprecate`)
+}
+
+export function rejectRegistryIntent(slug: string, note?: string): Promise<{ entry: RegistryEntry }> {
+  return client.post(`/admin/intent-library/registry/${slug}/reject`, { note })
+}
+
+// ── L2 索引蓝绿重建 ──
+
+export function getIndexStatus(): Promise<IndexStatus> {
+  return client.get("/admin/intent-library/index/status")
+}
+
+export function rebuildIndex(): Promise<{ scheduled: boolean }> {
+  return client.post("/admin/intent-library/index/rebuild")
+}
+
+export function rollbackIndex(): Promise<{ version: number }> {
+  return client.post("/admin/intent-library/index/rollback")
 }

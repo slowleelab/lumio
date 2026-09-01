@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ## [Unreleased]
 
 ### Added
+- **意图注册表：流派二（Config-as-Code + 治理流水线）全链路落地** —— 新增意图不再要求发版
+  - `shared/intent_registry.py`：运营意图注册表（`intent_registry.json` 持久化 + .bak 备份，建议入 Git 管理）与生命周期状态机 `draft → pending_review →(双人复核)→ 评测闸门 → shadow → active → deprecated/rejected`；双人复核强制评审人≠登记者（maker-checker）；最少种子 10 条（建议 20）+ slug 命名规范 + 出厂枚举冲突校验；每步迁移留审计历史（actor/action/note）
+  - 评测闸门 `intent_eval.py`（全本地无 LLM）：重叠检测（候选种子 vs 出厂+已生效语料近重复比对，warn 0.94 / hard 0.97，按 mxbai 中文短句底噪实测标定）+ 金标域回归（虚拟最近邻域分类器，加入新种子后金标准确率跌幅 ≤0.02 才放行）
+  - L2 索引蓝绿重建 `intent_vector.py`：物理集合按版本命名 `_v{N}`，别名原子切换，保留上一版支持一键回滚，旧版本自动 GC；激活/下线意图自动触发重建（后台 task 持引用防 GC）
+  - 管线四接入点：`domain_of/group_of` 注册表回退（五域骨架权威扩展到运营意图）、中文标签回退、L3 分类 prompt 动态追加影子/生效意图（影子标注且只记日志不改路由）、L2 种子语料并入已生效意图
+  - 新指标：`lumio_intent_registry_hits_total`（按 slug/state）、`lumio_intent_index_rebuilds_total`（success/failed/rolled_back）
+  - 管理端 11 个新端点（注册表 CRUD/提交/评审/评测/激活/下线/驳回 + 索引 status/rebuild/rollback）+ 前端「意图注册表」页签（索引状态卡/状态机操作/新增意图弹窗/审计历史时间线）+ 意图树合并展示运营意图（运营/影子/已下线徽标）
+  - 真实 E2E 已验证：登记→自审被拒→交叉复核→评测通过→影子→激活（索引 v1 201 条）→下线（重建 v2 191 条）→树保留审计痕迹
+
 - **目标架构 v2：两级路由决策 + 四条执行链 + 出站合规闸门**（BOT_ROUTING_V2_ENABLED，默认关）
   - ④ 决策一交易性质三分流（金融交易/只读查询/高风险转人工/咨询）+ 决策二只读四分流（FAQ/RAG/复合/低置信竞速），分类表以 INTENT_DOMAINS+SENSITIVE_INTENTS 归并生成
   - ⑤B 查询轻链路：槽位参数→直连 MCP 工具（绕过 LLM 循环）→Redis 结果缓存（5min）→单次摘要；缺槽反问

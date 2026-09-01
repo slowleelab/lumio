@@ -197,9 +197,21 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
 
 
 def intent_name_zh(slug: str) -> str:
-    """查中文标签, 未收录时返回 slug 本身"""
-    return INTENT_LABELS_ZH.get(slug, (slug, ""))[0]
+    """查中文标签, 未收录时查运营注册表, 仍未收录返回 slug 本身"""
+    hit = INTENT_LABELS_ZH.get(slug)
+    if hit is not None:
+        return hit[0]
+    from lumio.shared.intent_registry import registry_label
+
+    reg = registry_label(slug)
+    return reg[0] if reg else slug
 
 
 def intent_desc_zh(slug: str) -> str:
-    return INTENT_LABELS_ZH.get(slug, (slug, ""))[1]
+    hit = INTENT_LABELS_ZH.get(slug)
+    if hit is not None:
+        return hit[1]
+    from lumio.shared.intent_registry import registry_label
+
+    reg = registry_label(slug)
+    return reg[1] if reg else ""

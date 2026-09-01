@@ -134,8 +134,20 @@ _DOMAIN_OVERRIDES: dict[IntentLabel, IntentDomain] = {
 
 
 def domain_of(intent: IntentLabel | str) -> IntentDomain:
-    """叶子意图 → 五域 (骨架第一级)"""
+    """叶子意图 → 五域 (骨架第一级)
+
+    运营注册表意图 (未进代码枚举的 slug) 先查注册表 —— 否则会被
+    normalize_intent 未知值兜底成 FAQ, 注册表意图的域判定失效。
+    """
     if isinstance(intent, str) and not isinstance(intent, IntentLabel):
+        from lumio.shared.intent_registry import registry_domain
+
+        reg = registry_domain(intent)
+        if reg is not None:
+            try:
+                return IntentDomain(reg)
+            except ValueError:
+                pass
         intent = normalize_intent(intent)
     override = _DOMAIN_OVERRIDES.get(intent)
     if override:
@@ -157,11 +169,38 @@ def domain_of_with_text(intent: IntentLabel | str, text: str) -> IntentDomain:
 def group_of(intent: IntentLabel | str) -> str:
     """叶子意图 → 子域组 (骨架第二级)"""
     if isinstance(intent, str) and not isinstance(intent, IntentLabel):
+        from lumio.shared.intent_registry import registry_domain, registry_group
+
+        reg = registry_group(intent)
+        if reg is not None:
+            return reg
+        reg_dom = registry_domain(intent)
+        if reg_dom is not None:
+            # 注册表意图未指定组 → 按其注册域的默认组 (不能走 normalize→FAQ 的组覆盖)
+            try:
+                return _DOMAIN_DEFAULT_GROUP[IntentDomain(reg_dom)]
+            except (ValueError, KeyError):
+                return ""
         intent = normalize_intent(intent)
     override = _GROUP_OVERRIDES.get(intent)
     if override:
         return override
     return _DOMAIN_DEFAULT_GROUP.get(domain_of(intent), "")
+
+
+# 域代表叶子: L2 域命中/注册表意图映射到枚举叶子时使用 (保持单一来源)
+_DOMAIN_REPRESENTATIVE: dict[IntentDomain, IntentLabel] = {
+    IntentDomain.QUERY: IntentLabel.ACCOUNT_BILL_QUERY,
+    IntentDomain.TRANSACTION: IntentLabel.CARD_LOSS_REPORT,
+    IntentDomain.CONSULTING: IntentLabel.FAQ,
+    IntentDomain.SERVICE: IntentLabel.TRANSFER_AGENT,
+    IntentDomain.CHITCHAT: IntentLabel.CHITCHAT,
+}
+
+
+def domain_representative(domain: IntentDomain) -> IntentLabel:
+    """域 → 代表叶子意图 (注册表意图按域落叶子时用, 与 L2 域命中同一张表)"""
+    return _DOMAIN_REPRESENTATIVE[domain]
 
 
 def leaves_in_domain(domain: IntentDomain) -> list[IntentLabel]:

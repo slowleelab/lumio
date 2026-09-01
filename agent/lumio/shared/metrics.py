@@ -352,6 +352,20 @@ BAD_CASE_MARKED = Counter(
     ["reason"],
 )
 
+# ── 意图注册表治理指标 (流派二: 登记→评审→评测→影子→生效) ──
+
+INTENT_REGISTRY_HITS = Counter(
+    "lumio_intent_registry_hits_total",
+    "运营注册表意图 L3 命中计数（按状态分: shadow 仅观察 / active 已生效）",
+    ["slug", "state"],
+)
+
+INTENT_INDEX_REBUILDS = Counter(
+    "lumio_intent_index_rebuilds_total",
+    "L2 意图索引蓝绿重建结果",
+    ["result"],  # success/failed/rolled_back
+)
+
 # 排除自采集，避免 Prometheus 抓取 /metrics 产生反馈循环
 _EXCLUDED_PATHS = {"/metrics", "/health", "/favicon.ico"}
 

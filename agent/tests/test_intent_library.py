@@ -42,14 +42,21 @@ async def _req(app: FastAPI, method: str, url: str, **kwargs):
         return await c.request(method, url, **kwargs)
 
 
-ADMIN = lambda: AuthUser(user_id="admin-x", role="admin", session_id=None)
+def make_admin():
+    return AuthUser(user_id="admin-x", role="admin", session_id=None)
 
 
 @pytest.fixture
 def seed_env(tmp_path):
     data = _seed_data()
     app = _make_app(data, tmp_path)
+    # 隔离运营注册表 (真实文件可能含运行期登记的意图, 影响 149 条断言)
+    import lumio.shared.intent_registry as ir
+
+    ir.REGISTRY_PATH = tmp_path / "intent_registry.json"
+    ir.reset_registry_singleton()
     yield app, tmp_path / "seed_dataset.json"
+    ir.reset_registry_singleton()
 
 
 def _seed_data() -> dict:

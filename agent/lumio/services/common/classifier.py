@@ -451,6 +451,64 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 """
 
 
+def build_classify_system_prompt() -> str:
+    """L3 分类 prompt = 静态基线 + 运营注册表增量 (影子/生效意图)。
+
+    注册表为空时与静态串逐字节一致 (零回归); 有增量时追加候选段。
+    影子意图标注 [影子观察中]: 模型可选它, 线上只记日志不改变路由。
+    """
+    from lumio.shared.intent_registry import get_registry
+
+    extra = get_registry().prompt_intents()
+    if not extra:
+        return _CLASSIFY_SYSTEM_PROMPT
+    lines = ["", "## 运营新增意图 (与上面的意图标签同等可选)"]
+    for it in extra:
+        mark = " [影子观察中]" if it["state"] == "shadow" else ""
+        definition = f" — {it['definition']}" if it["definition"] else ""
+        lines.append(f"- {it['slug']}: {it['name_zh']}{definition}{mark}")
+    return _CLASSIFY_SYSTEM_PROMPT + "\n".join(lines) + "\n"
+
+
+def _apply_registry_intent(raw_intent: str) -> IntentLabel | None:
+    """LLM 输出命中运营注册表意图 → 按域落代表叶子。
+
+    v2 路由按 (五域, 交易性质) 分流, 注册表意图尚无专属工具/槽位, 域代表
+    叶子即其真实路由语义; 影子状态只记命中日志与指标, 不进路由索引。
+    """
+    from lumio.shared.intent_registry import RegistryState, get_registry
+    from lumio.shared.intent_taxonomy import IntentDomain, domain_representative
+
+    entry = get_registry().get(raw_intent)
+    if entry is None or entry.state not in (RegistryState.SHADOW, RegistryState.ACTIVE):
+        return None
+    try:
+        rep = domain_representative(IntentDomain(entry.domain))
+    except (ValueError, KeyError):
+        return None
+    is_shadow = entry.state == RegistryState.SHADOW
+    get_registry().record_hit(entry.slug, shadow=is_shadow)
+    from lumio.shared.metrics import INTENT_REGISTRY_HITS
+
+    INTENT_REGISTRY_HITS.labels(slug=entry.slug, state=entry.state).inc()
+    if is_shadow:
+        logger.info(
+            "[影子命中] %s (%s) domain=%s conf 待上层记录 — 仅观察不影响路由",
+            entry.slug,
+            entry.name_zh,
+            entry.domain,
+        )
+    else:
+        logger.info(
+            "[注册表意图] %s (%s) domain=%s → 叶子 %s",
+            entry.slug,
+            entry.name_zh,
+            entry.domain,
+            rep.value,
+        )
+    return rep
+
+
 class RuleClassifier:
     """规则分类器（Fast Path）
 
@@ -579,7 +637,7 @@ class LLMClassifier:
             timeout = llm_settings.classify_timeout
             result = await asyncio.wait_for(
                 self._llm.classify(
-                    system_prompt=_CLASSIFY_SYSTEM_PROMPT,
+                    system_prompt=build_classify_system_prompt(),
                     user_input=text,
                     timeout=timeout,
                 ),
@@ -593,7 +651,10 @@ class LLMClassifier:
             logger.warning("LLM 分类调用失败/超时(≤%.1fs)，上抛交 Fast Path 兜底", llm_settings.classify_timeout)
             raise
 
-        intent_label = _parse_intent(result.get("intent", ""))
+        # 运营注册表意图优先: 命中影子/生效条目时按域落代表叶子 (未命中走枚举解析)
+        intent_label = _apply_registry_intent(str(result.get("intent", "")))
+        if intent_label is None:
+            intent_label = _parse_intent(result.get("intent", ""))
         confidence = result.get("confidence", 0.0)
         entities = _parse_entities(result.get("entities", []))
         sentiment = _parse_sentiment(result.get("sentiment", ""))
@@ -759,30 +820,26 @@ class IntentClassifier:
             try:
                 vm = await self._intent_vector.search(text)
                 if vm.matched and vm.score >= get_settings().classification.vector_intent_threshold:
-                    from lumio.shared.intent_taxonomy import IntentDomain, domain_of
+                    from lumio.shared.intent_taxonomy import (
+                        IntentDomain,
+                        domain_of,
+                        domain_of_with_text,
+                        domain_representative,
+                    )
 
                     # L2 判定五域 (骨架第一级); 叶子优先取快路径同域意图 (更精确),
                     # 否则用域代表叶子, 保证 v2 路由 TrafficClass 与域一致
-                    domain_rep = {
-                        IntentDomain.QUERY: IntentLabel.ACCOUNT_BILL_QUERY,
-                        IntentDomain.TRANSACTION: IntentLabel.CARD_LOSS_REPORT,
-                        IntentDomain.CONSULTING: IntentLabel.FAQ,
-                        IntentDomain.SERVICE: IntentLabel.TRANSFER_AGENT,
-                        IntentDomain.CHITCHAT: IntentLabel.CHITCHAT,
-                    }
                     try:
                         v_domain = IntentDomain(vm.intent)
                     except ValueError:
                         v_domain = None
                     if v_domain is None:
                         raise ValueError(f"L2 返回未知域: {vm.intent}")
-                    from lumio.shared.intent_taxonomy import domain_of_with_text
-
                     v_domain = domain_of_with_text(v_domain, text)  # 定义句式强制咨询域
                     if domain_of(fast_result.primary_intent) == v_domain:
                         v_leaf = fast_result.primary_intent
                     else:
-                        v_leaf = domain_rep[v_domain]
+                        v_leaf = domain_representative(v_domain)
                     logger.info("L2 向量域命中: %s@%.3f → 叶子 %s", v_domain.value, vm.score, v_leaf.value)
                     fast_result = IntentResult(
                         primary_intent=v_leaf,

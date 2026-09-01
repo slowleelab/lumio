@@ -28,13 +28,6 @@ def classifier_with_vector(monkeypatch):
     vec = MagicMock()
     vec.search = AsyncMock(return_value=_vm())
 
-    settings_patch = {
-        "classification.vector_intent_enabled": True,
-        "classification.vector_intent_threshold": 0.55,
-        "classification.intent_threshold": 0.6,
-    }
-    real_get_settings = None
-
     clf = IntentClassifier(rule_classifier=rule, llm_classifier=llm, intent_vector=vec)
 
     from lumio.shared.config import Settings
