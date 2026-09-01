@@ -1892,10 +1892,13 @@ async def chat_feedback(body: ChatFeedbackRequest, req: Request, user: CurrentUs
                         last_user_input = content or ""
                     elif speaker in ("bot", "assistant") and not last_bot_output:
                         last_bot_output = content or ""
+                        resp_source = row[4] or ""
                         snapshot = {
                             "intent": row[2] or "",
                             "confidence": float(row[3]) if row[3] is not None else None,
-                            "response_source": row[4] or "",
+                            "response_source": resp_source,
+                            # dialogue_log 无独立 rag 命中列, 按回复来源推断 (rag/faq=命中, 其他=未走检索)
+                            "rag_hit": resp_source in ("rag", "faq", "hybrid", "parallel_race"),
                         }
                 if last_user_input:
                     from lumio.services.common.badcase_store import capture_badcase

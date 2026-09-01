@@ -562,6 +562,7 @@ class LumioAgent:
                                     "confidence": intent_result.primary_confidence,
                                     "response_source": "clarify",
                                     "guard_reason": verdict.reason,
+                                    "rag_hit": bool(str(result.get("retrieval_context", "") or "").strip()),
                                 },
                             )
                     except Exception:
