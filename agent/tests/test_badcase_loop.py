@@ -298,3 +298,63 @@ async def test_capture_dedup_merges_snapshot() -> None:
     )
     assert merged.snapshot == {"intent": "transfer_agent", "confidence": 0.9}
     assert merged.bot_output == "新回复"
+
+
+# ── 跨家族远程裁判 (Anthropic 协议 + 本地兜底) ─────────────────────────
+
+
+def _judge_env(monkeypatch, base="https://fake.example", key="k", model="GLM-5.3-Flash"):
+    from lumio.shared.config import get_settings
+
+    s = get_settings()
+    monkeypatch.setattr(s.llm, "judge_base_url", base)
+    monkeypatch.setattr(s.llm, "judge_api_key", key)
+    monkeypatch.setattr(s.llm, "judge_model", model)
+    monkeypatch.setattr(s.llm, "judge_timeout", 10.0)
+
+
+@pytest.mark.asyncio
+async def test_remote_judge_parses_anthropic_response(monkeypatch) -> None:
+    """thinking 块过滤 + text 块拼接 + chat_json 解析"""
+    import lumio.services.common.judge_client as jc
+
+    _judge_env(monkeypatch, base="https://fake.example")
+    client = jc.RemoteJudgeClient(fallback_llm=None)
+
+    async def fake_remote(messages, timeout):
+        return '{"root_cause_layer": "layer_5", "note": "ok"}'
+
+    monkeypatch.setattr(client, "_remote", fake_remote)
+    out = await client.chat_json([{"role": "user", "content": "x"}])
+    assert out["root_cause_layer"] == "layer_5"
+
+
+@pytest.mark.asyncio
+async def test_remote_judge_falls_back_to_local(monkeypatch) -> None:
+    """远程异常 → 本地 LLMClient 兜底, 且进入降级期 (后续直接走本地)"""
+    import lumio.services.common.judge_client as jc
+
+    _judge_env(monkeypatch)
+    calls = {"local": 0}
+    local = MagicMock()
+    local.chat = AsyncMock(side_effect=lambda m, timeout=None: (calls.__setitem__("local", calls["local"] + 1) or "本地回复"))
+    client = jc.RemoteJudgeClient(fallback_llm=local)
+
+    async def boom(messages, timeout):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(client, "_remote", boom)
+    out = await client.chat([{"role": "user", "content": "x"}])
+    assert out == "本地回复"
+    assert calls["local"] == 1
+    # 降级后不再打远程
+    out2 = await client.chat([{"role": "user", "content": "y"}])
+    assert out2 == "本地回复" and calls["local"] == 2
+
+
+def test_remote_judge_json_fencing() -> None:
+    from lumio.services.common.judge_client import _parse_json
+
+    assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert _parse_json('前置说明 {"b": 2} 尾部') == {"b": 2}
+    assert _parse_json("完全不是json") is None

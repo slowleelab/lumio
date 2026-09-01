@@ -26,6 +26,23 @@ from lumio.shared.exceptions import LumioError
 
 logger = logging.getLogger(__name__)
 
+
+def _build_judge(request: Request) -> BadcaseJudge:
+    """裁判构造: 配置了 judge_base_url 则走远程跨家族裁判 (GLM coding plan),
+    远程失败由 RemoteJudgeClient 自动回退本地; 否则用本地 qwen。"""
+    from lumio.services.common.judge_client import RemoteJudgeClient
+
+    settings = get_settings()
+    llm_client = getattr(request.app.state, "llm_client", None)
+    if llm_client is None:
+        raise LumioError(code=5001, message="LLM 未就绪")
+    if settings.llm.judge_base_url and settings.llm.judge_api_key:
+        judge_llm = RemoteJudgeClient(fallback_llm=llm_client)
+        logger.info("归因裁判: 远程 %s (跨家族, 本地兜底)", settings.llm.judge_model)
+    else:
+        judge_llm = llm_client
+    return BadcaseJudge(judge_llm, model=settings.llm.judge_model, min_confidence=0.7, samples=3)
+
 router = APIRouter(prefix="/admin/closed-loop", tags=["closed-loop"])
 
 AdminOnlyUser = Annotated[AuthUser, Depends(require_role("admin"))]
@@ -113,21 +130,11 @@ async def attribute_badcase(
 ) -> dict[str, Any]:
     """模块 A: LLM-as-Judge 自动归因 (n=3 自一致性, 闸门不足转人工)"""
 
-    settings = get_settings()
     bc = await get_badcase(request.app.state.db_session_factory, badcase_id)
     if bc is None:
         raise LumioError(code=2001, message=f"Badcase 不存在: {badcase_id}")
 
-    # judge 模型: 与生成模型同端点 (本地单 LLM), 跨家族原则在生产多模型时生效
-    llm_client = getattr(request.app.state, "llm_client", None)
-    if llm_client is None:
-        raise LumioError(code=5001, message="LLM 未就绪")
-    judge = BadcaseJudge(
-        llm_client,
-        model=settings.llm.judge_model,
-        min_confidence=0.7,
-        samples=3,
-    )
+    judge = _build_judge(request)
     sf = getattr(request.app.state, "db_session_factory", None)
     if not sf:
         raise LumioError(code=5001, message="数据库未就绪")
@@ -157,7 +164,7 @@ async def _batch_attribute_task(request: Request, limit: int) -> None:
     try:
         if sf is None or llm_client is None:
             raise RuntimeError("LLM 或数据库未就绪")
-        judge = BadcaseJudge(llm_client, model=get_settings().llm.judge_model, min_confidence=0.7, samples=3)
+        judge = _build_judge(request)
         from lumio.shared.orm_models import Badcase
 
         async with sf() as db:

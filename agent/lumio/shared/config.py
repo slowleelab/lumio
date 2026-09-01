@@ -197,6 +197,11 @@ class LLMSettings(BaseSettings):
     classify_timeout: float = 6.0
     # 模块 A 归因 judge 模型 (方案 §9.3: 生产应跨家族选型, 避免自我偏好偏差)
     judge_model: str = "qwen2.5:7b"
+    # 跨家族远程裁判 (Anthropic Messages 协议, 如 GLM coding plan):
+    # 留空则用本地 base_url 的 judge_model; 配置后归因走远程, 失败自动回退本地。
+    judge_base_url: str = ""
+    judge_api_key: str = ""
+    judge_timeout: float = 90.0
     # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
     # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
     classify_cache_enabled: bool = True
