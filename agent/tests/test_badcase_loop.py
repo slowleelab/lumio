@@ -57,7 +57,7 @@ def _sf():
         async def get(self, model, pk):
             return store["badcases"][0] if store["badcases"] else None
 
-        def execute(self, q):
+        async def execute(self, q):
             return FakeResult(None)
 
     class Factory:
@@ -190,3 +190,111 @@ class TestFilterVariants:
     def test_compliance_blocked(self) -> None:
         passed, rejected = filter_variants(["套现教程"], compliance_words={"套现"})
         assert passed == [] and len(rejected) == 1
+
+
+def _sf_smart():
+    """带查询参数解析的 fake factory: 支持 capture_badcase 的去重 SELECT 语义"""
+
+    store: dict = {"badcases": []}
+
+    class FakeResult:
+        def __init__(self, val):
+            self._v = val
+
+        def scalar_one_or_none(self):
+            return self._v
+
+        def scalar(self):
+            return 0
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [self._v] if self._v else []
+
+    def _dedup_match(stmt):
+        try:
+            params = stmt.compile().params
+        except Exception:
+            return None
+        colvals = {}
+        for k, v in params.items():
+            base = k.rsplit("_", 1)[0]
+            if base in ("dedup_group_id", "signal_source", "fix_status"):
+                colvals[base] = v
+        if not colvals:
+            return None
+        hits = [b for b in store["badcases"] if all(getattr(b, c, None) == v for c, v in colvals.items())]
+        return hits[-1] if hits else None
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def add(self, obj):
+            store["badcases"].append(obj)
+
+        async def commit(self):
+            pass
+
+        async def refresh(self, obj):
+            pass
+
+        async def execute(self, q):
+            return FakeResult(_dedup_match(q))
+
+    class Factory:
+        def __call__(self):
+            return Session()
+
+    return Factory(), store
+
+
+@pytest.mark.asyncio
+async def test_capture_dedup_aggregates_same_input() -> None:
+    """同输入+同信号源+未处置 → 累加出现次数, 不插新行"""
+    factory, store = _sf_smart()
+    kw = dict(trace_id="t", session_id="s", signal_source="transfer", user_input="我的卡丢了, 要挂失")
+    first = await capture_badcase(factory, **kw)
+    assert len(store["badcases"]) == 1
+    assert first.signal_detail["occurrences"] == 1
+
+    second = await capture_badcase(factory, **kw)
+    assert len(store["badcases"]) == 1, "重复信号应聚合到既有行"
+    assert second is first
+    assert second.signal_detail["occurrences"] == 2
+    assert second.signal_detail["last_seen_at"] == "s"
+
+    # 不同信号源 → 各自一行
+    await capture_badcase(factory, trace_id="t", session_id="s", signal_source="negative_feedback", user_input="我的卡丢了, 要挂失")
+    assert len(store["badcases"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_capture_reopens_after_resolved() -> None:
+    """处置过 (fix_status != pending) 的组重新开新行, 保留修复前后对照"""
+    factory, store = _sf_smart()
+    kw = dict(trace_id="t", session_id="s", signal_source="transfer", user_input="我的卡丢了, 要挂失")
+    first = await capture_badcase(factory, **kw)
+    first.fix_status = "deployed"  # 模拟已处置
+    again = await capture_badcase(factory, **kw)
+    assert len(store["badcases"]) == 2, "已处置后同输入应开新行"
+    assert again is not first
+    assert again.signal_detail["occurrences"] == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_dedup_merges_snapshot() -> None:
+    """聚合时快照合并 (后到的中间产物字段覆盖), bot_output 取最近"""
+    factory, store = _sf_smart()
+    kw = dict(trace_id="t", session_id="s1", signal_source="transfer", user_input="转人工")
+    await capture_badcase(factory, bot_output="旧回复", snapshot={"intent": "transfer_agent"}, **kw)
+    merged = await capture_badcase(
+        factory, bot_output="新回复", snapshot={"confidence": 0.9, "intent": "transfer_agent"}, **kw
+    )
+    assert merged.snapshot == {"intent": "transfer_agent", "confidence": 0.9}
+    assert merged.bot_output == "新回复"

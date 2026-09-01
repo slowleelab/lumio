@@ -3,6 +3,9 @@
     <div class="page-header">
       <h2>智能质检 <span class="page-subtitle">问题案例归因与整改闭环</span></h2>
       <div class="header-stats">
+        <el-button size="small" type="primary" plain :loading="batch.running" @click="doBatchAttribution">
+          {{ batch.running ? `批量归因中 ${batch.done}/${batch.total}` : "批量归因待归因项" }}
+        </el-button>
         <span class="stat">今日新增 <b>{{ stats?.today_new ?? "-" }}</b></span>
         <span class="stat">待复核 <b class="warn">{{ stats?.pending_review ?? "-" }}</b></span>
         <span class="stat">已确认 <b>{{ stats?.confirmed ?? "-" }}</b></span>
@@ -37,6 +40,12 @@
       <el-table-column label="信号源" width="110">
         <template #default="{ row }">
           <el-tag size="small" :type="signalType(row.signal_source)">{{ signalLabel(row.signal_source) }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="次数" width="60" align="center">
+        <template #default="{ row }">
+          <el-tag v-if="(row.occurrences ?? 1) > 1" size="small" type="warning">{{ row.occurrences }}</el-tag>
+          <span v-else class="muted">1</span>
         </template>
       </el-table-column>
       <el-table-column label="根因层" width="120">
@@ -116,22 +125,32 @@
         </template>
         <div class="section-title">八层现场快照</div>
         <pre class="snapshot">{{ JSON.stringify(detail.snapshot, null, 2) }}</pre>
+        <div class="detail-actions">
+          <el-button size="small" @click="addToGolden(detail)">以该输入扩充金标集</el-button>
+          <el-button size="small" @click="gotoAudit(detail)">查看完整会话审计</el-button>
+        </div>
       </div>
     </el-drawer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue"
+import { onMounted, onUnmounted, ref } from "vue"
+import { useRouter } from "vue-router"
 import { ElMessage } from "element-plus"
 import {
   listBadcases,
   attributeBadcase,
   resolveBadcase,
   getClosedLoopHealth,
+  startBatchAttribution,
+  getBatchAttributionStatus,
+  expandGoldenSet,
   type Badcase,
   type ClosedLoopHealth,
 } from "@/api/closedLoop"
+
+const router = useRouter()
 
 const badcases = ref<Badcase[]>([])
 const total = ref(0)
@@ -139,6 +158,52 @@ const page = ref(1)
 const pageSize = ref(50)
 const loading = ref(false)
 const filters = ref({ signal_source: "", root_cause_layer: "", fix_status: "" })
+
+// ── 批量归因 (后台任务, 每条 ~21s, 轮询进度) ──
+const batch = ref({ running: false, total: 0, done: 0, failed: 0 })
+let batchTimer: ReturnType<typeof setInterval> | null = null
+
+async function pollBatch() {
+  try {
+    const st = await getBatchAttributionStatus()
+    batch.value = { running: st.running, total: st.total, done: st.done, failed: st.failed }
+    if (!st.running) {
+      if (batchTimer) {
+        clearInterval(batchTimer)
+        batchTimer = null
+      }
+      if (st.total > 0) {
+        ElMessage.success(`批量归因完成: 成功 ${st.done} / 失败 ${st.failed} / 共 ${st.total}`)
+        load()
+      }
+    }
+  } catch {
+    /* handled */
+  }
+}
+
+async function doBatchAttribution() {
+  try {
+    await startBatchAttribution(200)
+    ElMessage.success("批量归因已启动 (后台执行, 每条约 20 秒)")
+    if (!batchTimer) batchTimer = setInterval(pollBatch, 4000)
+  } catch {
+    /* handled */
+  }
+}
+
+async function addToGolden(row: Badcase) {
+  try {
+    const r = await expandGoldenSet([row.user_input])
+    ElMessage.success(`金标扩充完成: 生成 ${r.variants.length} 条变体 (可到种子样本页抽检入库)`)
+  } catch {
+    /* handled */
+  }
+}
+
+function gotoAudit(row: Badcase) {
+  router.push({ path: "/admin/audit", query: { session_id: row.session_id } })
+}
 const detailVisible = ref(false)
 const detail = ref<Badcase | null>(null)
 const health = ref<ClosedLoopHealth | null>(null)
@@ -310,8 +375,12 @@ async function loadHealth() {
 
 onMounted(() => {
   load()
+  pollBatch()
   loadStats()
   loadHealth()
+})
+onUnmounted(() => {
+  if (batchTimer) clearInterval(batchTimer)
 })
 </script>
 

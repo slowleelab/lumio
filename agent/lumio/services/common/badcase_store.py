@@ -33,19 +33,56 @@ async def capture_badcase(
     snapshot: dict[str, Any] | None = None,
     fix_status: str = "pending",
 ) -> Badcase:
-    """信号采集: 五路信号 → badcase 落库 (粗去重 key 同步写入)"""
+    """信号采集: 五路信号 → badcase 落库。
+
+    去重聚合: 同 (dedup_group_id + signal_source) 且未处置 (fix_status=pending)
+    的既有条目只累加出现次数 (signal_detail.occurrences + 最近一次现场快照),
+    不再插新行 —— 否则同一句"我的卡丢了"一小时就能刷出 41 条重复记录,
+    列表被刷屏、归因重复劳动。处置过 (fixing/deployed) 的组重新计数开新行,
+    保留修复前后对照。
+    """
     async with session_factory() as session:
+        group = dedup_key(user_input)
+        existing = (
+            await session.execute(
+                select(Badcase)
+                .where(
+                    Badcase.dedup_group_id == group,
+                    Badcase.signal_source == signal_source,
+                    Badcase.fix_status == "pending",
+                )
+                .order_by(Badcase.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            detail = dict(existing.signal_detail or {})
+            detail["occurrences"] = int(detail.get("occurrences", 1)) + 1
+            detail["last_seen_at"] = session_id
+            existing.signal_detail = detail
+            if snapshot:
+                merged = dict(existing.snapshot or {})
+                merged.update(snapshot)
+                existing.snapshot = merged
+            if bot_output:
+                existing.bot_output = bot_output
+            await session.commit()
+            await session.refresh(existing)
+            logger.info(
+                "Badcase 聚合去重: group=%s source=%s occurrences=%d", group, signal_source, detail["occurrences"]
+            )
+            return existing
         bc = Badcase(
             trace_id=trace_id or session_id,
             session_id=session_id,
             customer_id=customer_id,
             channel=channel,
             signal_source=signal_source,
-            signal_detail=signal_detail,
+            signal_detail={**(signal_detail or {}), "occurrences": 1},
             user_input=user_input,
             bot_output=bot_output,
             snapshot=snapshot,
-            dedup_group_id=dedup_key(user_input),
+            dedup_group_id=group,
             needs_human_review=True,
             fix_status=fix_status,
         )
@@ -117,6 +154,7 @@ def _to_dict(b: Badcase) -> dict[str, Any]:
         "fix_note": b.fix_note,
         "resolved_at": b.resolved_at.isoformat() if b.resolved_at else None,
         "created_at": b.created_at.isoformat() if b.created_at else None,
+        "occurrences": int((b.signal_detail or {}).get("occurrences", 1)),
     }
 
 

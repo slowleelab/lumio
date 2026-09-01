@@ -145,6 +145,79 @@ async def attribute_badcase(
     }
 
 
+# ── 批量归因 (后台任务, 每条 ~21s 本地 n=3; 大库存一条条点不现实) ──
+
+_batch_state: dict[str, Any] = {"running": False, "total": 0, "done": 0, "failed": 0, "started_at": 0.0, "error": ""}
+_batch_tasks: set = set()
+
+
+async def _batch_attribute_task(request: Request, limit: int) -> None:
+    sf = getattr(request.app.state, "db_session_factory", None)
+    llm_client = getattr(request.app.state, "llm_client", None)
+    try:
+        if sf is None or llm_client is None:
+            raise RuntimeError("LLM 或数据库未就绪")
+        judge = BadcaseJudge(llm_client, model=get_settings().llm.judge_model, min_confidence=0.7, samples=3)
+        from lumio.shared.orm_models import Badcase
+
+        async with sf() as db:
+            rows = (
+                (
+                    await db.execute(
+                        select(Badcase.id)
+                        .where(Badcase.root_cause_layer.is_(None))
+                        .order_by(Badcase.created_at.desc())
+                        .limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        ids = [str(r) for r in rows]
+        _batch_state.update(total=len(ids), done=0, failed=0)
+        logger.info("批量归因启动: %d 条待归因", len(ids))
+        for bid in ids:
+            result = await attribute_and_save(sf, judge, badcase_id=bid)
+            if result is None:
+                _batch_state["failed"] += 1
+            else:
+                _batch_state["done"] += 1
+        logger.info(
+            "批量归因完成: 成功 %d / 失败 %d / 共 %d",
+            _batch_state["done"],
+            _batch_state["failed"],
+            len(ids),
+        )
+    except Exception as exc:
+        _batch_state["error"] = str(exc)
+        logger.warning("批量归因异常: %s", exc)
+    finally:
+        _batch_state["running"] = False
+
+
+@router.post("/badcases/attribute-batch")
+async def attribute_batch(user: AdminOnlyUser, request: Request, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """批量归因待归因坏例 (后台任务, 状态见 /badcases/attribute-batch/status)"""
+    import asyncio
+    import time as _time
+
+    if _batch_state["running"]:
+        raise LumioError(code=3001, message="批量归因进行中, 请等待完成")
+    limit = int((body or {}).get("limit") or 50)
+    limit = max(1, min(limit, 500))
+    _batch_state.update(running=True, total=0, done=0, failed=0, started_at=_time.time(), error="")
+    task = asyncio.create_task(_batch_attribute_task(request, limit))
+    _batch_tasks.add(task)
+    task.add_done_callback(_batch_tasks.discard)
+    return {"scheduled": True, "limit": limit}
+
+
+@router.get("/badcases/attribute-batch/status")
+async def attribute_batch_status(user: AdminAgentUser) -> dict[str, Any]:
+    """批量归因进度 (前端轮询)"""
+    return dict(_batch_state)
+
+
 @router.post("/badcases/{badcase_id}/resolve")
 async def resolve_badcase(
     badcase_id: str,

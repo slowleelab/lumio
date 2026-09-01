@@ -26,6 +26,7 @@ export interface Badcase {
   resolved_at: string | null
   snapshot: Record<string, unknown> | null
   created_at: string | null
+  occurrences?: number
 }
 
 export interface BadcaseListResponse {
@@ -85,4 +86,25 @@ export interface BadcaseStats {
 
 export function getBadcaseStats(): Promise<BadcaseStats> {
   return client.get("/admin/closed-loop/badcases/stats")
+}
+
+export interface BatchAttributionStatus {
+  running: boolean
+  total: number
+  done: number
+  failed: number
+  started_at: number
+  error: string
+}
+
+export function startBatchAttribution(limit = 50): Promise<{ scheduled: boolean; limit: number }> {
+  return client.post("/admin/closed-loop/badcases/attribute-batch", { limit })
+}
+
+export function getBatchAttributionStatus(): Promise<BatchAttributionStatus> {
+  return client.get("/admin/closed-loop/badcases/attribute-batch/status")
+}
+
+export function expandGoldenSet(seeds: string[]): Promise<{ seed_count: number; variants: string[]; rejected_count: number }> {
+  return client.post("/admin/closed-loop/golden/expand", { seeds })
 }

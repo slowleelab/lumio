@@ -557,7 +557,12 @@ class LumioAgent:
                                 customer_id=customer_id,
                                 bot_output=str(verdict.reply),
                                 signal_detail={"reason": verdict.reason},
-                                snapshot={"intent": intent_result.primary_intent.value, "response_source": "clarify"},
+                                snapshot={
+                                    "intent": intent_result.primary_intent.value,
+                                    "confidence": intent_result.primary_confidence,
+                                    "response_source": "clarify",
+                                    "guard_reason": verdict.reason,
+                                },
                             )
                     except Exception:
                         logger.debug("合规 Badcase 采集失败(不阻断)")
@@ -1483,6 +1488,9 @@ class LumioAgent:
                     else None
                 )
                 if sf:
+                    from lumio.services.bot.routing import classify_traffic
+
+                    _dom, _tc = classify_traffic(primary)
                     await capture_badcase(
                         sf,
                         trace_id=session_id,
@@ -1492,6 +1500,12 @@ class LumioAgent:
                         customer_id=customer_id,
                         bot_output=BUSINESS_TRANSFER_TEMPLATE.format(reason=reason),
                         signal_detail={"transfer_reason": reason, "stage": "immediate", "intent": primary.value},
+                        snapshot={
+                            "intent": primary.value,
+                            "confidence": conf,
+                            "traffic_class": _tc.value if _tc else None,
+                            "response_source": "template",
+                        },
                     )
             except Exception:
                 logger.debug("转人工 Badcase 采集失败(不阻断)")
@@ -1949,6 +1963,13 @@ class LumioAgent:
                             customer_id=None,
                             bot_output=BUSINESS_TRANSFER_TEMPLATE.format(reason=reason),
                             signal_detail={"transfer_reason": reason, "stage": "confirmed"},
+                            snapshot={
+                                "intent": "transfer_agent",
+                                "confidence": None,
+                                "traffic_class": "high_risk",
+                                "response_source": "template",
+                                "stage_detail": "L3 低置信确认链",
+                            },
                         )
                 except Exception:
                     logger.debug("转人工 Badcase 采集失败(不阻断)")

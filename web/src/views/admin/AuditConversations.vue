@@ -184,6 +184,7 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from "vue"
+import { useRoute } from "vue-router"
 import {
   listConversations,
   getConversationReplay,
@@ -303,7 +304,12 @@ function formatTime(s: string | null) {
   return s?.slice(0, 19).replace("T", " ") || "-"
 }
 
-onMounted(load)
+const route = useRoute()
+onMounted(() => {
+  const q = route.query.session_id as string | undefined
+  if (q && filters.value) filters.value.session_id = q
+  load()
+})
 </script>
 
 <style scoped lang="scss">
