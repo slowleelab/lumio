@@ -25,7 +25,7 @@ from lumio.services.bot.routing import TrafficClass, classify_traffic
 from lumio.services.common.classifier import INTENT_DOMAINS
 from lumio.shared.auth import AuthUser, require_role
 from lumio.shared.exceptions import LumioError
-from lumio.shared.intent_registry import RegistryError, RegistryState, get_registry
+from lumio.shared.intent_registry import RegistryEntry, RegistryError, RegistryState, get_registry
 from lumio.shared.intent_taxonomy import (
     _DOMAIN_DEFAULT_GROUP,
     _GROUP_OVERRIDES,
@@ -333,7 +333,7 @@ async def review_registry_intent(
     approve = bool(body.get("approve"))
     action = "approve" if approve else "reject"
     try:
-        entry = get_registry().transition(
+        get_registry().transition(
             slug,
             action,
             actor=user.user_id,

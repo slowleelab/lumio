@@ -35,6 +35,7 @@ async def list_scenarios(user: AdminAgentUser) -> dict[str, Any]:
                 "key": s.key,
                 "name_zh": s.name_zh,
                 "turns": len(s.turns),
+                "variants": s.variant_count(),
                 "final_feedback": s.final_feedback,
                 "tags": s.tags,
             }

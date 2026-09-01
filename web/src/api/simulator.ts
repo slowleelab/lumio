@@ -8,6 +8,7 @@ export interface ScenarioInfo {
   key: string
   name_zh: string
   turns: number
+  variants: number
   final_feedback: string
   tags: string[]
 }
@@ -20,6 +21,7 @@ export interface SimulatorStats {
   expect_checks: number
   feedbacks: number
   errors: number
+  abandoned: number
   latency_avg_ms: number
   latency_p95_ms: number
 }

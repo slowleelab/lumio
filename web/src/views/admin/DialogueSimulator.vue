@@ -32,6 +32,7 @@
         <div class="stat"><b>{{ status.stats.latency_avg_ms || "-" }}</b><span>均延迟 ms</span></div>
         <div class="stat"><b>{{ status.stats.latency_p95_ms || "-" }}</b><span>P95 ms</span></div>
         <div class="stat"><b class="warn">{{ status.stats.feedbacks }}</b><span>差评(喂闭环)</span></div>
+        <div class="stat"><b>{{ status.stats.abandoned }}</b><span>中途挂断</span></div>
         <div class="stat"><b class="warn">{{ status.stats.errors }}</b><span>错误</span></div>
       </div>
     </div>
@@ -44,7 +45,7 @@
             <div v-for="s in scenarios" :key="s.key" class="scenario-row">
               <el-checkbox :value="s.key" :disabled="status.running">
                 <span class="sc-name">{{ s.name_zh }}</span>
-                <span class="muted sc-meta">{{ s.turns }} 轮</span>
+                <span class="muted sc-meta">{{ s.turns }} 轮 · {{ s.variants }} 变体</span>
                 <el-tag v-if="s.final_feedback === 'down'" size="small" type="danger" effect="plain">差评</el-tag>
                 <el-tag v-for="t in s.tags.slice(0, 2)" :key="t" size="small" type="info" effect="plain">{{ t }}</el-tag>
               </el-checkbox>
@@ -108,7 +109,7 @@ const status = ref<SimulatorStatus>({
   config: { scenario_keys: [], users: 2, interval: 8 },
   stats: {
     started_at: 0, sessions: 0, turns: 0, expect_hits: 0, expect_checks: 0,
-    feedbacks: 0, errors: 0, latency_avg_ms: 0, latency_p95_ms: 0,
+    feedbacks: 0, errors: 0, abandoned: 0, latency_avg_ms: 0, latency_p95_ms: 0,
   },
   recent: [],
 })
