@@ -19,7 +19,6 @@ from lumio.shared.orm_models import Badcase
 
 def _sf():
     """内存级 fake session factory (与 test_console_admin 同款)"""
-    from tests.test_console_admin import FakeSession, _Result
 
     store: dict = {"badcases": []}
 
@@ -88,9 +87,9 @@ async def test_capture_persists_and_dedup_key() -> None:
     async def test_update_fix_status(self) -> None:
         """状态流转持久化"""
         from unittest.mock import AsyncMock, MagicMock
+
         from uuid_utils import uuid7
 
-        from lumio.services.common.badcase_store import update_fix_status
 
         bc = Badcase(
             id=uuid7(), trace_id="t", session_id="s", signal_source="transfer",

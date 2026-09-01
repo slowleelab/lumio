@@ -93,6 +93,11 @@ def create_bot_app(lifespan: Callable | None = None) -> FastAPI:
 
     app.include_router(intent_library_router, prefix="/api")
 
+    # 对话模拟器路由 (客户端模拟 Agent 启停/状态)
+    from lumio.services.common.simulator_router import router as simulator_router
+
+    app.include_router(simulator_router, prefix="/api")
+
     # 审计日志中间件
     from lumio.shared.audit_middleware import register_audit_middleware
 

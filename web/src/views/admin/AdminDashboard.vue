@@ -23,6 +23,10 @@
           <el-icon><Notebook /></el-icon>
           <template #title>意图库管理</template>
         </el-menu-item>
+        <el-menu-item index="/admin/simulator">
+          <el-icon><VideoPlay /></el-icon>
+          <template #title>对话模拟</template>
+        </el-menu-item>
 
         <div class="menu-section">知识库</div>
         <el-menu-item index="/admin/documents">
@@ -83,6 +87,7 @@ import {
   TrendCharts,
   DataAnalysis,
   Notebook,
+  VideoPlay,
   Back,
 } from "@element-plus/icons-vue"
 

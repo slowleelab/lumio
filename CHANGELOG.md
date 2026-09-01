@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ## [Unreleased]
 
 ### Added
+- **客户端模拟 Agent + 对话模拟管理页**（虚拟客户黑盒压测, 喂闭环/验链路/测延迟）
+  - `services/common/simulator.py`：12 个场景剧本（账单查询槽位补齐/挂失确认链/分期 RAG/定义句式/复合意图/投诉/主动转人工/闲聊/乱码噪声/FAQ 直出/知识缺口+差评等）× N 并发虚拟客户；黑盒走自身 HTTP 链路 send→poll→feedback, 速率可配（用户数/间隔）, 期望命中/延迟 P95/差评计数实时统计
+  - `/admin/simulator/{scenarios,start,stop,status}` 管理端点 + 前端「对话模拟」页（启停按钮/场景勾选/并发与间隔配置/统计卡/实时轮次表 3s 轮询）
+  - 闭环两处采集缺口修复：即时转人工路径补采集钩子（此前仅 L3 低置信确认链采集）；`/chat/feedback` 差评自动采集 Badcase（此前只写 Redis 从未进闭环）
+  - 真实 E2E：12 会话/14 轮 → 7 条坏例自动入闭环（5 transfer + 2 negative_feedback）；并暴露真实 badcase（bot 对账单查询过度推能力边界, 应走链 B 而非拒绝）
+
+### Added
 - **意图注册表：流派二（Config-as-Code + 治理流水线）全链路落地** —— 新增意图不再要求发版
   - `shared/intent_registry.py`：运营意图注册表（`intent_registry.json` 持久化 + .bak 备份，建议入 Git 管理）与生命周期状态机 `draft → pending_review →(双人复核)→ 评测闸门 → shadow → active → deprecated/rejected`；双人复核强制评审人≠登记者（maker-checker）；最少种子 10 条（建议 20）+ slug 命名规范 + 出厂枚举冲突校验；每步迁移留审计历史（actor/action/note）
   - 评测闸门 `intent_eval.py`（全本地无 LLM）：重叠检测（候选种子 vs 出厂+已生效语料近重复比对，warn 0.94 / hard 0.97，按 mxbai 中文短句底噪实测标定）+ 金标域回归（虚拟最近邻域分类器，加入新种子后金标准确率跌幅 ≤0.02 才放行）

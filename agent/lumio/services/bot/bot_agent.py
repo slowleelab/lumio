@@ -1472,6 +1472,29 @@ class LumioAgent:
                     await self._create_complaint_ticket(session_id, user_input, customer_id)
                 except Exception as exc:
                     logger.debug("投诉工单创建失败 (不阻断转人工): session=%s err=%s", session_id, exc)
+            # 转人工信号采集 (闭环 §3.1 第二路): 真·明确转人工即时路径同样留痕归因现场
+            # —— 此前只有 L3 低置信确认链采集, 客户主动请求路径漏采。
+            try:
+                from lumio.services.common.badcase_store import capture_badcase
+
+                sf = (
+                    self._session_manager._resolve_factory()
+                    if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
+                    else None
+                )
+                if sf:
+                    await capture_badcase(
+                        sf,
+                        trace_id=session_id,
+                        session_id=session_id,
+                        signal_source="transfer",
+                        user_input=user_input,
+                        customer_id=customer_id,
+                        bot_output=BUSINESS_TRANSFER_TEMPLATE.format(reason=reason),
+                        signal_detail={"transfer_reason": reason, "stage": "immediate", "intent": primary.value},
+                    )
+            except Exception:
+                logger.debug("转人工 Badcase 采集失败(不阻断)")
             return self._build_result(
                 session_id,
                 user_input,

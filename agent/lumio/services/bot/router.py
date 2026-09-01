@@ -1860,6 +1860,49 @@ async def chat_feedback(body: ChatFeedbackRequest, req: Request, user: CurrentUs
                 ensure_ascii=False,
             ),
         )
+    # 闭环 §3.1 第一路: 差评 (rating=down) 自动采集 Badcase —— 此前只写 Redis,
+    # 负面反馈从未进归因闭环。取会话最后一轮 (客户输入 + bot 回复) 作归因现场。
+    if body.rating == "down":
+        try:
+            sf = getattr(req.app.state, "db_session_factory", None) or _db_session_factory
+            if sf:
+                last_user_input, last_bot_output = "", ""
+                async with sf() as db:
+                    from sqlalchemy import select
+
+                    from lumio.shared.orm_models import DialogueLog
+
+                    res = await db.execute(
+                        select(DialogueLog.speaker, DialogueLog.content)
+                        .where(DialogueLog.session_id == body.session_id)
+                        .order_by(DialogueLog.timestamp.desc())
+                        .limit(4)
+                    )
+                    rows = list(res.all())
+                for speaker, content in reversed(rows):
+                    if speaker == "customer" and not last_user_input:
+                        last_user_input = content or ""
+                    elif speaker in ("bot", "assistant") and not last_bot_output:
+                        last_bot_output = content or ""
+                if last_user_input:
+                    from lumio.services.common.badcase_store import capture_badcase
+
+                    await capture_badcase(
+                        sf,
+                        trace_id=body.session_id,
+                        session_id=body.session_id,
+                        signal_source="negative_feedback",
+                        user_input=last_user_input,
+                        customer_id=None,
+                        bot_output=last_bot_output or None,
+                        signal_detail={
+                            "message_id": body.message_id,
+                            "comment": body.comment[:200],
+                            "stage": "auto",
+                        },
+                    )
+        except Exception:
+            logger.debug("差评 Badcase 采集失败(不阻断反馈)")
     return {"status": "ok"}
 
 
