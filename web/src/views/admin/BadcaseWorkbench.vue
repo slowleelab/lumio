@@ -1,7 +1,7 @@
 <template>
   <div class="badcase-page">
     <div class="page-header">
-      <h2>Badcase 工作台</h2>
+      <h2>智能质检 <span class="page-subtitle">问题案例归因与整改闭环</span></h2>
       <div class="header-stats">
         <span class="stat">今日新增 <b>{{ stats?.today_new ?? "-" }}</b></span>
         <span class="stat">待复核 <b class="warn">{{ stats?.pending_review ?? "-" }}</b></span>
@@ -279,6 +279,12 @@ onMounted(() => {
   justify-content: space-between;
   flex-wrap: wrap;
   gap: var(--space-2);
+}
+.page-subtitle {
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  color: var(--color-text-secondary);
+  margin-left: 8px;
 }
 .header-stats {
   display: flex;

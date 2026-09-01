@@ -17,7 +17,7 @@
         <div class="menu-section">闭环运营</div>
         <el-menu-item index="/admin/badcase">
           <el-icon><DataAnalysis /></el-icon>
-          <template #title>Badcase 工作台</template>
+          <template #title>智能质检</template>
         </el-menu-item>
         <el-menu-item index="/admin/intent-library">
           <el-icon><Notebook /></el-icon>
