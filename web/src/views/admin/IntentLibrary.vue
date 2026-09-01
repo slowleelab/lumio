@@ -10,11 +10,36 @@
     <el-tabs v-model="activeTab">
       <!-- 意图树 -->
       <el-tab-pane label="意图树" name="tree">
-        <el-table :data="treeRows" v-loading="treeLoading" stripe size="small">
-          <el-table-column prop="domain" label="五域" width="140" />
-          <el-table-column prop="group" label="子域组" width="180" />
-          <el-table-column prop="intent" label="叶子意图" min-width="200" show-overflow-tooltip />
-        </el-table>
+        <el-input
+          v-model="treeFilter"
+          placeholder="过滤意图（中文名或 slug）"
+          size="small"
+          clearable
+          style="width: 280px; margin-bottom: 12px"
+        />
+        <el-tree
+          v-loading="treeLoading"
+          :data="treeData"
+          :props="{ label: 'label', children: 'children' }"
+          node-key="key"
+          default-expand-all
+          :filter-node-method="filterTreeNode"
+          ref="treeRef"
+        >
+          <template #default="{ data }">
+            <span v-if="data.type === 'intent'" class="tree-intent">
+              <span class="intent-name">{{ data.label }}</span>
+              <span class="intent-slug">{{ data.slug }}</span>
+              <el-tooltip v-if="data.definition" :content="data.definition" placement="top">
+                <el-icon class="intent-info"><InfoFilled /></el-icon>
+              </el-tooltip>
+            </span>
+            <span v-else class="tree-group-label">
+              {{ data.label }}
+              <el-tag size="small" type="info" effect="plain" class="tree-count">{{ data.count }}</el-tag>
+            </span>
+          </template>
+        </el-tree>
       </el-tab-pane>
 
       <!-- 种子样本 -->
@@ -49,7 +74,8 @@
           属性表为只读总览（五域/组/交易性质），修改需走代码变更 + 双人复核流程。
         </div>
         <el-table :data="attrRows" v-loading="attrLoading" stripe size="small" max-height="600">
-          <el-table-column prop="intent" label="意图" min-width="200" show-overflow-tooltip sortable />
+          <el-table-column prop="name_zh" label="中文名" width="130" show-overflow-tooltip />
+          <el-table-column prop="intent" label="意图 slug" min-width="200" show-overflow-tooltip sortable />
           <el-table-column prop="domain" label="五域" width="120" />
           <el-table-column prop="group" label="子域组" width="160" />
           <el-table-column label="交易性质" width="160">
@@ -91,8 +117,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { ElMessage } from "element-plus"
+import { InfoFilled } from "@element-plus/icons-vue"
 import {
   getIntentTree,
   listSeeds,
@@ -105,28 +132,89 @@ import {
 
 const activeTab = ref("tree")
 
-// ── 意图树 ──
-const treeRows = ref<{ domain: string; group: string; intent: string }[]>([])
+// ── 意图树 (el-tree 三级: 域 → 组 → 叶子) ──
+interface TreeNode {
+  key: string
+  label: string
+  type: "domain" | "group" | "intent"
+  children?: TreeNode[]
+  slug?: string
+  definition?: string
+  count?: number
+}
+
+const treeData = ref<TreeNode[]>([])
 const treeLoading = ref(false)
+const treeFilter = ref("")
+const treeRef = ref()
+
+const DOMAIN_LABELS: Record<string, string> = {
+  query: "查询域（非金融）",
+  transaction: "交易域（金融类）",
+  consulting: "咨询域",
+  service: "服务域",
+  chitchat: "闲聊域",
+}
+
+const GROUP_LABELS: Record<string, string> = {
+  A1_account_query: "账户查询",
+  A2_bill_query: "账单查询",
+  A3_progress_query: "进度查询",
+  B1_funds: "资金类",
+  B2_account_change: "账户变更类",
+  C1_product: "产品咨询",
+  C2_business: "业务咨询",
+  C3_dispute: "争议咨询",
+  D1_transfer: "人工转接",
+  D2_complaint: "投诉建议",
+  E_chitchat: "闲聊",
+}
 
 async function loadTree() {
   treeLoading.value = true
   try {
     const res = await getIntentTree()
-    const rows: { domain: string; group: string; intent: string }[] = []
+    const nodes: TreeNode[] = []
     for (const [dom, dv] of Object.entries(res.domains)) {
-      for (const [grp, gv] of Object.entries(dv.groups)) {
-        for (const item of (gv as { intents: { intent: string }[] }).intents) {
-          rows.push({ domain: dom, group: grp, intent: item.intent })
-        }
+      const domNode: TreeNode = {
+        key: dom,
+        label: DOMAIN_LABELS[dom] ?? dom,
+        type: "domain",
+        children: [],
       }
+      for (const [grp, gv] of Object.entries(dv.groups)) {
+        const intents = (gv as { intents: { intent: string; name_zh?: string; definition?: string }[] }).intents
+        domNode.children!.push({
+          key: `${dom}/${grp}`,
+          label: GROUP_LABELS[grp] ?? grp,
+          type: "group",
+          count: intents.length,
+          children: intents.map((it) => ({
+            key: `${dom}/${grp}/${it.intent}`,
+            label: it.name_zh ? `${it.name_zh}` : it.intent,
+            slug: it.intent,
+            definition: it.definition,
+            type: "intent" as const,
+          })),
+        })
+      }
+      nodes.push(domNode)
     }
-    treeRows.value = rows
+    treeData.value = nodes
   } catch {
     /* handled */
   } finally {
     treeLoading.value = false
   }
+}
+
+function filterTreeNode(value: string, data: TreeNode) {
+  if (!value) return true
+  const v = value.toLowerCase()
+  return (
+    data.label.toLowerCase().includes(v) ||
+    (data.slug ?? "").toLowerCase().includes(v)
+  )
 }
 
 // ── 种子样本 ──
@@ -141,7 +229,13 @@ const newSeed = ref({ intent: "", text: "" })
 
 const allIntentLabels = computed(() => {
   const labels = new Set<string>()
-  for (const r of treeRows.value) labels.add(r.intent)
+  const walk = (nodes: TreeNode[]) => {
+    for (const n of nodes) {
+      if (n.type === "intent" && n.slug) labels.add(n.slug)
+      if (n.children) walk(n.children)
+    }
+  }
+  walk(treeData.value)
   return [...labels].sort()
 })
 
@@ -233,6 +327,10 @@ function trafficTag(s: string): string {
   return m[s] ?? "info"
 }
 
+watch(treeFilter, (v) => {
+  treeRef.value?.filter(v)
+})
+
 onMounted(() => {
   loadTree()
   loadSeeds()
@@ -269,4 +367,30 @@ onMounted(() => {
   color: var(--el-color-warning-dark-2, #b8860b);
 }
 .muted { color: var(--color-text-secondary); }
+
+.tree-intent {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+
+  .intent-name { font-size: 13px; }
+  .intent-slug {
+    font-size: 11px;
+    color: var(--color-text-secondary);
+    font-family: ui-monospace, Menlo, monospace;
+  }
+  .intent-info {
+    color: var(--color-text-placeholder);
+    cursor: help;
+    font-size: 13px;
+  }
+}
+
+.tree-group-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  .tree-count { transform: scale(0.85); }
+}
 </style>

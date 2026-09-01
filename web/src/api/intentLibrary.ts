@@ -6,6 +6,8 @@ import { client } from "./client"
 
 export interface IntentTreeNode {
   intent: string
+  name_zh?: string
+  definition?: string
   domain: string
   group: string
 }
@@ -26,6 +28,7 @@ export interface SeedListResponse {
 
 export interface AttributeRow {
   intent: string
+  name_zh?: string
   domain: string
   group: string
   traffic_class: string | null

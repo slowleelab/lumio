@@ -65,9 +65,13 @@ async def intent_tree(user: AdminAgentUser) -> dict[str, Any]:
             {"domain": dom.value, "groups": {}},
         )
         g = d["groups"].setdefault(grp, {"group": grp, "intents": []})
+        from lumio.shared.intent_labels_zh import intent_desc_zh, intent_name_zh
+
         g["intents"].append(
             {
                 "intent": label.value,
+                "name_zh": intent_name_zh(label.value),
+                "definition": intent_desc_zh(label.value),
                 "domain": dom.value,
                 "group": grp,
             }
@@ -145,9 +149,12 @@ async def attribute_table(user: AdminAgentUser) -> dict[str, Any]:
         dom = domain_of(label)
         grp = group_of(label)
         _dom, traffic = classify_traffic(label)
+        from lumio.shared.intent_labels_zh import intent_name_zh
+
         rows.append(
             {
                 "intent": label.value,
+                "name_zh": intent_name_zh(label.value),
                 "domain": dom.value,
                 "group": grp,
                 "traffic_class": traffic.value if traffic else None,
