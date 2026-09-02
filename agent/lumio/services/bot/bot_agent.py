@@ -24,6 +24,7 @@ from lumio.services.bot.prompts import (
     _SUMMARIZE_SYSTEM_PROMPT,
     BUSINESS_SYSTEM_PROMPT,
     BUSINESS_TRANSFER_TEMPLATE,
+    CHITCHAT_REDIRECT_RESPONSE,
     CLARIFY_RESPONSE,
     CLARIFY_RESPONSES,
     CONFIRM_FOLLOWUP_RESPONSE,
@@ -779,6 +780,7 @@ class LumioAgent:
             classify_traffic,
             decision_two,
             detect_composite,
+            is_chitchat_redirect,
         )
 
         intent = intent_result.primary_intent
@@ -888,6 +890,38 @@ class LumioAgent:
             )
 
         # ── 决策二 (CONSULTING) ──
+        # 闲聊域短路 (会话 8700a2ea 复盘): 决策二只有 复合/竞速/RAG 三个出口, 闲聊流量
+        # 按置信分流全部落进 RAG 链 — "锄禾日当午"检索"命中"账单文档, 15 秒生成了整段
+        # 答非所问的账单说明。闲聊无业务诉求: 模板轻回复引导回业务, 零检索零生成零幻觉。
+        # alternatives 携带业务域意图的混合句不拦 (is_chitchat_redirect 内部判定)。
+        if is_chitchat_redirect(intent, list(intent_result.alternatives or [])):
+            logger.info(
+                "闲聊域轻回复引导: session=%s input=%r conf=%.2f",
+                session_id,
+                user_input[:20],
+                confidence,
+            )
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.INTENT_CLASSIFY,
+                    reasoning="闲聊域轻回复引导(决策二短路), 不检索不生成",
+                    evidence={
+                        "traffic_class": None,
+                        "domain": v2_domain.value,
+                        "confidence": confidence,
+                        "chitchat_redirect": True,
+                    },
+                    turn_id=uuid_module.uuid4().hex[:16],
+                    customer_id=customer_id,
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+            return self._build_result(
+                session_id, user_input, CHITCHAT_REDIRECT_RESPONSE, "template", "chitchat", confidence
+            )
+
         route = decision_two(confidence, composite)
         if route.value == "parallel_race":
             return await self._handle_parallel_race(session_id, user_input, intent_result, history, entities, sentiment)
@@ -2517,6 +2551,7 @@ class LumioAgent:
         except Exception:
             pass
         try:
+            from lumio.services.common.retrieval import query_chunk_overlap_zero
             from lumio.services.common.retrieval import retrieve as do_retrieve
 
             settings = get_settings()
@@ -2538,6 +2573,17 @@ class LumioAgent:
             )
             self._last_citation_docids = [r.source_doc for r in (resp.results or [])]
             if resp.results:
+                # 相关性兜底门 (会话 8700a2ea): reranker 退化时 RRF 阈值 0 形同虚设,
+                # "锄禾日当午"靠单字"日"BM25 非零命中账单文档。查询与全部片段零词法
+                # 重叠 → 无证据不生成, 判 miss 走既有无知识降级话术。
+                if query_chunk_overlap_zero(query, [r.content for r in resp.results]):
+                    logger.info(
+                        "检索词法重叠门: 查询与全部片段零重叠, 视为 miss: query=%r docs=%d",
+                        query[:30],
+                        len(resp.results),
+                    )
+                    self._last_citation_docids = []
+                    return ""
                 # P0-3 首尾重排 (LongLLMLingua reorder_context="sort"):
                 # lost-in-middle — 模型对中段注意力最弱, 相关性最高的文档放最前,
                 # 次高放最后, 其余居中

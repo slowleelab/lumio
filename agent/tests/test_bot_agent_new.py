@@ -2087,3 +2087,69 @@ class TestAsksForParameters:
 
     def test_empty_content(self) -> None:
         assert _asks_for_parameters("") is False
+
+
+class TestDispatchV2ChitchatRedirect:
+    """闲聊域轻回复引导 (会话 8700a2ea: "锄禾日当午"进 RAG 链生成账单说明)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(
+                IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5),
+                [],
+                MagicMock(),
+                "",
+            )
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_chitchat_returns_template_without_retrieval(self) -> None:
+        """chitchat 主意图 → 模板轻回复, 不进知识链 (零检索零生成)"""
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock(return_value={"response": "不该到这"})
+        result = await agent._dispatch_v2(
+            "s1",
+            "锄禾日当午",
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.29),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "fallback",
+            "c1",
+        )
+        assert result["response_source"] == "template"
+        assert "信用卡智能客服" in result["response"]
+        agent._handle_knowledge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_utterance_with_business_alt_not_redirected(self) -> None:
+        """混合句 ("哈哈…帮我查下账单"): alternatives 携带业务意图时不拦, 照常走决策二"""
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock(
+            return_value={"response": "知识回复", "response_source": "knowledge"}
+        )
+        result = await agent._dispatch_v2(
+            "s1",
+            "哈哈帮我查下账单",
+            IntentResult(
+                primary_intent=IntentLabel.NB_CHITCHAT,
+                primary_confidence=0.65,
+                alternatives=[IntentLabel.BILL_QUERY],
+            ),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "fallback",
+            "c1",
+        )
+        agent._handle_knowledge.assert_awaited()
+        assert result["response_source"] == "knowledge"

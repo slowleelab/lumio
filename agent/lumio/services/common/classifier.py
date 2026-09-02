@@ -119,6 +119,15 @@ def fix_adjacent_typos(text: str) -> str:
 # bot_agent 的 CLARIFY_CONFIDENCE_FLOOR (0.3) 对齐, 低于它本来就该回确定性澄清.
 _LOW_CONF_FLOOR = 0.3
 
+# 闲聊/噪声意图置信封顶 (会话 8700a2ea 复盘): LLM 慢路径对闲聊的自评置信会到
+# 0.7+ ("锄禾日当午"→chitchat@0.70), 中高置信让它跳过低置信护栏直通知识链生成。
+# 闲聊本质是"没认出业务意图", 记账置信必须压到低置信地板以下, 让下游噪声闸/
+# 澄清/v2 竞速按"不确定"对待。fast_conf 保留原始值作分歧证据, 只封 primary。
+_NONBUSINESS_CONF_CAP = 0.29
+# 注意含旧 flat 别名 IntentLabel.CHITCHAT — BERT/LLM 分类器直接构造别名对象,
+# 不会自动归一化到 NB_CHITCHAT (E2E 实测 poll 显示 chitchat@0.7 漏封)
+_NONBUSINESS_CAP_INTENTS = frozenset({IntentLabel.NB_CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.CHITCHAT})
+
 
 def _collect_alternatives(
     hits: list[tuple[IntentLabel, float]], primary: IntentLabel, limit: int = 3
@@ -859,7 +868,7 @@ class IntentClassifier:
         text: str,
         history: list[dict[str, str]] | None = None,
     ) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
-        """执行双通道分类
+        """执行双通道分类 (公共入口: 出口处统一做闲聊/噪声置信封顶)
 
         Args:
             text: 用户输入文本
@@ -868,6 +877,30 @@ class IntentClassifier:
         Returns:
             (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback"|"bert:lowconf")
         """
+        intent_result, entities, sentiment, source = await self._classify_impl(text, history)
+        # 闲聊/噪声置信封顶 (会话 8700a2ea): 无论快慢路径, NB_CHITCHAT/NB_NOISE 的
+        # primary_confidence 一律压到 _NONBUSINESS_CONF_CAP — LLM 自评通胀的 0.7+
+        # 会跳过低置信护栏。fast_conf 不动 (保留原始分歧证据)。
+        if (
+            intent_result.primary_intent in _NONBUSINESS_CAP_INTENTS
+            and intent_result.primary_confidence > _NONBUSINESS_CONF_CAP
+        ):
+            logger.debug(
+                "闲聊/噪声置信封顶: %s@%.2f → %.2f (text=%r)",
+                intent_result.primary_intent.value,
+                intent_result.primary_confidence,
+                _NONBUSINESS_CONF_CAP,
+                text[:20],
+            )
+            intent_result.primary_confidence = _NONBUSINESS_CONF_CAP
+        return intent_result, entities, sentiment, source
+
+    async def _classify_impl(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
+        """双通道分类主体 (classify 的实现, 出口置信封顶在 classify 包装层)"""
         # ①预处理·乱序纠错 (layer_1 坏例根治): 修正文本进入全部三级分类
         text = fix_adjacent_typos(text)
         # Fast Path: 优先小 BERT, 否则规则; BERT 异常时回退规则 (打不挂线上)

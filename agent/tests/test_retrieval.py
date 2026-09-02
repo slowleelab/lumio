@@ -9,6 +9,7 @@ import pytest
 from lumio.services.common.retrieval import (
     build_es_filters,
     build_milvus_expr,
+    query_chunk_overlap_zero,
     retrieve,
     rrf_fusion,
     search_bm25,
@@ -615,3 +616,29 @@ class TestCacheKey:
         assert k1 == k2
         k3 = _build_cache_key("查询", {"category": "fee"}, 10)
         assert k1 != k3
+
+
+# ── 查询词法重叠门 (会话 8700a2ea: "锄禾日当午"单字"日"BM25 命中账单文档) ──
+
+
+class TestQueryChunkOverlapZero:
+    def test_poem_query_zero_overlap(self) -> None:
+        """古诗与账单文档零 2-gram 重叠 → 判 miss"""
+        chunks = ["账单日：银行每月固定日期汇总本期消费生成账单\n还款日：账单日后第20天，免息期最短20天最长50天"]
+        assert query_chunk_overlap_zero("锄禾日当午", chunks) is True
+
+    def test_real_query_has_overlap(self) -> None:
+        """真实业务问法与文档有词块重叠 → 放行"""
+        chunks = ["还款日：账单日后第20天"]
+        assert query_chunk_overlap_zero("还款日是几号", chunks) is False
+
+    def test_short_query_word_match(self) -> None:
+        assert query_chunk_overlap_zero("年费", ["首年免年费，次年200元"]) is False
+
+    def test_no_gram_query_passes(self) -> None:
+        """单字查询无可提取词块 → 无法判定, 放行 (不误杀)"""
+        assert query_chunk_overlap_zero("卡", ["信用卡激活流程"]) is False
+
+    def test_english_word_match(self) -> None:
+        assert query_chunk_overlap_zero("activate", ["how to activate your card"]) is False
+        assert query_chunk_overlap_zero("activate card", ["激活信用卡流程说明"]) is True

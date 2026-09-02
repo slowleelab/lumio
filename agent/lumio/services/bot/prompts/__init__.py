@@ -93,6 +93,10 @@ GREETING_RESPONSE = "您好, 我是 Lumio 智能客服, 请问有什么可以帮
 
 FAREWELL_RESPONSE = "感谢您的咨询, 如有其他问题随时联系我, 再见!"
 
+# 闲聊域轻回复引导 (会话 8700a2ea 复盘: "锄禾日当午"被送进 RAG 链, 检索"命中"账单
+# 文档生成了整段账单说明)。闲聊无业务诉求, 不检索不生成, 模板引导回业务。
+CHITCHAT_REDIRECT_RESPONSE = "哈哈，看来您想先聊聊～我是信用卡智能客服，可以帮您查账单、调额度、办分期、挂失补卡，请问有什么可以帮您？"
+
 # 无检索上下文 且 无任何对话依据 时的固定澄清话术 (确定性, 不调 LLM, 零幻觉):
 # 首句即无意义输入(如 "adb"/"889")时直接返回这句, 避免 LLM 空想编造(如误认 "adb" 为银行).
 CLARIFY_RESPONSE = "您的意思我还没太理解。"
@@ -129,6 +133,7 @@ CRISIS_RESPONSE = (
 __all__ = [
     "BUSINESS_SYSTEM_PROMPT",
     "BUSINESS_TRANSFER_TEMPLATE",
+    "CHITCHAT_REDIRECT_RESPONSE",
     "CLARIFY_RESPONSE",
     "CLARIFY_RESPONSES",
     "COMPLAINT_SYSTEM_PROMPT",

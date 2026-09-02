@@ -890,3 +890,92 @@ def test_colloquial_limit_query_variants() -> None:
     intent, _e, _s, _source = asyncio.run(classifier.classify("请问一下 现在卡里还能刷多少"))
     assert intent.primary_intent == IntentLabel.LIMIT_QUERY
     assert intent.primary_confidence == 0.95
+
+
+# ── 闲聊/噪声置信封顶 (会话 8700a2ea: "锄禾日当午"→chitchat@0.70 直通知识链) ──
+
+
+@pytest.mark.asyncio
+async def test_dual_path_chitchat_conf_capped() -> None:
+    """LLM 慢路径自评 chitchat@0.70 → 出口封顶 0.29 (低于低置信地板)"""
+    rule = RuleClassifier()
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.70),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(rule_classifier=rule, llm_classifier=mock_llm_classifier, fast_threshold=0.7)
+    intent, _entities, _sentiment, source = await classifier.classify("锄禾日当午")
+
+    assert intent.primary_intent == IntentLabel.NB_CHITCHAT
+    assert intent.primary_confidence <= 0.29
+    # 快慢分歧证据保留原始值
+    assert intent.fast_conf is None or intent.fast_conf >= 0.0
+    assert source == "llm"
+
+
+@pytest.mark.asyncio
+async def test_fast_path_chitchat_conf_capped() -> None:
+    """BERT 快路径 chitchat@0.75 直接放行时同样封顶"""
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.75)
+    )
+
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(),
+        llm_classifier=None,
+        fast_threshold=0.7,
+        bert_classifier=fake_bert,
+    )
+    intent, _entities, _sentiment, source = await classifier.classify("哈哈哈")
+
+    assert intent.primary_confidence <= 0.29
+
+
+@pytest.mark.asyncio
+async def test_business_intent_conf_not_capped() -> None:
+    """业务意图置信不受封顶影响"""
+    rule = RuleClassifier()
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.88),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(rule_classifier=rule, llm_classifier=mock_llm_classifier, fast_threshold=0.7)
+    # 用不命中规则的输入, 让慢路径 LLM 结果 (bill_query@0.88) 成为最终结果
+    intent, _entities, _sentiment, _source = await classifier.classify("这个怎么弄")
+
+    assert intent.primary_intent == IntentLabel.BILL_QUERY
+    assert intent.primary_confidence == 0.88
+
+
+@pytest.mark.asyncio
+async def test_chitchat_legacy_alias_conf_capped() -> None:
+    """旧 flat 别名 IntentLabel.CHITCHAT ("chitchat") 同样封顶
+
+    E2E 实测 (会话 8700a2ea 复盘轮): BERT/LLM 直接构造别名对象, 不经归一化,
+    首版封顶集合只含 NB_CHITCHAT/NB_NOISE 时漏封 — poll 仍显示 chitchat@0.7。
+    """
+    rule = RuleClassifier()
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.70),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(rule_classifier=rule, llm_classifier=mock_llm_classifier, fast_threshold=0.7)
+    intent, _entities, _sentiment, _source = await classifier.classify("锄禾日当午")
+
+    assert intent.primary_confidence <= 0.29

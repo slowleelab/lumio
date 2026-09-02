@@ -128,3 +128,24 @@ def detect_composite(intent: IntentLabel, alternatives: list[IntentLabel], text:
     if any(a not in (IntentLabel.FAQ,) and domain_of(a) == IntentDomain.CONSULTING for a in alternatives or []):
         return True
     return any(p in text for p in _EXPLAIN_PATTERNS)
+
+
+# 闲聊域轻回复引导 (会话 8700a2ea 复盘): "锄禾日当午"被分类成 chitchat@0.70 进
+# 决策二, 高置信直落 RAG 链, 检索靠单字"日"BM25 非零命中"账单日"文档, 15 秒生成
+# 了整段账单说明 — 答非所问。闲聊/无义输入没有业务诉求, 检索与生成只有成本和
+# 幻觉风险, 应模板轻回复引导回业务。
+# alternatives 携带业务域意图的混合句 ("哈哈帮我查下账单") 不拦 — 照常走决策二,
+# 让检索/竞速链路服务其中的业务诉求。
+_NONBUSINESS_PASSTHROUGH = frozenset(
+    {IntentLabel.FAQ, IntentLabel.NB_CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.CHITCHAT}
+)
+_BUSINESS_DOMAINS = frozenset({IntentDomain.QUERY, IntentDomain.TRANSACTION, IntentDomain.SERVICE})
+
+
+def is_chitchat_redirect(intent: IntentLabel, alternatives: list[IntentLabel] | None) -> bool:
+    """闲聊域轻回复判定: 主意图属闲聊域 且 alternatives 不携带业务域意图"""
+    if domain_of(intent) != IntentDomain.CHITCHAT:
+        return False
+    return not any(
+        a not in _NONBUSINESS_PASSTHROUGH and domain_of(a) in _BUSINESS_DOMAINS for a in alternatives or []
+    )

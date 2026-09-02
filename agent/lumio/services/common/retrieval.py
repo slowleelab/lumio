@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -155,6 +156,41 @@ def _build_cache_key(
     if rerank:
         key += ":rerank"
     return key
+
+
+# ── 查询词法重叠门 (会话 8700a2ea 复盘) ──
+# "锄禾日当午"靠单字"日"BM25 非零命中"账单日"文档: reranker 可用时 confidence_threshold
+# (rerank 分数对 query+doc 联合打分) 能拦, 但 reranker 退化 (Ollama /api/rerank 404) 时
+# 回退 RRF 阈值 0.0 = 零过滤, 词法证据门又只拦"BM25 零命中" — 单字命中即绕过。
+# 本门在调用侧兜底: 查询的全部信息性词块 (CJK 2-gram / ≥2 字符拉丁数字词) 与所有
+# 检索片段零重叠 → 无任何词法证据, 视为 miss。与 FAQ 双门槛同一哲学: 没有证据不生成。
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z0-9]+")
+_ALNUM_RUN = re.compile(r"[A-Za-z0-9]+")
+
+
+def _query_grams(query: str) -> set[str]:
+    """提取查询的信息性词块: 连续 CJK 段的 2-gram + ≥2 字符拉丁/数字词"""
+    grams: set[str] = set()
+    for run in _CJK_RUN.findall(query or ""):
+        if _ALNUM_RUN.fullmatch(run):
+            if len(run) >= 2:
+                grams.add(run.lower())
+        else:
+            grams.update(run[i : i + 2] for i in range(len(run) - 1))
+    return grams
+
+
+def query_chunk_overlap_zero(query: str, chunks: list[str]) -> bool:
+    """查询与检索片段零词法重叠判定 (调用侧相关性兜底门)
+
+    True = 查询没有任何信息性词块出现在任何片段里 → 判 miss;
+    查询本身无可提取词块 (如单字"卡") 时无法判定 → False (放行, 不误杀)。
+    """
+    grams = _query_grams(query)
+    if not grams:
+        return False
+    blob = "\n".join(chunks)
+    return not any(g in blob for g in grams)
 
 
 def _date_to_epoch(date_str: str) -> int | None:

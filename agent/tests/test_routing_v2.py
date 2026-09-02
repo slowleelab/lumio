@@ -15,6 +15,7 @@ from lumio.services.bot.routing import (
     classify_traffic,
     decision_two,
     detect_composite,
+    is_chitchat_redirect,
 )
 from lumio.shared.auth import AuthUser, get_current_user
 from lumio.shared.models import IntentLabel
@@ -239,3 +240,33 @@ class TestDispatchV2:
         monkeypatch.delenv("BOT_ROUTING_V2_ENABLED", raising=False)
         s = Settings(_env_file=())
         assert s.bot.routing_v2_enabled is False
+
+
+class TestChitchatRedirect:
+    """闲聊域轻回复判定 (会话 8700a2ea: "锄禾日当午"进 RAG 链答非所问)"""
+
+    def test_pure_chitchat_redirects(self) -> None:
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, []) is True
+        assert is_chitchat_redirect(IntentLabel.NB_NOISE, []) is True
+        # LLM 慢路径自评通胀的高置信同样拦 (置信封顶兜底之外的域级短路)
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, []) is True
+
+    def test_business_alternative_passes_through(self) -> None:
+        # 混合句 "哈哈帮我查下账单": alternatives 携带业务域意图 → 不拦
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, [IntentLabel.BILL_QUERY]) is False
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, [IntentLabel.TRANSFER_AGENT]) is False
+
+    def test_nonbusiness_alternative_still_redirects(self) -> None:
+        # FAQ/闲聊类 alternatives 不是业务诉求, 照拦
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, [IntentLabel.FAQ]) is True
+
+    def test_consulting_primary_never_redirects(self) -> None:
+        # 咨询/查询主意图与闲聊判定无关
+        assert is_chitchat_redirect(IntentLabel.FAQ, []) is False
+        assert is_chitchat_redirect(IntentLabel.BILL_QUERY, []) is False
+
+    def test_legacy_alias_intent_redirects(self) -> None:
+        """旧 flat 别名 CHITCHAT ("chitchat") 与 NB_CHITCHAT 同判 (E2E 实测走别名)"""
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, []) is True
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.FAQ]) is True
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY]) is False
