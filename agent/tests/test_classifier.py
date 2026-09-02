@@ -881,3 +881,12 @@ def test_wallet_stolen_overridden_to_card_loss() -> None:
     intent, _e, _s, source = asyncio.run(classifier.classify("钱包被偷了, 卡也在里面"))
     assert intent.primary_intent == IntentLabel.CARD_LOSS
     assert source == "rule"
+
+
+def test_colloquial_limit_query_variants() -> None:
+    """口语变体额度查询 (长对话场景暴露): '还能刷多少'应判额度而非被拒"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.74)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _e, _s, _source = asyncio.run(classifier.classify("请问一下 现在卡里还能刷多少"))
+    assert intent.primary_intent == IntentLabel.LIMIT_QUERY
+    assert intent.primary_confidence == 0.95

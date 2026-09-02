@@ -311,6 +311,61 @@ SCENARIOS: list[Scenario] = [
         final_feedback="down",
         tags=["rag", "feedback", "closed_loop"],
     ),
+    # ── 长对话场景 (多轮链式: 槽位继承/意图切换/指代消解/澄清拉扯的真正考验) ──
+    Scenario(
+        key="bill_deep_dive",
+        name_zh="账单深挖 (5轮链式)",
+        turns=[
+            {"variants": ["帮我查一下信用卡账单"], "expect": ["账单"]},
+            {"variants": ["最低还款额怎么这么高啊", "为什么最低还款这么多"], "expect": ""},
+            {"variants": ["那分期的话手续费多少", "分12期要多少手续费"], "expect": ""},
+            {"variants": ["帮我办这个分期", "那帮我办12期的"], "expect": ""},
+            {"variants": ["好的谢谢", "行, 那就这样"], "expect": ""},
+        ],
+        tags=["long", "chain_c", "slot_inherit"],
+    ),
+    Scenario(
+        key="card_loss_full",
+        name_zh="挂失全流程 (5轮)",
+        turns=[
+            {"variants": ["我的卡丢了", "信用卡找不到了"], "expect": ["挂失", "确认"]},
+            {"variants": ["对, 帮我挂失", "确认挂失"], "expect": ""},
+            {"variants": ["补卡要多久能拿到", "新卡什么时候到"], "expect": ""},
+            {"variants": ["补卡收费吗", "要收多少钱"], "expect": ""},
+            {"variants": ["好的, 谢谢", "行, 那就先这样"], "expect": ""},
+        ],
+        tags=["long", "chain_a", "sensitive"],
+    ),
+    Scenario(
+        key="switch_topic_mid",
+        name_zh="中途换话题 (意图切换)",
+        turns=[
+            {"variants": ["帮我查下账单"], "expect": ["账单"]},
+            {"variants": ["算了, 我卡丢了要挂失", "先别查了, 我要挂失"], "expect": ["挂失", "确认"]},
+            {"variants": ["对, 挂失"], "expect": ""},
+        ],
+        tags=["long", "intent_switch"],
+    ),
+    Scenario(
+        key="clarify_loop",
+        name_zh="澄清拉扯 (模糊→明确)",
+        turns=[
+            {"variants": ["那个费用的事", "费用怎么回事"], "expect": ""},
+            {"variants": ["就是年费", "年费的費用"], "expect": ""},
+            {"variants": ["我的卡为什么收年费", "年费怎么收的"], "expect": ""},
+        ],
+        tags=["long", "clarify"],
+    ),
+    Scenario(
+        key="cross_query_session",
+        name_zh="跨诉求串行 (额度→积分→兑换)",
+        turns=[
+            {"variants": ["我的信用卡额度是多少"], "expect": ""},
+            {"variants": ["那积分还有多少", "积分余额多少"], "expect": ""},
+            {"variants": ["积分能换什么", "积分怎么用"], "expect": ""},
+        ],
+        tags=["long", "chain_b", "anaphora"],
+    ),
 ]
 
 SCENARIO_MAP = {s.key: s for s in SCENARIOS}
