@@ -385,7 +385,12 @@ async def search_faq(
     user_role: str | None = None,
     card_type: str | None = None,
     top_k: int = 5,
-    min_score: float = 0.75,
+    # 语义命中双门槛 (第三轮模拟 P0: mxbai 本地对中文短句区分度不足 — 同义对
+    # 0.556 / 无关对 0.648 信号倒挂, 单一 0.75 阈值让任何查询都命中 top1 FAQ,
+    # 全部流量被 FAQ 直出劫持)。高分 + 与次名显著拉开间隔才判语义命中;
+    # 同义问法主要由 question/variants 的归一化精确匹配承接。
+    min_score: float = 0.85,
+    min_margin: float = 0.04,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     session_id: str | None = None,
 ) -> dict:
@@ -440,6 +445,17 @@ async def search_faq(
 
                 if hit.score < min_score:
                     continue  # 低分 nearest 不是"命中", 闲聊/离题必须放行走常规流程
+                # 间隔判别: top1 与 top2 分数接近 = 嵌入无法区分语义, 放行走常规流程
+                if len(results[0]) > 1:
+                    second = results[0][1].score
+                    if hit.score - second < min_margin:
+                        logger.info(
+                            "FAQ 语义间隔不足放行: q=%r top1=%.3f top2=%.3f",
+                            query[:24],
+                            hit.score,
+                            second,
+                        )
+                        return {"match_type": "miss", "results": []}
                 faq_results.append(
                     {
                         "faq_id": entity.get("chunk_id", ""),

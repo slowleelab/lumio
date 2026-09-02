@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 BGE_QUERY_INSTRUCTION: str = "为这个句子生成表示以用于检索相关文章："
 
+# mxbai-embed-large 官方查询前缀 (非对称设计: 仅查询侧加, 文档侧不加)。
+# P0 修复: 此前 embed_query 恒用 BGE 中文指令, mxbai 对该未知前缀极度敏感 —
+# 所有查询向量塌缩同向 (无关句对余弦 0.96+), FAQ 语义匹配/ L2 意图检索
+# 分数全面虚高失真 (第三轮模拟 FAQ 劫持全部流量的根因)。
+MXBAI_QUERY_INSTRUCTION: str = "Represent this sentence for searching relevant passages: "
+
+
+def _query_instruction_for(model: str) -> str:
+    """按嵌入模型家族选择查询指令前缀 (选错前缀会让向量分布塌缩)"""
+    m = (model or "").lower()
+    if "mxbai" in m:
+        return MXBAI_QUERY_INSTRUCTION
+    if "bge" in m:
+        return BGE_QUERY_INSTRUCTION
+    return ""
+
 # mxbai-embed-large 上下文约 512 token；实测 480~640 中文字符之间即超限报 400。
 # 超过该上限的输入在 provider 内切段均值池化，避免整条文本被 ollama 拒绝。
 _EMBED_MAX_CHARS = 460
@@ -133,7 +149,7 @@ class OllamaEmbedding:
 
     @property
     def query_instruction(self) -> str:
-        return BGE_QUERY_INSTRUCTION
+        return _query_instruction_for(self._model)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -277,7 +293,7 @@ class TEIEmbedding:
 
     @property
     def query_instruction(self) -> str:
-        return BGE_QUERY_INSTRUCTION
+        return _query_instruction_for(self._model)
 
     @retry(
         stop=stop_after_attempt(3),
