@@ -431,15 +431,17 @@ async function loadContext(row: Badcase) {
   contextMessages.value = []
   contextLoading.value = true
   try {
-    const { client } = await import("@/api/client")
-    const r = (await client.get(`/sessions/${row.session_id}/messages`, { params: { limit: 6 } })) as {
-      messages?: { speaker: string; content: string }[]
-    }
-    const all: { speaker: string; content: string }[] = r.messages ?? []
+    // 管理端会话回放接口 (此前误调客户侧 /sessions/*: admin token + 已归档会话下 404)
+    const { getConversationReplay } = await import("@/api/console")
+    const r = await getConversationReplay(row.session_id)
+    const all: { speaker: string; content: string }[] = (r.turns ?? []).map((t) => ({
+      speaker: t.speaker,
+      content: t.content,
+    }))
     // 只显示现场轮之前的上文 (最后两条是本坏例现场, 模板里高亮单独渲染)
     contextMessages.value = all.slice(0, -2).slice(-4)
   } catch {
-    contextMessages.value = []
+    contextMessages.value = [] // 会话已归档/过期时静默降级, 仅显示现场轮
   } finally {
     contextLoading.value = false
   }
