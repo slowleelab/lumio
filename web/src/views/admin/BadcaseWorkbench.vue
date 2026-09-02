@@ -3,9 +3,19 @@
     <div class="page-header">
       <h2>智能质检 <span class="page-subtitle">问题案例归因与整改闭环</span></h2>
       <div class="header-actions">
-        <el-button size="small" type="primary" plain :loading="batch.running" @click="doBatchAttribution">
-          {{ batch.running ? `批量归因中 ${batch.done}/${batch.total}` : "批量归因待归因项" }}
-        </el-button>
+        <el-tooltip placement="left" effect="light">
+          <template #content>
+            <div class="judge-tip">
+              <b>GLM-5.3-Flash 裁判 · 批量归因</b><br />
+              对全部「未归因」坏例逐条跑 LLM 裁判 (n=3 多数票),<br />
+              每条约 20-40 秒后台执行, 完成后自动刷新。<br />
+              采集落库后不会自动归因 —— 由你在此触发。
+            </div>
+          </template>
+          <el-button size="small" type="primary" plain :loading="batch.running" @click="doBatchAttribution">
+            {{ batch.running ? `GLM 裁判中 ${batch.done}/${batch.total}` : "GLM 裁判 · 批量归因待归因项" }}
+          </el-button>
+        </el-tooltip>
       </div>
     </div>
 
@@ -147,7 +157,7 @@
       <el-table-column label="操作" width="150" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click.stop="openDetail(row)">详情</el-button>
-          <el-button v-if="!row.root_cause_layer" link type="warning" size="small" @click.stop="runAttribution(row)">归因</el-button>
+          <el-button v-if="!row.root_cause_layer" link type="warning" size="small" @click.stop="runAttribution(row)">GLM 裁判</el-button>
           <el-button
             v-else-if="row.needs_human_review"
             link type="success" size="small"
@@ -226,14 +236,14 @@
           </div>
           <div class="evidence">{{ detail.attribution_evidence }}</div>
         </template>
-        <div v-else class="section-title muted">尚未归因 — 点击下方「LLM 归因」开始</div>
+        <div v-else class="section-title muted">尚未归因 — 点击下方「GLM 裁判归因」开始 (约 20-40 秒)</div>
 
         <div class="section-title">八层现场快照</div>
         <pre class="snapshot">{{ snapshotPretty }}</pre>
 
         <div class="section-title">处理操作</div>
         <div class="action-grid">
-          <el-button v-if="!detail.root_cause_layer" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">LLM 归因</el-button>
+          <el-button v-if="!detail.root_cause_layer" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因</el-button>
           <el-button v-if="detail.needs_human_review" size="small" type="success" :loading="acting" @click="confirmResolve">
             确认归因并进入修复
           </el-button>

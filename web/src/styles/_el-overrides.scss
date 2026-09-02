@@ -66,3 +66,26 @@
   --el-disabled-border-color:          var(--color-border-lighter);
   --el-disabled-text-color:            var(--color-text-placeholder);
 }
+
+// ── 抽屉/弹层可读性修复: 遮罩压暗过重 + 阴影层层叠加, 暗色主题下文字不可读 ──
+// 遮罩降为轻灰 (不再黑罩压暗色页面), 抽屉阴影减到单层轻投影
+.el-overlay {
+  background: rgba(15, 22, 36, 0.32);
+  backdrop-filter: none;
+}
+.el-drawer {
+  box-shadow: -2px 0 12px rgba(0, 0, 0, 0.18);
+  .el-drawer__header {
+    margin-bottom: 8px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+    color: var(--color-text-primary);
+  }
+  .el-drawer__body {
+    background: var(--color-bg-page);
+  }
+}
+// 弹窗同理 (MessageBox/Dialog)
+.el-dialog {
+  box-shadow: var(--shadow-lg);
+}
