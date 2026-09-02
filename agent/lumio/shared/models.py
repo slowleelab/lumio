@@ -405,6 +405,10 @@ class IntentResult(BaseModel):
     primary_intent: IntentLabel
     primary_confidence: float
     alternatives: list[IntentLabel] = Field(default_factory=list)
+    # 次选意图分数 (与 alternatives 按下标对齐)。会话 22ad 复盘: 次选只带标签不带
+    # 分数, 路由策略只能"有业务次选就放行" — LLM/BERT 的对冲性弱次选 (softmax 第
+    # 二三名, 常 <0.3) 也能挡掉闲聊短路。空列表 = 无分数, 调用方按保守语义处理。
+    alternative_scores: list[float] = Field(default_factory=list)
     # P1: 本次分类的 energy-OOD 分 (-logsumexp). 随本对象按次透传给上层噪声闸,
     # 避免各 session 并发时共享 classifier._last_energy 造成跨会话串线.
     energy: float | None = Field(default=None, exclude=True)

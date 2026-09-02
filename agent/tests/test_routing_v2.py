@@ -270,3 +270,22 @@ class TestChitchatRedirect:
         assert is_chitchat_redirect(IntentLabel.CHITCHAT, []) is True
         assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.FAQ]) is True
         assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY]) is False
+
+    def test_weak_business_alt_score_redirects(self) -> None:
+        """弱次选 (<0.30, softmax 对冲) 不再挡闲聊短路 — 会话 22ad 根治"""
+        assert (
+            is_chitchat_redirect(
+                IntentLabel.CHITCHAT, [IntentLabel.TRANSFER_AGENT, IntentLabel.TRANSACTION_QUERY], [0.18, 0.12]
+            )
+            is True
+        )
+
+    def test_strong_business_alt_score_passes_through(self) -> None:
+        """强次选 (≥0.30, 真混合句) 仍放行, 保护「哈哈帮我查下账单」"""
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY], [0.45]) is False
+
+    def test_missing_scores_conservative_passthrough(self) -> None:
+        """无分数 (旧调用方) 保持保守放行, 不弱化混合句保护"""
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY]) is False
+        # 部分带分数: 有分数的按分数, 缺分数的按强处理
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY, IntentLabel.COMPLAINT], [0.1]) is False

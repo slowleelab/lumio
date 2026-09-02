@@ -979,3 +979,129 @@ async def test_chitchat_legacy_alias_conf_capped() -> None:
     intent, _entities, _sentiment, _source = await classifier.classify("锄禾日当午")
 
     assert intent.primary_confidence <= 0.29
+
+
+# ── 次选意图分数 (会话 22ad: 弱次选挡闲聊短路) + OOD 短路 (免 6s LLM 复核) ──
+
+
+def test_rule_alternatives_carry_scores() -> None:
+    """规则次选带对齐分数 (conf ≥0.5 的次选才进列表, 分数同步)"""
+    result = RuleClassifier().classify("查一下账单和积分")
+    assert len(result.alternatives) == len(result.alternative_scores)
+    for s in result.alternative_scores:
+        assert s >= 0.5
+
+
+@pytest.mark.asyncio
+async def test_llm_result_inherits_fast_alternative_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LLM 慢路径采纳时, 继承快路径 (BERT top-K) 的带分数次选"""
+    from lumio.shared.config import Settings
+
+    settings = Settings()
+    settings.bot.routing_v2_enabled = False
+    monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
+
+    rule = RuleClassifier()
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(
+            primary_intent=IntentLabel.CHITCHAT,
+            primary_confidence=0.45,
+            alternatives=[IntentLabel.BILL_QUERY],
+            alternative_scores=[0.22],
+        )
+    )
+    # energy 判 known (-5.0 < 阈值 -3.203) → 闲聊 OOD 短路不触发, 走 LLM 慢路径
+    fake_bert.ood_score = AsyncMock(return_value=-5.0)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.70),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(
+        rule_classifier=rule,
+        llm_classifier=mock_llm,
+        bert_classifier=fake_bert,
+        fast_threshold=0.7,
+    )
+    intent, _e, _s, source = await classifier.classify("锄禾日当午")
+
+    assert source == "llm"
+    # LLM 只出主意图, 次选继承快路径的带分数次选
+    assert intent.alternatives == [IntentLabel.BILL_QUERY]
+    assert intent.alternative_scores == [0.22]
+    assert intent.primary_confidence <= 0.29  # 出口封顶
+
+
+@pytest.mark.asyncio
+async def test_ood_unknown_short_circuits_llm_for_chitchat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BERT 判闲聊 + energy 判 unknown → 双信号同向, 免 LLM 复核 (会话 22ad 根治)"""
+    from lumio.shared.config import Settings
+
+    settings = Settings()
+    settings.bot.routing_v2_enabled = False
+    settings.classification.ood_enabled = True
+    settings.classification.ood_energy_threshold = -5.0  # energy=-8.0 < -5.0-band → known? 注意方向
+    monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
+
+    # ood_verdict: energy 高 → unknown。取 energy=+2.0, threshold=-5.0 → unknown
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.45)
+    )
+    fake_bert.ood_score = AsyncMock(return_value=2.0)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock()
+
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(),
+        llm_classifier=mock_llm,
+        bert_classifier=fake_bert,
+        fast_threshold=0.7,
+    )
+    intent, _e, _s, source = await classifier.classify("丈二和尚")
+
+    assert source == "bert:ood"
+    mock_llm.classify.assert_not_called()  # 6s 慢路径被省掉
+    assert intent.primary_confidence <= 0.29  # 出口封顶仍生效
+
+
+@pytest.mark.asyncio
+async def test_ood_unknown_business_intent_still_uses_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """业务意图即使 unknown 仍走 LLM (可能是新意图/长尾, 不能误杀)"""
+    from lumio.shared.config import Settings
+
+    settings = Settings()
+    settings.bot.routing_v2_enabled = False
+    settings.classification.ood_enabled = True
+    settings.classification.ood_energy_threshold = -5.0
+    monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
+
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.45)
+    )
+    fake_bert.ood_score = AsyncMock(return_value=2.0)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.8),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(),
+        llm_classifier=mock_llm,
+        bert_classifier=fake_bert,
+        fast_threshold=0.7,
+    )
+    _intent, _e, _s, source = await classifier.classify("帮我看下这个月的账单")
+
+    assert source == "llm"
+    mock_llm.classify.assert_awaited_once()

@@ -302,9 +302,11 @@ class BertIntentClassifier:
         probs = torch.softmax(logits, dim=-1)
         top_idx = probs.topk(min(_TOP_K, len(probs))).indices.tolist()
         labels = [self._idx_to_label[int(i)] for i in top_idx]
-        conf = float(probs[top_idx[0]])
+        confs = [float(probs[i]) for i in top_idx]
         return IntentResult(
             primary_intent=labels[0],
-            primary_confidence=conf,
-            alternatives=[lbl for lbl in labels if lbl != labels[0]],
+            primary_confidence=confs[0],
+            alternatives=labels[1:],
+            # 次选分数与 alternatives 按下标对齐 (softmax 概率), 供路由按强弱加权
+            alternative_scores=confs[1:],
         )

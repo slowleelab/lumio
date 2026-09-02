@@ -811,6 +811,7 @@ class LumioAgent:
                         primary_intent=swapped_intent,
                         primary_confidence=0.6,  # 上文已确认的意图, 不按本轮低置信记账
                         alternatives=intent_result.alternatives,
+                        alternative_scores=intent_result.alternative_scores,
                         energy=intent_result.energy,
                         fast_conf=confidence,
                         fast_intent=intent,
@@ -894,7 +895,9 @@ class LumioAgent:
         # 按置信分流全部落进 RAG 链 — "锄禾日当午"检索"命中"账单文档, 15 秒生成了整段
         # 答非所问的账单说明。闲聊无业务诉求: 模板轻回复引导回业务, 零检索零生成零幻觉。
         # alternatives 携带业务域意图的混合句不拦 (is_chitchat_redirect 内部判定)。
-        if is_chitchat_redirect(intent, list(intent_result.alternatives or [])):
+        if is_chitchat_redirect(
+            intent, list(intent_result.alternatives or []), list(intent_result.alternative_scores or [])
+        ):
             logger.info(
                 "闲聊域轻回复引导: session=%s input=%r conf=%.2f",
                 session_id,
@@ -3329,9 +3332,18 @@ class LumioAgent:
         }
         if is_replying:
             return None, evidence
-        # P1: energy 强"不认" -> 直接当噪声拦截 (非回话), 高于低置信的澄清强度
+        # P1: energy 强"不认" -> 直接当噪声拦截 (非回话), 高于低置信的澄清强度。
+        # 双信号收窄 (OOD 阈值校准 2026-09-02: ID/OOD 能量分布部分重叠, ID 侧
+        # 误杀 ~4.2% — 能量单信号不再一刀切): 快路径强置信业务判定 (≥0.7 且非
+        # 闲聊/兜底域) 信任分类器放行, 其余 (闲聊/低置信/慢路径) 保持拦截。
         if verdict == "unknown":
-            return "ood_unknown", evidence
+            strong_business = (
+                intent.primary_confidence >= 0.7
+                and get_domain(intent.primary_intent) not in ("fallback",)
+                and not _fast_slow_disagreement(intent)
+            )
+            if not strong_business:
+                return "ood_unknown", evidence
         if low_conf:
             # 分类器失败兜底 (conf=0.0) 不拦: 放行走 RAG, 由检索 grounding/
             # 词法证据门决定答还是澄清 —— GPU 争抢下分类高频超时, 一刀切

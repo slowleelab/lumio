@@ -393,10 +393,12 @@ class ClassificationSettings(BaseSettings):
     # 五域阈值: 0.72 采信判对的 consulting (会话 2b3b2613 根治); 定义句式另由
     # domain_of_with_text 强制咨询域兜底。误判风险由下游 grounding 门把关。
     vector_intent_threshold: float = 0.72
-    ood_enabled: bool = False  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
-    # energy 阈值: energy 高于此 → 认为"认识"可用(信任 BERT); 低于 → "不认"倾向 OOD/噪声.
-    # energy 数值尺度取决于 logits 绝对值, 需在部署环境用验证集标定, 这里给保守初值.
-    ood_energy_threshold: float = 0.0
+    # OOD 落地闭环 (2026-09-02 校准, scripts/calibrate_ood_threshold.py):
+    # ID(seed 191 例).p99=-2.913 / OOD(badcase 实录 27 例).p5=-3.493, 分布部分重叠
+    # → 能量门一律双信号使用 (意图+能量), 单信号处已收窄 (噪声门 strong_business 放行)。
+    # 阈值 = ID.p99 与 OOD.p5 中点: ID 误杀 4.2%, OOD 捕获 88.9%。换模型/扩种子集后重跑校准。
+    ood_enabled: bool = True  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
+    ood_energy_threshold: float = -3.203
     # 温度缩放: logits / temperature 后再 softmax. 1.0 = 不缩放. 用验证集一维标定,
     # 把置信度校准到与准确率匹配(>1 更保守、压低过拟合 BERT 的虚高置信).
     ood_temperature: float = 1.0

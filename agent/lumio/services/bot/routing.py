@@ -140,12 +140,30 @@ _NONBUSINESS_PASSTHROUGH = frozenset(
     {IntentLabel.FAQ, IntentLabel.NB_CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.CHITCHAT}
 )
 _BUSINESS_DOMAINS = frozenset({IntentDomain.QUERY, IntentDomain.TRANSACTION, IntentDomain.SERVICE})
+# 业务次选"强到足以代表业务诉求"的分数线 (softmax 概率)。会话 22ad: "丈二和尚"
+# 的 BERT 次选 transfer_agent/transaction_query 是对冲性弱次选 (<0.3), 却挡掉了
+# 闲聊短路。带分数时低于此线的弱次选不拦; 无分数 (旧调用方) 保持保守放行。
+_ALT_BUSINESS_PASS_SCORE = 0.30
 
 
-def is_chitchat_redirect(intent: IntentLabel, alternatives: list[IntentLabel] | None) -> bool:
-    """闲聊域轻回复判定: 主意图属闲聊域 且 alternatives 不携带业务域意图"""
+def is_chitchat_redirect(
+    intent: IntentLabel,
+    alternatives: list[IntentLabel] | None,
+    alternative_scores: list[float] | None = None,
+) -> bool:
+    """闲聊域轻回复判定: 主意图属闲聊域 且 alternatives 不携带**强**业务域意图。
+
+    强弱由 alternative_scores (与 alternatives 按下标对齐) 判定:
+    分数缺失的次选按"强"处理 (保守放行, 不弱化混合句保护)。
+    """
     if domain_of(intent) != IntentDomain.CHITCHAT:
         return False
-    return not any(
-        a not in _NONBUSINESS_PASSTHROUGH and domain_of(a) in _BUSINESS_DOMAINS for a in alternatives or []
-    )
+    scores = alternative_scores or []
+    for i, alt in enumerate(alternatives or []):
+        if alt in _NONBUSINESS_PASSTHROUGH:
+            continue
+        if domain_of(alt) in _BUSINESS_DOMAINS:
+            score = scores[i] if i < len(scores) else None
+            if score is None or score >= _ALT_BUSINESS_PASS_SCORE:
+                return False
+    return True

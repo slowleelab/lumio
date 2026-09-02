@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-
 from lumio.services.bot.bot_agent import (
     _TRANSFER_OFFER_PROMPT,
     LumioAgent,
@@ -2153,3 +2152,54 @@ class TestDispatchV2ChitchatRedirect:
         )
         agent._handle_knowledge.assert_awaited()
         assert result["response_source"] == "knowledge"
+
+
+class TestNoiseGateOodNarrowing:
+    """OOD 双信号收窄 (2026-09-02 校准: 分布重叠, 能量单信号误杀 ID ~4.2%)"""
+
+    @pytest.mark.asyncio
+    async def test_strong_business_passes_ood_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """快路径强置信业务判定 + energy unknown → 信任分类器放行 (不误杀)"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = -3.203
+        settings.classification.ood_ambiguous_band = 0.0
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent() if hasattr(self, "_make_agent") else None
+        if agent is None:
+            agent = LumioAgent(
+                classifier=MagicMock(),
+                degradation_mgr=MagicMock(
+                    _degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))
+                ),
+                transfer_checker=MagicMock(),
+                session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+            )
+        intent = IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.84, energy=-2.5)
+        reason, evidence = await agent._evaluate_noise_gate("s1", "帮我把账单明细发我邮箱", intent, [], [])
+        assert reason is None
+        assert evidence["ood_verdict"] == "unknown"  # 证据留痕, 但强业务不拦
+
+    @pytest.mark.asyncio
+    async def test_weak_intent_still_blocked_by_ood_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """闲聊/低置信 + energy unknown → 仍拦截"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = -3.203
+        settings.classification.ood_ambiguous_band = 0.0
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = LumioAgent(
+            classifier=MagicMock(),
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+        intent = IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.29, energy=-2.5)
+        reason, _ = await agent._evaluate_noise_gate("s1", "丈二和尚", intent, [], [])
+        assert reason == "ood_unknown"

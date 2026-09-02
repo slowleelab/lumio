@@ -16,7 +16,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from lumio.services.bot.entity_extractor import extract_entities, normalize_entity_type
-from lumio.services.common.bert_classifier import BertIntentClassifier
+from lumio.services.common.bert_classifier import BertIntentClassifier, ood_verdict
 from lumio.services.common.trap_collector import TrapCollector, TrapRecord
 from lumio.shared.config import get_settings
 from lumio.shared.models import Entity, IntentLabel, IntentResult, SentimentLabel, normalize_intent
@@ -131,8 +131,8 @@ _NONBUSINESS_CAP_INTENTS = frozenset({IntentLabel.NB_CHITCHAT, IntentLabel.NB_NO
 
 def _collect_alternatives(
     hits: list[tuple[IntentLabel, float]], primary: IntentLabel, limit: int = 3
-) -> list[IntentLabel]:
-    """从规则命中列表收集次意图 (多意图).
+) -> tuple[list[IntentLabel], list[float]]:
+    """从规则命中列表收集次意图 (多意图), 返回 (次意图, 对齐分数).
 
     - 去重、剔除主意图
     - 按置信度降序
@@ -140,6 +140,7 @@ def _collect_alternatives(
     """
     seen: set[IntentLabel] = set()
     out: list[IntentLabel] = []
+    out_scores: list[float] = []
     for intent, conf in sorted(hits, key=lambda x: x[1], reverse=True):
         if intent == primary or intent in seen:
             continue
@@ -147,9 +148,10 @@ def _collect_alternatives(
             continue
         seen.add(intent)
         out.append(intent)
+        out_scores.append(conf)
         if len(out) >= limit - 1:  # include primary, so return at most limit-1
             break
-    return out
+    return out, out_scores
 
 
 # 写类（办理/申请/设置/变更/取消/绑定/兑换/激活）意图集合。
@@ -670,10 +672,12 @@ class RuleClassifier:
                     best_intent = rule["intent"]
                     best_confidence = rule_confidence
 
+        alt_labels, alt_scores = _collect_alternatives(hits, best_intent)
         return IntentResult(
             primary_intent=best_intent,
             primary_confidence=best_confidence,
-            alternatives=_collect_alternatives(hits, best_intent),
+            alternatives=alt_labels,
+            alternative_scores=alt_scores,
         )
 
 
@@ -962,6 +966,7 @@ class IntentClassifier:
                         primary_intent=v_leaf,
                         primary_confidence=round(min(vm.score, 0.99), 4),
                         alternatives=fast_result.alternatives,
+                        alternative_scores=fast_result.alternative_scores,
                         energy=fast_result.energy,
                         fast_conf=fast_result.primary_confidence,
                         fast_intent=fast_result.primary_intent,
@@ -993,6 +998,7 @@ class IntentClassifier:
                 primary_intent=rule_fast.primary_intent,
                 primary_confidence=rule_fast.primary_confidence,
                 alternatives=fast_result.alternatives,
+                alternative_scores=fast_result.alternative_scores,
                 energy=fast_result.energy,
                 # 审计留痕: 保留 BERT 原始判定, 事后可查"哪一路在幻觉"
                 fast_conf=fast_result.primary_confidence,
@@ -1023,6 +1029,7 @@ class IntentClassifier:
                 primary_intent=rule_fast.primary_intent,
                 primary_confidence=rule_fast.primary_confidence,
                 alternatives=fast_result.alternatives,
+                alternative_scores=fast_result.alternative_scores,
                 energy=fast_result.energy,
                 fast_conf=fast_result.primary_confidence,
                 fast_intent=fast_result.primary_intent,
@@ -1056,6 +1063,31 @@ class IntentClassifier:
             )
             await self._emit_sample(text, fast_source, fast_result, fast_result, "bert:lowconf")
             return fast_result, extract_entities(text), self._rule_sentiment(text), "bert:lowconf"
+
+        # P0 闲聊/噪声 OOD 短路 (会话 22ad 复盘: BERT 已判 chitchat@0.4x, LLM 慢路径
+        # 6.4s 复核出同一个结论, 且因"慢不优于快"最终采纳的还是快路径答案 — 6.4s 纯
+        # 浪费). 双信号同向才短路: BERT 主意图是闲聊/噪声 且 energy-OOD 判 "unknown"
+        # (分布外)。业务意图即使 unknown 仍走 LLM (可能是新意图/长尾问法, 不能误杀)。
+        if (
+            fast_source == "bert"
+            and fast_result.primary_intent in _NONBUSINESS_CAP_INTENTS
+            and fast_result.energy is not None
+            and ood_verdict(
+                fast_result.energy,
+                get_settings().classification.ood_energy_threshold,
+                get_settings().classification.ood_ambiguous_band,
+            )
+            == "unknown"
+        ):
+            logger.info(
+                "闲聊/噪声 OOD 短路慢路径: intent=%s@%.2f energy=%.2f → 免 LLM 复核 (text=%r)",
+                fast_result.primary_intent.value,
+                fast_result.primary_confidence,
+                fast_result.energy,
+                text[:20],
+            )
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "bert:ood")
+            return fast_result, extract_entities(text), self._rule_sentiment(text), "bert:ood"
 
         # Slow Path
         if self._llm is None:
@@ -1106,6 +1138,11 @@ class IntentClassifier:
         source = "llm" if llm_result.primary_confidence >= 0.3 else "fallback"
         await self._emit_sample(text, fast_source, fast_result, llm_result, source)
         llm_result.energy = self._last_energy  # 快路径 energy 随慢路径结果一起透传
+        # 次选意图继承: LLM 慢路径只出主意图, 快路径 (BERT top-K) 的带分数次选
+        # 随结果透传 — 路由层的混合句判定 (闲聊短路放行) 依赖次选分数加权。
+        if not llm_result.alternatives and fast_result.alternatives:
+            llm_result.alternatives = fast_result.alternatives
+            llm_result.alternative_scores = fast_result.alternative_scores
         # P0 快慢分歧信号: 慢路径覆盖快路径时保留快路径意图/置信, 供下游噪声闸与
         # 转人工派发门判"两路分歧" -- 慢路径对乱码的自评置信会稳定通胀(会话 e33d1fa8:
         # BERT limit_query@0.39 -> LLM bill_query@0.7), 最终置信单项不可信.
