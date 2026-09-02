@@ -196,12 +196,18 @@ class BadcaseJudge:
             response_source=context.get("response_source", ""),
         )
 
+        # n=3 自一致性采样并发执行 (原串行为本地 qwen 单卡时代的实现; 远程裁判
+        # 3 路并发单条耗时降至 ~1/3, 采样独立性不受影响 — 每次请求独立采样)
+        import asyncio
+
+        results = await asyncio.gather(
+            *[self._one_sample(user_prompt) for _ in range(self._samples)],
+            return_exceptions=True,
+        )
         votes: list[dict[str, Any]] = []
-        for attempt in range(self._samples):
-            try:
-                parsed = await self._one_sample(user_prompt)
-            except Exception as exc:
-                logger.warning("归因采样 %s 失败: %s", attempt + 1, exc)
+        for attempt, parsed in enumerate(results):
+            if isinstance(parsed, BaseException):
+                logger.warning("归因采样 %s 失败: %s", attempt + 1, parsed)
                 continue
             if parsed:
                 votes.append(parsed)

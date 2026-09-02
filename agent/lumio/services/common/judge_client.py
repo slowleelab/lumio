@@ -72,6 +72,9 @@ class RemoteJudgeClient:
         payload = {
             "model": self._model,
             "max_tokens": 1024,
+            # 裁判是判定锚点驱动的结构化任务, 关闭 thinking: 实测 12.3s→3.3s (3.7x)
+            # 且证据更聚焦 (深度推理对锚点判定无增益)
+            "thinking": {"type": "disabled"},
             "messages": [m for m in messages if m.get("role") != "system"],
         }
         system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
