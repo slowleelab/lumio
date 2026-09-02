@@ -52,6 +52,8 @@ export function listBadcases(params?: {
   root_cause_layer?: string
   fix_status?: string
   fix_table?: string
+  needs_review?: boolean
+  keyword?: string
   limit?: number
   offset?: number
 }): Promise<BadcaseListResponse> {
@@ -76,6 +78,8 @@ export function getClosedLoopHealth(): Promise<ClosedLoopHealth> {
 }
 
 export interface BadcaseStats {
+  layer_dist?: Record<string, number>
+  signal_dist?: Record<string, number>
   total: number
   today_new: number
   pending_review: number

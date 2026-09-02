@@ -100,10 +100,12 @@ async def list_badcases(
     root_cause_layer: str | None = None,
     fix_status: str | None = None,
     fix_table: str | None = None,
+    needs_review: bool | None = None,
+    keyword: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
-    """查询 Badcase 列表"""
+    """查询 Badcase 列表 (统计卡联动过滤 + 关键字搜索)"""
     conds = []
     if signal_source:
         conds.append(Badcase.signal_source == signal_source)
@@ -113,6 +115,10 @@ async def list_badcases(
         conds.append(Badcase.fix_status == fix_status)
     if fix_table:
         conds.append(Badcase.fix_table == fix_table)
+    if needs_review is not None:
+        conds.append(Badcase.needs_human_review.is_(needs_review))
+    if keyword:
+        conds.append(Badcase.user_input.ilike(f"%{keyword}%"))
 
     query = select(Badcase)
     count_q = select(func.count()).select_from(Badcase)

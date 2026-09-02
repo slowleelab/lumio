@@ -105,16 +105,20 @@ async def list_badcases_endpoint(
     root_cause_layer: str | None = None,
     fix_status: str | None = None,
     fix_table: str | None = None,
+    needs_review: bool | None = None,
+    keyword: str | None = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
-    """Badcase 列表 (支持按信号/根因层/修复状态过滤)"""
+    """Badcase 列表 (信号/根因层/修复状态/复核态过滤 + 输入关键字搜索)"""
     items, total = await list_badcases(
         db,
         signal_source=signal_source,
         root_cause_layer=root_cause_layer,
         fix_status=fix_status,
         fix_table=fix_table,
+        needs_review=needs_review,
+        keyword=keyword,
         limit=limit,
         offset=offset,
     )
@@ -318,6 +322,15 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
         or 0
     )
     pass_rate = (llm_auto / confirmed) if confirmed else None
+    # 分布聚合 (质检工作台概览条)
+    layer_rows = (
+        await db.execute(
+            select(Badcase.root_cause_layer, func.count())
+            .where(Badcase.root_cause_layer.is_not(None))
+            .group_by(Badcase.root_cause_layer)
+        )
+    ).all()
+    signal_rows = (await db.execute(select(Badcase.signal_source, func.count()).group_by(Badcase.signal_source))).all()
     return {
         "total": total,
         "today_new": today_new,
@@ -325,6 +338,8 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
         "confirmed": confirmed,
         "deployed": deployed,
         "llm_pass_rate": round(pass_rate, 3) if pass_rate is not None else None,
+        "layer_dist": {str(k or "uncertain"): v for k, v in layer_rows},
+        "signal_dist": {str(k): v for k, v in signal_rows},
     }
 
 
