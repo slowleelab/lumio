@@ -33,7 +33,7 @@ from lumio.shared.logger import get_logger
 
 logger = get_logger(__name__)
 
-POLL_TIMEOUT = 30.0  # 单轮等待回复上限 (本地 LLM 慢)
+POLL_TIMEOUT = 60.0  # 单轮等待回复上限 (链A编排预算 40s + 余量; 本地慢 LLM)
 TURN_GAP = 2.0  # 轮间隔 (秒), 模拟人打字
 
 # ── 会话级行为概率 (真实客户不总是走完剧本) ──
