@@ -1544,6 +1544,14 @@ class LumioAgent:
                     logger.debug("投诉工单创建失败 (不阻断转人工): session=%s err=%s", session_id, exc)
             # 转人工信号采集 (闭环 §3.1 第二路): 真·明确转人工即时路径同样留痕归因现场
             # —— 此前只有 L3 低置信确认链采集, 客户主动请求路径漏采。
+            # 采集精度治理 (300会话规模轮: 52% 坏例为误采集): 客户开门见山的主动
+            # 转人工/投诉 (意图明确+高置信) 走对流程是正常诉求, 不是 bot 的坏例 —
+            # 不采集。该采的是低置信 streak/连续澄清被逼转人工 (L3 链另行采集)。
+            _explicit_transfer = primary in (
+                IntentLabel.TRANSFER_AGENT,
+                IntentLabel.COMPLAINT,
+                IntentLabel.DISPUTE_SUBMIT,
+            ) and conf >= 0.7
             try:
                 from lumio.services.common.badcase_store import capture_badcase
 
@@ -1552,7 +1560,7 @@ class LumioAgent:
                     if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
                     else None
                 )
-                if sf:
+                if sf and not _explicit_transfer:
                     from lumio.services.bot.routing import classify_traffic
 
                     _dom, _tc = classify_traffic(primary)
@@ -1770,6 +1778,27 @@ class LumioAgent:
             except Exception:
                 rag_context = ""
             if rag_context:
+                # 300会话规模轮修复 (确认继承断裂根因): 挂失等敏感写类编排无工具调用
+                # 转 knowledge 给引导话术时, 同时挂 pending 挂失确认 — 否则下一句
+                # "确认挂失"无状态可继承被重新分类成 faq, 23 条 layer_3 坏例的来源。
+                if intent.primary_intent in (
+                    IntentLabel.CARD_LOSS,
+                    IntentLabel.CARD_LOSS_REPORT,
+                ) and self._session_manager is not None:
+                    try:
+                        from lumio.shared.models import PendingAction
+
+                        await self._save_pending_action(
+                            session_id,
+                            PendingAction(
+                                tool_name="report_card_lost",
+                                confirm_prompt="如您确认需要挂失, 请回复『确认』, 我将为您办理挂失。",
+                                arguments={"source": "orchestration_fallback"},
+                            ),
+                        )
+                        logger.info("敏感意图编排无工具, 已挂 pending 确认: session=%s", session_id)
+                    except Exception:
+                        logger.debug("pending 挂失确认挂载失败(不阻断): session=%s", session_id)
                 logger.info("工具编排无工具调用且检索有据, 转知识路径 grounding: session=%s", session_id)
                 return await self._handle_knowledge(
                     session_id, user_input, intent, history, entities, sentiment, _sensitive_rerouted=True
