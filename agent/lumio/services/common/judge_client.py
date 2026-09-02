@@ -34,6 +34,8 @@ class RemoteJudgeClient:
         self._fallback = fallback_llm  # 本地 LLMClient (OpenAI 兼容), 失败兜底
         self._degraded = False  # 连续失败后进入降级, 周期性重试远程
         self._used_local = False  # 本轮归因是否发生过本地回退 (审计标记)
+        self._strict = settings.judge_strict  # 严格模式: 失败不回退, 全程纯远程
+        self._retry_delays: tuple[float, ...] = (0.0, 2.0, 4.0)  # 首次 + 2 次退避重试
 
     @property
     def model_name(self) -> str:
@@ -47,16 +49,32 @@ class RemoteJudgeClient:
     async def chat(self, messages: list[dict[str, str]], *, timeout: float | None = None, **_: Any) -> str:
         if not (self._base and self._key):
             return await self._local(messages, timeout)
-        if self._degraded:
+        if self._degraded and not self._strict:
             return await self._local(messages, timeout)
         try:
-            text = await self._remote(messages, timeout or self._timeout)
-            return text
+            # 瞬时限流/网络抖动先重试 (2s/4s 退避), 仍失败按模式处置
+            return await self._remote_with_retry(messages, timeout or self._timeout)
         except Exception as exc:
+            if self._strict:
+                logger.warning("远程裁判失败 (严格模式, 不回退): %s", exc)
+                raise
             logger.warning("远程裁判调用失败, 本轮回退本地 judge: %s", exc)
             self._degraded = True
             _schedule_remote_recovery(self)
             return await self._local(messages, timeout)
+
+    async def _remote_with_retry(self, messages: list[dict[str, str]], timeout: float) -> str:
+        import asyncio
+
+        last: Exception | None = None
+        for delay in self._retry_delays:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                return await self._remote(messages, timeout)
+            except Exception as exc:
+                last = exc
+        raise last or RuntimeError("远程裁判重试耗尽")
 
     async def chat_json(self, messages: list[dict[str, str]], *, timeout: float | None = None, **_: Any) -> dict:
         text = await self.chat(messages, timeout=timeout)
@@ -112,8 +130,8 @@ def _parse_json(raw: str) -> dict | None:
         return None
 
 
-def _schedule_remote_recovery(client: RemoteJudgeClient, *, seconds: float = 300.0) -> None:
-    """降级后 5 分钟自动恢复尝试远程 (坏例归因是低频操作, 简单定时器足够)"""
+def _schedule_remote_recovery(client: RemoteJudgeClient, *, seconds: float = 60.0) -> None:
+    """降级后 1 分钟自动恢复尝试远程 (限流多为瞬时, 5 分钟过于保守)"""
     import asyncio
 
     async def _recover() -> None:

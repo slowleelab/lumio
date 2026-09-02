@@ -206,6 +206,9 @@ class LLMSettings(BaseSettings):
     judge_base_url: str = ""
     judge_api_key: str = ""
     judge_timeout: float = 90.0
+    # 严格模式: 远程裁判失败重试耗尽后直接判该条失败, 绝不回退本地 (全程纯 GLM
+    # 审计); 默认关 = 失败回退本地兜底, 闭环不断粮
+    judge_strict: bool = False
     # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
     # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
     classify_cache_enabled: bool = True

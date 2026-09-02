@@ -335,6 +335,9 @@ async def test_remote_judge_falls_back_to_local(monkeypatch) -> None:
     import lumio.services.common.judge_client as jc
 
     _judge_env(monkeypatch)
+    from lumio.shared.config import get_settings
+
+    monkeypatch.setattr(get_settings().llm, "judge_strict", False)  # 免受部署 env 污染
     calls = {"local": 0}
     local = MagicMock()
     local.chat = AsyncMock(side_effect=lambda m, timeout=None: (calls.__setitem__("local", calls["local"] + 1) or "本地回复"))
@@ -358,3 +361,52 @@ def test_remote_judge_json_fencing() -> None:
     assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert _parse_json('前置说明 {"b": 2} 尾部') == {"b": 2}
     assert _parse_json("完全不是json") is None
+
+
+# ── 严格模式: 全程纯 GLM (失败重试耗尽后判失败, 不回退本地) ──
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_never_falls_back(monkeypatch) -> None:
+    import lumio.services.common.judge_client as jc
+    from lumio.shared.config import get_settings
+
+    _judge_env(monkeypatch)
+    get_settings().llm.judge_strict = True
+    try:
+        local = MagicMock()
+        local.chat = AsyncMock(return_value="本地回复")
+        client = jc.RemoteJudgeClient(fallback_llm=local)
+
+        async def boom(messages, timeout):
+            raise RuntimeError("429 rate limit")
+
+        monkeypatch.setattr(client, "_remote", boom)
+        client._retry_delays = (0.0, 0.0)
+        with pytest.raises(RuntimeError, match="429"):
+            await client.chat([{"role": "user", "content": "x"}])
+        local.chat.assert_not_awaited()  # 严格模式绝不碰本地
+    finally:
+        get_settings().llm.judge_strict = False
+
+
+@pytest.mark.asyncio
+async def test_remote_retry_recovers_transient(monkeypatch) -> None:
+    """瞬时限流重试后成功, 不降级不回退"""
+    import lumio.services.common.judge_client as jc
+
+    _judge_env(monkeypatch)
+    client = jc.RemoteJudgeClient(fallback_llm=None)
+    calls = {"n": 0}
+
+    async def flaky(messages, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("429 transient")
+        return "重试后成功"
+
+    monkeypatch.setattr(client, "_remote", flaky)
+    client._retry_delays = (0.0, 0.0)  # 测试跳过退避等待
+    out = await client.chat([{"role": "user", "content": "x"}])
+    assert out == "重试后成功"
+    assert calls["n"] == 2
