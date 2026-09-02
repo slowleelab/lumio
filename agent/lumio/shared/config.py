@@ -178,7 +178,9 @@ class LLMSettings(BaseSettings):
     temperature: float = 0.2
     # 生成输出上限: 实测本地 qwen2.5:7b RAG 答复多为 60~90 token, 2048 上限
     # 不收益且给解码预留过大解码预算; 512 有 6x 余量, 并限制异常长解码拖慢一轮。
-    max_tokens: int = 256
+    # 生成输出上限: M1 decode 26 tok/s, 每 token 都是真金白银的秒数 — 中文回复
+    # 已限 100 字 (~150-170 tok), 192 留格式余量, 相比 256 省 ~2.5s/轮
+    max_tokens: int = 192
     timeout_seconds: float = 60.0
 
     # 健康探测
