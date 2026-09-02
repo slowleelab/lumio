@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -871,3 +872,12 @@ def test_fix_adjacent_typos_normal_input_untouched() -> None:
 
     for normal in ("帮我查一下信用卡账单", "数字人民币硬钱包怎么充值", "我的卡丢了要挂失"):
         assert fix_adjacent_typos(normal) == normal
+
+
+def test_wallet_stolen_overridden_to_card_loss() -> None:
+    """挂失补词覆盖: '钱包被偷'必须判挂失而非 faq (错过挂失黄金时间是 P0)"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.73)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _e, _s, source = asyncio.run(classifier.classify("钱包被偷了, 卡也在里面"))
+    assert intent.primary_intent == IntentLabel.CARD_LOSS
+    assert source == "rule"

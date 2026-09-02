@@ -121,7 +121,8 @@ async def test_scenario_runner_with_fake_transport() -> None:
         if request.url.path == "/api/chat/send":
             return httpx.Response(200, json={"accepted": True})
         if request.url.path == "/api/chat/poll":
-            return httpx.Response(200, json={"status": "done", "has_message": True, "reply": "模拟回复内容"})
+            # 差评条件化后: 回复需含拒答话术才触发差评
+            return httpx.Response(200, json={"status": "done", "has_message": True, "reply": "抱歉，无法直接查询，请通过官方渠道"})
         if request.url.path == "/api/chat/feedback":
             return httpx.Response(200, json={"status": "ok"})
         return httpx.Response(404)
@@ -150,9 +151,9 @@ async def test_scenario_runner_with_fake_transport() -> None:
         httpx.AsyncClient.__init__ = orig_init  # type: ignore[method-assign]
 
     assert len(records) == 1
-    assert records[0].reply == "模拟回复内容"
+    assert "无法" in records[0].reply  # 拒答话术完整透传
     assert records[0].text  # 随机化后话术仍非空
-    assert state.stats.feedbacks == 1  # 差评成功才计数
+    assert state.stats.feedbacks == 1  # 拒答回复 → 差评计数
     assert "/api/chat/send" in calls and "/api/chat/feedback" in calls
 
 
@@ -162,3 +163,13 @@ def test_state_singleton_shape() -> None:
     assert len(s.recent) == 0
     d = s.stats.to_dict()
     assert d["sessions"] == 0 and d["latency_avg_ms"] == 0 and d["abandoned"] == 0
+
+
+def test_feedback_only_on_bad_reply() -> None:
+    """差评条件化: 正常作答(无拒答话术)不差评 — 消除假阳性"""
+    from lumio.services.common.simulator import SimCustomer
+
+    assert SimCustomer._reply_is_bad(None, "抱歉，无法直接查询，请通过官方渠道") is True
+    assert SimCustomer._reply_is_bad(None, "您的意思我还没太理解") is True
+    assert SimCustomer._reply_is_bad(None, "您可以通过手机银行APP数字人民币专区为硬钱包充值") is False
+    assert SimCustomer._reply_is_bad(None, "") is False

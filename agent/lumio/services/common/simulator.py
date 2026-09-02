@@ -143,7 +143,7 @@ SCENARIOS: list[Scenario] = [
                 ],
                 "expect": ["卡号", "账单"],
             },
-            {"variants": ["卡号是 {card_no}", "{card_no}", "用 {card_no} 这张查"], "expect": ""},
+            {"variants": ["卡号是 {card_no}", "{card_no}", "用 {card_no} 这张查"], "expect": "", "only_if_asked": "卡号"},
         ],
         tags=["chain_b", "slot"],
     ),
@@ -316,6 +316,16 @@ SCENARIOS: list[Scenario] = [
 SCENARIO_MAP = {s.key: s for s in SCENARIOS}
 
 _GREETING_VARIANTS = ["你好", "在吗", "hi", "你好呀，请教个问题"]
+
+# 拒答话术特征 (模块级): 差评仅在回复命中拒答话术时发送, 消除"答对了也差评"假阳性
+_BAD_REPLY_MARKERS = (
+    "无法",
+    "请咨询",
+    "官方渠道",
+    "没太理解",
+    "暂不支持",
+    "拨打客服热线",
+)
 # 多主题连问只串轻量场景 (不串敏感/转人工类)
 _CHAINABLE_KEYS = ("balance_query", "installment", "definition", "faq_points", "chitchat")
 
@@ -422,7 +432,12 @@ class SimCustomer:
                     logger.debug("模拟客户中途挂断: session=%s 场景=%s 第 %d 轮", self._session_id, sc.key, i)
                     state.stats.sessions += 1
                     return records
-            if sc.final_feedback == "down" and records and await self._send_feedback(client, records[-1]):
+            if (
+                sc.final_feedback == "down"
+                and records
+                and self._reply_is_bad(records[-1].reply)
+                and await self._send_feedback(client, records[-1])
+            ):
                 state.stats.feedbacks += 1
             # 多主题连问: 本主题没转人工时, 概率性在同一会话再问一个轻量主题
             transferred = any(k in (rec.reply or "") for rec in records for k in ("转接", "人工", "专员"))
@@ -482,6 +497,12 @@ class SimCustomer:
                 return str(data.get("reply") or "")
             await asyncio.sleep(1.0)
         return "(超时未收到回复)"
+
+    # 拒答话术特征: 命中才值得差评 (第二轮模拟假阳性根因: 答对了也差评)
+    _BAD_REPLY_MARKERS = _BAD_REPLY_MARKERS
+
+    def _reply_is_bad(self, reply: str) -> bool:
+        return any(m in (reply or "") for m in _BAD_REPLY_MARKERS)
 
     async def _send_feedback(self, client: httpx.AsyncClient, last: TurnRecord) -> bool:
         headers = {"Authorization": f"Bearer {state.auth_token}"} if state.auth_token else {}

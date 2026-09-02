@@ -36,7 +36,14 @@ _FAST_PATH_THRESHOLD = 0.7
 # 写类主名意图; 规则层对这些意图高置信命中时覆盖 BERT 快路径结果。仅收办理动作词
 # (提额/降额), 覆盖阈值取两规则置信 0.96 之下、其余规则最高置信 0.95 之上。
 _APPLY_INTENT_RULE_OVERRIDE: frozenset[IntentLabel] = frozenset(
-    {IntentLabel.LIMIT_APPLY_INCREASE, IntentLabel.LIMIT_APPLY_DECREASE}
+    {
+        IntentLabel.LIMIT_APPLY_INCREASE,
+        IntentLabel.LIMIT_APPLY_DECREASE,
+        # 挂失类 (第二轮模拟: "钱包被偷了卡也在里面"被 BERT 判 faq@0.73 → 走知识链
+        # 给安抚话术而非挂失链, 错过挂失黄金时间) — 规则命中即覆盖
+        IntentLabel.CARD_LOSS,
+        IntentLabel.CARD_LOSS_REPORT,
+    }
 )
 _APPLY_OVERRIDE_CONF = 0.95
 
@@ -378,6 +385,13 @@ _SENSITIVE_RULE_PRIORITY: frozenset[IntentLabel] = frozenset(
     {IntentLabel.CARD_LOSS, IntentLabel.COMPLAINT, IntentLabel.TRANSFER_AGENT}
 )
 _RULES: list[dict[str, Any]] = [
+    # 挂失类 (第二轮模拟补词: "钱包被偷了卡也在里面"变体没接住)
+    {
+        "intent": IntentLabel.CARD_LOSS,
+        "patterns": [r"钱包被偷", r"钱包被[盗抢]", r"卡片被盗", r"被盗刷"],
+        "keywords": ["钱包被偷", "钱包被盗", "被盗刷"],
+        "confidence": 0.96,
+    },
     # 账单类
     {
         "intent": IntentLabel.BILL_QUERY,

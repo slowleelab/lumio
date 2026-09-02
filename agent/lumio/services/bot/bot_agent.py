@@ -783,6 +783,38 @@ class LumioAgent:
 
         intent = intent_result.primary_intent
         confidence = intent_result.primary_confidence
+
+        # v2 裸槽位回归 (第二轮模拟 compliance_alert 根因): 上轮链B反问槽位后, 本轮
+        # 裸给值被分类成低置信 faq — v1 由噪声门 awaiting_hit 换回等待意图续办, 而
+        # v2 分派先于噪声门把请求抢走, 落进知识链/竞速后被出站闸拦成"没太理解"。
+        # 此处等价补位: 有等待快照 + 本轮低置信 → 换回等待意图按其流量性质分派
+        # (等待意图多为查询类 → 链 B → _load_slot_prompt 消费快照与本轮槽值直查)。
+        if confidence < CLARIFY_CONFIDENCE_FLOOR:
+            try:
+                await_intent_v2, awaiting_v2 = await self._session_awaiting_slots(session_id)
+            except Exception:
+                await_intent_v2, awaiting_v2 = None, []
+            if awaiting_v2 and await_intent_v2:
+                try:
+                    swapped_intent = normalize_intent(await_intent_v2)
+                except ValueError:
+                    swapped_intent = None
+                if swapped_intent is not None:
+                    logger.info(
+                        "v2 等待快照回归: 换回等待意图 %s 续办 (input=%r)",
+                        swapped_intent.value,
+                        user_input[:20],
+                    )
+                    intent_result = IntentResult(
+                        primary_intent=swapped_intent,
+                        primary_confidence=0.6,  # 上文已确认的意图, 不按本轮低置信记账
+                        alternatives=intent_result.alternatives,
+                        energy=intent_result.energy,
+                        fast_conf=confidence,
+                        fast_intent=intent,
+                    )
+                    intent = swapped_intent
+                    confidence = 0.6
         # classify_traffic 返回 (五域, 交易性质) 二元组 — P0 修复: 此前当单值比较,
         # tuple == 枚举恒 False, 三分支全落空直奔决策二 (v2 代码首次开启时暴露;
         # 开关默认关期间从未执行, 单测只测了函数本身没测分派比较)
