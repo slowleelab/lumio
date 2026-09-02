@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import re
 import time
 import uuid as uuid_module
@@ -44,6 +43,7 @@ from lumio.services.common.decision_log import DecisionAction, log_decision
 from lumio.services.common.degradation import DegradationManager
 from lumio.services.common.transfer import TRANSFER_CONFIDENT_CONF, TransferChecker
 from lumio.shared.config import get_settings
+from lumio.shared.logger import setup_logger
 from lumio.shared.metrics import TOOL_CONFIRMATIONS
 from lumio.shared.models import (
     SENSITIVE_INTENTS,
@@ -94,7 +94,10 @@ if TYPE_CHECKING:
     from lumio.services.common.session import SessionManager
     from lumio.shared.models import PendingAction
 
-logger = logging.getLogger(__name__)
+# P0 日志修复: 此前裸 getLogger — 无 handler 无级别, 本模块全部 INFO 被静默吞掉
+# (L2 域命中/路由分派/查询链路回落等关键链路日志在服务进程从未出现过, 排障只能靠
+# 决策日志旁证)。setup_logger 顶部导入, 此处仅建实例。
+logger = setup_logger(__name__)
 
 
 # ── Token 估算（统一委托 lumio.shared.token_utils，避免分叉实现） ──
@@ -446,6 +449,13 @@ class LumioAgent:
             # 历史实体池(last_entities)从不累积, 指代消解与"[已知实体]"内存全部空转.
             result = None
             routing_v2 = get_settings().bot.routing_v2_enabled
+            logger.debug(
+                "路由分派: routing_v2=%s executor=%s has_tools=%s intent=%s",
+                routing_v2,
+                self._tool_executor is not None,
+                self._tool_executor.has_tools() if self._tool_executor is not None else False,
+                intent_result.primary_intent.value,
+            )
             if routing_v2:
                 # 目标架构 ④ 两级路由决策: 决策一交易性质 / 决策二只读四分流。
                 # 既有闸门 (噪声门/敏感回话/等待快照) 均在 handler 内部, 位置不动。
@@ -773,18 +783,27 @@ class LumioAgent:
 
         intent = intent_result.primary_intent
         confidence = intent_result.primary_confidence
-        traffic = classify_traffic(intent)
+        # classify_traffic 返回 (五域, 交易性质) 二元组 — P0 修复: 此前当单值比较,
+        # tuple == 枚举恒 False, 三分支全落空直奔决策二 (v2 代码首次开启时暴露;
+        # 开关默认关期间从未执行, 单测只测了函数本身没测分派比较)
+        v2_domain, traffic = classify_traffic(intent)
         composite = detect_composite(intent, list(intent_result.alternatives or []), user_input)
+        logger.debug(
+            "dispatch_v2: traffic=%s composite=%s intent=%s alts=%s",
+            traffic.value,
+            composite,
+            intent.value,
+            [a.value for a in (intent_result.alternatives or [])],
+        )
         try:
             log_decision(
                 session_id=session_id,
                 agent_name="bot_agent",
-                action=DecisionAction.TOOL_CALL
-                if traffic != TrafficClass.CONSULTING
-                else DecisionAction.INTENT_CLASSIFY,
-                reasoning=f"v2 路由: 决策一={traffic.value} 决策二预备 composite={composite}",
+                action=DecisionAction.TOOL_CALL if traffic is not None else DecisionAction.INTENT_CLASSIFY,
+                reasoning=f"v2 路由: 决策一={traffic.value if traffic else '咨询'} 决策二预备 composite={composite}",
                 evidence={
-                    "traffic_class": traffic.value,
+                    "traffic_class": traffic.value if traffic else None,
+                    "domain": v2_domain.value,
                     "confidence": confidence,
                     "composite": composite,
                     "alternatives": [a.value for a in (intent_result.alternatives or [])],
@@ -821,9 +840,15 @@ class LumioAgent:
                     return comp
             # 链 B · 查询轻链路: 直连工具 + 缓存; 无工具/链失败回落
             if self._tool_executor is not None and self._tool_executor.has_tools():
-                qc = await self._handle_query_chain(
-                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
-                )
+                try:
+                    qc = await self._handle_query_chain(
+                        session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                    )
+                except Exception as exc:
+                    import traceback
+
+                    logger.warning("链B异常: %s\n%s", exc, traceback.format_exc()[-600:])
+                    qc = None
                 if qc is not None:
                     return qc
             return await self._handle_tool(
@@ -884,15 +909,22 @@ class LumioAgent:
             logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
             return None
         if qc.missing_params:
-            # 缺参先探知识 (会话 2b3b2613 复盘: "信用额度是什么"缺卡号被反问,
-            # 但定义类问题知识库可答 —— 反问个人参数前先看 RAG 有据与否)
-            try:
-                probe = await self._retrieve(user_input)
-            except Exception:
-                probe = ""
-            if probe:
-                logger.info("查询链路缺参但 RAG 有据, 转知识路径: session=%s", session_id)
-                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
+            # 缺参探知识仅限定义句式 (会话 2b3b2613 复盘: "信用额度是什么"该走知识)。
+            # 一小时模拟 badcase 修正: 真查询诉求 ("帮我查账单"要的是具体金额)曾被
+            # "如何看账单"类文档截胡转知识路径 —— 非定义句式直接反问补槽, 客户给
+            # 卡号即直查工具。定义句式现已在分类层被强制咨询域, 此分支仅兜漏网。
+            from lumio.shared.intent_taxonomy import is_definition_query
+
+            if is_definition_query(user_input):
+                try:
+                    probe = await self._retrieve(user_input)
+                except Exception:
+                    probe = ""
+                if probe:
+                    logger.info("查询链路缺参(定义句式)且 RAG 有据, 转知识路径: session=%s", session_id)
+                    return await self._handle_knowledge(
+                        session_id, user_input, intent_result, history, entities, sentiment
+                    )
             # 反问澄清 (TW6→S1 补槽回流): 槽位 prompt 过弱时用参数中文名直问
             param_zh = {
                 "period": "账期（如 2026-08）",

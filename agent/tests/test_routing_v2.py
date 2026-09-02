@@ -231,8 +231,11 @@ class TestDispatchV2:
         app.dependency_overrides[get_current_user] = lambda: AuthUser(user_id="a", role="admin", session_id=None)
         return app
 
-    def test_v2_flag_default_off(self) -> None:
+    def test_v2_flag_default_off(self, monkeypatch) -> None:
         from lumio.shared.config import Settings
 
+        # 部署环境可经 BOT_ROUTING_V2_ENABLED 合法开启; 此处验证的是
+        # "无环境变量注入时默认关" 的回滚保底语义
+        monkeypatch.delenv("BOT_ROUTING_V2_ENABLED", raising=False)
         s = Settings(_env_file=())
         assert s.bot.routing_v2_enabled is False

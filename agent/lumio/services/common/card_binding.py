@@ -38,10 +38,16 @@ def is_full_card_no(value: object) -> bool:
     return isinstance(value, str) and bool(_CARD_NO_RE.fullmatch(value.strip()))
 
 
-def schema_declares_card_no(input_schema: dict) -> bool:
-    """工具入参 schema 是否声明了 card_no 参数（仅对这类工具注入绑定卡号）。
+def schema_declares_card_no(input_schema: dict) -> str | None:
+    """工具入参 schema 声明的卡号参数名（仅对这类工具注入绑定卡号）。
 
+    返回 schema 实际声明的键名（'card_no' / 'cardNo'），未声明返回 None —
+    注入时用返回的键名, 避免 snake_case 注入 camelCase schema 导致缺参
+    (v2 链 B 首跑实测: 注入 card_no 而 query_card_bill 要求 cardNo)。
     挂失/投诉等用其他参数名（如 card）的工具不注入, 避免污染入参。
     """
     properties = (input_schema or {}).get("properties") or {}
-    return "card_no" in properties or "cardNo" in properties
+    for key in ("card_no", "cardNo"):
+        if key in properties:
+            return key
+    return None

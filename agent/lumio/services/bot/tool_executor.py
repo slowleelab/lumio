@@ -384,12 +384,13 @@ class ToolCallingExecutor:
         # 从对话收集。仅对 schema 声明了 card_no 参数的工具注入; LLM 已给出完整卡号时
         # 不覆盖 (如核验弹框路径已注入的 card_no)。
         spec = self._mcp.get_tool(tool_call.name)
+        card_key = schema_declares_card_no(spec.input_schema) if spec is not None else None
         if (
-            spec is not None
-            and schema_declares_card_no(spec.input_schema)
+            card_key
+            and not is_full_card_no(tool_call.arguments.get(card_key))
             and not is_full_card_no(tool_call.arguments.get("card_no"))
         ):
-            tool_call.arguments["card_no"] = resolve_card_no(actor_id)
+            tool_call.arguments[card_key] = resolve_card_no(actor_id)
         masked_args = mask_pii(json.dumps(tool_call.arguments, ensure_ascii=False))
         # P2-7 第五轮修复: 配额检查接线 — tool_robustness.ToolQuotaGuard 此前生产零调用,
         # TOOL_QUOTA_EXCEEDED 指标永不产生; 超配额直接拒绝, 不进 MCP

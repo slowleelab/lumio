@@ -7,6 +7,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _pin_v1_routing(monkeypatch):
+    """本文件测试基于 v1 链路 mock 编写: 显式关闭 v2 路由, 不随部署 env 漂移。
+
+    v2 分派的专测见 test_routing_v2.py / test_query_chain.py。
+    """
+    from lumio.shared.config import get_settings
+
+    monkeypatch.setattr(get_settings().bot, "routing_v2_enabled", False)
+
 from lumio.services.bot.bot_agent import (
     _TRANSFER_OFFER_PROMPT,
     LumioAgent,
@@ -33,6 +44,17 @@ from lumio.shared.models import (
     SessionState,
     SessionSubPhase,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_v1_routing(monkeypatch):
+    """本文件基于 v1 链路 mock 编写: 显式关闭 v2 路由, 不随部署 env 漂移。
+
+    v2 分派的专测见 test_routing_v2.py / test_query_chain.py。
+    """
+    from lumio.shared.config import get_settings
+
+    monkeypatch.setattr(get_settings().bot, "routing_v2_enabled", False)
 
 
 class TestGreetingDetection:
@@ -543,6 +565,8 @@ class TestProgressiveDisclosureRouting:
 
         settings = Settings()
         settings.mcp.progressive_disclosure_enabled = enabled
+        # 本类测 v1 渐进披露: 显式关 v2, 免受部署 env (BOT_ROUTING_V2_ENABLED) 漂移
+        settings.bot.routing_v2_enabled = False
         monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
 
     @pytest.mark.asyncio

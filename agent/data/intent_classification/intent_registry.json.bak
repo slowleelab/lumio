@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "intents": [
+    {
+      "slug": "fx_rate_query",
+      "domain": "query",
+      "group": "A1_account_query",
+      "name_zh": "外汇汇率查询",
+      "definition": "查询各币种兑人民币的实时汇率/牌价",
+      "traffic_class": "",
+      "seeds": [
+        "现在美元兑人民币汇率是多少",
+        "帮我查一下今天的欧元汇率",
+        "日元对人民币的卖出价是多少",
+        "我想看看英镑汇率现在多少",
+        "澳元汇率今天涨了还是跌了",
+        "查一下港币兑人民币的汇率",
+        "加元汇率现在是多少",
+        "新加坡元对人民币汇率",
+        "瑞士法郎汇率查询",
+        "韩元汇率今天多少"
+      ],
+      "state": "deprecated",
+      "created_by": "01a015c9-7a69-7923-9e71-4c87373a253e",
+      "created_at": 1788243570.358338,
+      "updated_at": 1788243750.554697,
+      "history": [
+        {
+          "ts": 1788243570.3583412,
+          "actor": "01a015c9-7a69-7923-9e71-4c87373a253e",
+          "action": "create",
+          "from": null,
+          "to": "draft",
+          "note": ""
+        },
+        {
+          "ts": 1788243579.64735,
+          "actor": "01a015c9-7a69-7923-9e71-4c87373a253e",
+          "action": "submit",
+          "from": "draft",
+          "to": "pending_review",
+          "note": ""
+        },
+        {
+          "ts": 1788243579.68128,
+          "actor": "01a05b9f-3f4c-70f2-82a8-df5c65c35649",
+          "action": "approve",
+          "from": "pending_review",
+          "to": "evaluating",
+          "note": "查询类意图,边界清晰"
+        },
+        {
+          "ts": 1788243586.193213,
+          "actor": "system:eval_gates",
+          "action": "gates_pass",
+          "from": "evaluating",
+          "to": "shadow",
+          "note": "overlap_max=0.9178, golden_drop=0.0"
+        },
+        {
+          "ts": 1788243696.674538,
+          "actor": "01a05b9f-3f4c-70f2-82a8-df5c65c35649",
+          "action": "activate",
+          "from": "shadow",
+          "to": "active",
+          "note": ""
+        },
+        {
+          "ts": 1788243750.554698,
+          "actor": "01a05b9f-3f4c-70f2-82a8-df5c65c35649",
+          "action": "deprecate",
+          "from": "active",
+          "to": "deprecated",
+          "note": ""
+        }
+      ],
+      "eval_report": {
+        "passed": true,
+        "overlap": {
+          "max_similarity": 0.9178,
+          "warn_count": 3,
+          "hard_conflicts": [],
+          "details": [
+            {
+              "seed": "帮我查一下今天的欧元汇率",
+              "similar_to": "查一下我昨天那笔交易记录",
+              "existing_intent": "transaction_query",
+              "similarity": 0.8636
+            },
+            {
+              "seed": "我想看看英镑汇率现在多少",
+              "similar_to": "我要投诉你们客服",
+              "existing_intent": "complaint",
+              "similarity": 0.9178
+            },
+            {
+              "seed": "韩元汇率今天多少",
+              "similar_to": "这些积分都能换什么",
+              "existing_intent": "reward_query",
+              "similarity": 0.8611
+            }
+          ],
+          "passed": true
+        },
+        "golden": {
+          "cases": 27,
+          "baseline_accuracy": 0.6667,
+          "with_candidate_accuracy": 0.6667,
+          "drop": 0.0,
+          "tolerance": 0.02,
+          "passed": true
+        },
+        "checked_at": 1788243579.685547
+      },
+      "shadow_hits": 0,
+      "active_hits": 0
+    },
+    {
+      "slug": "digital_rmb_pay_query",
+      "domain": "consulting",
+      "group": "C1_product",
+      "name_zh": "数字人民币支付咨询",
+      "definition": "数字人民币( e-CNY )支付/绑定/还款相关咨询",
+      "traffic_class": "",
+      "seeds": [
+        "你们信用卡支持数字人民币付款吗",
+        "怎么给信用卡绑定数字人民币钱包",
+        "数字人民币还信用卡可以吗",
+        "用数字人民币消费有优惠吗",
+        "数字人民币支付限额是多少",
+        "我的卡能开通数字人民币功能吗",
+        "数字人民币和微信支付有什么区别",
+        "哪里可以用数字人民币刷信用卡",
+        "数字人民币还款什么时候到账",
+        "开通数字人民币要收费吗"
+      ],
+      "state": "shadow",
+      "created_by": "01a015c9-7a69-7923-9e71-4c87373a253e",
+      "created_at": 1788243780.744407,
+      "updated_at": 1788243786.713345,
+      "history": [
+        {
+          "ts": 1788243780.74441,
+          "actor": "01a015c9-7a69-7923-9e71-4c87373a253e",
+          "action": "create",
+          "from": null,
+          "to": "draft",
+          "note": ""
+        },
+        {
+          "ts": 1788243780.764787,
+          "actor": "01a015c9-7a69-7923-9e71-4c87373a253e",
+          "action": "submit",
+          "from": "draft",
+          "to": "pending_review",
+          "note": ""
+        },
+        {
+          "ts": 1788243780.785436,
+          "actor": "01a05b9f-3f4c-70f2-82a8-df5c65c35649",
+          "action": "approve",
+          "from": "pending_review",
+          "to": "evaluating",
+          "note": "新兴支付方式,出厂意图未覆盖"
+        },
+        {
+          "ts": 1788243786.713347,
+          "actor": "system:eval_gates",
+          "action": "gates_pass",
+          "from": "evaluating",
+          "to": "shadow",
+          "note": "overlap_max=0.8944, golden_drop=0.0"
+        }
+      ],
+      "eval_report": {
+        "passed": true,
+        "overlap": {
+          "max_similarity": 0.8944,
+          "warn_count": 0,
+          "hard_conflicts": [],
+          "details": [],
+          "passed": true
+        },
+        "golden": {
+          "cases": 27,
+          "baseline_accuracy": 0.6667,
+          "with_candidate_accuracy": 0.6667,
+          "drop": 0.0,
+          "tolerance": 0.02,
+          "passed": true
+        },
+        "checked_at": 1788243780.790074
+      },
+      "shadow_hits": 0,
+      "active_hits": 0
+    }
+  ]
+}

@@ -815,3 +815,40 @@ async def test_non_apply_bert_result_not_overridden() -> None:
 
     assert intent.primary_intent == IntentLabel.LIMIT_QUERY
     assert source == "bert"
+
+
+# ── 查询类意图规则覆盖 (一小时模拟 badcase 根治: 账单查询被 BERT 判 faq) ──
+
+
+@pytest.mark.asyncio
+async def test_bert_faq_overridden_by_query_rule() -> None:
+    """BERT 把账单查询判成 faq 高置信 → 查询规则覆盖, 走工具链而非知识链"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.9)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("帮我查一下信用卡账单")
+
+    assert intent.primary_intent == IntentLabel.BILL_QUERY
+    assert intent.primary_confidence == 0.84
+    assert source == "rule:query"
+    assert intent.fast_intent == IntentLabel.FAQ  # 审计留痕
+
+
+@pytest.mark.asyncio
+async def test_consultive_bill_text_not_overridden() -> None:
+    """咨询句 (含手续费/怎么) 不被查询规则覆盖 —— "账单分期手续费怎么算"是咨询不是查询"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.9)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("账单分期手续费怎么算")
+
+    assert intent.primary_intent == IntentLabel.FAQ
+    assert source == "bert"
+
+
+@pytest.mark.asyncio
+async def test_balance_query_overridden() -> None:
+    fake = _fake_bert(IntentLabel.FAQ, 0.75)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("我的信用卡可用额度还有多少")
+
+    assert intent.primary_intent == IntentLabel.LIMIT_QUERY
+    assert source == "rule:query"

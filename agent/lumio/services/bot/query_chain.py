@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from lumio.services.common.card_binding import resolve_card_no, schema_declares_card_no
+from lumio.shared.logger import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 _CACHE_TTL_SECONDS = 300
 _CACHE_PREFIX = "lumio:query-chain:result:"
@@ -70,9 +70,7 @@ class QueryChain:
             return spec.name, spec.input_schema
         return None, None
 
-    def build_args(
-        self, input_schema: dict, slot_values: dict, customer_id: str | None
-    ) -> tuple[dict, list[str]]:
+    def build_args(self, input_schema: dict, slot_values: dict, customer_id: str | None) -> tuple[dict, list[str]]:
         """schema 驱动的参数组装: 槽位值按参数名填充 + card_no 绑定卡号自动注入。
 
         Returns: (args, missing_required) — missing 为 schema required 中无法提供的参数名。
@@ -92,8 +90,10 @@ class QueryChain:
 
             args["period"] = _date.today().strftime("%Y-%m")
         # card_no 由实名绑定关系注入, 客户只给过后四位也按绑定关系解析完整卡号
-        if schema_declares_card_no(input_schema) and "card_no" not in args:
-            args["card_no"] = resolve_card_no(customer_id)
+        # (注入键名取 schema 实际声明 — card_no/cardNo 两种形态, 免 camelCase 缺参)
+        card_key = schema_declares_card_no(input_schema)
+        if card_key and card_key not in args:
+            args[card_key] = resolve_card_no(customer_id)
 
         missing = [r for r in required if r not in args]
         if missing:
@@ -136,12 +136,21 @@ class QueryChain:
         Returns: QueryChainResult — content 空 + missing 非空 → 反问; error 非空 → 回落。
         """
         tool_name, schema = self._pick_tool(tool_names)
+        logger.info(
+            "链B入口: tool=%s schema=%s tools候选=%s",
+            tool_name,
+            bool(schema),
+            tool_names,
+        )
         if tool_name is None:
+            logger.warning("链B无可用查询工具: 候选=%s", tool_names)
             return QueryChainResult(error="no_query_tool")
 
         slots: dict = slot_values if slot_values is not None else {}
         args, missing = self.build_args(schema, slots, customer_id)
+        logger.info("链B参数: args=%s missing=%s", args, missing)
         if missing:
+            logger.info("链B缺参反问: missing=%s", missing)
             return QueryChainResult(missing_params=missing, tool_name=tool_name)
 
         key = _cache_key(tool_name, args)

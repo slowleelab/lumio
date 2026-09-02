@@ -40,6 +40,40 @@ _APPLY_INTENT_RULE_OVERRIDE: frozenset[IntentLabel] = frozenset(
 )
 _APPLY_OVERRIDE_CONF = 0.95
 
+# 查询类意图的规则覆盖集 (与 tool_selection.TOOL_INTENTS 查询子集对齐, 不新增
+# 第三处清单 —— 在此显式列出并注明对齐关系, 因 services.common 不得顶层依赖
+# services.bot)。旧 flat 别名与主名成对收录。
+_QUERY_INTENT_OVERRIDES: frozenset[IntentLabel] = frozenset(
+    {
+        IntentLabel.BILL_QUERY,
+        IntentLabel.TRANSACTION_QUERY,
+        IntentLabel.LIMIT_QUERY,
+        IntentLabel.REWARD_QUERY,
+        IntentLabel.ACCOUNT_BILL_QUERY,
+        IntentLabel.TXN_QUERY,
+        IntentLabel.POINTS_BALANCE_QUERY,
+    }
+)
+# 咨询标记词: 含这些词的句子是"关于账单/额度的问题"而非"查账单/额度"本身,
+# 规则关键词命中不作数 (如"账单分期手续费怎么算" ≠ 账单查询)。
+_CONSULTIVE_MARKERS = (
+    "怎么",
+    "如何",
+    "为什么",
+    "什么意思",
+    "是什么",
+    "什么是",
+    "什么叫",
+    "介绍",
+    "规则",
+    "政策",
+    "手续费",
+    "利率",
+    "条件",
+    "区别",
+    "划算",
+)
+
 # 低置信噪声闸下限: BERT 快路径置信度低于此值时视为"没认出来", 直接不花一次 LLM 慢路径分类.
 # 实测 LLM 慢路径会把噪声置信抬到恰 ≥ 此下限 (如 0.219→0.30), 既浪费一次 6s+ 调用,
 # 又掩盖噪声信号让下游 low_conf 噪声闸漏放. 仅 BERT 为快路径时激进兜底; 与
@@ -882,6 +916,35 @@ class IntentClassifier:
                 fast_intent=fast_result.primary_intent,
             )
             fast_source = "rule"
+
+        # 查询类意图规则覆盖 (一小时模拟 badcase 根治: "帮我查一下信用卡账单"被 BERT
+        # 判 faq → 知识链被能力边界红线拦截, 实际应走链 B 工具直查; L3 LLM 分类在
+        # 负载下 6s 超时后兜底 BERT, 误判被放大)。规则是人工维护的确定性关键词,
+        # 查询意图高置信命中且句式无咨询标记 (怎么/为什么/规则/手续费…) 时比 BERT
+        # 可靠 —— 与 _APPLY_INTENT_RULE_OVERRIDE 同型, 仅覆盖查询意图, 咨询句零回归。
+        if (
+            fast_result.primary_intent != rule_fast.primary_intent
+            and rule_fast.primary_confidence >= 0.8
+            and normalize_intent(rule_fast.primary_intent.value) in _QUERY_INTENT_OVERRIDES
+            and not any(m in text for m in _CONSULTIVE_MARKERS)
+        ):
+            logger.info(
+                "查询词规则覆盖快路径: %s@%.2f -> %s@%.2f (text=%r)",
+                fast_result.primary_intent.value,
+                fast_result.primary_confidence,
+                rule_fast.primary_intent.value,
+                rule_fast.primary_confidence,
+                text[:30],
+            )
+            fast_result = IntentResult(
+                primary_intent=rule_fast.primary_intent,
+                primary_confidence=rule_fast.primary_confidence,
+                alternatives=fast_result.alternatives,
+                energy=fast_result.energy,
+                fast_conf=fast_result.primary_confidence,
+                fast_intent=fast_result.primary_intent,
+            )
+            fast_source = "rule:query"
 
         if fast_result.primary_confidence >= self._threshold:
             logger.debug(
