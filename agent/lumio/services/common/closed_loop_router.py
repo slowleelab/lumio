@@ -157,25 +157,34 @@ async def attribute_badcase(
 
 # ── 批量归因 (后台任务, 每条 ~21s 本地 n=3; 大库存一条条点不现实) ──
 
-_batch_state: dict[str, Any] = {"running": False, "total": 0, "done": 0, "failed": 0, "started_at": 0.0, "error": ""}
+_batch_state: dict[str, Any] = {"running": False, "total": 0, "done": 0, "failed": 0, "started_at": 0.0, "error": "", "scope": None}
 _batch_tasks: set = set()
 
 
-async def _batch_attribute_task(request: Request, limit: int) -> None:
+async def _batch_attribute_task(request: Request, limit: int, flt: dict[str, Any]) -> None:
     sf = getattr(request.app.state, "db_session_factory", None)
     llm_client = getattr(request.app.state, "llm_client", None)
     try:
         if sf is None or llm_client is None:
             raise RuntimeError("LLM 或数据库未就绪")
         judge = _build_judge(request)
+        from sqlalchemy import or_
+
         from lumio.shared.orm_models import Badcase
 
         async with sf() as db:
+            conds = [Badcase.root_cause_layer.is_(None)]
+            if flt.get("signal_source"):
+                conds.append(Badcase.signal_source == flt["signal_source"])
+            if flt.get("keyword"):
+                conds.append(Badcase.user_input.ilike(f"%{flt['keyword']}%"))
+            if flt.get("layer") == "uncertain":
+                conds.append(or_(Badcase.root_cause_layer.is_(None), Badcase.root_cause_layer == "uncertain"))
             rows = (
                 (
                     await db.execute(
                         select(Badcase.id)
-                        .where(Badcase.root_cause_layer.is_(None))
+                        .where(*conds)
                         .order_by(Badcase.created_at.desc())
                         .limit(limit)
                     )
@@ -207,19 +216,21 @@ async def _batch_attribute_task(request: Request, limit: int) -> None:
 
 @router.post("/badcases/attribute-batch")
 async def attribute_batch(user: AdminOnlyUser, request: Request, body: dict[str, Any] | None = None) -> dict[str, Any]:
-    """批量归因待归因坏例 (后台任务, 状态见 /badcases/attribute-batch/status)"""
+    """批量归因待归因坏例 (后台任务; 可带 signal_source/keyword 过滤, 按当前筛选范围跑)"""
     import asyncio
     import time as _time
 
     if _batch_state["running"]:
         raise LumioError(code=3001, message="批量归因进行中, 请等待完成")
-    limit = int((body or {}).get("limit") or 50)
+    body = body or {}
+    limit = int(body.get("limit") or 50)
     limit = max(1, min(limit, 500))
-    _batch_state.update(running=True, total=0, done=0, failed=0, started_at=_time.time(), error="")
-    task = asyncio.create_task(_batch_attribute_task(request, limit))
+    flt = {"signal_source": body.get("signal_source"), "keyword": body.get("keyword"), "layer": body.get("layer")}
+    _batch_state.update(running=True, total=0, done=0, failed=0, started_at=_time.time(), error="", scope=flt)
+    task = asyncio.create_task(_batch_attribute_task(request, limit, flt))
     _batch_tasks.add(task)
     task.add_done_callback(_batch_tasks.discard)
-    return {"scheduled": True, "limit": limit}
+    return {"scheduled": True, "limit": limit, "scope": flt}
 
 
 @router.get("/badcases/attribute-batch/status")

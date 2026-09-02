@@ -20,6 +20,24 @@
     </div>
 
     <!-- 统计卡 (可点击联动筛选) -->
+    <!-- 批量归因进度条 -->
+    <el-progress
+      v-if="batch.running"
+      :percentage="batchPct"
+      :stroke-width="10"
+      striped
+      striped-flow
+      style="margin-top: 10px"
+    >
+      <template #default>
+        <span class="batch-progress-text">
+          GLM 裁判批量归因中 {{ batch.done }}/{{ batch.total }}
+          <template v-if="batch.failed"> (失败 {{ batch.failed }})</template>
+          <template v-if="batch.scope?.signal_source || batch.scope?.keyword"> · 范围: {{ batchScopeText }}</template>
+        </span>
+      </template>
+    </el-progress>
+
     <div class="stat-cards">
       <div class="stat-card" :class="{ active: filters.needs_review === true }" @click="toggleStatFilter('needs_review', true)">
         <span class="label">待复核</span>
@@ -565,14 +583,35 @@ async function batchTransition(status: string) {
   await Promise.all([load(), loadStats()])
 }
 
-// ── 批量归因 (后台任务轮询) ──
-const batch = ref({ running: false, total: 0, done: 0, failed: 0 })
+// ── 批量归因 (后台任务轮询, 跟随当前筛选范围) ──
+const batch = ref({
+  running: false,
+  total: 0,
+  done: 0,
+  failed: 0,
+  scope: null as { signal_source?: string; keyword?: string } | null,
+})
 let batchTimer: ReturnType<typeof setInterval> | null = null
+
+const batchPct = computed(() => (batch.value.total > 0 ? Math.round((batch.value.done / batch.value.total) * 100) : 0))
+
+const batchScopeText = computed(() => {
+  const parts: string[] = []
+  if (batch.value.scope?.signal_source) parts.push(signalLabel(batch.value.scope.signal_source))
+  if (batch.value.scope?.keyword) parts.push(`"${batch.value.scope.keyword}"`)
+  return parts.join(" + ") || "全部"
+})
 
 async function pollBatch() {
   try {
     const st = await getBatchAttributionStatus()
-    batch.value = { running: st.running, total: st.total, done: st.done, failed: st.failed }
+    batch.value = {
+      running: st.running,
+      total: st.total,
+      done: st.done,
+      failed: st.failed,
+      scope: (st.scope as { signal_source?: string; keyword?: string }) ?? null,
+    }
     if (!st.running) {
       if (batchTimer) {
         clearInterval(batchTimer)
@@ -589,9 +628,13 @@ async function pollBatch() {
 }
 
 async function doBatchAttribution() {
+  const scope: { signal_source?: string; keyword?: string } = {}
+  if (filters.value.signal_source) scope.signal_source = filters.value.signal_source
+  if (filters.value.keyword) scope.keyword = filters.value.keyword
+  const scopeText = Object.keys(scope).length ? " (按当前筛选范围)" : ""
   try {
-    await startBatchAttribution(200)
-    ElMessage.success("批量归因已启动 (后台执行, 每条约 20 秒)")
+    await startBatchAttribution(200, scope)
+    ElMessage.success(`GLM 裁判批量归因已启动${scopeText}, 每条约 20-40 秒`)
     if (!batchTimer) batchTimer = setInterval(pollBatch, 4000)
   } catch {
     /* handled */
@@ -726,6 +769,7 @@ onUnmounted(() => {
   .dist-empty { font-size: var(--fs-sm); }
 }
 
+.batch-progress-text { font-size: var(--fs-sm); color: var(--color-text-secondary); }
 .filters {
   display: flex;
   gap: var(--space-2);

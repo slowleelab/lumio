@@ -99,10 +99,14 @@ export interface BatchAttributionStatus {
   failed: number
   started_at: number
   error: string
+  scope?: { signal_source?: string; keyword?: string; layer?: string } | null
 }
 
-export function startBatchAttribution(limit = 50): Promise<{ scheduled: boolean; limit: number }> {
-  return client.post("/admin/closed-loop/badcases/attribute-batch", { limit })
+export function startBatchAttribution(
+  limit = 50,
+  scope?: { signal_source?: string; keyword?: string; layer?: string },
+): Promise<{ scheduled: boolean; limit: number }> {
+  return client.post("/admin/closed-loop/badcases/attribute-batch", { limit, ...scope })
 }
 
 export function getBatchAttributionStatus(): Promise<BatchAttributionStatus> {
