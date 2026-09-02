@@ -5,13 +5,17 @@
 
 :root {
   // 主色板
+  // light-N 是 Element Plus 的 tint 阶梯 (向白/向黑混合), 各档用途不同:
+  // light-9 = plain 按钮/标签底色, light-5 = plain 边框, light-3 = 实心按钮 hover,
+  // dark-2 = 实心按钮 active/文字加深档。曾把全部档位映射到同一个 --color-primary-light
+  // (#66b1ff), 导致 plain 按钮与标签变成"蓝底蓝字"不可读 — 必须逐档给真实色值。
   --el-color-primary:                  var(--color-primary);
-  --el-color-primary-light-3:         var(--color-primary-light);
-  --el-color-primary-light-5:         var(--color-primary-light);
-  --el-color-primary-light-7:         var(--color-primary-light);
-  --el-color-primary-light-8:         var(--color-primary-light);
-  --el-color-primary-light-9:         var(--color-primary-light);
-  --el-color-primary-dark-2:          var(--color-primary);
+  --el-color-primary-light-3:         #79bbff;
+  --el-color-primary-light-5:         #a0cfff;
+  --el-color-primary-light-7:         #c6e2ff;
+  --el-color-primary-light-8:         #d9ecff;
+  --el-color-primary-light-9:         #ecf5ff;
+  --el-color-primary-dark-2:          #337ecc;
   --el-color-success:                  var(--color-success);
   --el-color-warning:                  var(--color-warning);
   --el-color-danger:                   var(--color-danger);
@@ -65,6 +69,34 @@
   --el-disabled-bg-color:              var(--color-bg-page);
   --el-disabled-border-color:          var(--color-border-lighter);
   --el-disabled-text-color:            var(--color-text-placeholder);
+
+  // 暗色下 primary tint 阶梯反向: light-9 仍是 plain 按钮/标签底色,
+  // 但应向页面底色 (#0f172a) 混合成深蓝 chip, 而非沿用浅色主题的近白
+  --el-color-primary-light-3:         #3175bf;
+  --el-color-primary-light-5:         #275b95;
+  --el-color-primary-light-7:         #1d406a;
+  --el-color-primary-light-8:         #19365b;
+  --el-color-primary-light-9:         #142b4b;
+
+  // 暗色下 plain 文字用提亮档 (#337ecc 在深蓝底上反而更暗)
+  .el-button--primary.is-plain {
+    --el-button-text-color: #79bbff;
+  }
+  .el-tag--primary {
+    --el-tag-text-color: #79bbff;
+  }
+}
+
+// ── plain 主按钮/主色标签文字对比度 ──
+// EP 默认 plain 文字 = --el-color-primary (#409eff), 在 light-9 浅蓝底上
+// 对比度仅 ~2.7:1, 小字号发虚不可读 — 加深一档到 dark-2 (#337ecc, ~4.5:1)
+.el-button--primary.is-plain {
+  --el-button-text-color: var(--el-color-primary-dark-2);
+  --el-button-hover-text-color: var(--el-color-white, #fff);
+  --el-button-active-text-color: var(--el-color-white, #fff);
+}
+.el-tag--primary {
+  --el-tag-text-color: var(--el-color-primary-dark-2);
 }
 
 // ── 抽屉/弹层可读性修复: 遮罩压暗过重 + 阴影层层叠加, 暗色主题下文字不可读 ──
