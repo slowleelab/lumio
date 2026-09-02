@@ -852,3 +852,22 @@ async def test_balance_query_overridden() -> None:
 
     assert intent.primary_intent == IntentLabel.LIMIT_QUERY
     assert source == "rule:query"
+
+
+# ── 预处理乱序纠错 (layer_1 坏例根治: "数人字民币") ──
+
+
+def test_fix_adjacent_typos_swapped_word() -> None:
+    from lumio.services.common.classifier import fix_adjacent_typos
+
+    assert fix_adjacent_typos("怎么给数人字民币硬钱包充值呢") == "怎么给数字人民币硬钱包充值呢"
+    assert fix_adjacent_typos("我要查我的账单账")  # 不在词表形态的不误改
+    assert fix_adjacent_typos("信用卡挂失") == "信用卡挂失"  # 正常输入零改动
+    assert fix_adjacent_typos("") == ""
+
+
+def test_fix_adjacent_typos_normal_input_untouched() -> None:
+    from lumio.services.common.classifier import fix_adjacent_typos
+
+    for normal in ("帮我查一下信用卡账单", "数字人民币硬钱包怎么充值", "我的卡丢了要挂失"):
+        assert fix_adjacent_typos(normal) == normal

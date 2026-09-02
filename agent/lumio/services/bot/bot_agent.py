@@ -790,7 +790,7 @@ class LumioAgent:
         composite = detect_composite(intent, list(intent_result.alternatives or []), user_input)
         logger.debug(
             "dispatch_v2: traffic=%s composite=%s intent=%s alts=%s",
-            traffic.value,
+            traffic.value if traffic else "consulting",
             composite,
             intent.value,
             [a.value for a in (intent_result.alternatives or [])],

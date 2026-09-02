@@ -74,6 +74,35 @@ _CONSULTIVE_MARKERS = (
     "划算",
 )
 
+# 预处理轻量纠错 (坏例 layer_1 根治: "数人字民币"相邻字交换 → 意图为空全链拒答):
+# 对高频金融词穷举"相邻双字交换"变体, 命中即替换。只修词表内乱序, 不做通配纠错
+# (避免误纠正常输入), 修正后文本进入 L1/L2/L3 分类, 原文不受影响。
+_TYPO_FIX_VOCAB = (
+    "数字人民币",
+    "信用卡",
+    "账单",
+    "还款",
+    "额度",
+    "积分",
+    "挂失",
+    "分期",
+    "转账",
+    "密码",
+    "交易",
+    "限额",
+)
+
+
+def fix_adjacent_typos(text: str) -> str:
+    """词表驱动的相邻字交换纠错 (打字乱序的最常见形态)"""
+    for word in _TYPO_FIX_VOCAB:
+        for i in range(len(word) - 1):
+            swapped = word[:i] + word[i + 1] + word[i] + word[i + 2 :]
+            if swapped != word and swapped in text:
+                text = text.replace(swapped, word)
+    return text
+
+
 # 低置信噪声闸下限: BERT 快路径置信度低于此值时视为"没认出来", 直接不花一次 LLM 慢路径分类.
 # 实测 LLM 慢路径会把噪声置信抬到恰 ≥ 此下限 (如 0.219→0.30), 既浪费一次 6s+ 调用,
 # 又掩盖噪声信号让下游 low_conf 噪声闸漏放. 仅 BERT 为快路径时激进兜底; 与
@@ -820,6 +849,8 @@ class IntentClassifier:
         Returns:
             (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback"|"bert:lowconf")
         """
+        # ①预处理·乱序纠错 (layer_1 坏例根治): 修正文本进入全部三级分类
+        text = fix_adjacent_typos(text)
         # Fast Path: 优先小 BERT, 否则规则; BERT 异常时回退规则 (打不挂线上)
         fast_source = "rule"
         if self._bert is not None:
