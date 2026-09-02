@@ -70,8 +70,10 @@
 // ── 抽屉/弹层可读性修复: 遮罩压暗过重 + 阴影层层叠加, 暗色主题下文字不可读 ──
 // 遮罩降为轻灰 (不再黑罩压暗色页面), 抽屉阴影减到单层轻投影
 .el-overlay {
-  background: rgba(15, 22, 36, 0.32);
-  backdrop-filter: none;
+  // 极轻遮罩 + 背景模糊: 暗色主题上任何暗色遮罩都会压暗背景文字 (用户实测圈出
+  // 统计卡不可读) — 干扰感由 blur 承担, 不靠压暗; 背景文字保持可辨认
+  background: rgba(15, 22, 36, 0.16);
+  backdrop-filter: blur(3px);
 }
 .el-drawer {
   box-shadow: -2px 0 12px rgba(0, 0, 0, 0.18);
