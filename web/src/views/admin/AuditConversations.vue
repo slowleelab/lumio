@@ -136,16 +136,30 @@
                   v-for="d in replay.decisions"
                   :key="d.decision_id"
                   :timestamp="formatTime(d.created_at)"
+                  :type="decisionMeta(d.action).dot"
+                  :color="decisionMeta(d.action).color"
                   placement="top"
                 >
                   <div class="decision-card">
                     <div class="decision-head">
-                      <el-tag size="small">{{ d.agent_name }}</el-tag>
-                      <el-tag size="small" type="warning">{{ d.action }}</el-tag>
-                      <span v-if="d.latency_ms != null" class="meta-num">{{ d.latency_ms }}ms</span>
+                      <el-tag size="small" :type="decisionMeta(d.action).tag" effect="light">
+                        {{ decisionMeta(d.action).label }}
+                      </el-tag>
+                      <span v-if="d.latency_ms != null" class="meta-num">{{ Math.round(d.latency_ms) }}ms</span>
+                      <span class="decision-agent">{{ agentLabel(d.agent_name) }}</span>
                     </div>
                     <div class="decision-reason">{{ d.reasoning }}</div>
-                    <pre v-if="d.evidence" class="decision-evidence">{{ JSON.stringify(d.evidence, null, 2) }}</pre>
+                    <div v-if="evidenceSummary(d.evidence).length" class="decision-kv">
+                      <span v-for="kv in evidenceSummary(d.evidence)" :key="kv.k" class="kv-item">
+                        <span class="kv-k">{{ kv.k }}</span>
+                        <span class="kv-v" :class="{ 'kv-bad': kv.bad }">{{ kv.v }}</span>
+                      </span>
+                    </div>
+                    <el-collapse v-if="d.evidence && Object.keys(d.evidence).length" class="decision-raw">
+                      <el-collapse-item :title="`原始数据 (${Object.keys(d.evidence).length} 字段)`">
+                        <pre class="decision-evidence">{{ JSON.stringify(d.evidence, null, 2) }}</pre>
+                      </el-collapse-item>
+                    </el-collapse>
                   </div>
                 </el-timeline-item>
               </el-timeline>
@@ -300,6 +314,81 @@ function confClass(v: number | null) {
   return "conf-high"
 }
 
+// ── 决策链可读化: action 中文化+语义配色 / evidence 关键字段摘要 ──
+const ACTION_META: Record<string, { label: string; tag: string; dot: string; color?: string }> = {
+  intent_classify: { label: "意图分类", tag: "primary", dot: "primary" },
+  tool_call: { label: "工具执行", tag: "success", dot: "success" },
+  rag_retrieve: { label: "知识检索", tag: "primary", dot: "primary" },
+  llm_generate: { label: "回复生成", tag: "warning", dot: "warning" },
+  chain_complete: { label: "链路完成", tag: "info", dot: "" },
+  faq_direct: { label: "FAQ 直出", tag: "success", dot: "success" },
+  noise_blocked: { label: "噪声拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
+  transfer_agent: { label: "转人工", tag: "warning", dot: "warning" },
+  user_confirm: { label: "客户确认", tag: "info", dot: "" },
+  injection_blocked: { label: "注入拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
+  guard_denied: { label: "护栏拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
+  cache_hit: { label: "缓存命中", tag: "success", dot: "success" },
+}
+const AGENT_LABELS: Record<string, string> = {
+  bot_agent: "编排大脑",
+  query_chain: "查询链路",
+  tool_executor: "工具执行器",
+}
+function decisionMeta(action: string) {
+  return ACTION_META[action] ?? { label: action, tag: "info", dot: "" }
+}
+function agentLabel(name: string) {
+  return AGENT_LABELS[name] ?? name
+}
+// evidence 关键字段 → 人话摘要 (只挑审阅者关心的; 原始 JSON 仍可展开)
+const EV_KEYS: Record<string, string> = {
+  intent: "意图",
+  confidence: "置信度",
+  tool: "工具",
+  arguments: "参数",
+  cache_hit: "缓存",
+  is_error: "失败",
+  result_preview: "结果",
+  hit: "命中",
+  query: "查询",
+  citations: "引用",
+  traffic_class: "链路",
+  domain: "域",
+  composite: "复合意图",
+  direct: "直连",
+  chitchat_redirect: "闲聊引导",
+  fast_conf: "快路径置信",
+  fast_intent: "快路径意图",
+  missing_params: "缺参",
+  chain: "链",
+  reason: "原因",
+}
+function fmtVal(k: string, v: unknown): string {
+  if (typeof v === "number") return k === "confidence" || k === "fast_conf" ? `${Math.round(v * 100)}%` : String(Math.round(v * 100) / 100)
+  if (typeof v === "boolean") return v ? "是" : "否"
+  if (Array.isArray(v)) return v.slice(0, 3).join("、") + (v.length > 3 ? ` 等${v.length}项` : "")
+  if (v == null) return "-"
+  return String(v).slice(0, 40)
+}
+function evidenceSummary(ev: Record<string, unknown> | null): Array<{ k: string; v: string; bad?: boolean }> {
+  if (!ev) return []
+  const priority = ["intent", "confidence", "tool", "arguments", "cache_hit", "hit", "traffic_class", "is_error", "result_preview", "missing_params", "citations", "query", "direct"]
+  const out: Array<{ k: string; v: string; bad?: boolean }> = []
+  const seen = new Set<string>()
+  for (const k of priority) {
+    if (k in ev && ev[k] != null) {
+      out.push({ k: EV_KEYS[k] ?? k, v: fmtVal(k, ev[k]), bad: k === "is_error" && ev[k] === true })
+      seen.add(k)
+    }
+  }
+  for (const [k, v] of Object.entries(ev)) {
+    if (!seen.has(k) && out.length < 8 && k !== "alternatives" && v != null) {
+      out.push({ k: EV_KEYS[k] ?? k, v: fmtVal(k, v) })
+    }
+  }
+  return out
+}
+
 function formatTime(s: string | null) {
   return s?.slice(0, 19).replace("T", " ") || "-"
 }
@@ -386,6 +475,44 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+}
+.decision-kv {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 6px;
+}
+.kv-item {
+  font-size: 12px;
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.kv-k {
+  color: var(--el-text-color-secondary);
+}
+.kv-v {
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+.kv-bad {
+  color: var(--el-color-danger);
+}
+.decision-agent {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-left: auto;
+}
+.decision-raw :deep(.el-collapse-item__header) {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  height: 28px;
+  line-height: 28px;
+  background: transparent;
+  border: none;
+}
+.decision-raw :deep(.el-collapse-item__wrap) {
+  background: transparent;
 }
 .decision-reason {
   margin-top: var(--space-1);
