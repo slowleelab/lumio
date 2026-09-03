@@ -331,8 +331,11 @@ class ToolCallingExecutor:
                             transfer_reason=f"tool_guard_refused: {tool_call.name} ({guard_decision.reason})",
                         )
 
-                    # 敏感工具 → 短路，先发身份核验信号，不执行
-                    if self._mcp.is_sensitive(tool_call.name):
+                    # 敏感工具 → 短路，先发身份核验信号，不执行。
+                    # 产品决策 (2026-09-03): 默认审核核实视为已通过 — 开关关闭时
+                    # 敏感写工具跳过核验弹框/文本确认直接执行 (审计照常); 合规
+                    # 环境置 true 恢复两段式。
+                    if self._settings.sensitive_confirm_enabled and self._mcp.is_sensitive(tool_call.name):
                         pending, verification = self._build_pending_action(tool_call, trace_id=trace_id)
                         TOOL_CONFIRMATIONS.labels(decision="pending").inc()
                         return ToolExecutionResult(

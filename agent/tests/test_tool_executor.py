@@ -38,7 +38,9 @@ def _make_executor(mcp=None, llm=None, settings=None, audit_factory=None):
     mcp = mcp or MagicMock()
     mcp.to_openai_tools.return_value = [{"type": "function", "function": {"name": "query_balance"}}]
     llm = llm or MagicMock()
-    settings = settings or MCPSettings(enabled=True, max_tool_iterations=5, confirmation_ttl_seconds=300)
+    # sensitive_confirm_enabled=True: 既有用例测的是两段式确认逻辑本身;
+    # 默认放行行为见 TestSensitiveAutoPassed
+    settings = settings or MCPSettings(enabled=True, max_tool_iterations=5, confirmation_ttl_seconds=300, sensitive_confirm_enabled=True)
     return ToolCallingExecutor(mcp_client=mcp, llm_client=llm, audit_session_factory=audit_factory, settings=settings)
 
 
@@ -296,3 +298,32 @@ async def test_execute_keeps_full_card_no() -> None:
 
     args = mcp.call_tool.await_args.args[1]
     assert args["card_no"] == "6222021234567890"  # 完整卡号保留原值
+
+
+class TestSensitiveAutoPassed:
+    """产品决策 (2026-09-03): 默认审核核实视为已通过 — 敏感工具直接执行"""
+
+    async def test_sensitive_tool_executes_directly_by_default(self):
+        """开关默认关: 敏感工具不走核验弹框/确认, 直接执行 + 审计照常"""
+        mcp = MagicMock()
+        mcp.to_openai_tools.return_value = [{"type": "function", "function": {"name": "card_loss"}}]
+        mcp.is_sensitive.return_value = True
+        mcp.get_tool.return_value = MagicMock(description="银行卡挂失")
+        mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "已为您办理挂失"})
+
+        llm = MagicMock()
+        first = ToolCallResult(
+            tool_calls=[ToolCall(id="t1", name="card_loss", arguments={"card": "1234"})],
+            raw_message={"role": "assistant", "content": "", "tool_calls": []},
+        )
+        llm.chat_with_tools = AsyncMock(side_effect=[first, ToolCallResult(content="已为您办理挂失, 请问还有其他需要吗?")])
+        settings = MCPSettings(enabled=True, max_tool_iterations=5, sensitive_confirm_enabled=False)
+        ex = ToolCallingExecutor(mcp_client=mcp, llm_client=llm, audit_session_factory=None, settings=settings)
+
+        result = await ex.run_conversation(
+            system_prompt="sys", user_input="挂失", history=[], session_id="s1", actor_id="c1"
+        )
+        assert result.pending_action is None  # 不产生确认态
+        assert result.verification is None  # 不发核验弹框
+        mcp.call_tool.assert_awaited_once()  # 直接执行了
+        assert result.executed_tools == ["card_loss"]

@@ -696,6 +696,11 @@ class MCPSettings(BaseSettings):
     默认 ``enabled=False``：编排大脑行为与现状完全一致（零回归）。
     """
 
+    # 敏感工具"核验+确认"两段式总开关 (2026-09-03 产品决策: 默认审核核实视为
+    # 已通过 — 关闭时敏感写工具直接执行, 不走核验弹框/文本确认; 生产按合规
+    # 要求置 MCP_SENSITIVE_CONFIRM_ENABLED=true 恢复完整核验链)
+    sensitive_confirm_enabled: bool = False
+
     model_config = SettingsConfigDict(env_prefix="MCP_")
 
     # 总开关：关闭时不加载任何工具，bot 走原有 RAG/LLM 生成路径
