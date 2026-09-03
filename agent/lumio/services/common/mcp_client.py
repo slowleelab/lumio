@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -124,6 +125,10 @@ class MCPToolClient:
         # server 逻辑名 → 会话
         self._session_by_server: dict[str, ClientSession] = {}
         self._connected = False
+        # 会话僵死自愈 (2026-09-03: Java Server SSE 长连接 8 天后 stale, 工具调用
+        # 全量 40s 超时需人工重启容器) — 调用失败时重建直连重试一次
+        self._reconnect_lock = asyncio.Lock()
+        self._generation = 0
 
     @property
     def connected(self) -> bool:
@@ -190,6 +195,7 @@ class MCPToolClient:
         if len(bound) == 1:
             self._session = bound[0].session
         self._connected = True
+        self._generation += 1
         await self._refresh_tools()
         logger.info("MCP 已连接: backends=%d, tools=%d", len(bound), len(self._tools_cache))
 
@@ -343,19 +349,53 @@ class MCPToolClient:
                 return spec
         return None
 
+    async def _reconnect(self, stale_generation: int) -> bool:
+        """僵死会话自愈: 关闭旧连接重建直连。
+
+        SSE 长连接无心跳保活时会在服务端资源回收后 stale — 首次调用抛超时, 但
+        客户端仍持有死会话, 后续每次调用都打满超时 (2026-09-03 实测 8 天后全量
+        40s 超时, 只能人工重启容器)。调用失败即重建, 恢复无需人工介入。
+        代际双检: 等锁期间别的协程已重建成功则不重复连接。
+        """
+        async with self._reconnect_lock:
+            if self._generation != stale_generation:
+                return self._connected
+            logger.warning("MCP 会话疑似僵死, 重建直连: endpoint=%s", self._settings.endpoint)
+            await self.close()
+            try:
+                await self.connect()
+            except Exception as exc:  # connect 自身吞异常, 此处防御性兜底
+                logger.warning("MCP 重连失败, 保持无工具模式: %s", exc)
+                return False
+            return self._connected
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """执行工具调用（路由模式下按分发索引派发到对应后端）
+        """执行工具调用（路由模式下按分发索引派发到对应后端）— 失败自愈重试一次
 
         Args:
             name: host-facing 工具名（多后端时含域前缀）。
 
         Returns:
             {"is_error": bool, "content": str, "structured": dict | None}
-            内容已由 Higress 侧治理（脱敏/鉴权），Python 侧仍会在编排层二次脱敏。
 
         Raises:
             RuntimeError: 未连接时调用
         """
+        try:
+            return await self._call_tool_once(name, arguments)
+        except Exception as first_err:
+            # 外部绑定会话 (use_session/测试) 无直连可重建, 原样抛出
+            if self._exit_stack is None:
+                raise
+            logger.warning(
+                "MCP 工具调用失败, 尝试重建直连后重试: tool=%s err=%s", name, first_err
+            )
+            if not await self._reconnect(self._generation):
+                raise
+            return await self._call_tool_once(name, arguments)
+
+    async def _call_tool_once(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """单次工具调用 (call_tool 的实现体, 自愈重试在包装层)"""
         if not self._connected:
             raise RuntimeError("MCP 未连接，无法调用工具")
 

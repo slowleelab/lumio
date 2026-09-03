@@ -700,11 +700,13 @@ class MCPSettings(BaseSettings):
 
     # 总开关：关闭时不加载任何工具，bot 走原有 RAG/LLM 生成路径
     enabled: bool = False
-    # 单后端传输协议: streamable-http(默认, 经 Higress) | sse(直连 Java MCP Server :8090)
-    transport: str = "streamable-http"
-    # Higress MCP 入口 URL（经 Nacos MCP Registry 发现的工具经此暴露）。
-    # 默认指向 Higress AI 网关统一 MCP 入口（streamable-http）；本地联调可改指参考 Server（:8080/mcp）。
-    endpoint: str = "http://localhost:10000/mcp/credit-card"
+    # 单后端传输协议: sse(默认, 直连 Java MCP Server :8090) | streamable-http(经 Higress)
+    # 2026-09-03 定向: MCP 不过网关, 默认直连 —— Higress 链路多一跳且非必需,
+    # 网关仅在生产需要统一治理 (鉴权/限流/脱敏) 时按 gateway profile 选配启用。
+    transport: str = "sse"
+    # Java MCP Server SSE 端点 (22 个信用卡工具, mock 数据)。生产接真实核心系统时
+    # 换端点即可; 若需经 Higress 治理, transport 改 streamable-http 并指向网关入口。
+    endpoint: str = "http://127.0.0.1:8090/sse"
     # 工具调用超时（秒）
     timeout_seconds: float = 10.0
     # ── 路由模式：多 MCP 后端（host 侧合并 + 分发）──

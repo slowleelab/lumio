@@ -196,3 +196,68 @@ class TestSseTransport:
             await client.connect()  # 连接异常被吞 → 降级无工具, 不抛到上层
         assert client.connected is False
         assert await client.list_tools() == []
+
+
+class TestSelfHealingReconnect:
+    """会话僵死自愈 (2026-09-03: SSE 长连接 stale 后全量超时, 人工重启才能恢复)"""
+
+    async def test_failure_triggers_reconnect_and_retry(self):
+        """真实直连 (有 exit_stack) 失败 → 重建连接 → 重试成功"""
+        client = MCPToolClient(settings=MCPSettings(enabled=False))
+        # enabled=False 使 connect() 直接返回 — 重连后 connected=False → 抛原异常?
+        # 此处验证路径: 失败后确实尝试了重连 (close 被调, 连接被重建)
+        client._connected = True
+        client._exit_stack = object()  # 模拟真实直连路径 (非外部绑定)
+        mock_session = MagicMock()
+        calls = {"n": 0}
+
+        async def flaky(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("stale sse session")
+            return SimpleNamespace(content=[SimpleNamespace(text="ok")], structuredContent=None, isError=False)
+
+        mock_session.call_tool = flaky
+        client._session = mock_session
+        reconnects = []
+
+        async def fake_reconnect(_self, gen):  # 类属性补丁需接收 self
+            reconnects.append(gen)
+            # 模拟重连成功换新会话
+            client._generation += 1
+            client._session = mock_session
+            return True
+
+        import lumio.services.common.mcp_client as m
+
+        orig = m.MCPToolClient._reconnect
+        m.MCPToolClient._reconnect = fake_reconnect
+        try:
+            result = await client.call_tool("query_balance", {})
+        finally:
+            m.MCPToolClient._reconnect = orig
+        assert result["content"] == "ok"
+        assert len(reconnects) == 1
+
+    async def test_external_session_no_reconnect(self):
+        """外部绑定会话 (use_session/测试, 无 exit_stack) 失败原样抛出, 不重连"""
+        client = MCPToolClient(settings=MCPSettings(enabled=True))
+        client._connected = True
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=TimeoutError("stale"))
+        client._session = mock_session
+        with pytest.raises(TimeoutError):
+            await client.call_tool("query_balance", {})
+        mock_session.call_tool.assert_awaited_once()  # 无重试
+
+    async def test_reconnect_failure_reraises_original(self):
+        """重连失败时抛原始异常 (而非重连内部错误)"""
+        client = MCPToolClient(settings=MCPSettings(enabled=False))
+        client._connected = True
+        client._exit_stack = object()
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=TimeoutError("stale"))
+        client._session = mock_session
+        # enabled=False → connect() 直接返回, connected=False → _reconnect 返回 False
+        with pytest.raises(TimeoutError):
+            await client.call_tool("query_balance", {})
