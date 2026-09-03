@@ -580,13 +580,17 @@ async def test_semantic_match_blocked_for_personal_query() -> None:
             return [1.0, 0.0]
 
     class _Hit:
-        def __init__(self, score: float) -> None:
+        def __init__(self, score: float, question: str) -> None:
             self.score = score
-            self.entity = {"chunk_id": "f1#0", "content": "分期占用额度吗", "category": "分期", "card_type": "", "keywords": []}
+            self.entity = {"chunk_id": "f1#0", "content": question, "category": "分期", "card_type": "", "keywords": []}
 
     class _Coll:
+        def __init__(self, q: str) -> None:
+            self._q = q
+
         def search(self, **kw):
-            return [[_Hit(0.91), _Hit(0.80)]]  # 双门槛全过
+            # content 即语义命中的 question (词面支撑校验读 question 字段)
+            return [[_Hit(0.91, self._q), _Hit(0.80, self._q)]]  # 双门槛全过
 
     class _Redis:
         async def get(self, _k):
@@ -595,8 +599,22 @@ async def test_semantic_match_blocked_for_personal_query() -> None:
         async def setex(self, *a):
             return None
 
-    res = await fs.search_faq("我的额度是什么", _Redis(), _Emb(), _Coll())
-    assert res["match_type"] == "miss"  # 防截胡放行
+    res = await fs.search_faq("我的额度是什么", _Redis(), _Emb(), _Coll("分期占用额度吗"))
+    assert res["match_type"] == "miss"  # 防截胡放行 (有词面支撑"额度", 但含个人诉求)
 
-    res2 = await fs.search_faq("积分怎么兑换步骤", _Redis(), _Emb(), _Coll())
-    assert res2["match_type"] == "semantic"  # 无个人诉求词不受影响
+    res2 = await fs.search_faq("积分怎么兑换步骤", _Redis(), _Emb(), _Coll("积分兑换步骤详解"))
+    assert res2["match_type"] == "semantic"  # 有支撑且无个人诉求 → 命中
+
+
+def test_shares_informative_gram() -> None:
+    """语义命中词面支撑校验 (mxbai 分数漂移 0.85→0.92 的嵌入噪声防线)"""
+    from lumio.services.common.faq_service import _shares_informative_gram
+
+    # 「逾期」不在「丢失怎么办」中 → 无支撑 → 拦
+    assert _shares_informative_gram("信用卡逾期了会有什么影响", "信用卡丢失怎么办？") is False
+    # 「积分」「换话费」共享 → 有支撑 → 放行
+    assert _shares_informative_gram("怎么用积分换话费", "积分如何换话费") is True
+    # 硬钱包共享 → 放行
+    assert _shares_informative_gram("硬钱包如何充值", "数字人民币硬钱包怎么充值") is True
+    # 无可判词块 (纯停用词) → 不拦
+    assert _shares_informative_gram("信用卡", "信用卡丢失怎么办？") is True

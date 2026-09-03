@@ -206,6 +206,8 @@ async def test_chat_timeout_retry_success() -> None:
 
     with patch.object(client, "_client") as mock_openai:
         mock_openai.chat.completions.create = AsyncMock(side_effect=[APITimeoutError("slow"), good_resp])
+        # 传输自愈会把 _client 重建为新实例 — 注入同款 mock, 重试仍走 fake
+        client._new_client = lambda: mock_openai  # type: ignore[method-assign]
         result = await client.chat([{"role": "user", "content": "hi"}])
         assert result == "ok"
 
@@ -386,3 +388,62 @@ async def test_record_usage_no_usage() -> None:
     client = LLMClient(settings=settings)
     resp = MagicMock(usage=None)
     client._record_usage("m", resp, method="chat")  # 不抛异常即可
+
+
+class TestTransportSelfHealing:
+    """传输层自愈 (2026-09-03 环境发现: Ollama 重启后连接池僵死需重启进程)"""
+
+    @pytest.mark.asyncio
+    async def test_timeout_triggers_client_rebuild_and_retry(self):
+        """首次调用超时 → 重建 client → 重试成功 (后端重启场景免人工干预)"""
+        from types import SimpleNamespace
+
+        import openai
+
+        from lumio.services.common.llm import LLMClient
+        from lumio.shared.config import LLMSettings
+
+        client = LLMClient(LLMSettings(base_url="http://127.0.0.1:1", api_key="x", timeout_seconds=1))
+        calls = {"n": 0}
+
+        class _FakeCompletions:
+            async def create(self, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise openai.APITimeoutError(request=None)  # type: ignore[arg-type]
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                    usage=None,
+                )
+
+        class _FakeAsyncOpenAI:
+            chat = SimpleNamespace(completions=_FakeCompletions())
+
+            async def aclose(self):
+                pass
+
+        fake = _FakeAsyncOpenAI()
+        client._client = fake
+        client._new_client = lambda: fake  # type: ignore[method-assign]  # 自愈重建注入同一 fake
+        out = await client.chat([{"role": "user", "content": "hi"}])
+        assert out == "ok"
+        assert calls["n"] == 2  # 失败一次 + 自愈后重试一次
+
+    @pytest.mark.asyncio
+    async def test_heal_client_generation_guard(self):
+        """代际双检: 等锁期间已重建则不重复动作"""
+        from lumio.services.common.llm import LLMClient
+        from lumio.shared.config import LLMSettings
+
+        client = LLMClient(LLMSettings(base_url="http://127.0.0.1:1", api_key="x"))
+        closed: list[int] = []
+        first = client._client
+        first.aclose = lambda: None  # type: ignore[method-assign]
+
+        async def fake_aclose():
+            closed.append(1)
+
+        first.aclose = fake_aclose  # type: ignore[method-assign]
+        client._client_generation += 1  # 模拟另一协程已重建
+        await client._heal_client(0)
+        assert closed == [] and client._client is first

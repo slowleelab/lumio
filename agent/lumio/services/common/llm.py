@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -20,9 +21,11 @@ from openai import AsyncOpenAI
 
 # P1-3: openai.APITimeoutError 不继承内置 TimeoutError, 统一引用避免死分支
 try:
+    from openai import APIConnectionError as _APIConnectionError
     from openai import APITimeoutError as _APITimeoutError
 except ImportError:  # 旧版 SDK
     _APITimeoutError = TimeoutError  # type: ignore[misc]
+    _APIConnectionError = ConnectionError  # type: ignore[misc]
 
 from lumio.shared.config import LLMSettings, get_settings
 from lumio.shared.exceptions import LLMInferenceError, LLMTimeoutError
@@ -113,11 +116,31 @@ class LLMClient:
     ) -> None:
         self._settings = settings or get_settings().llm
         self._breaker = breaker or LLMCircuitBreaker()
-        self._client = AsyncOpenAI(
+        self._client = self._new_client()
+        # 传输层自愈 (2026-09-03 环境发现: Ollama 重启后 SDK 内 httpx 连接池持有
+        # 死连接复用 + 熔断器开路, bot 全链 60s 超时需重启进程 — 与 MCP SSE 僵死
+        # 同型): 传输级失败时重建 client (新连接池), 代际双检防并发重建风暴
+        self._rebuild_lock = asyncio.Lock()
+        self._client_generation = 0
+
+    def _new_client(self) -> AsyncOpenAI:
+        return AsyncOpenAI(
             base_url=self._settings.base_url,
             api_key=self._settings.api_key,
             timeout=self._settings.timeout_seconds,
         )
+
+    async def _heal_client(self, stale_generation: int) -> None:
+        """传输层自愈: 关闭僵死 client 重建 (后端重启场景免人工干预)"""
+        async with self._rebuild_lock:
+            if self._client_generation != stale_generation:
+                return  # 等锁期间别的协程已重建
+            logger.warning("LLM client 传输层自愈: 重建连接池 (后端可能重启过)")
+            old = self._client
+            self._client = self._new_client()
+            self._client_generation += 1
+            with contextlib.suppress(Exception):
+                await old.aclose()
 
     @property
     def breaker(self) -> LLMCircuitBreaker:
@@ -201,6 +224,13 @@ class LLMClient:
                 # 旧 except TimeoutError 是死分支 (SDK 超时落入泛化 except, 超时统计永远不触发)
                 last_error = exc
                 logger.warning("LLM 调用超时 (attempt %d/%d)", attempt + 1, max_retries)
+                if attempt < max_retries - 1:
+                    await self._heal_client(self._client_generation)
+            except _APIConnectionError as exc:
+                last_error = exc
+                logger.warning("LLM 连接失败 (attempt %d/%d): %s", attempt + 1, max_retries, exc)
+                if attempt < max_retries - 1:
+                    await self._heal_client(self._client_generation)
             except LLMInferenceError:
                 # 业务错误 (如连续空内容) 不重试、不包装, 直接上抛 — 此前落入泛化
                 # except 被包装成 LLMTimeoutError, 与注释意图不符且误导熔断语义
@@ -283,6 +313,13 @@ class LLMClient:
             except (TimeoutError, _APITimeoutError) as exc:
                 last_error = exc
                 logger.warning("LLM tool-calling 超时 (attempt %d/%d)", attempt + 1, max_retries)
+                if attempt < max_retries - 1:
+                    await self._heal_client(self._client_generation)
+            except _APIConnectionError as exc:
+                last_error = exc
+                logger.warning("LLM tool-calling 连接失败 (attempt %d/%d): %s", attempt + 1, max_retries, exc)
+                if attempt < max_retries - 1:
+                    await self._heal_client(self._client_generation)
             except Exception as exc:
                 last_error = exc
                 logger.warning("LLM tool-calling 异常 (attempt %d/%d): %s", attempt + 1, max_retries, exc)

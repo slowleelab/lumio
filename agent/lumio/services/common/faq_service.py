@@ -386,6 +386,25 @@ async def check_faq_duplicate(
 # 答案截胡, 放行走分类→查询链。exact 路不受影响 (精确变体 = 已知问法)。
 _PERSONAL_QUERY_MARKERS = ("我的", "帮我查", "查一下", "查下", "还剩", "余额是", "是多少", "多少钱")
 
+# 通用 bigram: 几乎所有信用卡 query 都共享, 不构成"词面支撑"证据
+_FAQ_GENERIC_GRAMS = frozenset({"信用卡", "信用", "用卡", "的", "怎么", "如何", "什么", "可以", "吗", "怎么办", "一下", "麻烦", "请问"})  # 信用/用卡: "信用卡"的跨词 bigram, 不构成证据
+
+
+def _shares_informative_gram(query: str, question: str) -> bool:
+    """query 与命中 FAQ 问题是否共享至少一个信息性词块
+
+    mxbai 语义分数不稳定 (2026-09-03 实测: 同对"逾期影响 vs 丢失怎么办"昨天
+    miss <0.85 / 今天 0.92, 多次后端重启后漂移) — 语义命中必须有词面支撑:
+    共享任一非通用 CJK 2-gram / ≥2 字符数字词才放行, 否则视为嵌入噪声放行走
+    常规流程。query 无可判词块时不拦 (与 RAG 词法重叠门同约定)。
+    """
+    from lumio.services.common.retrieval import _query_grams
+
+    grams = _query_grams(query) - _FAQ_GENERIC_GRAMS
+    if not grams:
+        return True
+    return any(g in question for g in grams)
+
 
 async def search_faq(
     query: str,
@@ -479,6 +498,14 @@ async def search_faq(
                 if len(faq_results) >= top_k:
                     break
 
+            if faq_results and not _shares_informative_gram(query, str(faq_results[0].get("question") or "")):
+                logger.info(
+                    "FAQ 语义命中无词面支撑, 判嵌入噪声放行: q=%r top=%r score=%.3f",
+                    query[:24],
+                    str(faq_results[0].get("question") or "")[:24],
+                    faq_results[0].get("score", 0.0),
+                )
+                return {"match_type": "miss", "results": []}
             if faq_results and any(m in query for m in _PERSONAL_QUERY_MARKERS):
                 logger.info(
                     "FAQ 语义命中但 query 含个人查询诉求, 防截胡放行: q=%r top=%.3f",
