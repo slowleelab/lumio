@@ -405,7 +405,9 @@ _RULES: list[dict[str, Any]] = [
         # qa_scan 第四轮: "信用卡找不到了"两次被判没理解 — 该词须进 0.96 高置信
         # 规则 (_APPLY_INTENT_RULE_OVERRIDE 要求 ≥0.95 才能覆盖 BERT 误判的 faq@0.7+);
         # pattern 限定带"卡"字, 防"钥匙找不到了"误伤
-        "patterns": [r"钱包被偷", r"钱包被[盗抢]", r"卡片被盗", r"被盗刷", r"卡[不没]找了", r"卡找不到了"],
+        # "被盗"补词 (闭环挂账: "卡好像被盗了"不含"被盗刷/卡片被盗"完整词面, 置信
+        # 不足 0.8 没进直连, LLM 编排 18.6s 回落); "被盗"二字在客服语料足够特异
+        "patterns": [r"钱包被偷", r"钱包被[盗抢]", r"卡片被盗", r"被盗刷", r"被盗", r"卡[不没]找了", r"卡找不到了"],
         "keywords": ["钱包被偷", "钱包被盗", "被盗刷", "卡找不到了"],
         "confidence": 0.96,
     },
@@ -986,11 +988,19 @@ class IntentClassifier:
         # 规则层高置信 (≥0.95) 命中办理词时以规则意图覆盖快路径; 仅覆盖这两个意图,
         # 其余分类零回归。BERT 关闭时 rule==rule 为空操作。
         rule_fast = self._rule.classify(text)
-        if (
-            fast_result.primary_intent != rule_fast.primary_intent
-            and rule_fast.primary_intent in _APPLY_INTENT_RULE_OVERRIDE
+        # 同意图置信提升 (闭环挂账: "卡好像被盗了" BERT 判 card_loss@0.5x、规则
+        # 判 0.96 — 意图相同不触发旧覆盖条件, 低置信落 LLM 慢路径 0.76 错过
+        # 直连阈值): 敏感意图规则高置信而快路径置信不足时, 用规则置信 —
+        # 挂失是保护性操作, 规则词面 ("被盗/挂失/找不到了") 足够特异。
+        _rule_override = (
+            rule_fast.primary_intent in _APPLY_INTENT_RULE_OVERRIDE
             and rule_fast.primary_confidence >= _APPLY_OVERRIDE_CONF
-        ):
+            and (
+                fast_result.primary_intent != rule_fast.primary_intent
+                or fast_result.primary_confidence < 0.8
+            )
+        )
+        if _rule_override:
             logger.info(
                 "办理词规则覆盖快路径: %s@%.2f -> %s@%.2f (text=%r)",
                 fast_result.primary_intent.value,
