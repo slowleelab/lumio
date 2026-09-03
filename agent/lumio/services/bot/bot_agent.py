@@ -879,6 +879,18 @@ class LumioAgent:
                 )
             return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
         if traffic == TrafficClass.READ_ONLY_QUERY:
+            # 定义句式 (概念咨询) 直送知识链 (qa_scan 第五轮: "什么是临时额度"被
+            # 链 B 直查答成"您当前没有临时额度" — 客户问概念, 机器人答账户状态)。
+            # domain_of_with_text 的定义句式强制咨询域只作用于 L2 向量判定块,
+            # v2 分派走 domain_of 无文本修正 — 此处补齐; "我的额度是什么"类
+            # 含个人数据诉求词的由 is_definition_query 自身排除, 仍走查询。
+            from lumio.shared.intent_taxonomy import is_definition_query
+
+            if is_definition_query(user_input):
+                logger.info("定义句式直送知识链 (链B前置拦截): input=%r", user_input[:24])
+                return await self._handle_knowledge(
+                    session_id, user_input, intent_result, history, entities, sentiment
+                )
             # 复合意图 (查询 + 解释/FAQ 诉求) 优先走链 C: 纯定义类问题会被
             # 查询链路的缺参反问卡死 (会话 2b3b2613 实测: "信用额度是什么"三连问
             # 卡号, 用户永远出不去)。链 C 缺参/无工具时自然回落知识路径。

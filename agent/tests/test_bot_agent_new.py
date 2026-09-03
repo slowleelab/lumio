@@ -2256,3 +2256,59 @@ class TestIntentRetrievalAugmentation:
         # 意图不在表内 (faq 咨询) 不加词
         await agent._retrieve("信用卡是什么", intent=IntentLabel.FAQ, confidence=0.9)
         assert captured["query"] == "信用卡是什么"
+
+
+class TestDispatchV2DefinitionGuard:
+    """定义句式直送知识链 (qa_scan 第五轮: "什么是临时额度"被链 B 答成账户状态)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_definition_query_bypasses_query_chain(self) -> None:
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock(return_value={"response": "概念解释", "response_source": "knowledge"})
+        agent._handle_query_chain = AsyncMock(return_value={"response": "账户查询", "response_source": "tool"})
+        result = await agent._dispatch_v2(
+            "s1",
+            "什么是临时额度",
+            IntentResult(primary_intent=IntentLabel.LIMIT_QUERY, primary_confidence=0.9),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "query",
+            "c1",
+        )
+        agent._handle_knowledge.assert_awaited_once()
+        agent._handle_query_chain.assert_not_called()
+        assert result["response_source"] == "knowledge"
+
+    @pytest.mark.asyncio
+    async def test_personal_data_query_still_uses_query_chain(self) -> None:
+        """含个人数据诉求词的真查询 ("我的额度是什么") 不受定义句式拦截"""
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock()
+        # 无 tool_executor 时链 B 跳过、落 _handle_tool 兜底 (查询语义出口)
+        agent._handle_tool = AsyncMock(return_value={"response": "额度 5 万", "response_source": "tool"})
+        result = await agent._dispatch_v2(
+            "s1",
+            "我的额度是什么",
+            IntentResult(primary_intent=IntentLabel.LIMIT_QUERY, primary_confidence=0.9),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "query",
+            "c1",
+        )
+        agent._handle_tool.assert_awaited_once()
+        agent._handle_knowledge.assert_not_called()
+        assert result["response_source"] == "tool"

@@ -567,3 +567,36 @@ class TestFaqCrud:
 
         with pytest.raises(LumioError):
             await transition_faq_approval(sf, "id-1", "PUBLISHED", actor_id="admin", actor_role="admin")
+
+
+@pytest.mark.asyncio
+async def test_semantic_match_blocked_for_personal_query() -> None:
+    """个人查询诉求防截胡 (qa_scan 第五轮: "我的额度是什么"被"分期占用额度吗"截胡)"""
+
+    from lumio.services.common import faq_service as fs
+
+    class _Emb:
+        async def embed_query(self, text: str) -> list[float]:
+            return [1.0, 0.0]
+
+    class _Hit:
+        def __init__(self, score: float) -> None:
+            self.score = score
+            self.entity = {"chunk_id": "f1#0", "content": "分期占用额度吗", "category": "分期", "card_type": "", "keywords": []}
+
+    class _Coll:
+        def search(self, **kw):
+            return [[_Hit(0.91), _Hit(0.80)]]  # 双门槛全过
+
+    class _Redis:
+        async def get(self, _k):
+            return None
+
+        async def setex(self, *a):
+            return None
+
+    res = await fs.search_faq("我的额度是什么", _Redis(), _Emb(), _Coll())
+    assert res["match_type"] == "miss"  # 防截胡放行
+
+    res2 = await fs.search_faq("积分怎么兑换步骤", _Redis(), _Emb(), _Coll())
+    assert res2["match_type"] == "semantic"  # 无个人诉求词不受影响

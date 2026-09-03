@@ -178,6 +178,21 @@ async def update_faq_endpoint(faq_id: str, body: FaqUpdateRequest, request: Requ
     )
     if not updated:
         raise LumioError(code=2001, message=f"FAQ 不存在: {faq_id}")
+
+    # 索引联动 (2026-09-03 闭环踩坑): update 只写 PG 不刷索引/缓存, 检索侧
+    # 看不到新变体, 须手动 reindex-all 才生效 —— 已发布 FAQ 更新后自动重建
+    # 语义向量 (带旧文本清理) + 预热 exact 缓存; 失败不阻断保存, 可手动补偿。
+    faq = await _load_faq_orm(session_factory, faq_id)
+    if faq is not None and faq.approval_status == "PUBLISHED":
+        embedding_breaker = getattr(request.app.state, "embedding_breaker", None)
+        embedding_provider = embedding_breaker.provider if embedding_breaker and embedding_breaker.is_available else None
+        milvus_collection = getattr(request.app.state, "milvus_collection", None)
+        try:
+            redis_client = getattr(request.app.state, "redis_client", None)
+            await _index_faq_to_search(faq, redis_client, embedding_provider, milvus_collection)
+            await _warm_exact_match_cache(faq, redis_client)
+        except Exception as exc:
+            logger.warning("FAQ 更新后索引刷新失败 (可 reindex-all 补偿): faq=%s err=%s", faq_id, exc)
     return {"status": "ok"}
 
 

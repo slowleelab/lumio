@@ -380,6 +380,13 @@ async def check_faq_duplicate(
 # ── 检索 ──
 
 
+# 个人查询诉求标记 (qa_scan 第五轮: "我的额度是什么"被"分期占用额度吗?"语义截胡 —
+# mxbai 对共享话题词的短句区分度不足, "额度"二字让两个不同意图的问句余弦>0.85)。
+# 语义命中是"猜测" (exact 是查表): 带个人数据诉求的 query 永远不该被概念型 FAQ
+# 答案截胡, 放行走分类→查询链。exact 路不受影响 (精确变体 = 已知问法)。
+_PERSONAL_QUERY_MARKERS = ("我的", "帮我查", "查一下", "查下", "还剩", "余额是", "是多少", "多少钱")
+
+
 async def search_faq(
     query: str,
     redis_client: aioredis.Redis | None,
@@ -472,6 +479,13 @@ async def search_faq(
                 if len(faq_results) >= top_k:
                     break
 
+            if faq_results and any(m in query for m in _PERSONAL_QUERY_MARKERS):
+                logger.info(
+                    "FAQ 语义命中但 query 含个人查询诉求, 防截胡放行: q=%r top=%.3f",
+                    query[:24],
+                    faq_results[0].get("score", 0.0),
+                )
+                return {"match_type": "miss", "results": []}
             if faq_results:
                 # chunk_id 可能带变体序号后缀 (faqid#0), 落库前剥离取真实 FAQ UUID
                 faq_uuid = faq_results[0]["faq_id"].split("#", 1)[0]
