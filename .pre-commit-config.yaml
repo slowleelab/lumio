@@ -29,3 +29,13 @@ repos:
           - fastapi>=0.115
           - sqlalchemy>=2.0
           - redis>=5.0
+
+# 闭环 v2 防线④: 金标回归集 — 改词表/阈值/路由必须过历史修复用例
+- repo: local
+  hooks:
+    - id: golden-regression
+      name: golden regression (历史 badcase 修复用例)
+      entry: bash -c 'cd agent && poetry run pytest tests/test_golden_regression.py -q'
+      language: system
+      pass_filenames: false
+      files: ^(agent/lumio/|agent/data/policy/|agent/data/golden/)

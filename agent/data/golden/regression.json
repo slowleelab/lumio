@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "updated_at": "2026-09-04",
+  "purpose": "金标回归集 (闭环 v2 防线①): 十几轮闭环的每个历史修复 case 永久固化。任何词表/阈值/路由改动跑本集, 破一条即挡 — 终结'修 A 破 B 无人知'的打地鼠模式。断言分层: intent(分类) / route(链路选择) / gate(门判定)。",
+  "cases": [
+    {"id": "qa1-loss-wallet-stolen", "origin": "qa_scan 首轮 FAQ 劫持", "layer": "intent", "input": "钱包被偷了, 卡也在里面", "assert": {"intent": "CARD_LOSS", "min_conf": 0.9, "emergency_faq_exempt": true}},
+    {"id": "qa4-loss-cant-find", "origin": "qa_scan 第四轮 两次没理解", "layer": "intent", "input": "信用卡找不到了, 怎么办呢", "assert": {"intent": "CARD_LOSS", "min_conf": 0.9, "consultative": true}},
+    {"id": "qa8-loss-stolen-boost", "origin": "第八轮 同意图置信提升", "layer": "intent", "input": "卡好像被盗了, 赶紧给我停了", "assert": {"intent": "CARD_LOSS", "min_conf": 0.8}},
+    {"id": "qa9-loss-direct-imperative", "origin": "第九轮 直连边界", "layer": "route", "input": "我的卡丢了, 帮我挂失", "assert": {"intent": "CARD_LOSS", "direct_tool": true}},
+    {"id": "qa9-loss-consultative-bypass", "origin": "第九轮 咨询句式豁免", "layer": "route", "input": "信用卡挂失流程是什么", "assert": {"consultative": true, "direct_tool": false}},
+    {"id": "sess8700-poem-chitchat", "origin": "会话 8700a2ea 闲聊入 RAG", "layer": "gate", "input": "锄禾日当午", "assert": {"chitchat_capped": true, "max_conf": 0.29}},
+    {"id": "sess9ed5-nonsense-query", "origin": "会话 9ed55603 三层击穿", "layer": "gate", "input": "查看开发", "assert": {"retrieval_miss": true}},
+    {"id": "sess9ed5-generic-verb-still-works", "origin": "同上修复的误伤防线", "layer": "gate", "input": "查看账单", "assert": {"retrieval_hit_business": "账单"}},
+    {"id": "qa5-definition-to-knowledge", "origin": "第五轮 定义句式拦截", "layer": "route", "input": "什么是临时额度", "assert": {"definition": true, "knowledge_chain": true}},
+    {"id": "qa5-personal-query-not-hijacked", "origin": "第五轮 防截胡", "layer": "gate", "input": "我的额度是什么", "assert": {"personal_query": true, "faq_semantic_blocked": true}},
+    {"id": "qa5-faq-exact-with-particle", "origin": "第五轮 语气词剥离", "layer": "gate", "input": "积分怎么兑换礼品啊", "assert": {"faq_exact_variant": "积分怎么兑换礼品"}},
+    {"id": "infra-faq-lexical-support", "origin": "环境轮 mxbai 漂移 0.92", "layer": "gate", "input": "信用卡逾期了会有什么影响", "assert": {"faq_semantic_blocked_by": "逾期影响 vs 丢失怎么办 无词面支撑"}},
+    {"id": "qa4-faq-redeem-variants", "origin": "第四轮 变体补强", "layer": "gate", "input": "怎么用积分", "assert": {"faq_exact": true}},
+    {"id": "qa4-faq-hardwallet-variant", "origin": "第四轮 硬钱包变体", "layer": "gate", "input": "硬钱包如何充钱", "assert": {"faq_exact": true}},
+    {"id": "qa1-outbound-solicitation", "origin": "qa_scan 首轮 索敏", "layer": "gate", "input": "请提供您信用卡的后四位以便验证身份。", "assert": {"outbound_blocked": "sensitive_solicitation"}},
+    {"id": "qa1-outbound-strips-keeps-compliant", "origin": "第二轮 剥离策略", "layer": "gate", "input": "请立即拨打客服热线挂失。请告诉我您的卡号后四位。", "assert": {"outbound_stripped": true, "keeps": "客服热线"}},
+    {"id": "qa7-pending-new-topic-release", "origin": "第七轮 确认窗口吞话题", "layer": "gate", "input": "新卡一般多久能寄到", "assert": {"in_confirm_window": "released"}},
+    {"id": "qa7-pending-hesitation-keeps", "origin": "第七轮 短犹豫防误放", "layer": "gate", "input": "嗯", "assert": {"in_confirm_window": "counted"}},
+    {"id": "noise-garbage-clarify", "origin": "噪声门基线", "layer": "gate", "input": "sncjao", "assert": {"low_conf_or_noise": true}},
+    {"id": "bill-query-unchanged", "origin": "链B基线", "layer": "intent", "input": "帮我查一下账单", "assert": {"intent": "BILL_QUERY", "min_conf": 0.8, "query_chain": true}}
+  ]
+}

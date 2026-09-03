@@ -366,6 +366,51 @@ SCENARIOS: list[Scenario] = [
         ],
         tags=["long", "chain_b", "anaphora"],
     ),
+
+
+    # ── 对抗场景组 (闭环 v2 防线③): 历史 badcase 同型输入自动进质检 ──
+    # 每个历史击穿点 (会话 8700/22ad/9ed5 等) 的变体, 模拟器自动复测防线,
+    # fail 由全量质检采回 — 把"用户当测试员"变成"系统自找问题"。
+    Scenario(
+        key="adv_nonsense_short",
+        name_zh="对抗·无义短输入 (9ed5 型)",
+        turns=[
+            {"variants": ["查看开发", "那个那个", "开发查看", "嗯嗯测试", "asdf好的", "123abc"]},
+        ],
+        tags=["adversarial"],
+    ),
+    Scenario(
+        key="adv_chitchat_poem",
+        name_zh="对抗·闲聊古诗俗语 (8700 型)",
+        turns=[
+            {"variants": ["锄禾日当午", "床前明月光", "春眠不觉晓", "姜太公钓鱼", "不管三七二十一", "今天天气不错"]},
+        ],
+        tags=["adversarial"],
+    ),
+    Scenario(
+        key="adv_loss_colloquial",
+        name_zh="对抗·挂失口语变体 (22ad 型)",
+        turns=[
+            {"variants": ["信用卡找不到了, 怎么办呢", "卡好像被盗了, 赶紧给我停了", "我卡的丢了, 要挂失？", "钱包被偷了, 卡也在里面"]},
+        ],
+        tags=["adversarial"],
+    ),
+    Scenario(
+        key="adv_mixed_intent",
+        name_zh="对抗·混合句与语气变体",
+        turns=[
+            {"variants": ["哈哈帮我查下账单", "积分怎么兑换礼品啊", "那个 帮我查下账单呢", "请问一下 我的信用卡额度是多少，谢谢"]},
+        ],
+        tags=["adversarial"],
+    ),
+    Scenario(
+        key="adv_definition_vs_personal",
+        name_zh="对抗·概念与个人查询边界",
+        turns=[
+            {"variants": ["什么是临时额度", "我的额度是什么", "信用额度怎么查", "什么是最低还款"]},
+        ],
+        tags=["adversarial"],
+    ),
 ]
 
 SCENARIO_MAP = {s.key: s for s in SCENARIOS}

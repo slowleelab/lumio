@@ -15,6 +15,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from lumio.shared.config import get_settings
+from lumio.shared.lexicon import lexicon_values as _lex
 from lumio.shared.metrics import RAG_CACHE_OPS, RERANK_DEGRADATION, RETRIEVE_DURATION
 from lumio.shared.models import RetrievedChunk, RetrieveRequest, RetrieveResponse
 from lumio.shared.tracing import traced
@@ -183,25 +184,10 @@ def _query_grams(query: str) -> set[str]:
 # 通用动词/疑问/助词类 bigram: 几乎存在于所有银行业务文档 ("查看账单/登录APP/
 # 办理业务"), 命中不构成相关性证据 (会话 9ed55603: 无义输入"查看开发"靠"查看"
 # 一词击穿重叠门, 14.2s 生成了整段账单知识)。与 FAQ 侧 _FAQ_GENERIC_GRAMS 同型。
-_GENERIC_GRAMS = frozenset(
-    {
-        "查看", "登陆", "登录", "办理", "操作", "咨询", "帮忙", "一下", "请问", "麻烦",
-        "告诉", "了解", "相关", "问题", "业务", "银行", "网上", "客服", "怎么", "如何",
-        "什么", "可以", "能为", "需要", "我想", "还是", "没有", "不是",
-    }
-)
+_GENERIC_GRAMS = frozenset(_lex("retrieval_generic_grams"))
 
 # 业务名词词块 (强证据): 银行信用卡域稳定名词, 一个命中即构成相关性证据
-_BUSINESS_NOUN_GRAMS = frozenset(
-    {
-        "账单", "额度", "积分", "挂失", "还款", "分期", "年费", "逾期", "密码", "激活",
-        "销户", "销卡", "发票", "利息", "手续费", "账单日", "还款日", "信用", "授信",
-        "取现", "现金", "透支", "滞纳", "违约", "征信", "卡片", "补卡", "换卡", "盗刷",
-        "钱包", "数币", "人民币", "转账", "消费", "交易", "明细", "流水", "最低还款",
-        "临时额度", "还款额", "免息", "宽限", "积分兑换", "里程", "话费", "权益",
-        "冻结", "解冻", "限额", "申请", "白条",
-    }
-)
+_BUSINESS_NOUN_GRAMS = frozenset(_lex("business_noun_grams"))
 
 
 def query_chunk_overlap_zero(query: str, chunks: list[str]) -> bool:

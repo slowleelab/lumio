@@ -22,6 +22,7 @@ import redis.asyncio as aioredis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from lumio.shared.lexicon import lexicon_values as _lex
 from lumio.shared.orm_models import KbFaq, KbFaqSearchLog
 
 logger = logging.getLogger(__name__)
@@ -384,10 +385,10 @@ async def check_faq_duplicate(
 # mxbai 对共享话题词的短句区分度不足, "额度"二字让两个不同意图的问句余弦>0.85)。
 # 语义命中是"猜测" (exact 是查表): 带个人数据诉求的 query 永远不该被概念型 FAQ
 # 答案截胡, 放行走分类→查询链。exact 路不受影响 (精确变体 = 已知问法)。
-_PERSONAL_QUERY_MARKERS = ("我的", "帮我查", "查一下", "查下", "还剩", "余额是", "是多少", "多少钱")
+_PERSONAL_QUERY_MARKERS = _lex("personal_query_markers")
 
 # 通用 bigram: 几乎所有信用卡 query 都共享, 不构成"词面支撑"证据
-_FAQ_GENERIC_GRAMS = frozenset({"信用卡", "信用", "用卡", "的", "怎么", "如何", "什么", "可以", "吗", "怎么办", "一下", "麻烦", "请问"})  # 信用/用卡: "信用卡"的跨词 bigram, 不构成证据
+_FAQ_GENERIC_GRAMS = frozenset(_lex("faq_generic_grams"))  # 信用/用卡: "信用卡"的跨词 bigram, 不构成证据
 
 
 def _shares_informative_gram(query: str, question: str) -> bool:

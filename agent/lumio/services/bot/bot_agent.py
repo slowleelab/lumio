@@ -44,6 +44,8 @@ from lumio.services.common.decision_log import DecisionAction, log_decision
 from lumio.services.common.degradation import DegradationManager
 from lumio.services.common.transfer import TRANSFER_CONFIDENT_CONF, TransferChecker
 from lumio.shared.config import get_settings
+from lumio.shared.lexicon import lexicon_map as _lex_map
+from lumio.shared.lexicon import lexicon_values as _lex
 from lumio.shared.logger import setup_logger
 from lumio.shared.metrics import TOOL_CONFIRMATIONS
 from lumio.shared.models import (
@@ -879,7 +881,7 @@ class LumioAgent:
             # 咨询句式豁免直连 (第八轮质检挂账: "信用卡找不到了, 怎么办呢"客户在问
             # 流程, 直连把挂失办了 — 体验激进): 问"怎么办/怎么挂失"类走知识链答
             # 流程介绍; 祈使句式 ("帮我挂失/赶紧停了") 保持直连执行。
-            consultative_markers = ("怎么办", "怎么挂失", "如何挂失", "挂失流程", "怎么处理", "如何处理")
+            consultative_markers = _lex("consultative_loss_markers")
             if confidence >= 0.8 and any(m in user_input for m in consultative_markers):
                 logger.info("挂失咨询句式走知识链 (跳过直连): input=%r", user_input[:24])
                 return await self._handle_knowledge(
@@ -3740,20 +3742,15 @@ def _format_tool_result(content: str) -> str:
 # 能力), RRF 无相关性过滤)。高置信交易/风险意图把规范检索词拼进 query, 让 BM25
 # 命中正确的领域文档; 定义/咨询类意图无条目 = 原文检索不变。
 _INTENT_RETRIEVAL_TERMS: dict[IntentLabel, str] = {
-    IntentLabel.CARD_LOSS: "信用卡挂失 挂失流程 补卡",
-    IntentLabel.CARD_LOSS_REPORT: "信用卡挂失 挂失流程 补卡",
-    IntentLabel.LIMIT_QUERY: "信用卡额度 可用额度 额度调整",
-    IntentLabel.BILL_QUERY: "信用卡账单 账单查询 还款日",
-    IntentLabel.ACCOUNT_BILL_QUERY: "信用卡账单 账单查询 还款日",
-    IntentLabel.TRANSACTION_QUERY: "信用卡交易明细 交易记录 消费记录",
-    IntentLabel.TXN_QUERY: "信用卡交易明细 交易记录 消费记录",
+    IntentLabel[k]: v for k, v in _lex_map("intent_retrieval_terms").items()
 }
 
 
 # 紧急意图标记 (FAQ 短路豁免, qa_scan 首轮复盘): 挂失/盗刷类输入必须进意图分类
 # 走敏感链路, 不允许被字面相似的 FAQ 条目 (如"数字人民币硬钱包") 0.2s 劫持。
 # 宁可豁免面稍宽 (含这些词的 FAQ 咨询改走分类, 结果仍是挂失介绍/办理引导)。
-_EMERGENCY_MARKERS = ("挂失", "被盗", "被偷", "盗刷", "停卡", "冻结", "卡丢", "丢了卡", "钱包被", "找不到了", "不找了")
+
+_EMERGENCY_MARKERS = _lex("emergency_markers")
 
 
 def _has_emergency_marker(text: str) -> bool:
