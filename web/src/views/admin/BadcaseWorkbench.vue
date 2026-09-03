@@ -726,7 +726,7 @@ async function pollScan() {
 
 async function doQualityScan() {
   try {
-    await startQualityScan({ limit: 200 })
+    await startQualityScan({ limit: 5000 })  // 全量补扫: 后端批次循环至无未检会话
     ElMessage.success("全量质检已启动, 后台逐会话审查原始对话")
     if (!scanTimer) scanTimer = setInterval(pollScan, 4000)
   } catch {

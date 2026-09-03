@@ -426,7 +426,7 @@ async def start_quality_scan(
     from lumio.services.common import quality_scan
 
     body = body or {}
-    limit = max(1, min(int(body.get("limit") or 200), 1000))
+    limit = max(1, min(int(body.get("limit") or 200), 5000))
     sample_rate = min(max(float(body.get("sample_rate") or 1.0), 0.01), 1.0)
     lookback_hours = max(1, min(int(body.get("lookback_hours") or 720), 24 * 90))
     reinspect = bool(body.get("reinspect") or False)

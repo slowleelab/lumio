@@ -108,11 +108,16 @@ async def _load_sessions(
     limit: int,
     sample_rate: float,
     min_turns: int = 2,
-) -> list[tuple[str, list[dict[str, Any]]]]:
-    """取待检会话: 近 N 小时、≥min_turns 轮、按最后活跃倒序, 可抽样
+    exclude_checked: bool = False,
+    redis_client: Any = None,
+    offset: int = 0,
+) -> tuple[list[tuple[str, list[str, Any]]] | list, int, int]:
+    """取待检会话: 近 N 小时、≥min_turns 轮、按最后活跃倒序, 可抽样, 排除已检
 
     轮数过滤在取回轮次后做 (group_by + having count 的关联子查询写法跨库易错,
     且会话体量在万级以内, 取回过滤成本可接受)。
+    exclude_checked: 跳过已有 30 天检定 verdict 的会话 (全量补扫模式);
+    返回 (会话列表, 本批因已检而跳过的个数) — 跳过数供调用方累计翻页偏移。
     """
     since = datetime.now(UTC) - timedelta(hours=lookback_hours)
     async with session_factory() as session:
@@ -122,12 +127,26 @@ async def _load_sessions(
                 .where(DialogueLog.timestamp >= since)
                 .group_by(DialogueLog.session_id)
                 .order_by(func.max(DialogueLog.timestamp).desc())
-                .limit(limit * 3 if sample_rate < 1.0 else limit)
+                .limit(offset + limit * 3 if sample_rate < 1.0 else offset + limit)
+                .offset(offset)
             )
         ).all()
     session_ids = [r.session_id for r in rows]
+    raw_n = len(session_ids)
     if not session_ids:
-        return []
+        return [], offset, raw_n
+    if exclude_checked and redis_client is not None:
+        try:
+            keys = [_VERDICT_KEY.format(sid=sid) for sid in session_ids]
+            verdicts = await redis_client.mget(keys)
+            skipped = sum(1 for v in verdicts if v)
+            session_ids = [sid for sid, v in zip(session_ids, verdicts, strict=False) if not v]
+        except Exception:
+            skipped = 0
+    else:
+        skipped = 0
+    if not session_ids:
+        return [], offset + skipped, raw_n
     if sample_rate < 1.0:
         session_ids = random.sample(session_ids, k=max(1, int(len(session_ids) * sample_rate)))
         session_ids = session_ids[:limit]
@@ -152,7 +171,11 @@ async def _load_sessions(
         by_sid.setdefault(r.session_id, []).append(
             {"speaker": r.speaker, "content": r.content, "intent": r.intent, "response_source": r.response_source}
         )
-    return [(sid, turns) for sid, turns in by_sid.items() if len(turns) >= min_turns][:limit]
+    return (
+        [(sid, turns) for sid, turns in by_sid.items() if len(turns) >= min_turns][:limit],
+        skipped,
+        raw_n,
+    )
 
 
 async def scan_session(
@@ -258,16 +281,6 @@ async def _scan_task(
 
     async def one(sid: str, turns: list[dict[str, Any]]) -> None:
         async with sem:
-            # 已检去重 (reinspect 强制重检)
-            if not reinspect and redis_client is not None:
-                try:
-                    if await redis_client.exists(_VERDICT_KEY.format(sid=sid)):
-                        async with lock:
-                            stats["done"] += 1
-                            _scan_state.update(done=stats["done"])
-                        return
-                except Exception:
-                    pass
             try:
                 v = await scan_session(session_factory, judge_llm, redis_client, sid, turns, model)
                 async with lock:
@@ -281,11 +294,34 @@ async def _scan_task(
                 _scan_state.update(done=stats["done"], **{k: stats[k] for k in ("n_pass", "n_warn", "n_fail", "n_error")})
 
     try:
-        sessions = await _load_sessions(session_factory, lookback_hours=lookback_hours, limit=limit, sample_rate=sample_rate)
-        _scan_state.update(total=len(sessions))
-        if not sessions:
-            return
-        await asyncio.gather(*(one(sid, turns) for sid, turns in sessions))
+        # 全量补扫 (用户反馈: 没把所有会话纳入 — 旧实现单批 limit 扫完即停,
+        # 已检去重让后续轮次永远跳过更早的存量): 批次循环, 每批排除已检会话,
+        # 直到无未检会话或达总上限; limit 语义从"单批"变为"本轮总上限"。
+        batch_size = 100
+        scanned = 0
+        window = 0  # 已翻过的排序窗口位置 (含已检跳过)
+        _scan_state.update(total=0)
+        while scanned < limit:
+            batch_cap = min(batch_size, limit - scanned)
+            sessions, _skipped, raw_n = await _load_sessions(
+                session_factory,
+                lookback_hours=lookback_hours,
+                limit=batch_cap,
+                sample_rate=sample_rate,
+                exclude_checked=not reinspect and redis_client is not None,
+                redis_client=redis_client,
+                offset=window,
+            )
+            window += batch_cap
+            # 翻尽判据是 SQL 原始行数 (窗口内已检占位是常态 — 最近会话大多被
+            # 前几轮扫过, fresh 为 0 或 < batch_cap 都不代表窗口耗尽)
+            if raw_n < batch_cap:
+                break
+            if not sessions:
+                continue  # 本批全为已检占位, 翻下一页
+            _scan_state.update(total=_scan_state["total"] + len(sessions))
+            await asyncio.gather(*(one(sid, turns) for sid, turns in sessions))
+            scanned += len(sessions)
     except Exception as exc:
         _scan_state["error_msg"] = str(exc)[:300]
         logger.warning("qa_scan 任务异常: %s", exc, exc_info=True)
