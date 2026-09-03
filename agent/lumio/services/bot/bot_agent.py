@@ -1542,6 +1542,11 @@ class LumioAgent:
             messages=messages,
         )
         _llm_ms = (time.monotonic() - _t_llm) * 1000
+        # ⑥ 引用来源 (2026-09-04 产品决策: 客户回复不展示"来源：《…》"脚注):
+        # 引用文档标题改为记入生成决策日志 evidence, 审计可在回放中看到依据
+        citation_titles: list[str] = []
+        if context and result.source in ("llm", "retrieval"):
+            citation_titles = await self._citation_titles()
         # E2 决策可解释: 记录 LLM 生成决策 (含降级来源)
         try:
             log_decision(
@@ -1549,7 +1554,11 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"knowledge 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", ""), "rag_used": bool(context)},
+                evidence={
+                    "source": getattr(result, "source", ""),
+                    "rag_used": bool(context),
+                    "citations": citation_titles[:5],
+                },
                 latency_ms=_llm_ms,
                 turn_id=uuid_module.uuid4().hex[:16],
             )
@@ -1576,12 +1585,7 @@ class LumioAgent:
         if result.source in ("template", "fallback") and not should_transfer:
             should_transfer = True
             transfer_reason = f"degraded_{result.source}: LLM 不可用, 降级回复"
-        # ⑥ 引用来源标注: 知识生成回复尾部附《文档标题》(doc_id → 标题, 带缓存)
         reply = result.content
-        if context and result.source in ("llm", "retrieval"):
-            footer = await self._citation_footer()
-            if footer:
-                reply = f"{reply}{footer}"
 
         return self._build_result(
             session_id,
@@ -1597,7 +1601,7 @@ class LumioAgent:
             retrieval_context=context,
         )
 
-    async def _citation_footer(self) -> str:
+    async def _citation_titles(self) -> list[str]:
         """⑥ 引用来源: 本轮检索 chunk 的 source_doc → kb_document 标题 (带缓存)"""
         docids = [d for d in dict.fromkeys(getattr(self, "_last_citation_docids", None) or []) if d]
         if not docids:
@@ -1632,8 +1636,7 @@ class LumioAgent:
         except Exception as exc:
             logger.debug("引用标题查询失败(不阻断): %s", exc)
             return ""
-        unique = list(dict.fromkeys(titles))
-        return ("\n\n来源：" + "、".join(f"《{t}》" for t in unique)) if unique else ""
+        return list(dict.fromkeys(titles))
 
     async def _handle_business(
         self,
