@@ -474,6 +474,28 @@ class ToolCallingExecutor:
             detail={"arguments": masked_args, "result": masked_content[:500], "is_error": is_error},
             status_code=500 if is_error else 200,
         )
+        # E2 可解释 (用户反馈: 回放决策链缺执行过程): 工具执行同时写决策日志,
+        # 回放时间线上可见"调了什么工具/什么参数/返回摘要/耗时"
+        try:
+            from lumio.services.common.decision_log import DecisionAction, log_decision
+
+            log_decision(
+                session_id=session_id,
+                agent_name="tool_executor",
+                action=DecisionAction.TOOL_CALL,
+                reasoning=f"工具执行: {tool_call.name} ({'失败' if is_error else '成功'})",
+                evidence={
+                    "tool": tool_call.name,
+                    "arguments": json.loads(masked_args or "{}") if masked_args else {},
+                    "result_preview": masked_content[:200],
+                    "is_error": is_error,
+                },
+                latency_ms=0.0,
+                turn_id="",
+                customer_id=actor_id,
+            )
+        except Exception:
+            pass  # 决策日志失败不阻断执行
 
         return {
             "role": "tool",

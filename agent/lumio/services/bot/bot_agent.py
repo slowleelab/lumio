@@ -1054,6 +1054,32 @@ class LumioAgent:
             customer_id=customer_id,
             history=history,
         )
+        # E2 可解释 (用户反馈: 回放缺执行过程): 链B工具执行/缓存命中落决策日志
+        try:
+            log_decision(
+                session_id=session_id,
+                agent_name="query_chain",
+                action=DecisionAction.TOOL_CALL,
+                reasoning=(
+                    f"链B直连: {qc.tool_name}"
+                    f"{' (缓存命中)' if qc.cache_hit else ''}"
+                    f"{' 缺参: ' + ','.join(qc.missing_params) if qc.missing_params else ''}"
+                    if qc.tool_name
+                    else "链B未选到工具"
+                ),
+                evidence={
+                    "tool": qc.tool_name,
+                    "arguments": qc.tool_args,
+                    "cache_hit": qc.cache_hit,
+                    "result_preview": ((qc.raw_result if (qc.raw_result and qc.raw_result != "(cache)") else (qc.content or "")) or "")[:200],
+                    "missing_params": qc.missing_params,
+                    "chain": "B",
+                },
+                turn_id=uuid_module.uuid4().hex[:16],
+                customer_id=customer_id,
+            )
+        except Exception:
+            logger.debug("链B决策日志失败(不阻断): session=%s", session_id)
         if qc.error:
             logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
             return None
@@ -1388,7 +1414,12 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.RAG_RETRIEVE,
                 reasoning=f"RAG 检索{'命中' if context else '未命中'}",
-                evidence={"hit": bool(context), "context_len": len(context or "")},
+                evidence={
+                    "hit": bool(context),
+                    "context_len": len(context or ""),
+                    "query": user_input[:60],
+                    "citations": (self._last_citation_docids or [])[:5],
+                },
                 turn_id=uuid_module.uuid4().hex[:16],
                 latency_ms=(time.monotonic() - _rag_t0) * 1000,
             )
