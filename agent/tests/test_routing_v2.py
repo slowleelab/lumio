@@ -289,3 +289,19 @@ class TestChitchatRedirect:
         assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY]) is False
         # 部分带分数: 有分数的按分数, 缺分数的按强处理
         assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY, IntentLabel.COMPLAINT], [0.1]) is False
+
+
+class TestEmergencyFaqExemption:
+    """紧急意图豁免 FAQ 前置短路 (qa_scan 复盘: "钱包被偷"被硬钱包 FAQ 0.2s 劫持)"""
+
+    def test_markers(self) -> None:
+        from lumio.services.bot.bot_agent import _has_emergency_marker
+
+        assert _has_emergency_marker("钱包被偷了, 卡也在里面") is True
+        assert _has_emergency_marker("我的卡丢了, 要挂失啊") is True
+        assert _has_emergency_marker("卡好像被盗了, 赶紧给我停了") is True
+        assert _has_emergency_marker("信用卡怎么挂失") is True
+        # 无紧急标记的常规咨询不受影响
+        assert _has_emergency_marker("账单日是哪天") is False
+        assert _has_emergency_marker("数字人民币硬钱包没电怎么办") is False
+        assert _has_emergency_marker("") is False

@@ -341,61 +341,67 @@ class LumioAgent:
         # FAQ 实际不参与应答 (语义索引写入也是桩函数, 一并修复)。
         # 位置: 危机/护栏/问候告别之后、意图分类之前 —— 业务域问题 (如积分有效期)
         # 会被路由进工具编排, 埋在 _retrieve 内永远走不到。
-        try:
-            from lumio.services.common.faq_service import get_faq, search_faq
+        # 紧急意图豁免 (qa_scan 首轮复盘): FAQ 短路发生在意图分类之前, 敏感输入
+        # 会被字面相似FAQ劫持 —— "钱包被偷了,卡也在里面"0.2s命中"数字人民币硬钱包"
+        # 条目, 挂失规则 (0.96) 永远没机会跑。含紧急标记的输入跳过短路进分类。
+        if _has_emergency_marker(user_input):
+            logger.info("紧急意图豁免 FAQ 短路: input=%r", user_input[:30])
+        else:
+            try:
+                from lumio.services.common.faq_service import get_faq, search_faq
 
-            session_manager = self._session_manager
-            faq_embedding = (
-                self._embedding_breaker.provider
-                if self._embedding_breaker and self._embedding_breaker.is_available
-                else None
-            )
-            faq_res = await search_faq(
-                query=user_input,
-                redis_client=session_manager._redis if session_manager else None,
-                embedding_provider=faq_embedding,
-                milvus_collection=self._milvus_collection,
-                user_role="customer",
-                session_factory=(
-                    session_manager._resolve_factory()
-                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                session_manager = self._session_manager
+                faq_embedding = (
+                    self._embedding_breaker.provider
+                    if self._embedding_breaker and self._embedding_breaker.is_available
                     else None
-                ),
-                session_id=session_id,
-            )
-            if faq_res["match_type"] in ("exact", "semantic") and faq_res["results"]:
-                top = faq_res["results"][0]
-                answer = top.get("answer")
-                if not answer and top.get("faq_id"):
-                    from lumio.services.common.faq_service import get_faq
-
-                    faq_sf = (
+                )
+                faq_res = await search_faq(
+                    query=user_input,
+                    redis_client=session_manager._redis if session_manager else None,
+                    embedding_provider=faq_embedding,
+                    milvus_collection=self._milvus_collection,
+                    user_role="customer",
+                    session_factory=(
                         session_manager._resolve_factory()
                         if session_manager is not None and hasattr(session_manager, "_resolve_factory")
                         else None
-                    )
-                    # chunk_id 带变体序号后缀 (faqid#0), 回查前剥离取真实 FAQ UUID
-                    real_id = top["faq_id"].split("#", 1)[0]
-                    detail = await get_faq(faq_sf, real_id) if faq_sf else None
-                    answer = detail.get("answer") if detail else None
-                if answer:
-                    logger.info("FAQ 短路命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
-                    try:
-                        log_decision(
-                            session_id=session_id,
-                            agent_name="bot_agent",
-                            action=DecisionAction.FAQ_DIRECT,
-                            reasoning=f"FAQ 直出 ({faq_res['match_type']})",
-                            evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
-                            latency_ms=0.0,
-                            turn_id=uuid_module.uuid4().hex[:16],
-                            customer_id=customer_id,
+                    ),
+                    session_id=session_id,
+                )
+                if faq_res["match_type"] in ("exact", "semantic") and faq_res["results"]:
+                    top = faq_res["results"][0]
+                    answer = top.get("answer")
+                    if not answer and top.get("faq_id"):
+                        from lumio.services.common.faq_service import get_faq
+
+                        faq_sf = (
+                            session_manager._resolve_factory()
+                            if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                            else None
                         )
-                    except Exception:
-                        logger.debug("decision_log 记录失败(不阻断)")
-                    return self._build_result(session_id, user_input, answer, "faq", "faq")
-        except Exception as faq_err:
-            logger.warning("FAQ 优先匹配失败, 走常规流程: %s", faq_err)
+                        # chunk_id 带变体序号后缀 (faqid#0), 回查前剥离取真实 FAQ UUID
+                        real_id = top["faq_id"].split("#", 1)[0]
+                        detail = await get_faq(faq_sf, real_id) if faq_sf else None
+                        answer = detail.get("answer") if detail else None
+                    if answer:
+                        logger.info("FAQ 短路命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
+                        try:
+                            log_decision(
+                                session_id=session_id,
+                                agent_name="bot_agent",
+                                action=DecisionAction.FAQ_DIRECT,
+                                reasoning=f"FAQ 直出 ({faq_res['match_type']})",
+                                evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
+                                latency_ms=0.0,
+                                turn_id=uuid_module.uuid4().hex[:16],
+                                customer_id=customer_id,
+                            )
+                        except Exception:
+                            logger.debug("decision_log 记录失败(不阻断)")
+                        return self._build_result(session_id, user_input, answer, "faq", "faq")
+            except Exception as faq_err:
+                logger.warning("FAQ 优先匹配失败, 走常规流程: %s", faq_err)
 
         try:
             # 闭环 P1 感知缝: 提供会话/客户归属 (采样器被动读取, 业务不感知采样逻辑)
@@ -3569,6 +3575,17 @@ def _has_grounding(session_memory: str, history: list | None) -> bool:
     if any(m in session_memory for m in markers):
         return True
     return bool(history)
+
+
+# 紧急意图标记 (FAQ 短路豁免, qa_scan 首轮复盘): 挂失/盗刷类输入必须进意图分类
+# 走敏感链路, 不允许被字面相似的 FAQ 条目 (如"数字人民币硬钱包") 0.2s 劫持。
+# 宁可豁免面稍宽 (含这些词的 FAQ 咨询改走分类, 结果仍是挂失介绍/办理引导)。
+_EMERGENCY_MARKERS = ("挂失", "被盗", "被偷", "盗刷", "停卡", "冻结", "卡丢", "丢了卡", "钱包被")
+
+
+def _has_emergency_marker(text: str) -> bool:
+    """输入含紧急意图标记 (挂失/盗刷) → 豁免 FAQ 前置短路, 强制走意图分类"""
+    return any(m in (text or "") for m in _EMERGENCY_MARKERS)
 
 
 def _is_noise_input(text: str) -> bool:

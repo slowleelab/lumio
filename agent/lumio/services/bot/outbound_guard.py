@@ -21,6 +21,16 @@ logger = logging.getLogger(__name__)
 # 编造办理结果类话术 (无工具执行证据时出现即拦截)
 _FABRICATED_EXECUTION_PATTERNS = ("已为您办理", "已成功办理", "已完成办理", "已为您完成", "已成功为您")
 
+# 索敏话术 (qa_scan 首轮复盘: knowledge 回落生成仍在索要"卡号后四位以验证身份",
+# 违反 KNOWLEDGE prompt 第 6 条纪律 — LLM 不守纪律时由闸门兜底)。身份核验流程
+# (verification 弹框) 走独立通道不经本闸门, 此处拦的是自由文本里的索敏。
+# 只匹配"要求客户提供"的方向性话术 (提供/告知/请输入+敏感凭证), 不匹配知识文档
+# 引用的流程描述 (如"在手机银行APP中输入卡号后四位"是描述银行流程, 不是索要)。
+_SENSITIVE_SOLICITATION_RE = re.compile(
+    r"(提供|告知|发送|报一下|说一下|告诉我)[^。！？!?]{0,12}(您的?|你)?(卡号|后四位|后4位|末四位|完整卡号|密码|验证码)"
+    r"|请[^。！？!?]{0,12}(提供|告知|输入|发送)[^。！？!?]{0,12}(卡号|后四位|后4位|末四位|密码|验证码)"
+)
+
 _DIGIT_TOKEN_RE = re.compile(r"\d{2,}")
 
 # 常见无害数字 (热线/年份/通用时限), 不参与比对
@@ -72,6 +82,11 @@ class OutboundGuard:
         if not tool_executed and any(p in reply for p in _FABRICATED_EXECUTION_PATTERNS):
             logger.warning("出站拦截-编造办理话术(无工具执行): %r", reply[:60])
             return OutboundVerdict(passed=False, reply=self._clarify, reason="fabricated_execution")
+
+        # 2b. 索敏话术: 自由文本索要卡号/密码/验证码 (LLM 违反 prompt 纪律的兜底)
+        if _SENSITIVE_SOLICITATION_RE.search(reply):
+            logger.warning("出站拦截-索敏话术: %r", reply[:60])
+            return OutboundVerdict(passed=False, reply=self._clarify, reason="sensitive_solicitation")
 
         # 3. 幻觉数字 v1: 有 grounding 源时, 回复中的数字 token 应能在源中找到
         if grounding_source:

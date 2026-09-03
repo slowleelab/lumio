@@ -410,3 +410,36 @@ async def test_remote_retry_recovers_transient(monkeypatch) -> None:
     out = await client.chat([{"role": "user", "content": "x"}])
     assert out == "重试后成功"
     assert calls["n"] == 2
+
+
+class TestOutboundSensitiveSolicitation:
+    """出站索敏检测 (qa_scan 复盘: knowledge 生成索要卡号后四位)"""
+
+    def _guard(self):
+        from lumio.services.bot.outbound_guard import OutboundGuard
+
+        class _FakeSafety:
+            def check_input(self, text):
+                return True, []
+
+        return OutboundGuard(_FakeSafety(), "安全话术")
+
+    def test_blocks_solicitation(self) -> None:
+        g = self._guard()
+        for reply in [
+            "请提供您信用卡的后四位以便验证身份。",
+            "请告诉我您的卡号后四位，我帮您查询。",
+            "麻烦提供一下验证码。",
+            "为了确保安全, 请发送您的完整卡号。",
+        ]:
+            v = g.check(reply, grounding_source="挂失流程文档")
+            assert v.passed is False, reply
+            assert v.reason == "sensitive_solicitation"
+
+    def test_allows_process_description(self) -> None:
+        g = self._guard()
+        # 流程描述 (转述银行官方渠道的操作步骤) 不算索敏
+        v = g.check("您可以在手机银行APP挂失, 或拨打客服热线400-888-8888办理。")
+        assert v.passed is True
+        v = g.check("挂失补卡需在网点办理, 携带本人身份证即可。")
+        assert v.passed is True
