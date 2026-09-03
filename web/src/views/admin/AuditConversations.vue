@@ -148,7 +148,8 @@
                       <span v-if="d.latency_ms != null" class="meta-num">{{ Math.round(d.latency_ms) }}ms</span>
                       <span class="decision-agent">{{ agentLabel(d.agent_name) }}</span>
                     </div>
-                    <div class="decision-reason">{{ d.reasoning }}</div>
+                    <div class="decision-explain">{{ decisionExplain(d) }}</div>
+                    <div class="decision-reason">技术记录：{{ d.reasoning }}</div>
                     <div v-if="evidenceSummary(d.evidence).length" class="decision-kv">
                       <span v-for="kv in evidenceSummary(d.evidence)" :key="kv.k" class="kv-item">
                         <span class="kv-k">{{ kv.k }}</span>
@@ -389,6 +390,95 @@ function evidenceSummary(ev: Record<string, unknown> | null): Array<{ k: string;
   return out
 }
 
+// ── 决策通俗解释: 按 action + evidence 生成面向审阅者的一句话说明 ──
+const INTENT_ZH: Record<string, string> = {
+  bill_query: "账单查询", account_bill_query: "账单查询", transaction_query: "交易明细查询",
+  txn_query: "交易明细查询", limit_query: "额度查询", installment_inquiry: "分期咨询",
+  reward_query: "积分相关", faq: "常见咨询", faq_product: "产品咨询", chitchat: "闲聊/无明确业务",
+  nb_chitchat: "闲聊/无明确业务", nb_noise: "无效输入", complaint: "投诉", transfer_agent: "要求转人工",
+  card_loss: "卡片挂失", card_loss_report: "卡片挂失",
+}
+const TRAFFIC_ZH: Record<string, string> = {
+  read_only_query: "查询直达链路（直接查系统，不走 AI 对话）",
+  financial_transaction: "交易办理链路（调用业务工具）",
+  high_risk: "高风险诉求（优先转人工）",
+}
+const NOISE_ZH: Record<string, string> = {
+  low_confidence: "系统无法识别这句话的含义",
+  ood_unknown: "这句话不属于客服知识范围",
+  noise: "输入内容像乱码或误触",
+  fast_slow_disagreement: "两套识别结果互相矛盾，稳妥起见不作答",
+}
+function intentZh(v: unknown): string {
+  const t = String(v ?? "")
+  return INTENT_ZH[t] ?? t
+}
+function decisionExplain(d: { action: string; reasoning: string; evidence?: Record<string, unknown> | null }): string {
+  const ev = d.evidence ?? {}
+  const conf = typeof ev.confidence === "number" ? `${Math.round(ev.confidence * 100)}%` : null
+  switch (d.action) {
+    case "intent_classify": {
+      // 路由预备决策 (traffic_class 存在) vs 纯意图决策
+      if ("traffic_class" in ev && ev.traffic_class != null) {
+        return `识别结果为「${intentZh(ev.intent)}」，判定走${TRAFFIC_ZH[String(ev.traffic_class)] ?? String(ev.traffic_class)}`
+      }
+      if (ev.chitchat_redirect) {
+        return "识别为闲聊或无效输入，直接用固定话术引导客户说明业务需求（不检索、不 AI 生成）"
+      }
+      if (ev.direct) {
+        return `识别为「${intentZh(ev.intent)}」且把握很高（${conf}），跳过 AI 决策直接调用对应业务工具`
+      }
+      let out = `系统识别客户意图为「${intentZh(ev.intent)}」，把握 ${conf ?? "未知"}`
+      const alts = Array.isArray(ev.alternatives) ? (ev.alternatives as string[]).filter(Boolean) : []
+      if (alts.length) out += `；也考虑过：${alts.slice(0, 2).map(intentZh).join("、")}`
+      return out
+    }
+    case "tool_call": {
+      if (ev.chain === "B" || ev.tool) {
+        const parts = [`直接调用业务工具「${ev.tool ?? "?"}」查询`]
+        parts.push(ev.cache_hit ? "（结果来自近期缓存，未重复查询）" : "")
+        if (Array.isArray(ev.missing_params) && ev.missing_params.length) parts.push(`；还缺信息：${(ev.missing_params as string[]).join("、")}`)
+        return parts.join("")
+      }
+      if (ev.traffic_class != null) return `根据识别结果选择处理方式：${TRAFFIC_ZH[String(ev.traffic_class)] ?? String(ev.traffic_class)}`
+      if (ev.traffic_class === null && "composite" in ev) return "意图属于咨询类，进入知识问答流程"
+      return d.reasoning
+    }
+    case "rag_retrieve": {
+      if (ev.hit) {
+        const n = Array.isArray(ev.citations) ? (ev.citations as unknown[]).length : 0
+        return `从知识库检索到相关内容（引用 ${n} 个知识来源），供下一步 AI 生成回答时参考`
+      }
+      return "知识库中未找到与这句话相关的内容"
+    }
+    case "llm_generate":
+      return ev.rag_used ? "AI 参考检索到的知识内容组织回复（非凭空生成）" : "AI 直接生成回复（无知识库参考）"
+    case "faq_direct":
+      return `命中常见问题「${String(ev.question ?? "").slice(0, 30)}」，直接返回人工审核过的标准答案（非 AI 生成）`
+    case "chain_complete":
+      return `本轮处理结束，客户收到「${sourceZh(ev.source)}」类型的回复`
+    case "noise_blocked": {
+      const why = NOISE_ZH[String(ev.reason ?? "")] ?? "内容不适合自动作答"
+      return `${why}。已用固定澄清话术回应，没有让 AI 猜测作答（防止答非所问）`
+    }
+    case "transfer_agent":
+      return "触发转人工流程，已为客户分配人工客服"
+    case "injection_blocked":
+      return "检测到输入中疑似包含诱导指令，已拦截（安全防线）"
+    case "guard_denied":
+      return "护栏规则拦截了本次请求"
+    default:
+      return d.reasoning
+  }
+}
+function sourceZh(v: unknown): string {
+  const m: Record<string, string> = {
+    tool: "系统查询结果", knowledge: "知识问答", faq: "标准答案", template: "固定话术",
+    clarify: "澄清引导", fallback: "降级话术", llm: "AI 生成", retrieval: "检索原文",
+  }
+  return m[String(v ?? "")] ?? String(v ?? "")
+}
+
 function formatTime(s: string | null) {
   return s?.slice(0, 19).replace("T", " ") || "-"
 }
@@ -514,6 +604,14 @@ onMounted(() => {
 .decision-raw :deep(.el-collapse-item__wrap) {
   background: transparent;
 }
+.decision-explain {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-primary);
+  margin-top: 6px;
+  line-height: 1.6;
+}
+
 .decision-reason {
   margin-top: var(--space-1);
   font-size: var(--fs-sm);
