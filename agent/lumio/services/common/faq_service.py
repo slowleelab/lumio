@@ -39,6 +39,10 @@ def _normalize_query(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).lower()
     # Python re 不支持 \p{P}: 显式枚举空白 + ASCII 标点 + CJK 标点区
     text = re.sub(r"[\s\u3000-\u303f\uff00-\uffef!-/:-@\[-`{-~]+", "", text)
+    # 尾部语气词剥离 (qa_scan 第四轮: "积分怎么兑换礼品啊"≠变体"积分怎么兑换礼品",
+    # exact 击穿落到慢路径): 只剥句尾单字语气词且最多两层, "丢了"类的"了"不在表中
+    for _ in range(2):
+        text = re.sub(r"(啊|呢|吧|呀|嘛|哦|哈|啦)$", "", text)
     return text
 
 

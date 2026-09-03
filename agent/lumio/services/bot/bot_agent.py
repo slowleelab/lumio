@@ -3617,7 +3617,7 @@ _INTENT_RETRIEVAL_TERMS: dict[IntentLabel, str] = {
 # 紧急意图标记 (FAQ 短路豁免, qa_scan 首轮复盘): 挂失/盗刷类输入必须进意图分类
 # 走敏感链路, 不允许被字面相似的 FAQ 条目 (如"数字人民币硬钱包") 0.2s 劫持。
 # 宁可豁免面稍宽 (含这些词的 FAQ 咨询改走分类, 结果仍是挂失介绍/办理引导)。
-_EMERGENCY_MARKERS = ("挂失", "被盗", "被偷", "盗刷", "停卡", "冻结", "卡丢", "丢了卡", "钱包被")
+_EMERGENCY_MARKERS = ("挂失", "被盗", "被偷", "盗刷", "停卡", "冻结", "卡丢", "丢了卡", "钱包被", "找不到了", "不找了")
 
 
 def _has_emergency_marker(text: str) -> bool:
