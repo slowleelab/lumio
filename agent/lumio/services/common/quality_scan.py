@@ -299,6 +299,7 @@ async def _scan_task(
         # 直到无未检会话或达总上限; limit 语义从"单批"变为"本轮总上限"。
         batch_size = 100
         scanned = 0
+        short_batches = 0
         window = 0  # 已翻过的排序窗口位置 (含已检跳过)
         _scan_state.update(total=0)
         while scanned < limit:
@@ -314,8 +315,11 @@ async def _scan_task(
             )
             window += batch_cap
             # 翻尽判据是 SQL 原始行数 (窗口内已检占位是常态 — 最近会话大多被
-            # 前几轮扫过, fresh 为 0 或 < batch_cap 都不代表窗口耗尽)
-            if raw_n < batch_cap:
+            # 前几轮扫过, fresh 为 0 或 < batch_cap 都不代表窗口耗尽)。
+            # 连续 2 个短批才判翻尽: SQL 偶发慢查询返回少行会误 break
+            # (实测首轮补扫因此在 1997/3255 处提前停, 二次续扫补完)
+            short_batches = short_batches + 1 if raw_n < batch_cap else 0
+            if short_batches >= 2:
                 break
             if not sessions:
                 continue  # 本批全为已检占位, 翻下一页
