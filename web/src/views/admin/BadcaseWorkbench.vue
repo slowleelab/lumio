@@ -16,7 +16,43 @@
             {{ batch.running ? `GLM 裁判中 ${batch.done}/${batch.total}` : "GLM 裁判 · 批量归因待归因项" }}
           </el-button>
         </el-tooltip>
+        <el-tooltip placement="left" effect="light">
+          <template #content>
+            <div class="judge-tip">
+              <b>全量质检巡检</b><br />
+              所有会话从<b>原始对话内容</b>过 GLM 裁判质检,<br />
+              不依赖置信度/差评信号 — 高置信但答非所问也逃不掉。<br />
+              fail 自动采集进待复核队列; 合格率见按钮下方。
+            </div>
+          </template>
+          <el-button size="small" type="success" plain :loading="scan.running" @click="doQualityScan">
+            {{ scan.running ? `全量质检中 ${scan.done}/${scan.total}` : "全量质检 · 扫描全部会话" }}
+          </el-button>
+        </el-tooltip>
       </div>
+    </div>
+
+    <!-- 全量质检进度条 -->
+    <el-progress
+      v-if="scan.running"
+      :percentage="scanPct"
+      :stroke-width="10"
+      striped
+      striped-flow
+      status="success"
+      style="margin-top: 10px"
+    >
+      <template #default>
+        <span class="batch-progress-text">
+          全量质检中 {{ scan.done }}/{{ scan.total }}
+          · 合格 {{ scan.n_pass }} / 提醒 {{ scan.n_warn }} / 不合格 {{ scan.n_fail }}
+          <template v-if="scan.n_error"> (失败 {{ scan.n_error }})</template>
+        </span>
+      </template>
+    </el-progress>
+    <div v-else-if="scan.lastRun" class="scan-summary muted">
+      上轮全量质检 {{ scan.lastRun.total }} 个会话 · 合格率 {{ ((scan.lastRun.pass_rate ?? 0) * 100).toFixed(1) }}%
+      · 不合格 {{ scan.lastRun.n_fail }} 已采入待复核 ({{ scan.lastRun.finished_at?.slice(5, 16).replace("T", " ") }})
     </div>
 
     <!-- 统计卡 (可点击联动筛选) -->
@@ -294,7 +330,10 @@ import {
   getBatchAttributionStatus,
   expandGoldenSet,
   getBadcaseStats,
+  startQualityScan,
+  getQualityScanStatus,
   type Badcase,
+  type QualityScanStatus,
 } from "@/api/closedLoop"
 
 const router = useRouter()
@@ -336,6 +375,7 @@ const SIGNAL_LABELS: Record<string, string> = {
   agent_revoke: "人工撤回",
   behavior_anomaly: "行为异常",
   compliance_alert: "合规告警",
+  qa_scan: "质检巡检",
 }
 const CATEGORY_LABELS: Record<string, string> = {
   semantic: "语义误判",
@@ -641,6 +681,59 @@ async function doBatchAttribution() {
   }
 }
 
+// ── 全量质检巡检 (后台任务轮询) ──
+const scan = ref({
+  running: false,
+  total: 0,
+  done: 0,
+  n_pass: 0,
+  n_warn: 0,
+  n_fail: 0,
+  n_error: 0,
+  lastRun: null as QualityScanStatus["last_run"],
+})
+let scanTimer: ReturnType<typeof setInterval> | null = null
+
+const scanPct = computed(() => (scan.value.total > 0 ? Math.round((scan.value.done / scan.value.total) * 100) : 0))
+
+async function pollScan() {
+  try {
+    const st = await getQualityScanStatus()
+    scan.value = {
+      running: st.running,
+      total: st.total,
+      done: st.done,
+      n_pass: st.n_pass,
+      n_warn: st.n_warn,
+      n_fail: st.n_fail,
+      n_error: st.n_error,
+      lastRun: st.last_run ?? scan.value.lastRun,
+    }
+    if (!st.running) {
+      if (scanTimer) {
+        clearInterval(scanTimer)
+        scanTimer = null
+      }
+      if (st.total > 0) {
+        ElMessage.success(`全量质检完成: 不合格 ${st.n_fail} 已采入待复核 (合格率 ${((st.last_run?.pass_rate ?? 0) * 100).toFixed(1)}%)`)
+        await Promise.all([load(), loadStats()])
+      }
+    }
+  } catch {
+    /* handled */
+  }
+}
+
+async function doQualityScan() {
+  try {
+    await startQualityScan({ limit: 200 })
+    ElMessage.success("全量质检已启动, 后台逐会话审查原始对话")
+    if (!scanTimer) scanTimer = setInterval(pollScan, 4000)
+  } catch {
+    /* handled */
+  }
+}
+
 async function addToGolden(row: Badcase) {
   try {
     const r = await expandGoldenSet([row.user_input])
@@ -662,6 +755,7 @@ function signalType(s: string): string {
     agent_revoke: "warning",
     behavior_anomaly: "info",
     compliance_alert: "danger",
+    qa_scan: "success",
   }
   return m[s] ?? "info"
 }
@@ -707,6 +801,7 @@ function relTime(iso?: string | null) {
 }
 
 onMounted(() => {
+  pollScan() // 恢复可能进行中的全量质检进度
   load()
   pollBatch()
   loadStats()

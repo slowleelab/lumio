@@ -53,6 +53,7 @@ _VALID_SIGNALS = (
     "agent_revoke",
     "behavior_anomaly",
     "compliance_alert",
+    "qa_scan",  # 全量质检巡检 (从原始对话内容审查, 非信号触发)
 )
 _VALID_FIX_STATUS = ("pending", "fixing", "canary", "deployed", "rejected")
 
@@ -406,3 +407,70 @@ async def closed_loop_health(user: AdminAgentUser, db: DbSession) -> dict[str, A
         "recurrence_rate": None,  # 需 L2 回归集积累后计算
         "golden_pass_rate": None,  # 由评测流水线回填
     }
+
+
+# ── 全量质检巡检 (qa_scan): 所有会话从原始对话内容过质检, 不依赖置信度/信号 ──
+
+
+@router.post("/quality/scan")
+async def start_quality_scan(
+    user: AdminOnlyUser, request: Request, body: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """启动全量会话质检巡检 (后台任务; GLM 裁判读对话原文逐项审查)
+
+    - limit: 单轮巡检会话上限 (默认 200, 上限 1000)
+    - sample_rate: 抽样率 0~1 (生产全量成本高时可 0.1 抽检)
+    - lookback_hours: 回看窗口 (默认 720h = 30 天)
+    - reinspect: 强制重检 (忽略 30 天已检去重)
+    """
+    from lumio.services.common import quality_scan
+
+    body = body or {}
+    limit = max(1, min(int(body.get("limit") or 200), 1000))
+    sample_rate = min(max(float(body.get("sample_rate") or 1.0), 0.01), 1.0)
+    lookback_hours = max(1, min(int(body.get("lookback_hours") or 720), 24 * 90))
+    reinspect = bool(body.get("reinspect") or False)
+
+    sf = getattr(request.app.state, "db_session_factory", None)
+    redis_client = getattr(request.app.state, "redis_client", None)
+    if sf is None:
+        raise LumioError(code=5001, message="DB 未就绪")
+
+    judge_llm = _build_judge_llm_only(request)
+    started = quality_scan.start_scan(
+        sf,
+        judge_llm,
+        redis_client,
+        get_settings().llm.judge_model if get_settings().llm.judge_base_url else get_settings().llm.primary_model,
+        limit=limit,
+        sample_rate=sample_rate,
+        lookback_hours=lookback_hours,
+        reinspect=reinspect,
+    )
+    if not started:
+        raise LumioError(code=3001, message="质检巡检进行中, 请等待完成")
+    return {"scheduled": True, "limit": limit, "sample_rate": sample_rate, "lookback_hours": lookback_hours}
+
+
+@router.get("/quality/scan/status")
+async def quality_scan_status(user: AdminAgentUser, request: Request) -> dict[str, Any]:
+    """巡检进度 + 上轮结果 (前端轮询; pass_rate = 合格率)"""
+    from lumio.services.common import quality_scan
+
+    redis_client = getattr(request.app.state, "redis_client", None)
+    status = quality_scan.scan_status()
+    status["last_run"] = await quality_scan.last_run(redis_client)
+    return status
+
+
+def _build_judge_llm_only(request: Request) -> Any:
+    """质检巡检裁判: 远程 GLM 优先 (与归因裁判同源), 未配置走本地"""
+    from lumio.services.common.judge_client import RemoteJudgeClient
+
+    settings = get_settings()
+    llm_client = getattr(request.app.state, "llm_client", None)
+    if llm_client is None:
+        raise LumioError(code=5001, message="LLM 未就绪")
+    if settings.llm.judge_base_url and settings.llm.judge_api_key:
+        return RemoteJudgeClient(fallback_llm=llm_client)
+    return llm_client

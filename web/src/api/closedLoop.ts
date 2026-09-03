@@ -116,3 +116,38 @@ export function getBatchAttributionStatus(): Promise<BatchAttributionStatus> {
 export function expandGoldenSet(seeds: string[]): Promise<{ seed_count: number; variants: string[]; rejected_count: number }> {
   return client.post("/admin/closed-loop/golden/expand", { seeds })
 }
+
+// ── 全量质检巡检 (所有会话从原始对话内容过质检, 不依赖置信度/信号) ──
+
+export interface QualityScanStatus {
+  running: boolean
+  total: number
+  done: number
+  n_pass: number
+  n_warn: number
+  n_fail: number
+  n_error: number
+  error_msg: string
+  last_run?: {
+    finished_at: string
+    total: number
+    n_pass: number
+    n_warn: number
+    n_fail: number
+    n_error: number
+    pass_rate: number | null
+  } | null
+}
+
+export function startQualityScan(opts?: {
+  limit?: number
+  sample_rate?: number
+  lookback_hours?: number
+  reinspect?: boolean
+}): Promise<{ scheduled: boolean; limit: number }> {
+  return client.post("/admin/closed-loop/quality/scan", opts ?? {})
+}
+
+export function getQualityScanStatus(): Promise<QualityScanStatus> {
+  return client.get("/admin/closed-loop/quality/scan/status")
+}
