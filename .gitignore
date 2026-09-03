@@ -96,3 +96,5 @@ agent/data/intent_classification/out_intent_clf.bak.*/
 # 意图分类数据文件的手工备份 (内容已在 git 历史, 不入库)
 agent/data/intent_classification/*.bak.*
 intent_registry.json.bak
+agent/data/simulator_state.json
+agent/data/simulator_worker.log

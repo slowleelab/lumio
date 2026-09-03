@@ -173,3 +173,72 @@ def test_feedback_only_on_bad_reply() -> None:
     assert SimCustomer._reply_is_bad(None, "您的意思我还没太理解") is True
     assert SimCustomer._reply_is_bad(None, "您可以通过手机银行APP数字人民币专区为硬钱包充值") is False
     assert SimCustomer._reply_is_bad(None, "") is False
+
+
+# ── 独立 worker 进程管理 (2026-09-03: 模拟器挪出 bot 服务进程) ──
+
+
+class TestWorkerProcessManagement:
+    def test_read_state_missing_file_defaults_stopped(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from lumio.services.common import simulator_router as sr
+
+        monkeypatch.setattr(sr, "_STATE_FILE", tmp_path / "nonexistent.json")
+        st = sr._read_state()
+        assert st["running"] is False
+        assert st["config"]["scenario_keys"] == []
+
+    def test_read_state_fresh_alive_pid_keeps_running(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import json
+        import os
+        import time
+
+        from lumio.services.common import simulator_router as sr
+
+        f = tmp_path / "state.json"
+        f.write_text(json.dumps({"running": True, "pid": os.getpid(), "heartbeat_at": time.time()}))
+        monkeypatch.setattr(sr, "_STATE_FILE", f)
+        assert sr._read_state()["running"] is True  # 自己的 pid 活着 + 心跳新鲜
+
+    def test_read_state_stale_heartbeat_corrected_to_stopped(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        from lumio.services.common import simulator_router as sr
+
+        f = tmp_path / "state.json"
+        # 死 pid + 过期心跳 → running 修正为 False
+        f.write_text(json.dumps({"running": True, "pid": 999999, "heartbeat_at": 0}))
+        monkeypatch.setattr(sr, "_STATE_FILE", f)
+        st = sr._read_state()
+        assert st["running"] is False
+        assert st.get("stale") is True
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_when_worker_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """worker 存活时重复启动 → 3001 (幂等保护)"""
+        import os
+
+        from lumio.services.common import simulator_router as sr
+        from lumio.shared.exceptions import LumioError
+
+        monkeypatch.setattr(sr, "_read_state", lambda: {"running": True, "pid": os.getpid()})
+
+        async def _fake_start(*a, **k):  # 不会被调用到 Popen 前
+            raise AssertionError
+
+        with pytest.raises(LumioError, match="已在运行"):
+            await sr.start(user=None, request=None, body={"scenario_keys": ["chitchat"]})
+
+    def test_worker_write_state_shape(self, tmp_path) -> None:
+        """worker 心跳写入: status_dict 展开 + pid + heartbeat_at"""
+        from lumio.services.common.simulator_worker import _write_state
+
+        f = tmp_path / "hb.json"
+        _write_state(f)
+        data = json.loads(f.read_text())
+        assert data["pid"] > 0
+        assert "heartbeat_at" in data and "running" in data and "config" in data
+
+
+import json  # noqa: E402  (测试块内多处使用, 统一顶部化由 ruff-isort 兜底)
