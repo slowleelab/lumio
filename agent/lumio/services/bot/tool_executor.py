@@ -17,7 +17,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from lumio.services.bot.tool_guard import GuardDecision
@@ -372,6 +372,32 @@ class ToolCallingExecutor:
             raise ToolLoopTimeoutError(
                 f"工具编排循环超时 (> {int(self._settings.tool_loop_timeout_ms)}ms): session={session_id}"
             ) from None
+
+    async def execute_direct(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        session_id: str,
+        actor_id: str,
+        actor_role: str = "customer",
+    ) -> ToolExecutionResult:
+        """确定性直连执行 (不经 LLM 编排循环)
+
+        高置信意图 + 工具映射唯一时由分派层调用 (qa_scan 挂账: 挂失链 LLM
+        编排在本地时延下 20-40s 超时回落知识链 — card_loss@0.96 的目标工具
+        是确定的, 无需 LLM 决策)。卡号注入/配额/重试/脱敏/审计与编排路径
+        完全同源 (_execute_and_audit)。异常上抛由调用方回落链 A。
+        """
+        tool_call = ToolCall(id=f"direct-{uuid4().hex[:12]}", name=tool_name, arguments=dict(arguments or {}))
+        tool_message = await self._execute_and_audit(
+            tool_call, session_id=session_id, actor_id=actor_id, actor_role=actor_role
+        )
+        return ToolExecutionResult(
+            content=str(tool_message.get("content") or ""),
+            source="tool",
+            executed_tools=[tool_name],
+        )
 
     async def _execute_and_audit(
         self,

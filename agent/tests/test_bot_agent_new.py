@@ -2381,3 +2381,17 @@ class TestPendingNewTopicFastRelease:
         agent._tool_executor = MagicMock(audit_decision=AsyncMock())  # 缺执行器会走"清除放行"防御分支
         result = await agent._handle_pending_action("s1", "嗯", state, "c1")
         assert result.get("pending_released") is None  # 未放行, 仍等确认
+
+
+def test_format_tool_result_json_to_reply() -> None:
+    """直连结果 JSON 模板化 (挂失回执 → 客户话术)"""
+    from lumio.services.bot.bot_agent import _format_tool_result
+
+    json_reply = '{"referenceNo":"LS20260903466203","cardNo":"6225****6780","action":"挂失","status":"已受理","effectiveTime":"2026-09-03 12:00:00"}'
+    out = _format_tool_result(json_reply)
+    assert "挂失已受理" in out and "LS20260903466203" in out and "已受理" in out
+    assert not out.startswith("{")
+    # 非 JSON 原文返回
+    assert _format_tool_result("纯文本结果") == "纯文本结果"
+    # 坏 JSON 原文返回
+    assert _format_tool_result("{bad json") == "{bad json"

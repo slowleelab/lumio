@@ -772,6 +772,8 @@ class MCPSettings(BaseSettings):
                 "cancel_installment",
             ],
             "reward_query": ["query_points", "query_card_benefits", "redeem_points"],
+            # 挂失: 意图→工具唯一确定, 高置信时分派层直连 (跳过 LLM 编排循环)
+            "card_loss": ["report_card_lost"],
         }
     )
 

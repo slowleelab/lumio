@@ -872,6 +872,50 @@ class LumioAgent:
                 session_id, user_input, intent_result, history, entities, sentiment, customer_id
             )
         if traffic == TrafficClass.FINANCIAL_TRANSACTION:
+            # 高置信确定性直连 (qa_scan 挂账: 挂失链 LLM 编排本地时延 20-40s 超时
+            # 回落知识链): 意图置信 ≥0.9 且意图→工具映射唯一时, 跳过 LLM 编排循环
+            # 直接执行工具 (卡号注入/配额/脱敏/审计同源)。失败回落链 A。
+            # 阈值 0.8: 挂失为保护性操作 (误挂可解挂), LLM 慢路径分类多落 0.76-0.85。
+            if (
+                confidence >= 0.8
+                and self._tool_executor is not None
+                and self._tool_executor.has_tools()
+                and get_settings().mcp.progressive_disclosure_enabled
+            ):
+                from lumio.services.bot.tool_selection import select_tools_for_intent
+
+                direct_tools = select_tools_for_intent(intent, confidence, get_settings().mcp)
+                if direct_tools and len(direct_tools) == 1:
+                    try:
+                        direct = await self._tool_executor.execute_direct(
+                            direct_tools[0],
+                            {},
+                            session_id=session_id,
+                            actor_id=customer_id or session_id,
+                        )
+                        logger.info(
+                            "高置信意图工具直连: intent=%s conf=%.2f tool=%s",
+                            intent.value,
+                            confidence,
+                            direct_tools[0],
+                        )
+                        try:
+                            log_decision(
+                                session_id=session_id,
+                                agent_name="bot_agent",
+                                action=DecisionAction.TOOL_CALL,
+                                reasoning=f"高置信确定性直连: {intent.value}@{confidence:.2f} → {direct_tools[0]} (跳过 LLM 编排)",
+                                evidence={"tool": direct_tools[0], "direct": True, "confidence": confidence},
+                                turn_id=uuid_module.uuid4().hex[:16],
+                                customer_id=customer_id,
+                            )
+                        except Exception:
+                            logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+                        return self._build_result(
+                            session_id, user_input, _format_tool_result(direct.content), "tool", intent.value, confidence
+                        )
+                    except Exception as exc:
+                        logger.warning("工具直连失败, 回落链 A 编排: tool=%s err=%s", direct_tools[0], exc)
             # 链 A · 交易链路: 工具编排 + 敏感确认状态机; 无工具回落知识
             if self._tool_executor is not None and self._tool_executor.has_tools():
                 return await self._handle_tool(
@@ -3615,6 +3659,36 @@ def _has_grounding(session_memory: str, history: list | None) -> bool:
     if any(m in session_memory for m in markers):
         return True
     return bool(history)
+
+
+def _format_tool_result(content: str) -> str:
+    """工具直连结果 → 客户话术 (JSON 原文模板化, 解析失败原文返回)
+
+    工具返回 JSON (工单号/卡号/状态) 不宜直接展示给客户; 挂失等敏感操作
+    的回执字段是稳定的, 模板化零 LLM 成本。
+    """
+    text = (content or "").strip()
+    if not text.startswith("{"):
+        return text
+    try:
+        import json as _json
+
+        data = _json.loads(text)
+    except Exception:
+        return text
+    if "action" in data and ("referenceNo" in data or "status" in data):
+        parts = [f"{data.get('action', '操作')}已受理"]
+        if data.get("referenceNo"):
+            parts.append(f"受理编号 {data['referenceNo']}")
+        if data.get("cardNo"):
+            parts.append(f"卡号 {data['cardNo']}")
+        if data.get("status"):
+            parts.append(f"当前状态: {data['status']}")
+        if data.get("effectiveTime"):
+            parts.append(f"生效时间 {data['effectiveTime']}")
+        parts.append("后续进展将以短信通知, 如需帮助可回复『转人工』")
+        return "，".join(parts) + "。"
+    return text
 
 
 # 意图感知检索词增强 (qa_scan 挂账: 挂失/额度口语 query 被《年费减免条件》字面

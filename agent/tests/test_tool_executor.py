@@ -327,3 +327,28 @@ class TestSensitiveAutoPassed:
         assert result.verification is None  # 不发核验弹框
         mcp.call_tool.assert_awaited_once()  # 直接执行了
         assert result.executed_tools == ["card_loss"]
+
+
+class TestExecuteDirect:
+    """确定性直连 (qa_scan 挂账: 高置信挂失跳过 LLM 编排)"""
+
+    async def test_execute_direct_returns_tool_content(self):
+        """直连执行: 卡号注入/审计同源, 返回工具内容, 不走 LLM"""
+        mcp = MagicMock()
+        mcp.get_tool.return_value = MagicMock(
+            description="挂失", input_schema={"properties": {"card_no": {"type": "string"}}}
+        )
+        mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "挂失申请已受理, 工单号 GL-20260903-001"})
+        llm = MagicMock()
+        llm.chat_with_tools = AsyncMock()  # 不应被调
+        ex = _make_executor(mcp=mcp, llm=llm)
+
+        result = await ex.execute_direct("report_card_lost", {}, session_id="s1", actor_id="cust-1")
+        assert result.source == "tool"
+        assert result.executed_tools == ["report_card_lost"]
+        assert "已受理" in result.content
+        llm.chat_with_tools.assert_not_called()
+        mcp.call_tool.assert_awaited_once()
+        # 卡号按实名绑定注入 (schema 声明 card_no)
+        args = mcp.call_tool.await_args.args[1]
+        assert args.get("card_no")
