@@ -180,17 +180,52 @@ def _query_grams(query: str) -> set[str]:
     return grams
 
 
+# 通用动词/疑问/助词类 bigram: 几乎存在于所有银行业务文档 ("查看账单/登录APP/
+# 办理业务"), 命中不构成相关性证据 (会话 9ed55603: 无义输入"查看开发"靠"查看"
+# 一词击穿重叠门, 14.2s 生成了整段账单知识)。与 FAQ 侧 _FAQ_GENERIC_GRAMS 同型。
+_GENERIC_GRAMS = frozenset(
+    {
+        "查看", "登陆", "登录", "办理", "操作", "咨询", "帮忙", "一下", "请问", "麻烦",
+        "告诉", "了解", "相关", "问题", "业务", "银行", "网上", "客服", "怎么", "如何",
+        "什么", "可以", "能为", "需要", "我想", "还是", "没有", "不是",
+    }
+)
+
+# 业务名词词块 (强证据): 银行信用卡域稳定名词, 一个命中即构成相关性证据
+_BUSINESS_NOUN_GRAMS = frozenset(
+    {
+        "账单", "额度", "积分", "挂失", "还款", "分期", "年费", "逾期", "密码", "激活",
+        "销户", "销卡", "发票", "利息", "手续费", "账单日", "还款日", "信用", "授信",
+        "取现", "现金", "透支", "滞纳", "违约", "征信", "卡片", "补卡", "换卡", "盗刷",
+        "钱包", "数币", "人民币", "转账", "消费", "交易", "明细", "流水", "最低还款",
+        "临时额度", "还款额", "免息", "宽限", "积分兑换", "里程", "话费", "权益",
+        "冻结", "解冻", "限额", "申请", "白条",
+    }
+)
+
+
 def query_chunk_overlap_zero(query: str, chunks: list[str]) -> bool:
     """查询与检索片段零词法重叠判定 (调用侧相关性兜底门)
 
     True = 查询没有任何信息性词块出现在任何片段里 → 判 miss;
     查询本身无可提取词块 (如单字"卡") 时无法判定 → False (放行, 不误杀)。
+    通用动词/疑问词块不计入证据 (去停用后无词块 = 无法判定, 放行)。
     """
-    grams = _query_grams(query)
+    grams = _query_grams(query) - _GENERIC_GRAMS
     if not grams:
         return False
     blob = "\n".join(chunks)
-    return not any(g in blob for g in grams)
+    # 业务名词强证据: 银行域稳定名词词块命中即放行 ("查看账单"的证据是"账单",
+    # 跨词 bigram "看账"会被拆碎 — 强名词一个就够)。
+    if any(g in blob for g in grams & _BUSINESS_NOUN_GRAMS):
+        return False
+    hits = sum(1 for g in grams if g in blob)
+    # 弱证据强度判据 (会话 9ed55603: "查看开发"靠碎片"开发"撞上无关文档放行):
+    # 表外词块需 ≥2 命中 — 单碎片撞词 (无义输入的 bigram 碎片碰上某文档) 判 miss;
+    # 单词块查询 (弱词但整块命中) 保留放行, 不误杀长尾真实问法。
+    if len(grams) == 1:
+        return hits == 0
+    return hits < 2
 
 
 def _date_to_epoch(date_str: str) -> int | None:

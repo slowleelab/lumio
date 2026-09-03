@@ -642,3 +642,35 @@ class TestQueryChunkOverlapZero:
     def test_english_word_match(self) -> None:
         assert query_chunk_overlap_zero("activate", ["how to activate your card"]) is False
         assert query_chunk_overlap_zero("activate card", ["激活信用卡流程说明"]) is True
+
+
+class TestOverlapGateStopGrams:
+    """通用动词 bigram 不构成证据 (会话 9ed55603: "查看开发"靠"查看"击穿重叠门)"""
+
+    def test_generic_verb_not_evidence(self) -> None:
+        chunks = ["账单日是银行每月定期汇总消费的日期。建议登录手机银行查看电子账单或设置自动推送。"]
+        # "查看"是通用动词不算证据; 剩余"看开/开发"不在文档 → 判 miss
+        assert query_chunk_overlap_zero("查看开发", chunks) is True
+
+    def test_real_query_with_generic_verb_still_passes(self) -> None:
+        chunks = ["建议登录手机银行查看电子账单, 账单日为每月5日。"]
+        # "查看账单"含业务词块"账单"(在文档中) → 放行
+        assert query_chunk_overlap_zero("查看账单", chunks) is False
+
+    def test_all_generic_query_unchanged(self) -> None:
+        # 全停用词查询无法判定 → 放行 (不误杀)
+        assert query_chunk_overlap_zero("查看", ["任意文档"]) is False
+
+    def test_single_fragment_hit_insufficient(self) -> None:
+        """多词块查询仅单碎片撞词 → 判 miss (会话 9ed55603: "查看开发"撞"开发票")"""
+        chunks = ["如需开发票, 请在账单日后通过手机银行申请。"]
+        # "看开/开发" 中仅"开发"命中 → 强度不足
+        assert query_chunk_overlap_zero("查看开发", chunks) is True
+
+    def test_single_business_word_query_passes(self) -> None:
+        """单词块查询 ("年费") 命中即放行"""
+        assert query_chunk_overlap_zero("年费", ["刚性年费卡种不可减免。"]) is False
+
+    def test_multi_fragment_real_query_passes(self) -> None:
+        """真实查询多词块命中 (挂失+补卡+流程) → 放行"""
+        assert query_chunk_overlap_zero("挂失补卡流程", ["挂失后补卡流程: 拨打热线办理, 补卡工本费20元。"]) is False
