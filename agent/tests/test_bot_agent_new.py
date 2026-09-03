@@ -2203,3 +2203,56 @@ class TestNoiseGateOodNarrowing:
         intent = IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.29, energy=-2.5)
         reason, _ = await agent._evaluate_noise_gate("s1", "丈二和尚", intent, [], [])
         assert reason == "ood_unknown"
+
+
+class TestIntentRetrievalAugmentation:
+    """意图感知检索词增强 (qa_scan 挂账: 挂失 query 被年费文档字面抢位)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_high_conf_risk_intent_augments_query(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from lumio.shared.models import RetrieveRequest, RetrieveResponse
+
+        captured: dict = {}
+
+        async def fake_retrieve(*, request: RetrieveRequest, **_: object) -> RetrieveResponse:
+            captured["query"] = request.query
+            return RetrieveResponse(results=[])
+
+        monkeypatch.setattr("lumio.services.common.retrieval.retrieve", fake_retrieve)
+        agent = self._make_agent()
+
+        await agent._retrieve("我的卡丢了, 要挂失啊", intent=IntentLabel.CARD_LOSS, confidence=0.9)
+        assert "挂失流程" in captured["query"]
+        assert "我的卡丢了" in captured["query"]  # 原文保留
+
+    @pytest.mark.asyncio
+    async def test_low_conf_or_unknown_intent_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from lumio.shared.models import RetrieveRequest, RetrieveResponse
+
+        captured: dict = {}
+
+        async def fake_retrieve(*, request: RetrieveRequest, **_: object) -> RetrieveResponse:
+            captured["query"] = request.query
+            return RetrieveResponse(results=[])
+
+        monkeypatch.setattr("lumio.services.common.retrieval.retrieve", fake_retrieve)
+        agent = self._make_agent()
+
+        # 低置信不加词
+        await agent._retrieve("我的卡丢了", intent=IntentLabel.CARD_LOSS, confidence=0.5)
+        assert captured["query"] == "我的卡丢了"
+        # 意图不在表内 (faq 咨询) 不加词
+        await agent._retrieve("信用卡是什么", intent=IntentLabel.FAQ, confidence=0.9)
+        assert captured["query"] == "信用卡是什么"

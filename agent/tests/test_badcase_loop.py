@@ -436,6 +436,32 @@ class TestOutboundSensitiveSolicitation:
             assert v.passed is False, reply
             assert v.reason == "sensitive_solicitation"
 
+    def test_strips_solicitation_keeps_compliant_part(self) -> None:
+        """索敏句剥离: 保留合规引导部分, 只删索敏句"""
+        g = self._guard()
+        reply = (
+            "很抱歉听到您的信用卡丢失了，请立即拨打24小时客服热线400-888-8888进行挂失。"
+            "我将帮您转接人工客服进行电话挂失，之后可申请补卡。请提供您的信用卡卡号后四位以便验证身份。"
+        )
+        v = g.check(reply, grounding_source="挂失流程")
+        assert v.passed is False
+        assert v.reason == "sensitive_solicitation_stripped"
+        assert "400-888-8888" in v.reply and "转接人工客服" in v.reply
+        assert "卡号后四位" not in v.reply
+
+    def test_all_solicitation_falls_back_to_emergency_reply(self) -> None:
+        """全句索敏时用挂失专属兜底 (而非通用澄清)"""
+        from lumio.services.bot.outbound_guard import OutboundGuard
+
+        class _S:
+            def check_input(self, t):
+                return True, []
+
+        g = OutboundGuard(_S(), "您的意思我还没太理解。", emergency_reply="请立即拨打客服热线挂失, 回复『转人工』。")
+        v = g.check("请告诉我您的卡号后四位。")
+        assert v.passed is False
+        assert v.reply == "请立即拨打客服热线挂失, 回复『转人工』。"
+
     def test_allows_process_description(self) -> None:
         g = self._guard()
         # 流程描述 (转述银行官方渠道的操作步骤) 不算索敏

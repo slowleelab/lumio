@@ -203,7 +203,16 @@ class LumioAgent:
         )
         from lumio.shared.safety import safety_filter as _safety_filter
 
-        self._outbound_guard = OutboundGuard(_safety_filter, CLARIFY_RESPONSE)
+        # 索敏整体替换的兜底话术: 紧急挂失场景给渠道引导+转人工邀约,
+        # 不用通用澄清 ("您的意思我还没太理解") 二次伤害紧急客户
+        self._outbound_guard = OutboundGuard(
+            _safety_filter,
+            CLARIFY_RESPONSE,
+            emergency_reply=(
+                "您的卡片疑似丢失, 请立即拨打24小时客服热线400-888-8888、"
+                "登录手机银行APP或前往就近网点办理挂失。如需协助, 回复『转人工』为您转接专属客服。"
+            ),
+        )
         self._citation_title_cache: dict[str, str] = {}
         self._last_citation_docids: list[str] = []
         # P0-3: 精排器 (loss-in-middle 缓解 + 相关性阈值过滤)
@@ -1302,7 +1311,9 @@ class LumioAgent:
                 intent.primary_confidence,
             )
         _rag_t0 = time.monotonic()
-        context = await self._retrieve(user_input)
+        context = await self._retrieve(
+            user_input, intent=intent.primary_intent, confidence=intent.primary_confidence
+        )
         if extra_context:
             context = f"{extra_context}\n\n{context}" if context else extra_context
         # E2 决策可解释: 记录 RAG 检索决策 (命中与否)
@@ -2542,8 +2553,18 @@ class LumioAgent:
         )
         return re.sub(r"[\s,?,.!;:；：]+", "", t)
 
-    async def _retrieve(self, query: str) -> str:
-        """RAG 检索 (P0-3 上下文工程: 接线 reranker + 相关性阈值 + 首尾重排 + RAG 预算截断)"""
+    async def _retrieve(self, query: str, *, intent: IntentLabel | None = None, confidence: float = 0.0) -> str:
+        """RAG 检索 (P0-3 上下文工程: 接线 reranker + 相关性阈值 + 首尾重排 + RAG 预算截算)
+
+        intent/confidence 提供时做意图感知检索词增强 (高置信交易/风险意图拼规范词)。
+        """
+        if intent is not None and confidence >= 0.7:
+            terms = _INTENT_RETRIEVAL_TERMS.get(intent)
+            if terms and terms not in query:
+                query = f"{query} {terms}"
+                logger.info(
+                    "意图感知检索词增强: intent=%s conf=%.2f → %r", intent.value, confidence, query[:60]
+                )
         if self._degradation_mgr.level == DegradationLevel.FALLBACK:
             return ""
         # P1-13 修复: 检索前查 ES/Milvus 熔断器 — 熔断打开时主动跳过检索,
@@ -3575,6 +3596,22 @@ def _has_grounding(session_memory: str, history: list | None) -> bool:
     if any(m in session_memory for m in markers):
         return True
     return bool(history)
+
+
+# 意图感知检索词增强 (qa_scan 挂账: 挂失/额度口语 query 被《年费减免条件》字面
+# 抢位 —— 年费文档里也有"挂失补卡"字样, BM25 词面区分度不足; reranker 在本环境
+# 结构性不可用 (Ollama 0.21 无 /api/rerank 端点, bge-reranker GGUF 仅 completion
+# 能力), RRF 无相关性过滤)。高置信交易/风险意图把规范检索词拼进 query, 让 BM25
+# 命中正确的领域文档; 定义/咨询类意图无条目 = 原文检索不变。
+_INTENT_RETRIEVAL_TERMS: dict[IntentLabel, str] = {
+    IntentLabel.CARD_LOSS: "信用卡挂失 挂失流程 补卡",
+    IntentLabel.CARD_LOSS_REPORT: "信用卡挂失 挂失流程 补卡",
+    IntentLabel.LIMIT_QUERY: "信用卡额度 可用额度 额度调整",
+    IntentLabel.BILL_QUERY: "信用卡账单 账单查询 还款日",
+    IntentLabel.ACCOUNT_BILL_QUERY: "信用卡账单 账单查询 还款日",
+    IntentLabel.TRANSACTION_QUERY: "信用卡交易明细 交易记录 消费记录",
+    IntentLabel.TXN_QUERY: "信用卡交易明细 交易记录 消费记录",
+}
 
 
 # 紧急意图标记 (FAQ 短路豁免, qa_scan 首轮复盘): 挂失/盗刷类输入必须进意图分类

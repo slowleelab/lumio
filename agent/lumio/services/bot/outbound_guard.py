@@ -57,9 +57,12 @@ class OutboundGuard:
         clarify_response: 拦截后的替换话术
     """
 
-    def __init__(self, safety_filter: Any, clarify_response: str) -> None:
+    def __init__(self, safety_filter: Any, clarify_response: str, emergency_reply: str = "") -> None:
         self._safety = safety_filter
         self._clarify = clarify_response
+        # 紧急场景 (挂失/盗刷) 索敏拦截后的替换话术 — 通用澄清 ("您的意思我还没
+        # 太理解") 对紧急挂失客户是二次伤害, 换挂失引导 + 转人工邀约
+        self._emergency_reply = emergency_reply
 
     def check(self, reply: str, grounding_source: str = "", tool_executed: bool = False) -> OutboundVerdict:
         """出站检查
@@ -83,10 +86,18 @@ class OutboundGuard:
             logger.warning("出站拦截-编造办理话术(无工具执行): %r", reply[:60])
             return OutboundVerdict(passed=False, reply=self._clarify, reason="fabricated_execution")
 
-        # 2b. 索敏话术: 自由文本索要卡号/密码/验证码 (LLM 违反 prompt 纪律的兜底)
+        # 2b. 索敏话术: 自由文本索要卡号/密码/验证码 (LLM 违反 prompt 纪律的兜底)。
+        # 剥离策略: 索敏句往往出现在合规引导之后的尾部 — 按句切分剔除命中句,
+        # 剩余合规部分 (挂失渠道/转人工邀约) 保留放行; 全被剔/剩太短才整体替换。
         if _SENSITIVE_SOLICITATION_RE.search(reply):
-            logger.warning("出站拦截-索敏话术: %r", reply[:60])
-            return OutboundVerdict(passed=False, reply=self._clarify, reason="sensitive_solicitation")
+            kept = [seg for seg in re.split(r"(?<=[。！？!?\n])", reply) if not _SENSITIVE_SOLICITATION_RE.search(seg)]
+            stripped = "".join(kept).strip()
+            if len(stripped) >= 20:
+                logger.warning("出站拦截-索敏话术(剥离索敏句保留合规部分): %r → %r", reply[:60], stripped[:60])
+                return OutboundVerdict(passed=False, reply=stripped, reason="sensitive_solicitation_stripped")
+            replacement = self._emergency_reply or self._clarify
+            logger.warning("出站拦截-索敏话术(整体替换): %r → %r", reply[:60], replacement[:60])
+            return OutboundVerdict(passed=False, reply=replacement, reason="sensitive_solicitation")
 
         # 3. 幻觉数字 v1: 有 grounding 源时, 回复中的数字 token 应能在源中找到
         if grounding_source:
