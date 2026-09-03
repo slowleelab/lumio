@@ -876,6 +876,15 @@ class LumioAgent:
             # 回落知识链): 意图置信 ≥0.9 且意图→工具映射唯一时, 跳过 LLM 编排循环
             # 直接执行工具 (卡号注入/配额/脱敏/审计同源)。失败回落链 A。
             # 阈值 0.8: 挂失为保护性操作 (误挂可解挂), LLM 慢路径分类多落 0.76-0.85。
+            # 咨询句式豁免直连 (第八轮质检挂账: "信用卡找不到了, 怎么办呢"客户在问
+            # 流程, 直连把挂失办了 — 体验激进): 问"怎么办/怎么挂失"类走知识链答
+            # 流程介绍; 祈使句式 ("帮我挂失/赶紧停了") 保持直连执行。
+            consultative_markers = ("怎么办", "怎么挂失", "如何挂失", "挂失流程", "怎么处理", "如何处理")
+            if confidence >= 0.8 and any(m in user_input for m in consultative_markers):
+                logger.info("挂失咨询句式走知识链 (跳过直连): input=%r", user_input[:24])
+                return await self._handle_knowledge(
+                    session_id, user_input, intent_result, history, entities, sentiment
+                )
             if (
                 confidence >= 0.8
                 and self._tool_executor is not None

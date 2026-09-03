@@ -2395,3 +2395,69 @@ def test_format_tool_result_json_to_reply() -> None:
     assert _format_tool_result("纯文本结果") == "纯文本结果"
     # 坏 JSON 原文返回
     assert _format_tool_result("{bad json") == "{bad json"
+
+
+class TestConsultativeLossGuard:
+    """挂失咨询句式豁免直连 (第八轮质检挂账: "怎么办"被直接办了)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_consultative_question_goes_knowledge(self) -> None:
+        """"信用卡找不到了, 怎么办呢" → 知识链答流程, 不直连执行"""
+        agent = self._make_agent()
+        agent._tool_executor = MagicMock()
+        agent._tool_executor.execute_direct = AsyncMock()
+        agent._handle_knowledge = AsyncMock(return_value={"response": "流程介绍", "response_source": "knowledge"})
+        result = await agent._dispatch_v2(
+            "s1",
+            "信用卡找不到了, 怎么办呢",
+            IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.96),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "transaction",
+            "c1",
+        )
+        agent._handle_knowledge.assert_awaited_once()
+        agent._tool_executor.execute_direct.assert_not_called()
+        assert result["response_source"] == "knowledge"
+
+    @pytest.mark.asyncio
+    async def test_imperative_still_direct(self) -> None:
+        """"帮我挂失" 祈使句式保持直连执行"""
+        agent = self._make_agent()
+        agent._tool_executor = MagicMock(has_tools=MagicMock(return_value=True))
+        agent._tool_executor.execute_direct = AsyncMock(
+            return_value=MagicMock(content="挂失已受理，受理编号 LS-123", executed_tools=["report_card_lost"])
+        )
+        agent._handle_knowledge = AsyncMock()
+        from lumio.shared.config import Settings
+
+        real = Settings()
+        real.mcp.progressive_disclosure_enabled = True
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "lumio.services.bot.bot_agent.get_settings", return_value=real
+        ):
+            result = await agent._dispatch_v2(
+                "s1",
+                "我的卡丢了, 帮我挂失",
+                IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.96),
+                [],
+                [],
+                SentimentLabel.NEUTRAL,
+                "transaction",
+                "c1",
+            )
+        agent._tool_executor.execute_direct.assert_awaited_once()
+        agent._handle_knowledge.assert_not_called()
