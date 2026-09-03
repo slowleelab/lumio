@@ -2045,7 +2045,14 @@ class LumioAgent:
         # unclear: 无法判定为确认/取消 — 计数, 达到上限自动取消并放行新消息
         # (业务场景: 确认窗口内用户发新问题, 若一直吞掉会被卡死, 需给逃生路径)
         new_count = (pending.unclear_count or 0) + 1
-        if new_count >= get_settings().mcp.unclear_auto_cancel_threshold:
+        # 明确新话题快速放行 (qa_scan 第六轮: 挂失确认等待中客户问"新卡多久
+        # 寄到", 连续两轮被重复确认话术吞掉): 带疑问特征或明显长于确认/犹豫
+        # 短语的输入, 不再计数等待 — 立即取消确认并按新消息处理。短回退词
+        # ("嗯"/"再想想") 仍走计数路径, 防误放行真犹豫。
+        stripped = (user_input or "").strip()
+        new_topic_markers = ("多久", "怎么", "什么", "为什么", "多少", "如何", "哪里", "几", "吗", "？", "?", "咋")
+        looks_new_topic = len(stripped) >= 10 or any(m in stripped for m in new_topic_markers)
+        if looks_new_topic or new_count >= get_settings().mcp.unclear_auto_cancel_threshold:
             await self._clear_pending_action(session_id, state.version)
             TOOL_CONFIRMATIONS.labels(decision="cancel").inc()
             await self._tool_executor.audit_decision(  # type: ignore[union-attr]

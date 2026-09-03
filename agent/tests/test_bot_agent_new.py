@@ -2312,3 +2312,72 @@ class TestDispatchV2DefinitionGuard:
         agent._handle_tool.assert_awaited_once()
         agent._handle_knowledge.assert_not_called()
         assert result["response_source"] == "tool"
+
+
+class TestPendingNewTopicFastRelease:
+    """确认窗口新话题快速放行 (qa_scan 第六轮: 挂失确认中问"新卡多久寄到"被吞两轮)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_question_in_confirm_window_releases_pending(self) -> None:
+        """带疑问特征的新话题 → 首轮即取消确认放行 (pending_released)"""
+        from datetime import UTC, datetime, timedelta
+
+        from lumio.shared.models import PendingAction
+
+        agent = self._make_agent()
+        agent._tool_executor = MagicMock()
+        agent._clear_pending_action = AsyncMock()
+        state = MagicMock(
+            pending_action=PendingAction(
+                tool_name="report_card_lost",
+                tool_call_id="t1",
+                arguments={"card_no": "1234"},
+                confirm_prompt="确认挂失吗",
+                created_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                unclear_count=0,
+            ),
+            version=1,
+            customer_id="c1",
+        )
+        agent._tool_executor.audit_decision = AsyncMock()
+        result = await agent._handle_pending_action("s1", "新卡一般多久能寄到", state, "c1")
+        assert result.get("pending_released") is True
+        agent._clear_pending_action.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_short_hesitation_still_counts(self) -> None:
+        """短犹豫词 ("嗯"/"再想想") 不放行, 走计数+确认话术"""
+        from datetime import UTC, datetime, timedelta
+
+        from lumio.shared.models import PendingAction
+
+        agent = self._make_agent()
+        state = MagicMock(
+            pending_action=PendingAction(
+                tool_name="report_card_lost",
+                tool_call_id="t1",
+                arguments={},
+                confirm_prompt="确认挂失吗",
+                created_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                unclear_count=0,
+            ),
+            version=1,
+            customer_id="c1",
+        )
+        agent._tool_executor = MagicMock(audit_decision=AsyncMock())  # 缺执行器会走"清除放行"防御分支
+        result = await agent._handle_pending_action("s1", "嗯", state, "c1")
+        assert result.get("pending_released") is None  # 未放行, 仍等确认
