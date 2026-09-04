@@ -224,3 +224,42 @@ def test_gate_pure_punct_not_reply() -> None:
     from lumio.services.bot.bot_agent import _is_noise_input
 
     assert _is_noise_input("。。。。。") is True
+
+
+def test_gate_topic_followup_rules() -> None:
+    """诉求回访规则 (第十一轮: 挂失切话题回访 + 防骚扰)"""
+    import asyncio
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, MagicMock
+
+    from lumio.services.bot.bot_agent import LumioAgent
+    from lumio.shared.models import IntentLabel, IntentResult, TopicRequest, TopicRequestStatus
+
+    def mk():
+        clf = MagicMock()
+        clf.classify = AsyncMock(return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), ""))
+        return LumioAgent(
+            classifier=clf,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="x"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None), patch_state=AsyncMock()),
+        )
+
+    loss = TopicRequest(id="card_loss", intent="card_loss", label_zh="挂失", urgency="high", raised_turn=1, updated_at=datetime.now(UTC))
+
+    # 1) 挂失未办结 + 本轮查账单 → 回访追加
+    a = mk()
+    r = {"response": "账单 8650 元。", "response_source": "tool"}
+    asyncio.run(a._track_and_followup("s", MagicMock(version=1, turn_count=2, active_requests=[loss]), IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.84), "query", r))
+    assert "挂失" in r["response"] and "未办理完成" in r["response"]
+
+    # 2) 本轮闲聊 (无新诉求) → 不回访
+    b = mk()
+    r2 = {"response": "哈哈", "response_source": "template"}
+    asyncio.run(b._track_and_followup("s", MagicMock(version=1, turn_count=2, active_requests=[loss.model_copy(deep=True)]), IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.29), "fallback", r2))
+    assert "未办理完成" not in r2["response"]
+
+    # 3) 已办结不回访 + 防带偏: fulfilled 不进进行中诉求
+    done = loss.model_copy(deep=True)
+    done.status = TopicRequestStatus.FULFILLED
+    assert b._pick_followup([done], "bill_query", 2) is None

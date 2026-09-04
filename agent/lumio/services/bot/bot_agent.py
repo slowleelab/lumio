@@ -59,6 +59,7 @@ from lumio.shared.models import (
     RetrieveResponse,
     SentimentLabel,
     SessionPhase,
+    TopicRequest,
     TransferTriggerLevel,
     VerificationRequest,
     VerificationResult,
@@ -656,6 +657,18 @@ class LumioAgent:
             # 覆写清空防陈旧快照误豁免后续无关输入。
             if result is not None:
                 await self._update_awaiting_snapshot(session_id, intent_result.primary_intent, result)
+                # 诉求跟踪: upsert/流转 + 高紧急未办结回访 (开关可回滚)
+                if routing_v2:
+                    try:
+                        track_state = (
+                            await self._session_manager.get_session(session_id)
+                            if self._session_manager is not None
+                            else None
+                        )
+                        if track_state is not None:
+                            await self._track_and_followup(session_id, track_state, intent_result, domain, result)
+                    except Exception:
+                        logger.debug("诉求跟踪跳过(不阻断): session=%s", session_id)
 
             # P0 修复: 澄清轮的 L3 补判 (run() 统一出口). 噪声门/低置信分支在 handler 内
             # 提前 return clarify, 永远到不了各路径末尾的 _check_transfer -- 连续低置信的
@@ -781,7 +794,7 @@ class LumioAgent:
             turns = await self._session_manager.get_history(session_id, limit=6)
         except Exception:
             return None
-        return [
+        ctx = [
             {
                 "speaker": t.speaker,
                 "content": t.content,
@@ -792,6 +805,25 @@ class LumioAgent:
             for t in turns
             if t.speaker in ("customer", "bot") and t.content
         ][-6:]
+        # 防带偏 (诉求跟踪联动, 2026-09-04 E2E 实证: "什么是临时额度"办结后,
+        # "我的额度是什么"新查询仍被 BERT 历史拼接拖回知识链): 开启诉求跟踪
+        # 且最近轮已办结 (无未办结诉求) 时, 只保留最后一对轮次作上下文 —
+        # 新话题判定需要干净视野; 有未办结诉求时保留全部 (多轮补槽需要上文)。
+        if ctx and get_settings().session.topic_tracking_enabled and self._session_manager is not None:
+            try:
+                from lumio.shared.models import TopicRequestStatus
+
+                st = await self._session_manager.get_session(session_id)
+                live = [
+                    t
+                    for t in (getattr(st, "active_requests", None) or [])
+                    if t.status in (TopicRequestStatus.OPEN, TopicRequestStatus.WAITING_INFO)
+                ]
+                if st is not None and not live and len(ctx) >= 4:
+                    ctx = ctx[-2:]  # 只留最近一问一答
+            except Exception:
+                pass
+        return ctx
 
     # ── 目标架构 v2 两级路由: 决策一/二 与四条执行链 ──
 
@@ -3088,6 +3120,161 @@ class LumioAgent:
         except Exception:
             logger.debug("摘要更新异常: session=%s", session_id)
 
+    # ── 诉求跟踪器 (多轮会话管理, 2026-09-04): 断档/带偏同根源修复 ──
+    #
+    # 设计纪律 (不留坑):
+    # - 回访只提醒不建新等待状态: 客户回复由既有分类器自然处理
+    #   ("挂失"关键词重新命中规则), 不引入第二个确认状态机
+    # - urgency 由意图域判定 (risk/complain/transfer=high), 不新增词表
+    # - patch_state 版本冲突放弃本轮更新 (下一轮自愈), 不重试循环
+    # - 上限 5 条, 满则挤掉最老的已办结项
+
+    _TOPIC_INTENT_ZH: dict[str, str] = {
+        "card_loss": "挂失", "card_loss_report": "挂失", "complaint": "投诉",
+        "transfer_agent": "转人工", "dispute_chargeback": "争议处理",
+        "dispute_submit": "争议处理", "bill_query": "账单查询",
+        "account_bill_query": "账单查询", "limit_query": "额度查询",
+        "installment_inquiry": "分期咨询", "reward_query": "积分服务",
+        "txn_query": "交易查询", "transaction_query": "交易查询",
+    }
+    _TOPIC_HIGH_URGENCY_DOMAINS = frozenset({"risk", "complain", "transfer"})
+    _TOPIC_MAX_ACTIVE = 5
+
+    def _intent_as_topic(self, intent_result: IntentResult, domain: str, turn_count: int) -> TopicRequest | None:
+        """本轮分类结果 → 诉求对象; 非诉求意图 (闲聊/低置信兜底) 返回 None"""
+        from lumio.shared.models import TopicRequest
+
+        intent = intent_result.primary_intent
+        conf = intent_result.primary_confidence
+        if intent in (IntentLabel.NB_CHITCHAT, IntentLabel.CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.FAQ):
+            if conf < 0.8:  # 低置信 faq 是兜底不是诉求; 高置信 faq (产品咨询) 也视为轻诉求不建 (FAQ 已直答即 fulfilled, 无跟踪价值)
+                return None
+        label = self._TOPIC_INTENT_ZH.get(intent.value, "")
+        if not label:
+            return None
+        urgency = "high" if domain in self._TOPIC_HIGH_URGENCY_DOMAINS else "normal"
+        return TopicRequest(
+            id=f"{intent.value}",
+            intent=intent.value,
+            label_zh=label,
+            urgency=urgency,
+            raised_turn=turn_count,
+        )
+
+    def _merge_topic_requests(
+        self, existing: list[TopicRequest], new_topic: TopicRequest | None, response_source: str
+    ) -> list[TopicRequest]:
+        """诉求合并与状态流转 (纯函数, 便于单测)
+
+        - new_topic 与本轮: response_source 决定状态 (tool/faq/knowledge=fulfilled,
+          slot_hint/clarify=waiting_info, 其他不动)
+        - 旧诉求: 同 intent 刷新; 不同 intent 保留原状态
+        - 挤出: 超上限时优先挤掉最老的 fulfilled
+        """
+        from lumio.shared.models import TopicRequestStatus
+
+        by_id = {t.id: t.model_copy(deep=True) for t in existing}
+        if new_topic is not None:
+            cur = by_id.get(new_topic.id)
+            if cur is not None:
+                cur.updated_at = new_topic.updated_at
+                cur.raised_turn = new_topic.raised_turn
+                cur.urgency = "high" if "high" in (cur.urgency, new_topic.urgency) else cur.urgency  # high 不降级
+            else:
+                by_id[new_topic.id] = new_topic
+            # 本轮诉求按回复来源流转
+            if response_source in ("tool", "faq", "knowledge", "retrieval"):
+                by_id[new_topic.id].status = TopicRequestStatus.FULFILLED
+            elif response_source in ("slot_hint", "clarify"):
+                by_id[new_topic.id].status = TopicRequestStatus.WAITING_INFO
+            # template/fallback 等不动 (转人工/问候不是诉求办结)
+        out = list(by_id.values())
+        if len(out) > self._TOPIC_MAX_ACTIVE:
+            fulfilled = sorted(
+                [t for t in out if t.status == TopicRequestStatus.FULFILLED], key=lambda t: t.updated_at
+            )
+            for t in fulfilled[: len(out) - self._TOPIC_MAX_ACTIVE]:
+                out.remove(t)
+            out = out[: self._TOPIC_MAX_ACTIVE]
+        return out
+
+    def _pick_followup(self, requests: list[TopicRequest], current_intent_value: str, revisit_max: int) -> TopicRequest | None:
+        """挑一条该回访的高紧急诉求: 未办结 + 非本轮意图 + 未超回访上限"""
+        from lumio.shared.models import TopicRequestStatus
+
+        for t in requests:
+            if (
+                t.urgency == "high"
+                and t.status in (TopicRequestStatus.OPEN, TopicRequestStatus.WAITING_INFO)
+                and t.intent != current_intent_value
+                and t.revisit_count < revisit_max
+            ):
+                return t
+        return None
+
+    async def _track_and_followup(
+        self,
+        session_id: str,
+        state: Any,
+        intent_result: IntentResult,
+        domain: str,
+        result: dict[str, Any],
+    ) -> None:
+        """run() 出口统一调用: 诉求 upsert/流转写回 + 高紧急回访追加 (总开关)"""
+
+        if not get_settings().session.topic_tracking_enabled or self._session_manager is None or state is None:
+            return
+        try:
+            turn_count = getattr(state, "turn_count", 0) or 0
+            new_topic = self._intent_as_topic(intent_result, domain, turn_count)
+            merged = self._merge_topic_requests(
+                list(getattr(state, "active_requests", None) or []),
+                new_topic,
+                str(result.get("response_source") or ""),
+            )
+            # 回访: 本轮是新话题 (≠诉求意图) 且诉求高紧急未办结
+            followup = self._pick_followup(
+                merged,
+                intent_result.primary_intent.value,
+                get_settings().session.topic_revisit_max,
+            )
+            revisit_note = ""
+            if followup is not None and new_topic is not None:  # 本轮有明确新诉求才算"切话题"
+                followup.revisit_count += 1
+                revisit_note = (
+                    f"\n\n另外，您刚才提到的{followup.label_zh}还未办理完成。"
+                    f"如仍需要，请再说一次，或回复『转人工』由专员为您协助。"
+                )
+                result["response"] = str(result.get("response") or "") + revisit_note
+            await self._session_manager.patch_state(
+                session_id=session_id,
+                expected_version=state.version,
+                patches={"active_requests": [t.model_dump(mode="json") for t in merged]},
+            )
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.TOPIC_TRACK,
+                    reasoning=(
+                        f"诉求跟踪: {new_topic.label_zh if new_topic else '本轮无新诉求'}"
+                        f"{'；回访提醒未办结的' + followup.label_zh if followup is not None and revisit_note else ''}"
+                    ),
+                    evidence={
+                        "requests": [
+                            {"intent": t.label_zh, "urgency": t.urgency, "status": t.status.value, "revisits": t.revisit_count}
+                            for t in merged
+                        ][:5],
+                        "followup_sent": bool(revisit_note),
+                    },
+                    turn_id=uuid_module.uuid4().hex[:16],
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            # 版本冲突等: 放弃本轮写回, 下一轮自愈 — 诉求跟踪失败绝不影响主回复
+            logger.debug("诉求跟踪写回失败(不阻断): session=%s err=%s", session_id, exc)
+
     async def _build_session_memory(self, session_id: str) -> str:
         """构建结构化会话记忆（注入 system prompt，永不裁剪）
 
@@ -3134,8 +3321,21 @@ class LumioAgent:
                     entity_strs = [f"{e.entity_type}={e.value}" for e in filtered]
                     parts.append(f"[已知实体] {', '.join(entity_strs)}")
 
-            # 意图栈
-            if state.intent_stack:
+            # 意图栈 (防带偏: 诉求跟踪开启时只保留未办结诉求的意图 + 当前意图 —
+            # 旧话题已办结不应再影响新轮判定, "临时额度概念带偏额度查询"根治)
+            _topic_on = get_settings().session.topic_tracking_enabled
+            _active = list(getattr(state, "active_requests", None) or [])
+            if _topic_on and _active:
+                from lumio.shared.models import TopicRequestStatus
+
+                live_ids = [
+                    t.id for t in _active if t.status in (TopicRequestStatus.OPEN, TopicRequestStatus.WAITING_INFO)
+                ]
+                if state.last_intent is not None and state.last_intent.value not in live_ids:
+                    live_ids.append(state.last_intent.value)
+                if live_ids:
+                    parts.append(f"[进行中诉求] {'、'.join(live_ids)}")
+            elif state.intent_stack:
                 intent_strs = [i.value if hasattr(i, "value") else str(i) for i in state.intent_stack]
                 parts.append(f"[意图历史] {' → '.join(intent_strs)}")
 

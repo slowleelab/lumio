@@ -491,6 +491,11 @@ class SafetySettings(BaseSettings):
 
 class SessionSettings(BaseSettings):
     """会话状态配置"""
+    # 诉求跟踪 (2026-09-04 多轮会话管理): 断档(紧急诉求切话题蒸发)与
+    # 带偏(旧话题影响新轮)的同根源修复。关闭即完全回滚旧行为。
+    topic_tracking_enabled: bool = True
+    # 同一高紧急诉求的最大回访次数 (防骚扰)
+    topic_revisit_max: int = 2
 
     model_config = SettingsConfigDict(env_prefix="SESSION_")
 

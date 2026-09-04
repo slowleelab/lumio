@@ -526,6 +526,33 @@ class SlotValue(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class TopicRequestStatus(StrEnum):
+    """会话内诉求生命周期 (多轮会话管理, 2026-09-04)
+
+    断档/带偏同根源根治: 系统此前没有"客户有哪些进行中诉求"的表示 —
+    挂失说了没办完, 切话题后诉求蒸发 (断档); 旧话题又过度影响新轮
+    判定 (带偏)。诉求跟踪器让两边都有显式状态可依。
+    """
+
+    OPEN = "open"  # 已提出, 未开始处理
+    WAITING_INFO = "waiting_info"  # 处理中, 等客户补参数/确认
+    FULFILLED = "fulfilled"  # 已办结 (工具执行/知识回答完成)
+    DROPPED = "dropped"  # 客户明确放弃 / 会话结束
+
+
+class TopicRequest(BaseModel):
+    """进行中的客户诉求 (会话级, 跨轮持久)"""
+
+    id: str
+    intent: str  # IntentLabel value
+    label_zh: str  # 回访话术用中文名 ("挂失")
+    urgency: str = "normal"  # high: 挂失/投诉/转人工域 → 切话题后回访
+    status: TopicRequestStatus = TopicRequestStatus.OPEN
+    raised_turn: int = 0
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    revisit_count: int = 0  # 回访次数 (防骚扰上限)
+
+
 class SessionState(BaseModel):
     """会话状态对象
 
@@ -569,6 +596,10 @@ class SessionState(BaseModel):
     # 结构: {"intent": "installment_inquiry", "slots": [("amount","分期金额"), ...]}
     # 只存槽名/标签等元信息, 不含敏感值; 下轮放行/正常流转后整体覆写清空。
     awaiting_slots: dict[str, Any] = Field(default_factory=dict)
+
+    # 进行中诉求 (多轮会话管理): 客户已表达且未办结/未放弃的诉求清单,
+    # 每轮按意图 upsert、按回复来源流转状态; 高紧急未办结诉求切话题后回访
+    active_requests: list[TopicRequest] = Field(default_factory=list)
 
     # 对话摘要压缩（长对话场景）
     conversation_summary: str = ""  # 被裁剪轮次的摘要

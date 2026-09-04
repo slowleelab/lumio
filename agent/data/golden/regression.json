@@ -195,6 +195,25 @@
         "min_conf": 0.8,
         "query_chain": true
       }
+    },
+    {
+      "id": "qa11-topic-followup",
+      "origin": "第十一轮: 挂失切账单话题回访 + 防带偏记忆过滤",
+      "layer": "gate",
+      "input": "多轮: 挂失→查账单",
+      "assert": {
+        "followup_on_high_urgency": true,
+        "memory_filters_fulfilled": true
+      }
+    },
+    {
+      "id": "qa11-topic-no-revisit-chitchat",
+      "origin": "回访不打扰闲聊轮",
+      "layer": "gate",
+      "input": "多轮: 挂失→闲聊",
+      "assert": {
+        "no_followup_without_new_topic": true
+      }
     }
   ]
 }
