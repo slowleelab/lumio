@@ -558,7 +558,9 @@ async def search_faq(
     # 1b. BM25 词法检索 (主力通道, 2026-09-04 范式升级): exact 是快路径缓存,
     # 变体 (前缀/语气/同义词/词序) 全部由 BM25+IDF 承接 — 高频礼貌词权重
     # 天然消解, 业务词共现决定排序。命中回查 PG 拿标准答案。
-    if es_client is not None:
+    if es_client is not None and not any(m in query for m in _PERSONAL_QUERY_MARKERS):
+        # 个人查询防截胡 (与语义路同纪律, 重放实测: "我的信用卡额度是多少"被 BM25
+        # 命中年费 FAQ@13.1 — 个人账户数据诉求不应被概念型 FAQ 截胡)
         faq_id_bm25, bm25_score = await _bm25_faq_match(es_client, query)
         if faq_id_bm25:
             from sqlalchemy import select as _select
