@@ -3323,7 +3323,9 @@ class LumioAgent:
 
             # 意图栈 (防带偏: 诉求跟踪开启时只保留未办结诉求的意图 + 当前意图 —
             # 旧话题已办结不应再影响新轮判定, "临时额度概念带偏额度查询"根治)
-            _topic_on = get_settings().session.topic_tracking_enabled
+            from lumio.shared.config import get_settings as _gs_topic
+
+            _topic_on = _gs_topic().session.topic_tracking_enabled
             _active = list(getattr(state, "active_requests", None) or [])
             if _topic_on and _active:
                 from lumio.shared.models import TopicRequestStatus
