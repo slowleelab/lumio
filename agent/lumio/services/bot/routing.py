@@ -5,8 +5,6 @@
 
 分类表以既有 INTENT_DOMAINS + SENSITIVE_INTENTS 为单一事实源归并生成，
 另加显式覆盖表，避免第三处意图清单漂移。
-
-(v1 旧链路已删除, 2026-09-04: v2 经 12 轮闭环验证后为唯一路径; 回滚用 git revert)
 """
 
 from __future__ import annotations
@@ -46,7 +44,7 @@ class RouteDecision(StrEnum):
 _HIGH_RISK_DOMAINS = {"complain", "transfer"}
 
 # 金融交易: 资金变动/账户变更类。
-# v1 口径 = risk 域 (挂失/冻结/欺诈上报, 有确认状态机背书的敏感工具) ∪ SENSITIVE_INTENTS
+# 口径 = risk 域 (挂失/冻结/欺诈上报, 有确认状态机背书的敏感工具) ∪ SENSITIVE_INTENTS
 # 中非投诉争议类。其余"knowledge 域的写类意图" (如电子账单设置) 仍走知识介绍——
 # 无对应执行工具, 贸然进交易链会零工具可用 (与现状一致, 工具补齐后在此表追加)。
 _FINANCIAL_DOMAINS = {"risk"}
@@ -113,7 +111,7 @@ def decision_two(confidence: float, has_composite: bool) -> RouteDecision:
     return RouteDecision.RAG_CHAIN
 
 
-# ── 复合意图检测 (链 C, v1 规则) ──
+# ── 复合意图检测 (链 C 规则) ──
 
 _EXPLAIN_PATTERNS = ("为什么", "怎么算", "如何计算", "怎么收费", "什么意思", "解释")
 
@@ -121,7 +119,7 @@ _EXPLAIN_PATTERNS = ("为什么", "怎么算", "如何计算", "怎么收费", "
 def detect_composite(intent: IntentLabel, alternatives: list[IntentLabel], text: str) -> bool:
     """查询诉求 + 解释诉求的复合检测
 
-    v1 规则: 主意图为查询类 且 (alternatives 携带知识类意图 或 文本含解释诉求词)。
+    规则: 主意图为查询类 且 (alternatives 携带知识类意图 或 文本含解释诉求词)。
     """
     if not normalize_for_query(intent):
         return False

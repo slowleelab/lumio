@@ -128,7 +128,7 @@ _LOW_CONF_FLOOR = 0.3
 # 闲聊/噪声意图置信封顶 (会话 8700a2ea 复盘): LLM 慢路径对闲聊的自评置信会到
 # 0.7+ ("锄禾日当午"→chitchat@0.70), 中高置信让它跳过低置信护栏直通知识链生成。
 # 闲聊本质是"没认出业务意图", 记账置信必须压到低置信地板以下, 让下游噪声闸/
-# 澄清/v2 竞速按"不确定"对待。fast_conf 保留原始值作分歧证据, 只封 primary。
+# 澄清/竞速按"不确定"对待。fast_conf 保留原始值作分歧证据, 只封 primary。
 _NONBUSINESS_CONF_CAP = 0.29
 # 注意含旧 flat 别名 IntentLabel.CHITCHAT — BERT/LLM 分类器直接构造别名对象,
 # 不会自动归一化到 NB_CHITCHAT (E2E 实测 poll 显示 chitchat@0.7 漏封)
@@ -579,7 +579,7 @@ def build_classify_system_prompt() -> str:
 def _apply_registry_intent(raw_intent: str) -> IntentLabel | None:
     """LLM 输出命中运营注册表意图 → 按域落代表叶子。
 
-    v2 路由按 (五域, 交易性质) 分流, 注册表意图尚无专属工具/槽位, 域代表
+    两级路由按 (五域, 交易性质) 分流, 注册表意图尚无专属工具/槽位, 域代表
     叶子即其真实路由语义; 影子状态只记命中日志与指标, 不进路由索引。
     """
     from lumio.shared.intent_registry import RegistryState, get_registry
@@ -962,7 +962,7 @@ class IntentClassifier:
                     )
 
                     # L2 判定五域 (骨架第一级); 叶子优先取快路径同域意图 (更精确),
-                    # 否则用域代表叶子, 保证 v2 路由 TrafficClass 与域一致
+                    # 否则用域代表叶子, 保证两级路由 TrafficClass 与域一致
                     try:
                         v_domain = IntentDomain(vm.intent)
                     except ValueError:

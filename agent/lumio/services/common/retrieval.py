@@ -131,7 +131,7 @@ def build_milvus_expr(filters: dict) -> str:
                 if epoch_sec:
                     conditions.append(f"{key} >= {epoch_sec}")
         elif key == "keywords":
-            # v2.1: ARRAY_CONTAINS 精确过滤，替代 like 模糊匹配
+            # ARRAY_CONTAINS 精确过滤，替代 like 模糊匹配
             if isinstance(value, list):
                 kw_conds = [f'ARRAY_CONTAINS(keywords, "{kw}")' for kw in value]
                 conditions.append("(" + " or ".join(kw_conds) + ")")

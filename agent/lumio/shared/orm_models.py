@@ -1167,7 +1167,7 @@ class ClassifierSample(Base):
 
 
 class Badcase(Base):
-    """Badcase 资产表 (事后优化闭环 ⑧, 方案 v2.0 §7.4)
+    """Badcase 资产表 (事后优化闭环 ⑧, 方案 §7.4)
 
     五路信号采集 → 粗筛去重 → LLM 自动归因 (模块A) → 修复策略路由
     (A 知识库 / B 意图库 / C 规则配置 / D 模型) → 回归评测集 (L2 只增不减)。

@@ -1,11 +1,10 @@
-"""目标架构 v2 两级路由 + 执行链 + 出站闸门测试"""
+"""目标架构 ④ 两级路由 + 执行链 + 出站闸门测试"""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
 
 from lumio.services.bot.outbound_guard import OutboundGuard
 from lumio.services.bot.parallel_race import race
@@ -17,7 +16,6 @@ from lumio.services.bot.routing import (
     detect_composite,
     is_chitchat_redirect,
 )
-from lumio.shared.auth import AuthUser, get_current_user
 from lumio.shared.models import IntentLabel
 from lumio.shared.safety import SafetyFilter
 
@@ -214,24 +212,6 @@ class TestOutboundGuard:
     def test_no_grounding_no_number_check(self) -> None:
         v = self._guard().check("一般费率为 0.75%", grounding_source="")
         assert v.passed
-
-
-# ── ② 分派冒烟: 开关开启时走 v2 ──
-
-
-class TestDispatchV2:
-    def _patch_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from lumio.shared.config import Settings
-
-        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: Settings())
-
-    def _make_app(self, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> FastAPI:
-        from lumio.services.bot.bot_agent import LumioAgent  # noqa: F401
-
-        self._patch_v2(monkeypatch, enabled)
-        app = FastAPI()
-        app.dependency_overrides[get_current_user] = lambda: AuthUser(user_id="a", role="admin", session_id=None)
-        return app
 
 
 class TestChitchatRedirect:

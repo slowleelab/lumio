@@ -4,7 +4,7 @@ import type { ChatSendResponse, PollResponse } from "@/api/types"
 export type PollMode = "bot" | "agent"
 
 /**
- * Bot 长轮询 — v2.0 适配新状态格式。
+ * Bot 长轮询 — 适配新状态格式。
  *
  * 轮询返回 status 字段: done / queued / processing / timeout
  * 前端根据状态展示排队提示或处理结果。

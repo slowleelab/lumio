@@ -6,7 +6,7 @@ export type WsStatus = "connecting" | "connected" | "disconnected" | "error"
 /**
  * Assist WebSocket — per-agent 持久连接。
  *
- * v2.0 变更: 从按会话建连改为按坐席建连。
+ * 从按会话建连改为按坐席建连。
  * - 坐席登录时 connect(agentId)，生命周期 = 上班周期
  * - 会话上下文由消息中 session_id 字段区分
  * - 坐席接受会话时 send({type:"session_activated", session_id})

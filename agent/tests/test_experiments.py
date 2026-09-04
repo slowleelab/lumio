@@ -54,8 +54,8 @@ def _make_running_exp(name: str = "exp1") -> Experiment:
         name=name,
         description="d",
         variants=[
-            Variant(name="control", weight=50.0, config={"version": "v1"}),
-            Variant(name="treatment", weight=50.0, config={"version": "v2"}),
+            Variant(name="control", weight=50.0, config={"version": "baseline"}),
+            Variant(name="treatment", weight=50.0, config={"version": "candidate"}),
         ],
         status=ExperimentStatus.RUNNING,
     )
@@ -65,10 +65,10 @@ def test_register_and_assign_running():
     """RUNNING 实验能分配变体, 且粘性 (同一 customer 结果稳定)"""
     reg = ExperimentRegistry()
     reg.register(_make_running_exp())
-    v1 = reg.assign_variant("exp1", "cust-1")
-    v2 = reg.assign_variant("exp1", "cust-1")
-    assert v1 in {"control", "treatment"}
-    assert v1 == v2  # 粘性
+    first = reg.assign_variant("exp1", "cust-1")
+    second = reg.assign_variant("exp1", "cust-1")
+    assert first in {"control", "treatment"}
+    assert first == second  # 粘性
 
 
 def test_assign_variant_draft_returns_none():
@@ -120,7 +120,7 @@ def test_get_config():
     reg = ExperimentRegistry()
     reg.register(_make_running_exp())
     cfg = reg.get_config("exp1", "cust-2")
-    assert cfg in ({"version": "v1"}, {"version": "v2"})
+    assert cfg in ({"version": "baseline"}, {"version": "candidate"})
     # 未注册实验返回 default
     assert reg.get_config("no_such", "cust-2", default="d") == "d"
 
@@ -159,7 +159,7 @@ def test_register_default_experiments():
     """预置 3 个实验: 2 RUNNING + 1 DRAFT"""
     reg = ExperimentRegistry()
     register_default_experiments(reg)
-    assert "prompt_v2_test" in reg._experiments
+    assert "prompt_ab_test" in reg._experiments
     assert "kv_cache_enabled" in reg._experiments
     assert reg._experiments["a2ui_cards"].status == ExperimentStatus.DRAFT
 
@@ -169,4 +169,4 @@ def test_get_experiment_registry_singleton():
     reg1 = get_experiment_registry()
     reg2 = get_experiment_registry()
     assert reg1 is reg2
-    assert reg1.assign_variant("prompt_v2_test", "cust-x") in {"control", "treatment"}
+    assert reg1.assign_variant("prompt_ab_test", "cust-x") in {"control", "treatment"}

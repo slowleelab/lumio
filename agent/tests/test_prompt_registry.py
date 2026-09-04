@@ -95,11 +95,11 @@ def test_get_prompt_from_redis_cache(monkeypatch):
         def get(self, key: str):
             return self.data.get(key)
 
-    payload = json.dumps({"version": "v2", "content": "新版 prompt 内容", "rollout_pct": 100.0})
+    payload = json.dumps({"version": "2.0", "content": "新版 prompt 内容", "rollout_pct": 100.0})
     reg._redis_client = _FakeRedisSync({"lumio:prompt:knowledge_agent": payload})
     content = reg.get_prompt("knowledge_agent")
     assert content == "新版 prompt 内容"
-    assert reg._cache["knowledge_agent"].version == "v2"
+    assert reg._cache["knowledge_agent"].version == "2.0"
 
 
 def test_get_prompt_rollout_switch_back():
@@ -108,7 +108,7 @@ def test_get_prompt_rollout_switch_back():
     now = time.time()
     reg._cache["knowledge_agent"] = PromptVersion(
         name="knowledge_agent",
-        version="canary-v2",
+        version="canary-2.0",
         content="灰度内容",
         rollout_pct=1.0,  # 1% 灰度
     )
@@ -124,7 +124,7 @@ def test_get_prompt_rollout_hit():
     now = time.time()
     reg._cache["knowledge_agent"] = PromptVersion(
         name="knowledge_agent",
-        version="canary-v2",
+        version="canary-2.0",
         content="灰度内容",
         rollout_pct=100.0,
     )

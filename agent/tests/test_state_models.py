@@ -140,7 +140,7 @@ class TestArbitrationResult:
         ar = ArbitrationResult(
             primary_card={"script": "hello"},
             risk_badge={"level": "warn"},
-            marketing_slot={"product": "card_v2"},
+            marketing_slot={"product": "card_pro"},
             fusion_type="service_risk_marketing",
             trace_id="trace-001",
         )

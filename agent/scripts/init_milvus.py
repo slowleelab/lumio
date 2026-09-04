@@ -1,6 +1,6 @@
 """初始化 Milvus Collection
 
-创建 lumio_knowledge Collection (v2.1 — 标量索引 + ARRAY keywords):
+创建 lumio_knowledge Collection (标量索引 + ARRAY keywords):
 - 向量维度: 1024 (bge-large-zh-v1.5)
 - 索引类型: IVF_FLAT (nlist=128)
 - 度量类型: COSINE
@@ -49,7 +49,7 @@ def init_milvus():
             max_length=32,
             description="文档类型: faq/rule/rate/activity/product",
         ),
-        # v2.1: keywords 改为 ARRAY 类型，支持 ARRAY_CONTAINS 精确过滤
+        # keywords 采用 ARRAY 类型，支持 ARRAY_CONTAINS 精确过滤
         FieldSchema(
             name="keywords",
             dtype=DataType.ARRAY,
@@ -87,7 +87,7 @@ def init_milvus():
         ),
     ]
 
-    schema = CollectionSchema(fields=fields, description="智能客服知识库向量索引 v2.1")
+    schema = CollectionSchema(fields=fields, description="智能客服知识库向量索引")
     collection = Collection(name=collection_name, schema=schema)
 
     # 向量索引

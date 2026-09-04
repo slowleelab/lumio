@@ -1,4 +1,4 @@
-"""事后优化闭环核心 (目标架构 ⑧, 方案 v2.0)
+"""事后优化闭环核心 (目标架构 ⑧)
 
 模块一/二: 五路信号采集 + 粗筛去重
 模块A:   Badcase 根因自动归因 (LLM-as-Judge, n=3 自一致性 + 人工兜底闸门)
@@ -56,7 +56,7 @@ def fix_table_for_layer(layer: str | None) -> str:
     return _LAYER_TO_FIX_TABLE.get(layer or "", "none")
 
 
-# ── 粗筛去重 key (方案 §4.1: 向量相似 > 0.95 合并; v1 用文本哈希前缀粗分组) ──
+# ── 粗筛去重 key (方案 §4.1: 向量相似 > 0.95 合并, 文本哈希前缀粗分组) ──
 
 
 def dedup_key(user_input: str) -> str:
@@ -248,7 +248,7 @@ class BadcaseJudge:
         )
 
 
-# ── 模块 B: 金标评测集扩充 (引擎二 规则模板 + 四层过滤 v1) ──
+# ── 模块 B: 金标评测集扩充 (引擎二 规则模板 + 四层过滤) ──
 
 _SYNONYM_MAP: dict[str, list[str]] = {
     "查询": ["查", "看看", "查一下", "帮我查"],
@@ -285,7 +285,7 @@ def filter_variants(
     existing: set[str] | None = None,
     compliance_words: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
-    """四层过滤 v1 (方案 §10.4): 长度/合规/去重; PPL 与向量锚定留待嵌入服务可用时启用
+    """四层过滤 (方案 §10.4): 长度/合规/去重; PPL 与向量锚定留待嵌入服务可用时启用
 
     Returns: (passed, rejected)
     """

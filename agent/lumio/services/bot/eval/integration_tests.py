@@ -495,10 +495,10 @@ def test_ab_experiment() -> bool:
 
     # 2. 粘性: 同一 customer 多次分配应相同
     cust_id = "customer-sticky-001"
-    v1 = registry.assign_variant("test_exp", cust_id)
-    v2 = registry.assign_variant("test_exp", cust_id)
-    v3 = registry.assign_variant("test_exp", cust_id)
-    assert v1 == v2 == v3, f"粘性失败: {v1} {v2} {v3}"
+    first = registry.assign_variant("test_exp", cust_id)
+    second = registry.assign_variant("test_exp", cust_id)
+    third = registry.assign_variant("test_exp", cust_id)
+    assert first == second == third, f"粘性失败: {first} {second} {third}"
 
     # 3. 流量比例: 1000 个 customer 应大致 50:50
     from collections import Counter

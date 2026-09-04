@@ -532,8 +532,6 @@ class BotSettings(BaseSettings):
     max_session_queue: int = 20
     # P2-16: 同一客户同时进行的活跃会话数上限 (多设备/多标签页防资源耗尽)
     max_sessions_per_customer: int = 3
-    # 目标架构 v2 两级路由决策 (决策一交易性质 / 决策二只读四分流)。
-    # 默认关: 开启需显式 BOT_ROUTING_V2_ENABLED=true (灰度开关, 关闭时走旧链路回滚保底)。
 
 
 class AssistSettings(BaseSettings):

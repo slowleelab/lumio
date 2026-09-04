@@ -4,7 +4,7 @@
 
     五域 (IntentDomain) → 子域组 (GroupKey) → 叶子意图 (既有 IntentLabel)
 
-五域与 v2 路由 TrafficClass 直接对齐:
+五域与两级路由 TrafficClass 直接对齐:
     query 查询域(非金融) → READ_ONLY_QUERY → 链 B
     transaction 交易域(金融类) → FINANCIAL_TRANSACTION → 链 A
     consulting 咨询域 → CONSULTING → 决策二

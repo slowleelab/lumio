@@ -219,7 +219,7 @@ class LumioAgent:
         # 工具执行器（MCP_ENABLED=False 时为 None，走原有降级链，零回归）
         self._tool_executor = tool_executor
 
-        # 目标架构 v2: 链 B 查询轻链路 + ⑦ 出站合规闸门 + ⑥ 引用标题缓存
+        # 目标架构: 链 B 查询轻链路 + ⑦ 出站合规闸门 + ⑥ 引用标题缓存
         from lumio.services.bot.outbound_guard import OutboundGuard
         from lumio.services.bot.query_chain import QueryChain
 
@@ -496,9 +496,7 @@ class LumioAgent:
             result = None
             # 目标架构 ④ 两级路由决策: 决策一交易性质 / 决策二只读四分流。
             # 既有闸门 (噪声门/敏感回话/等待快照) 均在 handler 内部, 位置不动。
-            # (v1 旧链路已删除, 2026-09-04: v2 经 12 轮闭环验证后成为唯一路径,
-            #  routing_v2_enabled 开关随之退役 — 需要"回滚"时用 git revert)
-            result = await self._dispatch_v2(
+            result = await self._dispatch(
                 session_id,
                 user_input,
                 intent_result,
@@ -510,8 +508,7 @@ class LumioAgent:
             )
             # P0 多轮治理: 噪声门回话豁免所需"上文缺槽快照", 提前到 domain 分派前读取,
             # 避免各 handler 内 _load_slot_prompt 因意图切换重置 tracker 而清掉"上文在等什么"。
-            # v1 域三分派已删除 (2026-09-04, v2 经 12 轮闭环验证): dispatch_v2
-            # 覆盖全部域 — 决策一三分支 + 决策二 + chitchat 短路 + 各 handler 内部
+            # 分派覆盖全部域 — 决策一三分支 + 决策二 + chitchat 短路 + 各 handler 内部
             # 噪声门。此处仅防御性兜底: dispatch 异常返回 None 时走 fallback 噪声门。
             if result is None:
                 result = await self._handle_fallback(
@@ -527,7 +524,7 @@ class LumioAgent:
             if result and entities:
                 result["entities"] = entities
 
-            # ⑦ 出站合规闸门 (v2): 生成类回复过敏感词/幻觉检查, 拦截替换为澄清话术
+            # ⑦ 出站合规闸门: 生成类回复过敏感词/幻觉检查, 拦截替换为澄清话术
             if result is not None and result.get("response_source") in ("knowledge", "llm"):
                 verdict = self._outbound_guard.check(
                     str(result.get("response", "")),
@@ -774,9 +771,9 @@ class LumioAgent:
                 pass
         return ctx
 
-    # ── 目标架构 v2 两级路由: 决策一/二 与四条执行链 ──
+    # ── 目标架构 ④ 两级路由: 决策一/二 与四条执行链 ──
 
-    async def _dispatch_v2(
+    async def _dispatch(
         self,
         session_id: str,
         user_input: str,
@@ -804,24 +801,24 @@ class LumioAgent:
         intent = intent_result.primary_intent
         confidence = intent_result.primary_confidence
 
-        # v2 裸槽位回归 (第二轮模拟 compliance_alert 根因): 上轮链B反问槽位后, 本轮
-        # 裸给值被分类成低置信 faq — v1 由噪声门 awaiting_hit 换回等待意图续办, 而
-        # v2 分派先于噪声门把请求抢走, 落进知识链/竞速后被出站闸拦成"没太理解"。
+        # 裸槽位回归 (第二轮模拟 compliance_alert 根因): 上轮链B反问槽位后, 本轮
+        # 裸给值被分类成低置信 faq — 噪声门的 awaiting_hit 兜底位于各 handler 内部,
+        # 而分派先于 handler 把请求抢走, 落进知识链/竞速后被出站闸拦成"没太理解"。
         # 此处等价补位: 有等待快照 + 本轮低置信 → 换回等待意图按其流量性质分派
         # (等待意图多为查询类 → 链 B → _load_slot_prompt 消费快照与本轮槽值直查)。
         if confidence < CLARIFY_CONFIDENCE_FLOOR:
             try:
-                await_intent_v2, awaiting_v2 = await self._session_awaiting_slots(session_id)
+                await_intent, awaiting = await self._session_awaiting_slots(session_id)
             except Exception:
-                await_intent_v2, awaiting_v2 = None, []
-            if awaiting_v2 and await_intent_v2:
+                await_intent, awaiting = None, []
+            if awaiting and await_intent:
                 try:
-                    swapped_intent = normalize_intent(await_intent_v2)
+                    swapped_intent = normalize_intent(await_intent)
                 except ValueError:
                     swapped_intent = None
                 if swapped_intent is not None:
                     logger.info(
-                        "v2 等待快照回归: 换回等待意图 %s 续办 (input=%r)",
+                        "等待快照回归: 换回等待意图 %s 续办 (input=%r)",
                         swapped_intent.value,
                         user_input[:20],
                     )
@@ -837,12 +834,12 @@ class LumioAgent:
                     intent = swapped_intent
                     confidence = 0.6
         # classify_traffic 返回 (五域, 交易性质) 二元组 — P0 修复: 此前当单值比较,
-        # tuple == 枚举恒 False, 三分支全落空直奔决策二 (v2 代码首次开启时暴露;
-        # 开关默认关期间从未执行, 单测只测了函数本身没测分派比较)
-        v2_domain, traffic = classify_traffic(intent)
+        # tuple == 枚举恒 False, 三分支全落空直奔决策二 (单测只测了函数本身没测
+        # 分派比较, 分派联调时暴露)
+        traffic_domain, traffic = classify_traffic(intent)
         composite = detect_composite(intent, list(intent_result.alternatives or []), user_input)
         logger.debug(
-            "dispatch_v2: traffic=%s composite=%s intent=%s alts=%s",
+            "dispatch: traffic=%s composite=%s intent=%s alts=%s",
             traffic.value if traffic else "consulting",
             composite,
             intent.value,
@@ -864,7 +861,7 @@ class LumioAgent:
                 ),
                 evidence={
                     "traffic_class": traffic.value if traffic else None,
-                    "domain": v2_domain.value,
+                    "domain": traffic_domain.value,
                     "confidence": confidence,
                     "composite": composite,
                     "alternatives": [a.value for a in (intent_result.alternatives or [])],
@@ -949,7 +946,7 @@ class LumioAgent:
             # 定义句式 (概念咨询) 直送知识链 (qa_scan 第五轮: "什么是临时额度"被
             # 链 B 直查答成"您当前没有临时额度" — 客户问概念, 机器人答账户状态)。
             # domain_of_with_text 的定义句式强制咨询域只作用于 L2 向量判定块,
-            # v2 分派走 domain_of 无文本修正 — 此处补齐; "我的额度是什么"类
+            # 两级分派走 domain_of 无文本修正 — 此处补齐; "我的额度是什么"类
             # 含个人数据诉求词的由 is_definition_query 自身排除, 仍走查询。
             from lumio.shared.intent_taxonomy import is_definition_query
 
@@ -1007,7 +1004,7 @@ class LumioAgent:
                     reasoning="闲聊域轻回复引导(决策二短路), 不检索不生成",
                     evidence={
                         "traffic_class": None,
-                        "domain": v2_domain.value,
+                        "domain": traffic_domain.value,
                         "confidence": confidence,
                         "chitchat_redirect": True,
                     },

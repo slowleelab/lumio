@@ -19,17 +19,6 @@ from lumio.services.bot.bot_agent import (
 from lumio.services.bot.prompts import CONFIRM_FOLLOWUP_RESPONSE
 from lumio.shared.models import IntentLabel, IntentResult
 
-
-@pytest.fixture(autouse=True)
-def _pin_v1_routing(monkeypatch):
-    """本文件基于 v1 链路 mock 编写: 显式关闭 v2 路由, 不随部署 env 漂移。
-
-    v2 分派的专测见 test_routing_v2.py / test_query_chain.py。
-    """
-
-    pass  # v1 链路已删除 (2026-09-04): v2 是唯一路径, 无需再 pin
-
-
 # ── 纯函数: 上轮反问检测 ──
 
 

@@ -30,7 +30,7 @@ repos:
           - sqlalchemy>=2.0
           - redis>=5.0
 
-# 闭环 v2 防线④: 金标回归集 — 改词表/阈值/路由必须过历史修复用例
+# 闭环防线④: 金标回归集 — 改词表/阈值/路由必须过历史修复用例
 - repo: local
   hooks:
     - id: golden-regression

@@ -1,4 +1,4 @@
-"""金标回归集 (闭环 v2 防线①)
+"""金标回归集 (闭环防线①)
 
 data/golden/regression.json 里的每个 case 对应十几轮闭环的一次真实修复。
 任何词表 / 阈值 / 路由改动必须全绿本集 — 终结"修 A 破 B 无人知"的模式。
@@ -140,8 +140,8 @@ def test_gate_outbound_solicitation() -> None:
     assert v.passed is False and "卡号" not in v.reply
 
     mixed = "请立即拨打客服热线400-888-8888进行挂失。请告诉我您的卡号后四位。"
-    v2 = g.check(mixed)
-    assert v2.passed is False and "客服热线" in v2.reply and "卡号" not in v2.reply
+    out = g.check(mixed)
+    assert out.passed is False and "客服热线" in out.reply and "卡号" not in out.reply
 
 
 def test_gate_emergency_faq_exempt() -> None:

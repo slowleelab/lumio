@@ -1,4 +1,4 @@
-"""闭环管理 API: Badcase 采集/归因/裁决 + 金标扩充 (方案 v2.0)"""
+"""闭环管理 API: Badcase 采集/归因/裁决 + 金标扩充"""
 
 from __future__ import annotations
 
@@ -276,7 +276,7 @@ async def expand_golden_set(
     request: Request,
     body: dict[str, Any],
 ) -> dict[str, Any]:
-    """模块 B: 金标评测集扩充 (引擎二·规则模板层 v1 + 四层过滤)
+    """模块 B: 金标评测集扩充 (引擎二·规则模板层 + 四层过滤)
 
     输入种子问法列表 → 同义/口语化变体生成 → 去重/合规过滤 → 返回变体
     (人工抽检后入库金标集 L1/L3; LLM 改写层后续接入)
@@ -359,10 +359,10 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
 async def closed_loop_health(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
     """闭环健康度七指标 (方案 §8.1): 转人工率/修复时长/复现率等聚合
 
-    v1 口径说明:
+    口径说明:
     - 转人工率: transfer 信号 Badcase 数 / 总会话数 (近期 7 天)
     - 平均修复时长: deployed 样本 created→resolved 均值
-    - 复现率 v1 需 L2 回归集积累, 暂返回 None
+    - 复现率需 L2 回归集积累, 暂返回 None
     """
     from datetime import UTC, datetime, timedelta
 

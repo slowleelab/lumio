@@ -1,4 +1,4 @@
-"""策略词表统一加载器 (闭环 v2 防线②)
+"""策略词表统一加载器 (闭环防线②)
 
 十几轮闭环沉淀的词表曾散落在 bot_agent / classifier / retrieval / faq_service
 四模块, 彼此不可见 — 每个 badcase 往其中一张表加一行, 表间交互不可控。
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 _LEXICON_PATH = Path(__file__).resolve().parents[2] / "data" / "policy" / "lexicon.json"
 
-# 内置兜底 (与 lexicon.json v1 同值) — 文件损坏时保底, 正常情况不会用到
+# 内置兜底 (与 lexicon.json 同值) — 文件损坏时保底, 正常情况不会用到
 _FALLBACK: dict = {
     "emergency_markers": ["挂失", "被盗", "被偷", "盗刷", "停卡", "冻结", "卡丢", "丢了卡", "钱包被", "找不到了", "不找了"],
     "consultative_loss_markers": ["怎么办", "怎么挂失", "如何挂失", "挂失流程", "怎么处理", "如何处理"],

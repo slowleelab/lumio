@@ -163,7 +163,7 @@ def _patch_settings(
     confirm: bool = False,
     drop_query_tools: tuple[str, ...] = (),
 ) -> None:
-    """v2 唯一路径的设置注入.
+    """两级路由设置注入.
 
     confirm=True: 恢复敏感工具两段式核验 (产品默认核实通过直连执行, 合规环境置 true)。
     drop_query_tools: 从 intent_tool_map 裁掉查询意图 → 链 B 报 no_query_tool 回落
@@ -183,7 +183,7 @@ class TestBotMcpE2E:
     """LumioAgent.run() 触发真实 MCP 工具调用的端到端链路"""
 
     async def test_run_triggers_real_nonsensitive_tool(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """v2 主路径: 积分查询意图 → run() → 链 B 直连 → 真实 query_points 执行 (零 LLM 编排)"""
+        """主路径: 积分查询意图 → run() → 链 B 直连 → 真实 query_points 执行 (零 LLM 编排)"""
         _patch_settings(monkeypatch)
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
@@ -463,7 +463,7 @@ class TestToolRouteAuditAndRagFallback:
     """会话 48882b05 修复回归: 工具编排路由留痕 + 索参数轮 RAG 知识兜底 + 等待快照"""
 
     async def test_tool_interception_logs_actual_route_decision(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """决策日志必须记录查询意图的实际路由 (v2: 链 B 直连), 不让映射表域名误导审计"""
+        """决策日志必须记录查询意图的实际路由 (链 B 直连), 不让映射表域名误导审计"""
         from lumio.services.common.decision_log import DecisionAction
 
         _patch_settings(monkeypatch)

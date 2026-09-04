@@ -1,7 +1,7 @@
 {
   "version": 1,
   "updated_at": "2026-09-04",
-  "purpose": "策略词表单一事实源 (闭环 v2 防线②): 十几轮闭环沉淀的八张散落词表收口, 每张表带来源 badcase 标注。改任何词表必须过金标回归集 (tests/test_golden_regression.py)。",
+  "purpose": "策略词表单一事实源 (闭环防线②): 十几轮闭环沉淀的八张散落词表收口, 每张表带来源 badcase 标注。改任何词表必须过金标回归集 (tests/test_golden_regression.py)。",
   "tables": {
     "emergency_markers": {
       "owner": "bot_agent (FAQ 短路豁免)",

@@ -1,4 +1,4 @@
-"""闭环优化方案测试: Badcase 采集/归因闸门/金标扩充 (方案 v2.0 P0-P2 核心)"""
+"""闭环优化方案测试: Badcase 采集/归因闸门/金标扩充 (方案 P0-P2 核心)"""
 
 from __future__ import annotations
 

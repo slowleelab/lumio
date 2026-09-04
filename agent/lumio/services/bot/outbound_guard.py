@@ -1,9 +1,9 @@
 """出站合规闸门（目标架构 ⑦）
 
-统一出站检查：话术合规（敏感词）+ 幻觉检测 v1（无依据的具体数字断言）。
+统一出站检查：话术合规（敏感词）+ 幻觉检测（无依据的具体数字断言）。
 位于回复生成之后、返回用户之前；拦截时替换为澄清话术并写审计决策。
 
-幻觉检测 v1 口径（保守，宁放勿拦）：
+幻觉检测口径（保守，宁放勿拦）：
 - 仅当本轮有 grounding 源（RAG 上下文/工具结果）时才启用数字比对；
 - 回复中的多位数字 token 全部不在 grounding 源中出现 → 判为无依据断言；
 - 无 grounding 源时只拦"编造办理结果"类话术（已为您办理/已成功执行）。
@@ -99,7 +99,7 @@ class OutboundGuard:
             logger.warning("出站拦截-索敏话术(整体替换): %r → %r", reply[:60], replacement[:60])
             return OutboundVerdict(passed=False, reply=replacement, reason="sensitive_solicitation")
 
-        # 3. 幻觉数字 v1: 有 grounding 源时, 回复中的数字 token 应能在源中找到
+        # 3. 幻觉数字检查: 有 grounding 源时, 回复中的数字 token 应能在源中找到
         if grounding_source:
             tokens = [t for t in _DIGIT_TOKEN_RE.findall(reply) if t not in _DIGIT_ALLOWLIST]
             if tokens and not any(t in grounding_source for t in tokens):

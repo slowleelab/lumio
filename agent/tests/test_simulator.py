@@ -26,7 +26,7 @@ def test_scenarios_well_formed() -> None:
     for s in SCENARIOS:
         assert s.turns, f"场景 {s.key} 无轮次"
         for t in s.turns:
-            # v2: 轮次为 noise 标记或 variants/text 池
+            # 轮次为 noise 标记或 variants/text 池
             if not t.get("noise"):
                 variants = t.get("variants") or [t.get("text") or ""]
                 assert all(v.strip() for v in variants), f"场景 {s.key} 存在空话术变体"

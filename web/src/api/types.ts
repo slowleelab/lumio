@@ -124,7 +124,7 @@ export interface ChatSendResponse {
   session_id: string
 }
 
-// v2.0: 轮询返回 status 字段替代 has_message
+// 轮询返回 status 字段替代 has_message
 export interface PollResponse {
   status: "done" | "queued" | "processing" | "timeout"
   reply?: string
