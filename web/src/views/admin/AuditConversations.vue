@@ -329,6 +329,9 @@ const ACTION_META: Record<string, { label: string; tag: string; dot: string; col
   injection_blocked: { label: "注入拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
   guard_denied: { label: "护栏拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
   cache_hit: { label: "缓存命中", tag: "success", dot: "success" },
+  outbound_guard: { label: "出站拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
+  context_reply_pass: { label: "回话放行", tag: "info", dot: "" },
+  mis_kill_candidate: { label: "误杀排查", tag: "warning", dot: "warning" },
 }
 const AGENT_LABELS: Record<string, string> = {
   bot_agent: "编排大脑",
@@ -422,6 +425,9 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
       if ("traffic_class" in ev && ev.traffic_class != null) {
         return `识别结果为「${intentZh(ev.intent)}」，判定走${TRAFFIC_ZH[String(ev.traffic_class)] ?? String(ev.traffic_class)}`
       }
+      if ("traffic_class" in ev && ev.traffic_class == null && "composite" in ev) {
+        return "意图属于咨询类，进入知识问答流程（检索知识库 + AI 组织回答）"
+      }
       if (ev.chitchat_redirect) {
         return "识别为闲聊或无效输入，直接用固定话术引导客户说明业务需求（不检索、不 AI 生成）"
       }
@@ -434,11 +440,20 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
       return out
     }
     case "tool_call": {
-      if (ev.chain === "B" || ev.tool) {
-        const parts = [`直接调用业务工具「${ev.tool ?? "?"}」查询`]
-        parts.push(ev.cache_hit ? "（结果来自近期缓存，未重复查询）" : "")
+      // 三种工具决策: 链B查询直连 / 高置信办理直连 / 编排循环内的工具执行
+      if (ev.direct) {
+        return `识别把握很高，跳过 AI 决策环节，直接调用「${ev.tool}」为客户办理（更快更稳定）`
+      }
+      if (ev.chain === "B") {
+        const parts = [`直接调用查询工具「${ev.tool ?? "?"}」查系统数据（不走 AI 对话）`]
+        parts.push(ev.cache_hit ? "，结果来自近期缓存，未重复查询" : "")
         if (Array.isArray(ev.missing_params) && ev.missing_params.length) parts.push(`；还缺信息：${(ev.missing_params as string[]).join("、")}`)
         return parts.join("")
+      }
+      if (ev.result_preview !== undefined) {
+        const ok = ev.is_error !== true
+        const args = ev.arguments && typeof ev.arguments === "object" ? Object.entries(ev.arguments as Record<string, unknown>).map(([k, v]) => `${k}=${String(v).slice(0, 12)}`).join(" ") : ""
+        return `AI 编排过程中调用了工具「${ev.tool}」${args ? `（${args}）` : ""}，${ok ? "执行成功" : "执行失败"}`
       }
       if (ev.traffic_class != null) return `根据识别结果选择处理方式：${TRAFFIC_ZH[String(ev.traffic_class)] ?? String(ev.traffic_class)}`
       if (ev.traffic_class === null && "composite" in ev) return "意图属于咨询类，进入知识问答流程"
@@ -466,7 +481,22 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
     case "injection_blocked":
       return "检测到输入中疑似包含诱导指令，已拦截（安全防线）"
     case "guard_denied":
-      return "护栏规则拦截了本次请求"
+      return "护栏规则拦截了本次请求（内容不适合自动处理）"
+    case "outbound_guard": {
+      const why: Record<string, string> = {
+        sensitive_solicitation: "回复中出现索要卡号/密码等敏感信息的话术",
+        sensitive_solicitation_stripped: "回复中部分话术不当（索要敏感信息），已自动删去该句、保留合规内容",
+        ungrounded_numbers: "回复中的数字没有知识依据（疑似 AI 编造），已被替换",
+        fabricated_execution: "回复声称已办理业务但实际未执行（AI 编造办理结果），已被替换",
+        sensitive_words: "回复包含敏感词，已被替换",
+      }
+      const reason = String((ev as { reason?: string }).reason ?? "")
+      return `${why[reason] ?? "回复内容未通过出站合规检查"}，客户收到的是安全话术`
+    }
+    case "context_reply_pass":
+      return "客户这句话是在回答上一轮的提问（如补充卡号/日期），正常放行继续处理"
+    case "mis_kill_candidate":
+      return "系统连续两次没听懂客户，已标记为疑似误判案例，等待人工复核"
     default:
       return d.reasoning
   }
