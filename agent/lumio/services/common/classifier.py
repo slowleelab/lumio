@@ -63,6 +63,12 @@ _QUERY_INTENT_OVERRIDES: frozenset[IntentLabel] = frozenset(
 )
 # 咨询标记词: 含这些词的句子是"关于账单/额度的问题"而非"查账单/额度"本身,
 # 规则关键词命中不作数 (如"账单分期手续费怎么算" ≠ 账单查询)。
+# 强查询动作词 (闭环第十轮: "上个月账单给我看看, 最低还款是怎么算的"被咨询
+# 标记"怎么"拦住查询覆盖, BERT 误判 faq@0.82 走知识链未查账单): 客户动作
+# 词 + 业务名词并存时主诉求是查数, "怎么算"是追问解释 — 查询意图优先
+# (链 B/C 取数后仍可解释), 咨询标记不再一票否决。
+_STRONG_QUERY_ACTIONS = ("给我看", "看看", "查一下", "查下", "帮我查", "帮我看", "帮我看下", "明细", "拉一下")
+
 _CONSULTIVE_MARKERS = (
     "怎么",
     "如何",
@@ -1030,7 +1036,10 @@ class IntentClassifier:
             fast_result.primary_intent != rule_fast.primary_intent
             and rule_fast.primary_confidence >= 0.8
             and normalize_intent(rule_fast.primary_intent.value) in _QUERY_INTENT_OVERRIDES
-            and not any(m in text for m in _CONSULTIVE_MARKERS)
+            and (
+                not any(m in text for m in _CONSULTIVE_MARKERS)
+                or any(a in text for a in _STRONG_QUERY_ACTIONS)
+            )
         ):
             logger.info(
                 "查询词规则覆盖快路径: %s@%.2f -> %s@%.2f (text=%r)",

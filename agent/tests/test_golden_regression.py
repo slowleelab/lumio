@@ -195,3 +195,32 @@ def test_lexicon_source_file_matches_loaded() -> None:
     for key, spec in disk.items():
         if "values" in spec:
             assert loaded[key] == spec["values"], f"{key} 与磁盘不一致 (兜底生效中?)"
+
+
+def test_gate_query_action_override() -> None:
+    """查询动作词压过咨询标记 (第十轮: '账单给我看看+怎么算'被 BERT faq 劫持)"""
+    from lumio.services.common.classifier import RuleClassifier
+    from lumio.shared.models import IntentLabel
+
+    r = RuleClassifier().classify("上个月账单给我看看, 最低还款是怎么算的")
+    assert r.primary_intent == IntentLabel.BILL_QUERY and r.primary_confidence >= 0.8
+    # 纯咨询句式 (无动作词) 不触发覆盖: mock BERT faq@0.82 应保持 faq
+    from lumio.services.common.classifier import IntentClassifier
+    from lumio.shared.models import IntentResult
+
+    class _FB:
+        async def classify(self, text, history=None):
+            return IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.82)
+
+    clf = IntentClassifier(rule_classifier=RuleClassifier(), bert_classifier=_FB(), fast_threshold=0.7)
+    import asyncio
+
+    out, _e, _s, _src = asyncio.run(clf.classify("最低还款是什么意思"))
+    assert out.primary_intent == IntentLabel.FAQ, f"纯咨询被误覆盖: {out.primary_intent}"
+
+
+def test_gate_pure_punct_not_reply() -> None:
+    """纯标点不算有效回话 (第十轮: '。。。。'借回话豁免漏放)"""
+    from lumio.services.bot.bot_agent import _is_noise_input
+
+    assert _is_noise_input("。。。。。") is True

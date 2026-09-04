@@ -3493,6 +3493,15 @@ class LumioAgent:
             "fast_intent": intent.fast_intent.value if intent.fast_intent else None,
             "fast_slow_disagreement": _fast_slow_disagreement(intent),
         }
+        # 零信息量输入不算有效回话 (闭环第十轮: "。。。。。"借上轮积分话题的
+        # 回话豁免漏放, 被当槽位答案查积分还答了兑换比例)。注意不能复用
+        # _is_noise_input (纯数字 "4444" 是合法槽位答案, 上轮问卡号本轮作答
+        # 是回话豁免的核心场景) — 仅拦"去标点后无任何内容"的纯标点形态。
+        import re as _re
+
+        _stripped_for_reply = _re.sub(r"[\s，。、；：！？!?,.;:·…─~～#@*&%$()（）\"'\-]+", "", user_input or "")
+        if is_replying and not _stripped_for_reply:
+            return "noise", evidence
         if is_replying:
             return None, evidence
         # P1: energy 强"不认" -> 直接当噪声拦截 (非回话), 高于低置信的澄清强度。
