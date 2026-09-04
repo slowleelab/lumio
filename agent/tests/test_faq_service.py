@@ -618,3 +618,14 @@ def test_shares_informative_gram() -> None:
     assert _shares_informative_gram("硬钱包如何充值", "数字人民币硬钱包怎么充值") is True
     # 无可判词块 (纯停用词) → 不拦
     assert _shares_informative_gram("信用卡", "信用卡丢失怎么办？") is True
+
+
+def test_normalize_strips_polite_prefix() -> None:
+    """礼貌前缀剥离 (第十二轮: 模拟器随机前缀致 FAQ exact 全线击穿)"""
+    from lumio.services.common.faq_service import _normalize_query
+
+    assert _normalize_query("请问一下 积分怎么兑换礼品") == _normalize_query("积分怎么兑换礼品")
+    assert _normalize_query("那个 帮我查下账单") == _normalize_query("帮我查下账单")
+    assert _normalize_query("我想问下 信用卡怎么挂失呢") == _normalize_query("信用卡怎么挂失")
+    # 业务句本身不含前缀词时不误伤
+    assert _normalize_query("帮我查一下账单") == "帮我查一下账单"

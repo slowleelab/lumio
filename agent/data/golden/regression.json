@@ -214,6 +214,15 @@
       "assert": {
         "no_followup_without_new_topic": true
       }
+    },
+    {
+      "id": "qa12-faq-prefix-strip",
+      "origin": "第十二轮: 模拟器随机礼貌前缀致 FAQ exact 全线击穿",
+      "layer": "gate",
+      "input": "请问一下 积分怎么兑换礼品",
+      "assert": {
+        "faq_exact_variant": "积分怎么兑换礼品"
+      }
     }
   ]
 }

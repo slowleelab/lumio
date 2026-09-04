@@ -44,7 +44,12 @@ def _normalize_query(text: str) -> str:
     # exact 击穿落到慢路径): 只剥句尾单字语气词且最多两层, "丢了"类的"了"不在表中
     for _ in range(2):
         text = re.sub(r"(啊|呢|吧|呀|嘛|哦|哈|啦)$", "", text)
-    return text
+    # 首部礼貌/填充前缀剥离 (第十二轮模拟: 变体全部带随机前缀 "请问一下/那个/
+    # 麻烦/我想问下", FAQ exact 全线击穿落到 reward_query 工具链答有效期)。
+    # 只剥开头连续前缀词 (≤3 层), 业务句本身不受影响。
+    for _ in range(3):
+        text = re.sub(r"^(请问一下|请问|麻烦|那个|我想问下|我想问|帮我看看|请问您)", "", text)
+    return text.strip()
 
 
 def _cache_key(query: str) -> str:
