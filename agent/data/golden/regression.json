@@ -223,6 +223,16 @@
       "assert": {
         "faq_exact_variant": "积分怎么兑换礼品"
       }
+    },
+    {
+      "id": "qa12-bm25-variants",
+      "origin": "范式升级: FAQ BM25 主力通道, 20 变体暴力集",
+      "layer": "gate",
+      "input": "变体集: 前缀/语气/同义词/词序/叠加 × 积分兑换 + 3 负例",
+      "assert": {
+        "bm25_all_variants_hit": true,
+        "negatives_miss": true
+      }
     }
   ]
 }

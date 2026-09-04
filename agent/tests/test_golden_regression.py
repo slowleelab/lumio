@@ -263,3 +263,40 @@ def test_gate_topic_followup_rules() -> None:
     done = loss.model_copy(deep=True)
     done.status = TopicRequestStatus.FULFILLED
     assert b._pick_followup([done], "bill_query", 2) is None
+
+
+def test_gate_bm25_cross_faq_margin() -> None:
+    """BM25 区分度判别: 同 FAQ 变体竞争不拦, 跨 FAQ 分数接近才拦 (暴力测试实证)"""
+    import asyncio
+
+    from lumio.services.common.faq_service import _bm25_faq_match
+
+    class _ES:
+        def __init__(self, hits):
+            self._hits = hits
+
+        async def search(self, index, body):
+            return {"hits": {"hits": self._hits}}
+
+    doc = "01a048ee-136e"
+    # 同 FAQ 两条变体分数接近 → 命中 (不参与 margin)
+    same = _ES([
+        {"_score": 4.95, "_source": {"doc_id": doc}},
+        {"_score": 4.52, "_source": {"doc_id": doc}},
+    ])
+    fid, score = asyncio.run(_bm25_faq_match(same, "那个 积分怎么兑换"))
+    assert fid == doc and score == 4.95
+    # 不同 FAQ 分数接近且处边缘低分区 → 拦
+    rival = _ES([
+        {"_score": 4.0, "_source": {"doc_id": doc}},
+        {"_score": 3.6, "_source": {"doc_id": "other"}},
+    ])
+    fid2, _ = asyncio.run(_bm25_faq_match(rival, "积分"))
+    assert fid2 is None
+    # 高分区 (≥6) 旁路: 次名同量级多因通用词, 不拦 (实测 "信用卡怎么挂失" 8.09/7.74)
+    hi = _ES([
+        {"_score": 8.09, "_source": {"doc_id": doc}},
+        {"_score": 7.74, "_source": {"doc_id": "other"}},
+    ])
+    fid3, _ = asyncio.run(_bm25_faq_match(hi, "信用卡怎么挂失"))
+    assert fid3 == doc

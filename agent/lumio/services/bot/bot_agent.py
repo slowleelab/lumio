@@ -391,6 +391,7 @@ class LumioAgent:
                     redis_client=session_manager._redis if session_manager else None,
                     embedding_provider=faq_embedding,
                     milvus_collection=self._milvus_collection,
+                    es_client=self._es_client,
                     user_role="customer",
                     session_factory=(
                         session_manager._resolve_factory()
@@ -399,7 +400,7 @@ class LumioAgent:
                     ),
                     session_id=session_id,
                 )
-                if faq_res["match_type"] in ("exact", "semantic") and faq_res["results"]:
+                if faq_res["match_type"] in ("exact", "semantic", "bm25") and faq_res["results"]:
                     top = faq_res["results"][0]
                     answer = top.get("answer")
                     if not answer and top.get("faq_id"):
@@ -1224,6 +1225,7 @@ class LumioAgent:
                 redis_client=session_manager._redis if session_manager else None,
                 embedding_provider=embedding_provider,
                 milvus_collection=self._milvus_collection,
+                es_client=self._es_client,
                 user_role="customer",
                 session_factory=(
                     session_manager._resolve_factory()

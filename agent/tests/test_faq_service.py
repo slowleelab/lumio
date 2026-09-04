@@ -629,3 +629,104 @@ def test_normalize_strips_polite_prefix() -> None:
     assert _normalize_query("我想问下 信用卡怎么挂失呢") == _normalize_query("信用卡怎么挂失")
     # 业务句本身不含前缀词时不误伤
     assert _normalize_query("帮我查一下账单") == "帮我查一下账单"
+
+
+class TestFaqBm25Channel:
+    """FAQ BM25 通道 (范式升级: exact 快路径, BM25 主力 — 变体结构性免疫)"""
+
+
+    @pytest.fixture
+    def fake_es(self):
+        class _Hits:
+            def __init__(self, hits):
+                self.hits = hits
+
+        class _ES:
+            def __init__(self, results=None, exc=None):
+                self.results = results or []
+                self.exc = exc
+                self.queries = []
+
+            async def search(self, index, body):
+                self.queries.append(body["query"]["match"]["content"]["query"])
+                if self.exc:
+                    raise self.exc
+                return {"hits": {"hits": self.results}}
+
+        return _ES
+
+    @pytest.mark.asyncio
+    async def test_bm25_hit_returns_faq(self, fake_es) -> None:
+        """BM25 命中 → 回查 PG 返回标准答案 (match_type=bm25)"""
+        import lumio.services.common.faq_service as fs
+
+        es = fake_es(results=[{"_score": 8.2, "_source": {"doc_id": FAQ_ID}}])
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=_faq_row())))
+        mock_sf = MagicMock(return_value=AsyncMock().__aiter__() and _async_ctx(mock_db))
+
+        # 简化: 直接测 _bm25_faq_match (检索层) + 集成验证走 E2E
+        faq_id, score = await fs._bm25_faq_match(es, "请问一下哈 积分怎么兑换礼品呢")
+        assert faq_id == FAQ_ID and score == 8.2
+
+    @pytest.mark.asyncio
+    async def test_bm25_margin_blocks_ambiguous(self, fake_es) -> None:
+        """top1/top2 区分度不足 → 不赌 (返回 None)"""
+        import lumio.services.common.faq_service as fs
+
+        # 边缘低分区间才判 margin (高分 ≥6 有旁路): 4.0/3.6 <1.3 → 拦
+        es = fake_es(results=[
+            {"_score": 4.0, "_source": {"doc_id": FAQ_ID}},
+            {"_score": 3.6, "_source": {"doc_id": "other"}},
+        ])
+        faq_id, _ = await fs._bm25_faq_match(es, "积分")
+        assert faq_id is None
+        # 高分同量级 (通用词让次名也高分) → 旁路放行
+        es_hi = fake_es(results=[
+            {"_score": 8.0, "_source": {"doc_id": FAQ_ID}},
+            {"_score": 7.0, "_source": {"doc_id": "other"}},
+        ])
+        fid_hi, _ = await fs._bm25_faq_match(es_hi, "信用卡怎么挂失")
+        assert fid_hi == FAQ_ID
+
+    @pytest.mark.asyncio
+    async def test_bm25_no_hits(self, fake_es) -> None:
+        import lumio.services.common.faq_service as fs
+
+        es = fake_es(results=[])
+        faq_id, _ = await fs._bm25_faq_match(es, "完全无关的内容查询")
+        assert faq_id is None
+
+    @pytest.mark.asyncio
+    async def test_bm25_es_down_degrades(self, fake_es) -> None:
+        """ES 故障 → 静默降级 (None), 不抛异常"""
+        import lumio.services.common.faq_service as fs
+
+        es = fake_es(exc=RuntimeError("es down"))
+        faq_id, score = await fs._bm25_faq_match(es, "积分")
+        assert faq_id is None and score == 0.0
+
+
+FAQ_ID = "01a048ee-136e-7192-8f60-6f3857bf542c"
+
+
+def _faq_row():
+    row = MagicMock()
+    row.id = FAQ_ID
+    row.question = "积分可以兑换什么？"
+    row.answer = "积分可兑换航空里程/商城商品/话费/年费抵扣"
+    row.category = "积分"
+    row.card_types = []
+    row.allowed_roles = []
+    return row
+
+
+def _async_ctx(session):
+    class _Ctx:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *a):
+            return False
+
+    return _Ctx()

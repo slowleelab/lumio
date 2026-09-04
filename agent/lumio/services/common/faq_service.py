@@ -59,6 +59,102 @@ def _cache_key(query: str) -> str:
     return f"{_FAQ_CACHE_PREFIX}:{h}"
 
 
+# ── FAQ BM25 通道 (范式升级, 2026-09-04 用户批评成立: 逐词表范式脆弱) ──
+# exact 归一化匹配对自然语言变体结构性脆弱 (前缀/语气/同义词/词序每种都要
+# 人工补); BM25+IDF 是 60 年信息检索验证的机制: 高频礼貌前缀 IDF 极低天然
+# 消解, 业务词共现决定排序。exact 降级为快路径缓存, BM25 成为主力。
+_FAQ_ES_INDEX = "lumio_faq_index"
+
+
+async def _ensure_faq_es_index(es_client: Any) -> None:
+    """FAQ BM25 索引 (懒建): content=问题文本(主问题+变体逐条), doc_id=faq uuid"""
+    try:
+        if not await es_client.indices.exists(index=_FAQ_ES_INDEX):
+            await es_client.indices.create(
+                index=_FAQ_ES_INDEX,
+                mappings={
+                    "properties": {
+                        "content": {"type": "text", "analyzer": "ik_max_word"},
+                        "doc_id": {"type": "keyword"},
+                        "category": {"type": "keyword"},
+                    }
+                },
+            )
+    except Exception as exc:
+        logger.debug("FAQ ES 索引创建失败(复用已有): %s", exc)
+
+
+async def _index_faq_to_es(es_client: Any, faq: KbFaq) -> int:
+    """主问题+变体逐条写入 ES (BM25 检索面); 返回写入条数"""
+    if es_client is None:
+        return 0
+    await _ensure_faq_es_index(es_client)
+    # 逐条 index (bulk action 元数据在本 client 版本下解析异常, 逐条足够: FAQ ≤ 百级)
+    written = 0
+    for i, q in enumerate([faq.question, *(faq.variant_questions or [])]):
+        if not q:
+            continue
+        try:
+            await es_client.index(
+                index=_FAQ_ES_INDEX, id=f"{faq.id}#{i}", document={"content": q, "doc_id": str(faq.id), "category": faq.category or ""}, refresh="wait_for"
+            )
+            written += 1
+        except Exception as exc:
+            logger.warning("FAQ 写入 ES 失败(BM25 通道降级): %s", exc)
+            return written
+    return written
+
+
+async def _bm25_faq_match(
+    es_client: Any, query: str, min_score: float = 3.5, margin: float = 1.3
+) -> tuple[str | None, float]:
+    """BM25 词法检索 FAQ (变体免疫主力通道)
+
+    Returns: (faq_id, score) — 未命中返回 (None, 0)。
+    门槛双保险 (暴力集实测校准, 零自研词表):
+    - min_score 绝对分门槛: BM25 的 IDF 已把高频礼貌前缀权重压到极低,
+      业务词共现决定分数 — 真命中 3.7~9.5, 无关句 <1。不用 msm (词覆盖率
+      要求把前缀算进分母, 叠加变体「请问一下哈那个积分咋兑换礼品呢」被误杀)
+    - margin 跨 FAQ 区分度: 与不同 FAQ 次名分数比 ≥1.3 (同 FAQ 变体竞争不拦)
+    """
+    if es_client is None or not query.strip():
+        return None, 0.0
+    try:
+        resp = await es_client.search(
+            index=_FAQ_ES_INDEX,
+            body={
+                "query": {"match": {"content": {"query": query}}},
+                "size": 3,
+                "_source": ["doc_id"],
+            },
+        )
+        hits = resp["hits"]["hits"]
+        if not hits:
+            return None, 0.0
+        top = hits[0]
+        if float(top["_score"]) < min_score:
+            return None, 0.0
+        # 区分度判别: 比较对象是"不同 FAQ"的次名 — 同一 FAQ 的多条变体
+        # (doc_id 相同) 分数接近恰恰说明命中一致, 不参与 margin (暴力测试实证:
+        # "那个 积分怎么兑换" top1/top2 为同 FAQ 变体 4.95/4.52 曾被误拦)
+        # margin 只对边缘区间 (<6.0) 启用: 高分命中已有足量业务词共现, 次名同量级
+        # 多因通用词共现 ("信用卡怎么"让年费 FAQ 得 7.7 分) — 实测 "信用卡怎么挂失"
+        # 8.09/7.74 被误拦; 低分边缘才是真歧义区
+        strong_threshold = 6.0
+        rival = next((h for h in hits[1:] if h["_source"]["doc_id"] != top["_source"]["doc_id"]), None)
+        if (
+            float(top["_score"]) < strong_threshold
+            and rival is not None
+            and rival["_score"] > 0
+            and top["_score"] / rival["_score"] < margin
+        ):
+            return None, 0.0
+        return top["_source"]["doc_id"], float(top["_score"])
+    except Exception as exc:
+        logger.debug("FAQ BM25 检索失败(通道降级): %s", exc)
+        return None, 0.0
+
+
 # ── CRUD ──
 
 
@@ -417,6 +513,7 @@ async def search_faq(
     redis_client: aioredis.Redis | None,
     embedding_provider: Any = None,
     milvus_collection: Any = None,
+    es_client: Any = None,
     *,
     user_role: str | None = None,
     card_type: str | None = None,
@@ -457,6 +554,37 @@ async def search_faq(
                 else:
                     await _log_search(session_factory, query, "exact", faq_data.get("id"), 1.0, user_role, session_id)
                     return {"match_type": "exact", "results": [faq_data]}
+
+    # 1b. BM25 词法检索 (主力通道, 2026-09-04 范式升级): exact 是快路径缓存,
+    # 变体 (前缀/语气/同义词/词序) 全部由 BM25+IDF 承接 — 高频礼貌词权重
+    # 天然消解, 业务词共现决定排序。命中回查 PG 拿标准答案。
+    if es_client is not None:
+        faq_id_bm25, bm25_score = await _bm25_faq_match(es_client, query)
+        if faq_id_bm25:
+            from sqlalchemy import select as _select
+
+            if session_factory is not None:
+                try:
+                    async with session_factory() as _db:
+                        row = (
+                            await _db.execute(_select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id_bm25)))
+                        ).scalar_one_or_none()
+                    if row is not None:
+                        faq_data = {
+                            "id": str(row.id),
+                            "question": row.question,
+                            "answer": row.answer,
+                            "category": row.category,
+                            "card_types": row.card_types,
+                            "allowed_roles": row.allowed_roles,
+                        }
+                        if not (user_role and faq_data.get("allowed_roles") and user_role not in faq_data["allowed_roles"]):
+                            await _log_search(
+                                session_factory, query, "bm25", faq_data["id"], bm25_score, user_role, session_id
+                            )
+                            return {"match_type": "bm25", "results": [faq_data]}
+                except Exception as exc:
+                    logger.debug("BM25 命中回查失败(降级语义路): %s", exc)
 
     # 2. 语义匹配
     if embedding_provider and milvus_collection:
