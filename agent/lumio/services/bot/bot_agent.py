@@ -68,6 +68,24 @@ from lumio.shared.pii import pan_to_tail
 from lumio.shared.token_utils import estimate_tokens as _token_estimate  # P1-8 统一入口
 from lumio.shared.tracing import traced
 
+# 决策留痕中文化 (用户反馈: "决策二预备"/"域=query" 看不懂 — 留痕原文也要可读)
+_DOMAIN_ZH: dict[str, str] = {
+    "business": "业务办理", "knowledge": "知识咨询", "fallback": "闲聊/兜底",
+    "risk": "风险操作", "complain": "投诉", "transfer": "转人工",
+    "query": "查询", "consulting": "咨询", "transaction": "交易",
+    "service": "人工服务", "chitchat": "闲聊",
+}
+_TRAFFIC_ZH_LOG: dict[str, str] = {
+    "financial_transaction": "交易办理（走业务工具）",
+    "read_only_query": "查询直达（直接查系统）",
+    "high_risk": "高风险（优先人工）",
+}
+
+
+def _domain_zh(domain: str) -> str:
+    return _DOMAIN_ZH.get(domain, domain)
+
+
 
 def _effective_knowledge_source(raw_source: str, context: str) -> str:
     """回复来源记账: LLM 成功生成且本轮带 RAG 上下文 → knowledge.
@@ -440,7 +458,9 @@ class LumioAgent:
                     session_id=session_id,
                     agent_name="bot_agent",
                     action=DecisionAction.INTENT_CLASSIFY,
-                    reasoning=f"意图={intent_result.primary_intent.value} 置信={intent_result.primary_confidence:.2f} 域={domain}",
+                    reasoning=(
+                        f"识别意图：{intent_result.primary_intent.value}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
+                    ),
                     evidence={
                         "intent": intent_result.primary_intent.value,
                         "confidence": intent_result.primary_confidence,
@@ -852,7 +872,15 @@ class LumioAgent:
                 session_id=session_id,
                 agent_name="bot_agent",
                 action=DecisionAction.TOOL_CALL if traffic is not None else DecisionAction.INTENT_CLASSIFY,
-                reasoning=f"v2 路由: 决策一={traffic.value if traffic else '咨询'} 决策二预备 composite={composite}",
+                reasoning=(
+                    "两级路由：第一级判定="
+                    + (
+                        _TRAFFIC_ZH_LOG.get(traffic.value, traffic.value)
+                        if traffic is not None
+                        else "咨询类（进入知识问答）"
+                    )
+                    + f"；复合意图={'是' if composite else '否'}"
+                ),
                 evidence={
                     "traffic_class": traffic.value if traffic else None,
                     "domain": v2_domain.value,

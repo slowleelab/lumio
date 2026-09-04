@@ -367,7 +367,16 @@ const EV_KEYS: Record<string, string> = {
   chain: "链",
   reason: "原因",
 }
+const VALUE_ZH: Record<string, string> = {
+  // 域 (domain)
+  query: "查询", business: "业务办理", knowledge: "知识咨询", fallback: "闲聊/兜底",
+  risk: "风险操作", complain: "投诉", transfer: "转人工", consulting: "咨询",
+  transaction: "交易", service: "人工服务", chitchat: "闲聊",
+  // 链路 (traffic_class / chain)
+  read_only_query: "查询直达", financial_transaction: "交易办理", high_risk: "高风险→人工",
+}
 function fmtVal(k: string, v: unknown): string {
+  if (typeof v === "string" && VALUE_ZH[v]) return VALUE_ZH[v]
   if (typeof v === "number") return k === "confidence" || k === "fast_conf" ? `${Math.round(v * 100)}%` : String(Math.round(v * 100) / 100)
   if (typeof v === "boolean") return v ? "是" : "否"
   if (Array.isArray(v)) return v.slice(0, 3).join("、") + (v.length > 3 ? ` 等${v.length}项` : "")
