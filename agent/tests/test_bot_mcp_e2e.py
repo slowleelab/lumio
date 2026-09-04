@@ -81,6 +81,8 @@ class _FakeSessionManager:
     def __init__(self, state: SessionState | None = None, history: list[Any] | None = None) -> None:
         self._state = state
         self._history = history or []
+        # LumioAgent.__init__ 会取 session_manager._redis 组装链 B QueryChain; None=无缓存
+        self._redis = None
 
     async def get_session(self, session_id: str) -> SessionState | None:
         return self._state
@@ -125,11 +127,14 @@ def _make_agent(
     session_manager: _FakeSessionManager,
     client: MCPToolClient,
     history: list[Any] | None = None,
+    degradation_content: str = "降级",
 ) -> LumioAgent:
     classifier = MagicMock()
     classifier.classify = AsyncMock(return_value=(classifier_result, [], MagicMock(), ""))
     degradation_mgr = MagicMock()
-    degradation_mgr.generate_with_fallback = AsyncMock(return_value=MagicMock(content="降级", source="llm"))
+    degradation_mgr.generate_with_fallback = AsyncMock(
+        return_value=MagicMock(content=degradation_content, source="llm")
+    )
     degradation_mgr._degrader = MagicMock(hardcoded_fallback=MagicMock(return_value="兜底"))
     transfer_checker = MagicMock()
     transfer_checker.check = MagicMock(return_value=(False, "", ""))
@@ -151,9 +156,26 @@ def connected_client() -> Any:
     return None  # 占位: 各测试自行在 async with 内存会话内构造
 
 
-def _patch_progressive_disclosure(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+def _patch_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    disclosure: bool = True,
+    *,
+    confirm: bool = False,
+    drop_query_tools: tuple[str, ...] = (),
+) -> None:
+    """v2 唯一路径的设置注入.
+
+    confirm=True: 恢复敏感工具两段式核验 (产品默认核实通过直连执行, 合规环境置 true)。
+    drop_query_tools: 从 intent_tool_map 裁掉查询意图 → 链 B 报 no_query_tool 回落
+    工具编排 — 用于验证编排链路本身 (生产中链 B 不可用同因回落)。
+    """
     settings = Settings()
-    settings.mcp.progressive_disclosure_enabled = enabled
+    settings.mcp.progressive_disclosure_enabled = disclosure
+    settings.mcp.sensitive_confirm_enabled = confirm
+    if drop_query_tools:
+        settings.mcp.intent_tool_map = {
+            k: v for k, v in settings.mcp.intent_tool_map.items() if k not in drop_query_tools
+        }
     monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
 
 
@@ -161,11 +183,8 @@ class TestBotMcpE2E:
     """LumioAgent.run() 触发真实 MCP 工具调用的端到端链路"""
 
     async def test_run_triggers_real_nonsensitive_tool(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """渐进披露开启 + 积分查询意图 → run() → 工具编排 → 真实 query_points 执行
-
-        (分期意图已移出 TOOL_INTENTS — 会话 48882b05; 非敏感工具链路改用积分查询验证)
-        """
-        _patch_progressive_disclosure(monkeypatch, True)
+        """v2 主路径: 积分查询意图 → run() → 链 B 直连 → 真实 query_points 执行 (零 LLM 编排)"""
+        _patch_settings(monkeypatch)
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
@@ -183,21 +202,25 @@ class TestBotMcpE2E:
                 llm,
                 _FakeSessionManager(_make_state()),
                 client,
+                degradation_content="您当前可用积分 12,800 分。",
             )
 
             result = await agent.run("sess-e2e-bot", "帮我查一下积分")
 
-            assert result["response_source"] == "llm"
+            assert result["response_source"] == "tool"
             assert "积分" in result["response"]
-            assert llm.calls == 2  # 工具调用 + 最终答复
+            assert llm.calls == 0  # 链 B 直连: 不进 LLM 工具编排循环
 
     async def test_run_sensitive_tool_pending_then_confirm_executes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """敏感工具 adjust_temp_credit_limit: run() 短路为核验态 → 核验通过 → "确认" → 真实执行"""
-        _patch_progressive_disclosure(monkeypatch, True)
+        """敏感工具 adjust_temp_credit_limit: run() 短路为核验态 → 核验通过 → "确认" → 真实执行
+
+        (裁掉 limit_query 查询工具使链 B 回落编排; confirm=True 恢复合规两段式核验)
+        """
+        _patch_settings(monkeypatch, confirm=True, drop_query_tools=("limit_query",))
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
-            client = MCPToolClient(MCPSettings(enabled=True, sensitive_tools=[]))
+            client = MCPToolClient(MCPSettings(enabled=True, sensitive_confirm_enabled=True))
             await client.use_session(session)
 
             state = _make_state()
@@ -262,11 +285,11 @@ class TestBotMcpE2E:
 
     async def test_verification_cancel_clears_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """核验取消/失败 → 清除 pending, 不执行"""
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch, confirm=True, drop_query_tools=("limit_query",))
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
-            client = MCPToolClient(MCPSettings(enabled=True, sensitive_tools=[]))
+            client = MCPToolClient(MCPSettings(enabled=True, sensitive_confirm_enabled=True))
             await client.use_session(session)
 
             state = _make_state()
@@ -296,11 +319,11 @@ class TestBotMcpE2E:
 
     async def test_sensitive_reply_reroutes_to_mcp_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """会话 956a5fd2 E2E: 上轮索卡号 → 16 位卡号 → 豁免 + 重路由 → 工具编排继续"""
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch, confirm=True)
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
-            client = MCPToolClient(MCPSettings(enabled=True, sensitive_tools=[]))
+            client = MCPToolClient(MCPSettings(enabled=True, sensitive_confirm_enabled=True))
             await client.use_session(session)
 
             state = _make_state()
@@ -332,7 +355,7 @@ class TestBotMcpE2E:
 
     async def test_progressive_disclosure_off_no_tool_trigger(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """对照组: 渐进披露关闭 → 分期意图仍走 business 路径但工具编排可用时不触发? 验证开关语义"""
-        _patch_progressive_disclosure(monkeypatch, False)
+        _patch_settings(monkeypatch, False)
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
@@ -354,7 +377,7 @@ class TestBotMcpE2E:
     async def test_bare_slot_reply_reroutes_to_awaiting_intent(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """会话 1fb54681 E2E: bot 上轮在等金额/期数, 客户裸答"3"被分类 faq@0.00
         -> 等待快照放行 -> 换回 installment_inquiry 走工具编排续办, 不再死于澄清."""
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch)
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
@@ -395,7 +418,7 @@ class TestBotMcpE2E:
 
     async def test_sensitive_reply_no_tools_with_awaiting_goes_business(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """会话 1efbd1ad: 无工具 + 等待快照有效 + 客户给卡号后四位 → 走业务链路, 不转人工"""
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch)
         state = _make_state()
         state.awaiting_slots = {
             "intent": "installment_inquiry",
@@ -440,10 +463,10 @@ class TestToolRouteAuditAndRagFallback:
     """会话 48882b05 修复回归: 工具编排路由留痕 + 索参数轮 RAG 知识兜底 + 等待快照"""
 
     async def test_tool_interception_logs_actual_route_decision(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """决策日志必须显式记录"工具编排接管路由", 不让映射表域名误导审计"""
+        """决策日志必须记录查询意图的实际路由 (v2: 链 B 直连), 不让映射表域名误导审计"""
         from lumio.services.common.decision_log import DecisionAction
 
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch)
         recorded: list[dict[str, Any]] = []
 
         def _recorder(**kwargs: Any) -> str:
@@ -471,19 +494,18 @@ class TestToolRouteAuditAndRagFallback:
         route_calls = [
             r
             for r in recorded
-            if r.get("action") == DecisionAction.TOOL_CALL
-            and r.get("evidence", {}).get("actual_route") == "tool_orchestration"
+            if r.get("action") == DecisionAction.TOOL_CALL and r.get("evidence", {}).get("chain") == "B"
         ]
-        assert route_calls, f"未记录工具编排路由决策, recorded={[r.get('action') for r in recorded]}"
-        assert route_calls[0]["evidence"]["declared_domain"] == "business"
-        assert route_calls[0]["evidence"]["intent"] == "reward_query"
+        assert route_calls, f"未记录链 B 直连路由决策, recorded={[r.get('action') for r in recorded]}"
+        assert route_calls[0]["agent_name"] == "query_chain"
+        assert route_calls[0]["evidence"]["tool"] == "query_points"
 
     async def test_installment_intent_not_intercepted_by_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """会话 48882b05 核心回归: 裸"分期"(歧义输入)不再被工具编排劫持反问参数,
         而是走知识问答返回分期介绍; 工具编排全程零参与。"""
         from lumio.services.common.decision_log import DecisionAction
 
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch)
         recorded: list[dict[str, Any]] = []
 
         def _recorder(**kwargs: Any) -> str:
@@ -513,24 +535,33 @@ class TestToolRouteAuditAndRagFallback:
         # 工具编排零参与: LLM 的 chat_with_tools 一次都没被调用
         assert llm.calls == 0
         assert not [
-            r for r in recorded if r.get("action") == DecisionAction.TOOL_CALL
-        ], "分期意图不应记录工具编排路由决策"
+            r
+            for r in recorded
+            if r.get("action") == DecisionAction.TOOL_CALL and r.get("evidence", {}).get("chain") == "B"
+        ], "裸『分期』不应触发链 B 直连工具"
         # 走知识问答: RAG 检索被消费, 由 knowledge 生成链路出答复
         retrieve_mock.assert_awaited_once()
-        assert result["response_source"] == "llm"
+        assert result["response_source"] in ("llm", "knowledge")
 
     async def test_param_asking_reply_appends_rag_knowledge_and_saves_awaiting(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """索参数式澄清反问必须带 RAG 知识参考, 且等待快照落上 (裸数字下轮可豁免噪声门)"""
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch, drop_query_tools=("bill_query",))
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
             client = MCPToolClient(MCPSettings(enabled=True, sensitive_tools=[]))
             await client.use_session(session)
 
-            llm = _ScriptedLLM([_final_answer("请问您要查哪个月的账单？")])
+            # 先执行一次真实工具 (编排循环), 再索参数 —— 零工具直答会被 9d64b59
+            # 回路转知识链, 带工具执行的索参数轮才走 RAG 追加特性
+            llm = _ScriptedLLM(
+                [
+                    _tool_call_result("c7", "query_card_bill", {"period": "2026-08"}),
+                    _final_answer("请问您要查哪个月的账单？"),
+                ]
+            )
             state = _make_state()
             sm = _FakeSessionManager(state)
             agent = _make_agent(
@@ -554,7 +585,7 @@ class TestToolRouteAuditAndRagFallback:
 
     async def test_param_asking_reply_without_rag_hit_stays_intact(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """检索未命中时反问话术保持原样, 不追加空参考段"""
-        _patch_progressive_disclosure(monkeypatch, True)
+        _patch_settings(monkeypatch, drop_query_tools=("bill_query",))
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()

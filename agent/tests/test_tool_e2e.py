@@ -62,8 +62,9 @@ def _final_answer(text: str) -> ToolCallResult:
     return ToolCallResult(content=text, tool_calls=[], raw_message={"role": "assistant", "content": text})
 
 
-async def _make_client(session: Any) -> MCPToolClient:
-    client = MCPToolClient(MCPSettings(enabled=True, sensitive_tools=[]))
+async def _make_client(session: Any, *, confirm: bool = False) -> MCPToolClient:
+    # confirm=True: 测两段式核验链路本身 (产品默认核实通过直连执行, 合规环境才开)
+    client = MCPToolClient(MCPSettings(enabled=True, sensitive_confirm_enabled=confirm))
     await client.use_session(session)
     return client
 
@@ -159,7 +160,7 @@ class TestToolLayerE2E:
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
             await session.initialize()
-            client = await _make_client(session)
+            client = await _make_client(session, confirm=True)
 
             # 第一轮：LLM 请求敏感工具 → 应短路为核验态 pending（不执行，发核验信号）
             llm = _ScriptedLLM(

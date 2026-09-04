@@ -43,7 +43,10 @@ class TestTrafficClassification:
         }
         for intent, (want_domain, want_traffic) in cases.items():
             domain, traffic = classify_traffic(intent)
-            assert (domain.value, traffic.value if traffic else None) == (want_domain, want_traffic.value if want_traffic else None)
+            assert (domain.value, traffic.value if traffic else None) == (
+                want_domain,
+                want_traffic.value if want_traffic else None,
+            )
         # 咨询域无交易性质 → (consulting, None), 进决策二
         assert classify_traffic(IntentLabel.FAQ) == ("consulting", None)
 
@@ -217,12 +220,10 @@ class TestOutboundGuard:
 
 
 class TestDispatchV2:
-    def _patch_v2(self, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    def _patch_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from lumio.shared.config import Settings
 
-        settings = Settings()
-        settings.bot.routing_v2_enabled = enabled
-        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: Settings())
 
     def _make_app(self, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> FastAPI:
         from lumio.services.bot.bot_agent import LumioAgent  # noqa: F401
@@ -231,15 +232,6 @@ class TestDispatchV2:
         app = FastAPI()
         app.dependency_overrides[get_current_user] = lambda: AuthUser(user_id="a", role="admin", session_id=None)
         return app
-
-    def test_v2_flag_default_off(self, monkeypatch) -> None:
-        from lumio.shared.config import Settings
-
-        # 部署环境可经 BOT_ROUTING_V2_ENABLED 合法开启; 此处验证的是
-        # "无环境变量注入时默认关" 的回滚保底语义
-        monkeypatch.delenv("BOT_ROUTING_V2_ENABLED", raising=False)
-        s = Settings(_env_file=())
-        assert s.bot.routing_v2_enabled is False
 
 
 class TestChitchatRedirect:
@@ -288,7 +280,9 @@ class TestChitchatRedirect:
         """无分数 (旧调用方) 保持保守放行, 不弱化混合句保护"""
         assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY]) is False
         # 部分带分数: 有分数的按分数, 缺分数的按强处理
-        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY, IntentLabel.COMPLAINT], [0.1]) is False
+        assert (
+            is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY, IntentLabel.COMPLAINT], [0.1]) is False
+        )
 
 
 class TestEmergencyFaqExemption:

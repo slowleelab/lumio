@@ -26,9 +26,9 @@ def _pin_v1_routing(monkeypatch):
 
     v2 分派的专测见 test_routing_v2.py / test_query_chain.py。
     """
-    from lumio.shared.config import get_settings
 
-    monkeypatch.setattr(get_settings().bot, "routing_v2_enabled", False)
+    pass  # v1 链路已删除 (2026-09-04): v2 是唯一路径, 无需再 pin
+
 
 # ── 纯函数: 上轮反问检测 ──
 

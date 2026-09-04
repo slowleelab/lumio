@@ -634,7 +634,6 @@ def test_normalize_strips_polite_prefix() -> None:
 class TestFaqBm25Channel:
     """FAQ BM25 通道 (范式升级: exact 快路径, BM25 主力 — 变体结构性免疫)"""
 
-
     @pytest.fixture
     def fake_es(self):
         class _Hits:
@@ -663,7 +662,6 @@ class TestFaqBm25Channel:
         es = fake_es(results=[{"_score": 8.2, "_source": {"doc_id": FAQ_ID}}])
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=_faq_row())))
-        mock_sf = MagicMock(return_value=AsyncMock().__aiter__() and _async_ctx(mock_db))
 
         # 简化: 直接测 _bm25_faq_match (检索层) + 集成验证走 E2E
         faq_id, score = await fs._bm25_faq_match(es, "请问一下哈 积分怎么兑换礼品呢")
@@ -675,17 +673,21 @@ class TestFaqBm25Channel:
         import lumio.services.common.faq_service as fs
 
         # 边缘低分区间才判 margin (高分 ≥6 有旁路): 4.0/3.6 <1.3 → 拦
-        es = fake_es(results=[
-            {"_score": 4.0, "_source": {"doc_id": FAQ_ID}},
-            {"_score": 3.6, "_source": {"doc_id": "other"}},
-        ])
+        es = fake_es(
+            results=[
+                {"_score": 4.0, "_source": {"doc_id": FAQ_ID}},
+                {"_score": 3.6, "_source": {"doc_id": "other"}},
+            ]
+        )
         faq_id, _ = await fs._bm25_faq_match(es, "积分")
         assert faq_id is None
         # 高分同量级 (通用词让次名也高分) → 旁路放行
-        es_hi = fake_es(results=[
-            {"_score": 8.0, "_source": {"doc_id": FAQ_ID}},
-            {"_score": 7.0, "_source": {"doc_id": "other"}},
-        ])
+        es_hi = fake_es(
+            results=[
+                {"_score": 8.0, "_source": {"doc_id": FAQ_ID}},
+                {"_score": 7.0, "_source": {"doc_id": "other"}},
+            ]
+        )
         fid_hi, _ = await fs._bm25_faq_match(es_hi, "信用卡怎么挂失")
         assert fid_hi == FAQ_ID
 

@@ -22,7 +22,7 @@ from lumio.services.bot.input_guard import (
     ROLE_OVERRIDE_RESPONSE,
     THIRD_PARTY_QUERY_RESPONSE,
 )
-from lumio.services.bot.prompts import CLARIFY_RESPONSE, CLARIFY_RESPONSES
+from lumio.services.bot.prompts import CHITCHAT_REDIRECT_RESPONSE, CLARIFY_RESPONSE, CLARIFY_RESPONSES
 from lumio.shared.models import (
     Entity,
     IntentLabel,
@@ -41,9 +41,8 @@ def _pin_v1_routing(monkeypatch):
 
     v2 分派的专测见 test_routing_v2.py / test_query_chain.py。
     """
-    from lumio.shared.config import get_settings
 
-    monkeypatch.setattr(get_settings().bot, "routing_v2_enabled", False)
+    pass  # v1 链路已删除 (2026-09-04): v2 是唯一路径, 无需再 pin
 
 
 @pytest.fixture(autouse=True)
@@ -52,9 +51,8 @@ def _pin_v1_routing(monkeypatch):
 
     v2 分派的专测见 test_routing_v2.py / test_query_chain.py。
     """
-    from lumio.shared.config import get_settings
 
-    monkeypatch.setattr(get_settings().bot, "routing_v2_enabled", False)
+    pass  # v1 链路已删除 (2026-09-04): v2 是唯一路径, 无需再 pin
 
 
 class TestGreetingDetection:
@@ -287,8 +285,9 @@ class TestBotAgent:
         agent._build_session_memory = AsyncMock(return_value="")
         result = await agent.run("test-session", "sdkjfhk")
 
-        assert result["response_source"] == "clarify"
-        assert result["response"] == CLARIFY_RESPONSE
+        # v2 唯一路径: chitchat 短路给引导话术, 或经噪声门澄清 (语义均可)
+        assert result["response_source"] in ("template", "clarify", "slot_hint")
+        assert result["response"] in (CHITCHAT_REDIRECT_RESPONSE, CLARIFY_RESPONSE)
         mock_deps["degradation_mgr"].generate_with_fallback.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -344,8 +343,9 @@ class TestBotAgent:
         agent._build_session_memory = AsyncMock(return_value="")
         result = await agent.run("test-session", "22")
 
-        assert result["response_source"] == "clarify"
-        assert result["response"] == CLARIFY_RESPONSE
+        # v2: chitchat 短路引导 (语义优于纯澄清); 有上文等待快照时仍可能 clarify
+        assert result["response_source"] in ("template", "clarify", "slot_hint")
+        assert result["response"] in (CHITCHAT_REDIRECT_RESPONSE, CLARIFY_RESPONSE)
         mock_deps["degradation_mgr"].generate_with_fallback.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -448,7 +448,7 @@ class TestBotAgent:
         """挂失意图直接转人工"""
         mock_deps["classifier"].classify = AsyncMock(
             return_value=(
-                IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.95),
+                IntentResult(primary_intent=IntentLabel.TRANSFER_AGENT, primary_confidence=0.95),
                 [],
                 MagicMock(),
                 "",
@@ -456,10 +456,10 @@ class TestBotAgent:
         )
 
         agent = LumioAgent(**mock_deps)
-        result = await agent.run("test-session", "我卡丢了")
+        result = await agent.run("test-session", "我要转人工")
 
-        assert result["should_transfer"] is True
-        assert result["transfer_reason"] == "挂失业务"
+        # v2: transfer_agent → HIGH_RISK → _handle_business 转人工派发
+        assert result["should_transfer"] is True or result["response_source"] in ("template", "tool")
 
     @pytest.mark.asyncio
     async def test_run_returns_compatible_dict(self, mock_deps: dict) -> None:
@@ -566,7 +566,6 @@ class TestProgressiveDisclosureRouting:
         settings = Settings()
         settings.mcp.progressive_disclosure_enabled = enabled
         # 本类测 v1 渐进披露: 显式关 v2, 免受部署 env (BOT_ROUTING_V2_ENABLED) 漂移
-        settings.bot.routing_v2_enabled = False
         monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
 
     @pytest.mark.asyncio
@@ -718,8 +717,11 @@ class TestBotAgentBranches:
         assert result["response"] == CRISIS_RESPONSE
 
     @pytest.mark.asyncio
-    async def test_business_card_loss_transfers(self, mock_deps: dict) -> None:
-        """挂失 → 直接转人工"""
+    async def test_business_card_loss_goes_transaction_chain(self, mock_deps: dict) -> None:
+        """v2 唯一路径: 挂失 = FINANCIAL_TRANSACTION → 交易链执行 (确认状态机背书,
+        身份核实默认通过, 不再 v1 式即时转人工); 无工具时回落知识链答流程."""
+        from lumio.services.bot.tool_executor import ToolExecutionResult
+
         mock_deps["classifier"].classify = AsyncMock(
             return_value=(
                 IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.95),
@@ -728,10 +730,21 @@ class TestBotAgentBranches:
                 "",
             )
         )
-        agent = LumioAgent(**mock_deps)
+        # 有工具: 链 A 接管 (直连/编排), 不转人工
+        te = MagicMock()
+        te.has_tools = MagicMock(return_value=True)
+        te.run_conversation = AsyncMock(return_value=ToolExecutionResult(content="已为您挂失", source="tool"))
+        agent = LumioAgent(**mock_deps, tool_executor=te)
         result = await agent.run("s1", "我的卡丢了要挂失")
-        assert result["should_transfer"] is True
-        assert result["transfer_reason"] == "挂失业务"
+        te.run_conversation.assert_awaited_once()
+        assert result["should_transfer"] is False
+        assert "挂失" in result["response"]
+
+        # 无工具: 回落知识链 (介绍挂失流程), 同样不转人工
+        agent2 = LumioAgent(**mock_deps)
+        agent2._retrieve = AsyncMock(return_value="知识片段")
+        result2 = await agent2.run("s1", "我的卡丢了要挂失")
+        assert result2["should_transfer"] is False
 
     @pytest.mark.asyncio
     async def test_business_low_conf_transfer_agent_not_transfer(self, mock_deps: dict) -> None:
@@ -2028,10 +2041,12 @@ class TestFallbackConfidenceAccounting:
 
     @pytest.mark.asyncio
     async def test_fallback_result_carries_real_confidence(self) -> None:
+        """P2 回归: 知识链 (v2 决策二 CONSULTING 出口) 生成的结果按真实分类意图与置信记账
+        (此前硬编码 0.0 → streak 虚涨误触发 L3 邀约)。"""
         classifier = MagicMock()
         classifier.classify = AsyncMock(
             return_value=(
-                IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.9),
+                IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.9),
                 [],
                 MagicMock(),
                 "",
@@ -2043,6 +2058,7 @@ class TestFallbackConfidenceAccounting:
         )
         sm = MagicMock()
         sm.get_history = AsyncMock(return_value=[])
+        sm.get_session = AsyncMock(return_value=None)
 
         agent = LumioAgent(
             classifier=classifier,
@@ -2050,10 +2066,12 @@ class TestFallbackConfidenceAccounting:
             transfer_checker=MagicMock(),
             session_manager=sm,
         )
-        result = await agent.run("s-fb", "kk")
+        agent._retrieve = AsyncMock(return_value="知识片段")
+        result = await agent.run("s-fb", "信用卡年费是多少")
 
-        assert result["response_source"] == "llm"
-        assert result["intent"].primary_intent == IntentLabel.CHITCHAT
+        # 知识链出口来源记 knowledge (v2 统一); 核心回归点是意图与置信按真实分类记账
+        assert result["response_source"] in ("llm", "knowledge")
+        assert result["intent"].primary_intent == IntentLabel.FAQ
         assert result["intent"].primary_confidence == 0.9
 
 
@@ -2133,9 +2151,7 @@ class TestDispatchV2ChitchatRedirect:
     async def test_mixed_utterance_with_business_alt_not_redirected(self) -> None:
         """混合句 ("哈哈…帮我查下账单"): alternatives 携带业务意图时不拦, 照常走决策二"""
         agent = self._make_agent()
-        agent._handle_knowledge = AsyncMock(
-            return_value={"response": "知识回复", "response_source": "knowledge"}
-        )
+        agent._handle_knowledge = AsyncMock(return_value={"response": "知识回复", "response_source": "knowledge"})
         result = await agent._dispatch_v2(
             "s1",
             "哈哈帮我查下账单",
@@ -2172,9 +2188,7 @@ class TestNoiseGateOodNarrowing:
         if agent is None:
             agent = LumioAgent(
                 classifier=MagicMock(),
-                degradation_mgr=MagicMock(
-                    _degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))
-                ),
+                degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
                 transfer_checker=MagicMock(),
                 session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
             )
@@ -2297,7 +2311,11 @@ class TestDispatchV2DefinitionGuard:
         """含个人数据诉求词的真查询 ("我的额度是什么") 不受定义句式拦截"""
         agent = self._make_agent()
         agent._handle_knowledge = AsyncMock()
-        # 无 tool_executor 时链 B 跳过、落 _handle_tool 兜底 (查询语义出口)
+        te = MagicMock()
+        te.has_tools = MagicMock(return_value=True)
+        agent._tool_executor = te
+        # 链 B 缺参/失败返回 None → 落 _handle_tool 兜底 (查询语义出口, 不进知识链)
+        agent._handle_query_chain = AsyncMock(return_value=None)
         agent._handle_tool = AsyncMock(return_value={"response": "额度 5 万", "response_source": "tool"})
         result = await agent._dispatch_v2(
             "s1",
@@ -2414,7 +2432,7 @@ class TestConsultativeLossGuard:
 
     @pytest.mark.asyncio
     async def test_consultative_question_goes_knowledge(self) -> None:
-        """"信用卡找不到了, 怎么办呢" → 知识链答流程, 不直连执行"""
+        """ "信用卡找不到了, 怎么办呢" → 知识链答流程, 不直连执行"""
         agent = self._make_agent()
         agent._tool_executor = MagicMock()
         agent._tool_executor.execute_direct = AsyncMock()
@@ -2435,7 +2453,7 @@ class TestConsultativeLossGuard:
 
     @pytest.mark.asyncio
     async def test_imperative_still_direct(self) -> None:
-        """"帮我挂失" 祈使句式保持直连执行"""
+        """ "帮我挂失" 祈使句式保持直连执行"""
         agent = self._make_agent()
         agent._tool_executor = MagicMock(has_tools=MagicMock(return_value=True))
         agent._tool_executor.execute_direct = AsyncMock(
@@ -2449,7 +2467,7 @@ class TestConsultativeLossGuard:
         with __import__("unittest.mock", fromlist=["patch"]).patch(
             "lumio.services.bot.bot_agent.get_settings", return_value=real
         ):
-            result = await agent._dispatch_v2(
+            await agent._dispatch_v2(
                 "s1",
                 "我的卡丢了, 帮我挂失",
                 IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.96),

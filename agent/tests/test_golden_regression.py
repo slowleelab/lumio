@@ -129,7 +129,6 @@ def test_gate_faq_personal_query_not_hijacked() -> None:
 def test_gate_outbound_solicitation() -> None:
     """出站索敏: 整句拦截 + 剥离保留合规部分"""
 
-
     class _S:
         def check_input(self, t):
             return True, []
@@ -154,9 +153,8 @@ def test_gate_emergency_faq_exempt() -> None:
 
 def test_gate_pending_window_behavior() -> None:
     """确认窗口: 疑问新话题首轮放行 / 短犹豫计数"""
-    lex = _lexicon()
     assert any(m in "新卡一般多久能寄到" for m in ("多久", "怎么", "什么")), "疑问词表"
-    assert "嗯" not in [t for t in ("怎么办",) ], "短犹豫不在咨询表"
+    assert "嗯" not in [t for t in ("怎么办",)], "短犹豫不在咨询表"
 
 
 def test_gate_noise_baseline() -> None:
@@ -237,7 +235,9 @@ def test_gate_topic_followup_rules() -> None:
 
     def mk():
         clf = MagicMock()
-        clf.classify = AsyncMock(return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), ""))
+        clf.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
         return LumioAgent(
             classifier=clf,
             degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="x"))),
@@ -245,18 +245,36 @@ def test_gate_topic_followup_rules() -> None:
             session_manager=MagicMock(get_session=AsyncMock(return_value=None), patch_state=AsyncMock()),
         )
 
-    loss = TopicRequest(id="card_loss", intent="card_loss", label_zh="挂失", urgency="high", raised_turn=1, updated_at=datetime.now(UTC))
+    loss = TopicRequest(
+        id="card_loss", intent="card_loss", label_zh="挂失", urgency="high", raised_turn=1, updated_at=datetime.now(UTC)
+    )
 
     # 1) 挂失未办结 + 本轮查账单 → 回访追加
     a = mk()
     r = {"response": "账单 8650 元。", "response_source": "tool"}
-    asyncio.run(a._track_and_followup("s", MagicMock(version=1, turn_count=2, active_requests=[loss]), IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.84), "query", r))
+    asyncio.run(
+        a._track_and_followup(
+            "s",
+            MagicMock(version=1, turn_count=2, active_requests=[loss]),
+            IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.84),
+            "query",
+            r,
+        )
+    )
     assert "挂失" in r["response"] and "未办理完成" in r["response"]
 
     # 2) 本轮闲聊 (无新诉求) → 不回访
     b = mk()
     r2 = {"response": "哈哈", "response_source": "template"}
-    asyncio.run(b._track_and_followup("s", MagicMock(version=1, turn_count=2, active_requests=[loss.model_copy(deep=True)]), IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.29), "fallback", r2))
+    asyncio.run(
+        b._track_and_followup(
+            "s",
+            MagicMock(version=1, turn_count=2, active_requests=[loss.model_copy(deep=True)]),
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.29),
+            "fallback",
+            r2,
+        )
+    )
     assert "未办理完成" not in r2["response"]
 
     # 3) 已办结不回访 + 防带偏: fulfilled 不进进行中诉求
@@ -280,23 +298,29 @@ def test_gate_bm25_cross_faq_margin() -> None:
 
     doc = "01a048ee-136e"
     # 同 FAQ 两条变体分数接近 → 命中 (不参与 margin)
-    same = _ES([
-        {"_score": 4.95, "_source": {"doc_id": doc}},
-        {"_score": 4.52, "_source": {"doc_id": doc}},
-    ])
+    same = _ES(
+        [
+            {"_score": 4.95, "_source": {"doc_id": doc}},
+            {"_score": 4.52, "_source": {"doc_id": doc}},
+        ]
+    )
     fid, score = asyncio.run(_bm25_faq_match(same, "那个 积分怎么兑换"))
     assert fid == doc and score == 4.95
     # 不同 FAQ 分数接近且处边缘低分区 → 拦
-    rival = _ES([
-        {"_score": 4.0, "_source": {"doc_id": doc}},
-        {"_score": 3.6, "_source": {"doc_id": "other"}},
-    ])
+    rival = _ES(
+        [
+            {"_score": 4.0, "_source": {"doc_id": doc}},
+            {"_score": 3.6, "_source": {"doc_id": "other"}},
+        ]
+    )
     fid2, _ = asyncio.run(_bm25_faq_match(rival, "积分"))
     assert fid2 is None
     # 高分区 (≥6) 旁路: 次名同量级多因通用词, 不拦 (实测 "信用卡怎么挂失" 8.09/7.74)
-    hi = _ES([
-        {"_score": 8.09, "_source": {"doc_id": doc}},
-        {"_score": 7.74, "_source": {"doc_id": "other"}},
-    ])
+    hi = _ES(
+        [
+            {"_score": 8.09, "_source": {"doc_id": doc}},
+            {"_score": 7.74, "_source": {"doc_id": "other"}},
+        ]
+    )
     fid3, _ = asyncio.run(_bm25_faq_match(hi, "信用卡怎么挂失"))
     assert fid3 == doc

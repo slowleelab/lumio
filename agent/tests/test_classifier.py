@@ -998,7 +998,6 @@ async def test_llm_result_inherits_fast_alternative_scores(monkeypatch: pytest.M
     from lumio.shared.config import Settings
 
     settings = Settings()
-    settings.bot.routing_v2_enabled = False
     monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
 
     rule = RuleClassifier()
@@ -1043,7 +1042,6 @@ async def test_ood_unknown_short_circuits_llm_for_chitchat(monkeypatch: pytest.M
     from lumio.shared.config import Settings
 
     settings = Settings()
-    settings.bot.routing_v2_enabled = False
     settings.classification.ood_enabled = True
     settings.classification.ood_energy_threshold = -5.0  # energy=-8.0 < -5.0-band → known? 注意方向
     monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
@@ -1076,7 +1074,6 @@ async def test_ood_unknown_business_intent_still_uses_llm(monkeypatch: pytest.Mo
     from lumio.shared.config import Settings
 
     settings = Settings()
-    settings.bot.routing_v2_enabled = False
     settings.classification.ood_enabled = True
     settings.classification.ood_energy_threshold = -5.0
     monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)

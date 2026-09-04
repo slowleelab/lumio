@@ -10,6 +10,7 @@ import pytest
 
 from lumio.services.common.embedding import (
     BGE_QUERY_INSTRUCTION,
+    MXBAI_QUERY_INSTRUCTION,
     EmbeddingCircuitBreaker,
     EmbeddingProvider,
     OllamaEmbedding,
@@ -90,7 +91,8 @@ async def test_ollama_embed_query_adds_instruction() -> None:
 
     assert len(result) == 1024
     assert len(captured_input) == 1
-    assert captured_input[0].startswith(BGE_QUERY_INSTRUCTION)
+    # mxbai 家族用官方英文查询前缀, BGE 中文指令会让其向量分布塌缩 (P0 修复回归)
+    assert captured_input[0].startswith(MXBAI_QUERY_INSTRUCTION)
     assert "信用卡年费" in captured_input[0]
 
 
@@ -335,7 +337,7 @@ def test_provider_properties() -> None:
     )
     assert ollama.dim == 1024
     assert ollama.name == "mxbai-embed-large"
-    assert ollama.query_instruction == BGE_QUERY_INSTRUCTION
+    assert ollama.query_instruction == MXBAI_QUERY_INSTRUCTION
 
     tei = TEIEmbedding(
         base_url="http://localhost:8080",

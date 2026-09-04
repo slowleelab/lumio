@@ -17,7 +17,7 @@ import time
 import uuid as uuid_module
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from lumio.services.bot.input_gate import InputGate
 from lumio.services.bot.prompts import (
@@ -37,7 +37,7 @@ from lumio.services.bot.prompts import (
 )
 from lumio.services.bot.slot_tracker import _ENTITY_TO_SLOT, SlotTracker
 from lumio.services.bot.tool_executor import ConfirmDecision, ToolCallingExecutor, detect_confirmation
-from lumio.services.bot.tool_selection import TOOL_INTENTS, select_tools_for_intent
+from lumio.services.bot.tool_selection import select_tools_for_intent
 from lumio.services.common.bert_classifier import ood_verdict
 from lumio.services.common.classifier import IntentClassifier, get_domain
 from lumio.services.common.decision_log import DecisionAction, log_decision
@@ -71,10 +71,17 @@ from lumio.shared.tracing import traced
 
 # 决策留痕中文化 (用户反馈: "决策二预备"/"域=query" 看不懂 — 留痕原文也要可读)
 _DOMAIN_ZH: dict[str, str] = {
-    "business": "业务办理", "knowledge": "知识咨询", "fallback": "闲聊/兜底",
-    "risk": "风险操作", "complain": "投诉", "transfer": "转人工",
-    "query": "查询", "consulting": "咨询", "transaction": "交易",
-    "service": "人工服务", "chitchat": "闲聊",
+    "business": "业务办理",
+    "knowledge": "知识咨询",
+    "fallback": "闲聊/兜底",
+    "risk": "风险操作",
+    "complain": "投诉",
+    "transfer": "转人工",
+    "query": "查询",
+    "consulting": "咨询",
+    "transaction": "交易",
+    "service": "人工服务",
+    "chitchat": "闲聊",
 }
 _TRAFFIC_ZH_LOG: dict[str, str] = {
     "financial_transaction": "交易办理（走业务工具）",
@@ -85,7 +92,6 @@ _TRAFFIC_ZH_LOG: dict[str, str] = {
 
 def _domain_zh(domain: str) -> str:
     return _DOMAIN_ZH.get(domain, domain)
-
 
 
 def _effective_knowledge_source(raw_source: str, context: str) -> str:
@@ -488,98 +494,41 @@ class LumioAgent:
             # 此前各 handler 调 _build_result 时不传 entities, 落库实体恒空,
             # 历史实体池(last_entities)从不累积, 指代消解与"[已知实体]"内存全部空转.
             result = None
-            routing_v2 = get_settings().bot.routing_v2_enabled
-            logger.debug(
-                "路由分派: routing_v2=%s executor=%s has_tools=%s intent=%s",
-                routing_v2,
-                self._tool_executor is not None,
-                self._tool_executor.has_tools() if self._tool_executor is not None else False,
-                intent_result.primary_intent.value,
+            # 目标架构 ④ 两级路由决策: 决策一交易性质 / 决策二只读四分流。
+            # 既有闸门 (噪声门/敏感回话/等待快照) 均在 handler 内部, 位置不动。
+            # (v1 旧链路已删除, 2026-09-04: v2 经 12 轮闭环验证后成为唯一路径,
+            #  routing_v2_enabled 开关随之退役 — 需要"回滚"时用 git revert)
+            result = await self._dispatch_v2(
+                session_id,
+                user_input,
+                intent_result,
+                history,
+                entities,
+                sentiment,
+                domain,
+                customer_id,
             )
-            if routing_v2:
-                # 目标架构 ④ 两级路由决策: 决策一交易性质 / 决策二只读四分流。
-                # 既有闸门 (噪声门/敏感回话/等待快照) 均在 handler 内部, 位置不动。
-                result = await self._dispatch_v2(
+            # P0 多轮治理: 噪声门回话豁免所需"上文缺槽快照", 提前到 domain 分派前读取,
+            # 避免各 handler 内 _load_slot_prompt 因意图切换重置 tracker 而清掉"上文在等什么"。
+            # v1 域三分派已删除 (2026-09-04, v2 经 12 轮闭环验证): dispatch_v2
+            # 覆盖全部域 — 决策一三分支 + 决策二 + chitchat 短路 + 各 handler 内部
+            # 噪声门。此处仅防御性兜底: dispatch 异常返回 None 时走 fallback 噪声门。
+            if result is None:
+                result = await self._handle_fallback(
                     session_id,
                     user_input,
                     intent_result,
                     history,
                     entities,
                     sentiment,
-                    domain,
-                    customer_id,
                 )
-            elif (
-                get_settings().mcp.progressive_disclosure_enabled
-                and self._tool_executor is not None
-                and self._tool_executor.has_tools()
-                and normalize_intent(intent_result.primary_intent.value) in TOOL_INTENTS
-            ):
-                # 会话 48882b05 复盘: 本拦截在 domain 分派之前, 上面的 intent_classify 决策
-                # 记的 域=knowledge(映射表) 与实际走工具编排不符, 审计会误判 "该走 RAG 却
-                # 没走"。此处补一条实际路由决策, 显式声明劫持发生及原因。
-                try:
-                    log_decision(
-                        session_id=session_id,
-                        agent_name="bot_agent",
-                        action=DecisionAction.TOOL_CALL,
-                        reasoning=f"工具编排接管路由: intent={intent_result.primary_intent.value} 置信={intent_result.primary_confidence:.2f}",
-                        evidence={
-                            "actual_route": "tool_orchestration",
-                            "declared_domain": domain,
-                            "intent": intent_result.primary_intent.value,
-                            "confidence": intent_result.primary_confidence,
-                        },
-                        turn_id=uuid_module.uuid4().hex[:16],
-                        customer_id=customer_id,
-                    )
-                except Exception:
-                    logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
-                result = await self._handle_tool(
-                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
-                )
-
-            # P0 多轮治理: 噪声门回话豁免所需"上文缺槽快照", 提前到 domain 分派前读取,
-            # 避免各 handler 内 _load_slot_prompt 因意图切换重置 tracker 而清掉"上文在等什么"。
-            if result is None:
-                gate_missing_slots: list[tuple[str, str]] = []
-                if get_settings().classification.rephrase_guard_enabled:
-                    gate_missing_slots = await self._missing_required_slots(session_id, intent_result.primary_intent)
-
-                if domain == "knowledge":
-                    result = await self._handle_knowledge(
-                        session_id,
-                        user_input,
-                        intent_result,
-                        history,
-                        entities,
-                        sentiment,
-                        missing_slots=gate_missing_slots,
-                    )
-                elif domain in ("business", "risk", "complain", "transfer"):
-                    # risk/complain/transfer 域与 business 同走 _handle_business:
-                    # 敏感写直排人工/建工单、transfer 派发、工具编排的逻辑都在其中
-                    # (draft-0.3 §2 下游契约; 域细分不改派发行为)
-                    result = await self._handle_business(
-                        session_id, user_input, intent_result, history, entities, sentiment, customer_id
-                    )
-                else:
-                    result = await self._handle_fallback(
-                        session_id,
-                        user_input,
-                        intent_result,
-                        history,
-                        entities,
-                        sentiment,
-                        missing_slots=gate_missing_slots,
-                    )
 
             # 统一把增强后的实体写回 result, 保证 slot 填充/噪声门/持久化共用同一份数据
             if result and entities:
                 result["entities"] = entities
 
             # ⑦ 出站合规闸门 (v2): 生成类回复过敏感词/幻觉检查, 拦截替换为澄清话术
-            if result is not None and routing_v2 and result.get("response_source") in ("knowledge", "llm"):
+            if result is not None and result.get("response_source") in ("knowledge", "llm"):
                 verdict = self._outbound_guard.check(
                     str(result.get("response", "")),
                     grounding_source=str(result.get("retrieval_context", "") or ""),
@@ -659,17 +608,16 @@ class LumioAgent:
             if result is not None:
                 await self._update_awaiting_snapshot(session_id, intent_result.primary_intent, result)
                 # 诉求跟踪: upsert/流转 + 高紧急未办结回访 (开关可回滚)
-                if routing_v2:
-                    try:
-                        track_state = (
-                            await self._session_manager.get_session(session_id)
-                            if self._session_manager is not None
-                            else None
-                        )
-                        if track_state is not None:
-                            await self._track_and_followup(session_id, track_state, intent_result, domain, result)
-                    except Exception:
-                        logger.debug("诉求跟踪跳过(不阻断): session=%s", session_id)
+                try:
+                    track_state = (
+                        await self._session_manager.get_session(session_id)
+                        if self._session_manager is not None
+                        else None
+                    )
+                    if track_state is not None:
+                        await self._track_and_followup(session_id, track_state, intent_result, domain, result)
+                except Exception:
+                    logger.debug("诉求跟踪跳过(不阻断): session=%s", session_id)
 
             # P0 修复: 澄清轮的 L3 补判 (run() 统一出口). 噪声门/低置信分支在 handler 内
             # 提前 return clarify, 永远到不了各路径末尾的 _check_transfer -- 连续低置信的
@@ -945,9 +893,7 @@ class LumioAgent:
             consultative_markers = _lex("consultative_loss_markers")
             if confidence >= 0.8 and any(m in user_input for m in consultative_markers):
                 logger.info("挂失咨询句式走知识链 (跳过直连): input=%r", user_input[:24])
-                return await self._handle_knowledge(
-                    session_id, user_input, intent_result, history, entities, sentiment
-                )
+                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
             if (
                 confidence >= 0.8
                 and self._tool_executor is not None
@@ -984,7 +930,12 @@ class LumioAgent:
                         except Exception:
                             logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
                         return self._build_result(
-                            session_id, user_input, _format_tool_result(direct.content), "tool", intent.value, confidence
+                            session_id,
+                            user_input,
+                            _format_tool_result(direct.content),
+                            "tool",
+                            intent.value,
+                            confidence,
                         )
                     except Exception as exc:
                         logger.warning("工具直连失败, 回落链 A 编排: tool=%s err=%s", direct_tools[0], exc)
@@ -1004,9 +955,7 @@ class LumioAgent:
 
             if is_definition_query(user_input):
                 logger.info("定义句式直送知识链 (链B前置拦截): input=%r", user_input[:24])
-                return await self._handle_knowledge(
-                    session_id, user_input, intent_result, history, entities, sentiment
-                )
+                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
             # 复合意图 (查询 + 解释/FAQ 诉求) 优先走链 C: 纯定义类问题会被
             # 查询链路的缺参反问卡死 (会话 2b3b2613 实测: "信用额度是什么"三连问
             # 卡号, 用户永远出不去)。链 C 缺参/无工具时自然回落知识路径。
@@ -1029,9 +978,12 @@ class LumioAgent:
                     qc = None
                 if qc is not None:
                     return qc
-            return await self._handle_tool(
-                session_id, user_input, intent_result, history, entities, sentiment, customer_id
-            )
+            # 无可用工具 (链 B 不可达) → 回落知识链, 与交易分支"无工具回落知识"对齐
+            if self._tool_executor is not None and self._tool_executor.has_tools():
+                return await self._handle_tool(
+                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                )
+            return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
 
         # ── 决策二 (CONSULTING) ──
         # 闲聊域短路 (会话 8700a2ea 复盘): 决策二只有 复合/竞速/RAG 三个出口, 闲聊流量
@@ -1134,7 +1086,9 @@ class LumioAgent:
                     "tool": qc.tool_name,
                     "arguments": qc.tool_args,
                     "cache_hit": qc.cache_hit,
-                    "result_preview": ((qc.raw_result if (qc.raw_result and qc.raw_result != "(cache)") else (qc.content or "")) or "")[:200],
+                    "result_preview": (
+                        (qc.raw_result if (qc.raw_result and qc.raw_result != "(cache)") else (qc.content or "")) or ""
+                    )[:200],
                     "missing_params": qc.missing_params,
                     "chain": "B",
                 },
@@ -1466,9 +1420,7 @@ class LumioAgent:
                 intent.primary_confidence,
             )
         _rag_t0 = time.monotonic()
-        context = await self._retrieve(
-            user_input, intent=intent.primary_intent, confidence=intent.primary_confidence
-        )
+        context = await self._retrieve(user_input, intent=intent.primary_intent, confidence=intent.primary_confidence)
         if extra_context:
             context = f"{extra_context}\n\n{context}" if context else extra_context
         # E2 决策可解释: 记录 RAG 检索决策 (命中与否)
@@ -1764,11 +1716,15 @@ class LumioAgent:
             # 采集精度治理 (300会话规模轮: 52% 坏例为误采集): 客户开门见山的主动
             # 转人工/投诉 (意图明确+高置信) 走对流程是正常诉求, 不是 bot 的坏例 —
             # 不采集。该采的是低置信 streak/连续澄清被逼转人工 (L3 链另行采集)。
-            _explicit_transfer = primary in (
-                IntentLabel.TRANSFER_AGENT,
-                IntentLabel.COMPLAINT,
-                IntentLabel.DISPUTE_SUBMIT,
-            ) and conf >= 0.7
+            _explicit_transfer = (
+                primary
+                in (
+                    IntentLabel.TRANSFER_AGENT,
+                    IntentLabel.COMPLAINT,
+                    IntentLabel.DISPUTE_SUBMIT,
+                )
+                and conf >= 0.7
+            )
             try:
                 from lumio.services.common.badcase_store import capture_badcase
 
@@ -1998,10 +1954,14 @@ class LumioAgent:
                 # 300会话规模轮修复 (确认继承断裂根因): 挂失等敏感写类编排无工具调用
                 # 转 knowledge 给引导话术时, 同时挂 pending 挂失确认 — 否则下一句
                 # "确认挂失"无状态可继承被重新分类成 faq, 23 条 layer_3 坏例的来源。
-                if intent.primary_intent in (
-                    IntentLabel.CARD_LOSS,
-                    IntentLabel.CARD_LOSS_REPORT,
-                ) and self._session_manager is not None:
+                if (
+                    intent.primary_intent
+                    in (
+                        IntentLabel.CARD_LOSS,
+                        IntentLabel.CARD_LOSS_REPORT,
+                    )
+                    and self._session_manager is not None
+                ):
                     try:
                         from lumio.shared.models import PendingAction
 
@@ -2732,9 +2692,7 @@ class LumioAgent:
             terms = _INTENT_RETRIEVAL_TERMS.get(intent)
             if terms and terms not in query:
                 query = f"{query} {terms}"
-                logger.info(
-                    "意图感知检索词增强: intent=%s conf=%.2f → %r", intent.value, confidence, query[:60]
-                )
+                logger.info("意图感知检索词增强: intent=%s conf=%.2f → %r", intent.value, confidence, query[:60])
         if self._degradation_mgr.level == DegradationLevel.FALLBACK:
             return ""
         # P1-13 修复: 检索前查 ES/Milvus 熔断器 — 熔断打开时主动跳过检索,
@@ -3131,16 +3089,23 @@ class LumioAgent:
     # - patch_state 版本冲突放弃本轮更新 (下一轮自愈), 不重试循环
     # - 上限 5 条, 满则挤掉最老的已办结项
 
-    _TOPIC_INTENT_ZH: dict[str, str] = {
-        "card_loss": "挂失", "card_loss_report": "挂失", "complaint": "投诉",
-        "transfer_agent": "转人工", "dispute_chargeback": "争议处理",
-        "dispute_submit": "争议处理", "bill_query": "账单查询",
-        "account_bill_query": "账单查询", "limit_query": "额度查询",
-        "installment_inquiry": "分期咨询", "reward_query": "积分服务",
-        "txn_query": "交易查询", "transaction_query": "交易查询",
+    _TOPIC_INTENT_ZH: ClassVar[dict[str, str]] = {
+        "card_loss": "挂失",
+        "card_loss_report": "挂失",
+        "complaint": "投诉",
+        "transfer_agent": "转人工",
+        "dispute_chargeback": "争议处理",
+        "dispute_submit": "争议处理",
+        "bill_query": "账单查询",
+        "account_bill_query": "账单查询",
+        "limit_query": "额度查询",
+        "installment_inquiry": "分期咨询",
+        "reward_query": "积分服务",
+        "txn_query": "交易查询",
+        "transaction_query": "交易查询",
     }
-    _TOPIC_HIGH_URGENCY_DOMAINS = frozenset({"risk", "complain", "transfer"})
-    _TOPIC_MAX_ACTIVE = 5
+    _TOPIC_HIGH_URGENCY_DOMAINS: ClassVar[frozenset[str]] = frozenset({"risk", "complain", "transfer"})
+    _TOPIC_MAX_ACTIVE: ClassVar[int] = 5
 
     def _intent_as_topic(self, intent_result: IntentResult, domain: str, turn_count: int) -> TopicRequest | None:
         """本轮分类结果 → 诉求对象; 非诉求意图 (闲聊/低置信兜底) 返回 None"""
@@ -3148,9 +3113,13 @@ class LumioAgent:
 
         intent = intent_result.primary_intent
         conf = intent_result.primary_confidence
-        if intent in (IntentLabel.NB_CHITCHAT, IntentLabel.CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.FAQ):
-            if conf < 0.8:  # 低置信 faq 是兜底不是诉求; 高置信 faq (产品咨询) 也视为轻诉求不建 (FAQ 已直答即 fulfilled, 无跟踪价值)
-                return None
+        # 低置信 faq/闲聊是兜底不是诉求; 高置信 faq (产品咨询) 也视为轻诉求不建
+        # (FAQ 已直答即 fulfilled, 无跟踪价值)
+        if (
+            intent in (IntentLabel.NB_CHITCHAT, IntentLabel.CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.FAQ)
+            and conf < 0.8
+        ):
+            return None
         label = self._TOPIC_INTENT_ZH.get(intent.value, "")
         if not label:
             return None
@@ -3192,15 +3161,15 @@ class LumioAgent:
             # template/fallback 等不动 (转人工/问候不是诉求办结)
         out = list(by_id.values())
         if len(out) > self._TOPIC_MAX_ACTIVE:
-            fulfilled = sorted(
-                [t for t in out if t.status == TopicRequestStatus.FULFILLED], key=lambda t: t.updated_at
-            )
+            fulfilled = sorted([t for t in out if t.status == TopicRequestStatus.FULFILLED], key=lambda t: t.updated_at)
             for t in fulfilled[: len(out) - self._TOPIC_MAX_ACTIVE]:
                 out.remove(t)
             out = out[: self._TOPIC_MAX_ACTIVE]
         return out
 
-    def _pick_followup(self, requests: list[TopicRequest], current_intent_value: str, revisit_max: int) -> TopicRequest | None:
+    def _pick_followup(
+        self, requests: list[TopicRequest], current_intent_value: str, revisit_max: int
+    ) -> TopicRequest | None:
         """挑一条该回访的高紧急诉求: 未办结 + 非本轮意图 + 未超回访上限"""
         from lumio.shared.models import TopicRequestStatus
 
@@ -3253,7 +3222,7 @@ class LumioAgent:
                 expected_version=state.version,
                 patches={"active_requests": [t.model_dump(mode="json") for t in merged]},
             )
-            try:
+            with contextlib.suppress(Exception):
                 log_decision(
                     session_id=session_id,
                     agent_name="bot_agent",
@@ -3264,15 +3233,18 @@ class LumioAgent:
                     ),
                     evidence={
                         "requests": [
-                            {"intent": t.label_zh, "urgency": t.urgency, "status": t.status.value, "revisits": t.revisit_count}
+                            {
+                                "intent": t.label_zh,
+                                "urgency": t.urgency,
+                                "status": t.status.value,
+                                "revisits": t.revisit_count,
+                            }
                             for t in merged
                         ][:5],
                         "followup_sent": bool(revisit_note),
                     },
                     turn_id=uuid_module.uuid4().hex[:16],
                 )
-            except Exception:
-                pass
         except Exception as exc:
             # 版本冲突等: 放弃本轮写回, 下一轮自愈 — 诉求跟踪失败绝不影响主回复
             logger.debug("诉求跟踪写回失败(不阻断): session=%s err=%s", session_id, exc)

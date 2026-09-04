@@ -25,6 +25,11 @@ import pytest_asyncio
 # 需断言 tracing 行为的用例（test_observability）自行开启并注入内存 exporter。
 os.environ.setdefault("LUMIO_TRACING_ENABLED", "false")
 
+# 测试密闭性: 部署 .env 的 MCP_ENABLED 不得泄入测试子进程 —— 健康检查的依赖
+# 状态会随本机 :8090 的连接时序抖动成 degraded; 工具 e2e 一律用进程内内存
+# MCP Server 自行注入, 不依赖外部 MCP 后端。
+os.environ["MCP_ENABLED"] = "false"
+
 # ── 服务器子进程管理 ──
 
 _bot_process: subprocess.Popen | None = None

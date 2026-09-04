@@ -6,7 +6,7 @@
 分类表以既有 INTENT_DOMAINS + SENSITIVE_INTENTS 为单一事实源归并生成，
 另加显式覆盖表，避免第三处意图清单漂移。
 
-特性开关 bot.routing_v2_enabled 控制分派层走新决策还是旧链路（回滚保底）。
+(v1 旧链路已删除, 2026-09-04: v2 经 12 轮闭环验证后为唯一路径; 回滚用 git revert)
 """
 
 from __future__ import annotations

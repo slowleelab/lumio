@@ -491,6 +491,7 @@ class SafetySettings(BaseSettings):
 
 class SessionSettings(BaseSettings):
     """会话状态配置"""
+
     # 诉求跟踪 (2026-09-04 多轮会话管理): 断档(紧急诉求切话题蒸发)与
     # 带偏(旧话题影响新轮)的同根源修复。关闭即完全回滚旧行为。
     topic_tracking_enabled: bool = True
@@ -533,7 +534,6 @@ class BotSettings(BaseSettings):
     max_sessions_per_customer: int = 3
     # 目标架构 v2 两级路由决策 (决策一交易性质 / 决策二只读四分流)。
     # 默认关: 开启需显式 BOT_ROUTING_V2_ENABLED=true (灰度开关, 关闭时走旧链路回滚保底)。
-    routing_v2_enabled: bool = False
 
 
 class AssistSettings(BaseSettings):
