@@ -59,8 +59,24 @@ class TestTrafficClassification:
         assert not detect_composite(IntentLabel.LIMIT_QUERY, [], "我的额度是多少")
         assert not detect_composite(IntentLabel.FAQ, [], "为什么会调整")  # 非查询主意图不算复合
 
+    def test_composite_weak_alternative_filtered(self) -> None:
+        """弱次选分数线: 对冲性 CONSULTING 次选 (<0.30) 不触发复合级联
 
-# ── ③ 链 D 并行竞速 ──
+        会话 smoke-qa-1788567861 复盘: "账单日是几号" 挂 installment_inquiry 弱次选
+        被误判复合 → 级联取数后被废弃回落重跑 (决策链出现双 tool_call)。
+        """
+        alts = [IntentLabel.TRANSACTION_QUERY, IntentLabel.INSTALLMENT_INQUIRY]
+        # 弱次选 (0.08 < 0.30) → 不算复合
+        assert not detect_composite(IntentLabel.BILL_QUERY, alts, "我的信用卡账单日是几号", [0.08, 0.05])
+        # 强次选 (≥0.30) → 复合
+        assert detect_composite(IntentLabel.BILL_QUERY, alts, "我的信用卡账单日是几号", [0.4, 0.35])
+        # 分数缺失 → 保守按强处理 (不弱化复合保护)
+        assert detect_composite(IntentLabel.BILL_QUERY, alts, "我的信用卡账单日是几号")
+        # 文本含解释词 → 与次选无关, 恒复合
+        assert detect_composite(IntentLabel.BILL_QUERY, [], "账单日为什么是这天", [0.01])
+
+
+# ── ③ 低置信并行竞速 ──
 
 
 class TestParallelRace:
@@ -109,7 +125,7 @@ class TestParallelRace:
         assert out.winner == "rag" and out.faq_error
 
 
-# ── ④ 链 B 查询轻链路 ──
+# ── ④ 查询直达链路 ──
 
 
 def _mock_mcp(schema: dict, sensitive: bool = False) -> MagicMock:
@@ -175,6 +191,64 @@ class TestQueryChain:
         )
         assert out.cache_hit and out.content == "缓存命中回复"
         mcp.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cache_isolated_by_question(self) -> None:
+        """缓存按 (工具+参数+归一化问题) 隔离: 同工具同卡的不同问题不串答案
+
+        复盘: 缓存只按 工具+参数 键、存的是最终回复 — "账单日是几号"的缓存
+        会错配给同卡"最低还款多少"。修复后不同问题各查各的。
+        """
+        schema = {"properties": {"period": {"type": "string"}}, "required": ["period"]}
+        mcp = _mock_mcp(schema)
+        mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "工具结果"})
+        deg = MagicMock()
+        deg.generate_with_fallback = AsyncMock(return_value=MagicMock(content="按问题生成的回复"))
+        store: dict = {}
+
+        async def _get(k):
+            return store.get(k)
+
+        async def _set(k, v, **kw):
+            store[k] = v
+
+        redis = MagicMock()
+        redis.get = _get
+        redis.set = _set
+        chain = QueryChain(mcp_client=mcp, redis_client=redis, degradation_mgr=deg)
+        await chain.run(
+            intent_label="account_bill_query",
+            user_input="账单日是几号",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        # 同参数的另一个问题: 缓存不命中 (key 含问题), 重新调用工具
+        out2 = await chain.run(
+            intent_label="account_bill_query",
+            user_input="最低还款多少",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        assert not out2.cache_hit
+        assert mcp.call_tool.await_count == 2
+        # 同一问题书写差异 (空格/大小写) → 归一化后命中
+        out3 = await chain.run(
+            intent_label="account_bill_query",
+            user_input="账单日 是几号",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        assert out3.cache_hit and out3.content == "按问题生成的回复"
+
+    def test_stage_timings_recorded(self) -> None:
+        """分段耗时字段存在 (mcp_ms/summarize_ms/total_ms), 决策链归因用"""
+        from lumio.services.bot.query_chain import QueryChainResult
+
+        r = QueryChainResult(content="ok", mcp_ms=120.5, summarize_ms=3000.0, total_ms=3120.5)
+        assert r.mcp_ms == 120.5 and r.total_ms == 3120.5
 
     @pytest.mark.asyncio
     async def test_sensitive_tool_skipped(self) -> None:

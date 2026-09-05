@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from lumio.services.common.audit import update_chat_message, write_chat_message
+from lumio.services.common.decision_log import DecisionAction, bind_turn_context, log_decision
 from lumio.services.common.deps import (
     DbSession,
     EmbeddingBreakerDep,
@@ -613,6 +614,7 @@ async def _session_worker(
                             customer_id=customer_id,
                             customer_name=customer_name,
                             merged_message_ids=merged_message_ids,
+                            enqueue_time=enqueue_time,
                         )
                         # 处理耗时（含 RAG/LLM/工具/超时降级）分布
                         BOT_ANSWER_LATENCY.observe(asyncio.get_event_loop().time() - processing_start)
@@ -730,6 +732,7 @@ async def _run_agent(
     customer_id: str = "",  # P1-6 第三轮修复: 透传 customer_id (画像学习依赖)
     customer_name: str = "",  # 透传客户名称, 供转人工后坐席端展示
     merged_message_ids: list[str] | None = None,
+    enqueue_time: float = 0.0,  # 入队单调时钟 (TURN_START 排队耗时归因用)
 ) -> None:
     """标准 Agent 处理路径 (Semaphore 内)
 
@@ -786,6 +789,24 @@ async def _run_agent(
         return
 
     # Agent 编排 (P1-3 第三轮修复: 端到端 deadline, 防止 5 轮工具循环 × 60s 撑爆 semaphore)
+    # P1-3/P1-4 决策链整改: 绑定本轮 turn_id (本轮全部决策共用, 回放按轮分组) +
+    # 出队留痕 (排队耗时 — 此前入队到分类之间的等待在决策链上完全不可见)
+    _turn_id = uuid_module.uuid4().hex[:16]
+    bind_turn_context(_turn_id)
+    queue_wait_ms = round((asyncio.get_event_loop().time() - enqueue_time) * 1000, 1) if enqueue_time else None
+    try:
+        log_decision(
+            session_id=session_id,
+            agent_name="bot_agent",
+            action=DecisionAction.TURN_START,
+            reasoning=f"消息出队开始处理{'，排队 ' + str(int(queue_wait_ms)) + 'ms' if queue_wait_ms is not None else ''}",
+            evidence={"queue_wait_ms": queue_wait_ms, "input_preview": message[:60]},
+            latency_ms=queue_wait_ms or 0.0,
+            turn_id=_turn_id,
+            customer_id=customer_id or None,
+        )
+    except Exception:
+        logger.debug("TURN_START 决策留痕失败(不阻断): session=%s", session_id)
     try:
         result = await asyncio.wait_for(
             agent.run(session_id, message, customer_id=customer_id or None),

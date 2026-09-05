@@ -70,7 +70,7 @@ def test_route_consultative_bypass() -> None:
 
 
 def test_route_definition_to_knowledge() -> None:
-    """定义句式判咨询域 (链B前置拦截依据)"""
+    """定义句式判咨询域 (查询直达前置拦截依据)"""
     from lumio.shared.intent_taxonomy import is_definition_query
 
     assert is_definition_query("什么是临时额度") is True

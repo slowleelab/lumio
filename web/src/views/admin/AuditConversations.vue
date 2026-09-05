@@ -131,39 +131,46 @@
             </el-tab-pane>
 
             <el-tab-pane :label="`决策链 (${replay.decisions.length})`" name="decisions">
-              <el-timeline>
-                <el-timeline-item
-                  v-for="d in replay.decisions"
-                  :key="d.decision_id"
-                  :timestamp="formatTime(d.created_at)"
-                  :type="decisionMeta(d.action).dot"
-                  :color="decisionMeta(d.action).color"
-                  placement="top"
-                >
-                  <div class="decision-card">
-                    <div class="decision-head">
-                      <el-tag size="small" :type="decisionMeta(d.action).tag" effect="light">
-                        {{ decisionMeta(d.action).label }}
-                      </el-tag>
-                      <span v-if="d.latency_ms != null" class="meta-num">{{ Math.round(d.latency_ms) }}ms</span>
-                      <span class="decision-agent">{{ agentLabel(d.agent_name) }}</span>
+              <div v-for="(g, gi) in turnGroups" :key="g.turnId" class="turn-group">
+                <div class="turn-group-head">
+                  <span class="turn-badge">第 {{ gi + 1 }} 轮</span>
+                  <span class="turn-time">{{ formatTime(g.decisions[0].created_at) }}</span>
+                  <span v-if="g.totalMs != null" class="turn-total">全程 {{ g.totalMs >= 1000 ? (g.totalMs / 1000).toFixed(1) + 's' : Math.round(g.totalMs) + 'ms' }}</span>
+                  <span class="turn-steps">{{ g.decisions.length }} 步</span>
+                </div>
+                <el-timeline>
+                  <el-timeline-item
+                    v-for="d in g.decisions"
+                    :key="d.decision_id"
+                    :type="decisionMeta(d.action).dot"
+                    :color="decisionMeta(d.action).color"
+                    placement="top"
+                  >
+                    <div class="decision-card">
+                      <div class="decision-head">
+                        <el-tag size="small" :type="decisionMeta(d.action).tag" effect="light">
+                          {{ decisionMeta(d.action).label }}
+                        </el-tag>
+                        <span v-if="d.latency_ms != null && d.latency_ms > 0" class="meta-num">{{ Math.round(d.latency_ms) }}ms</span>
+                        <span class="decision-agent">{{ agentLabel(d.agent_name) }}</span>
+                      </div>
+                      <div class="decision-explain">{{ decisionExplain(d) }}</div>
+                      <div class="decision-reason">技术记录：{{ d.reasoning }}</div>
+                      <div v-if="evidenceSummary(d.evidence).length" class="decision-kv">
+                        <span v-for="kv in evidenceSummary(d.evidence)" :key="kv.k" class="kv-item">
+                          <span class="kv-k">{{ kv.k }}</span>
+                          <span class="kv-v" :class="{ 'kv-bad': kv.bad }">{{ kv.v }}</span>
+                        </span>
+                      </div>
+                      <el-collapse v-if="d.evidence && Object.keys(d.evidence).length" class="decision-raw">
+                        <el-collapse-item :title="`原始数据 (${Object.keys(d.evidence).length} 字段)`">
+                          <pre class="decision-evidence">{{ JSON.stringify(d.evidence, null, 2) }}</pre>
+                        </el-collapse-item>
+                      </el-collapse>
                     </div>
-                    <div class="decision-explain">{{ decisionExplain(d) }}</div>
-                    <div class="decision-reason">技术记录：{{ d.reasoning }}</div>
-                    <div v-if="evidenceSummary(d.evidence).length" class="decision-kv">
-                      <span v-for="kv in evidenceSummary(d.evidence)" :key="kv.k" class="kv-item">
-                        <span class="kv-k">{{ kv.k }}</span>
-                        <span class="kv-v" :class="{ 'kv-bad': kv.bad }">{{ kv.v }}</span>
-                      </span>
-                    </div>
-                    <el-collapse v-if="d.evidence && Object.keys(d.evidence).length" class="decision-raw">
-                      <el-collapse-item :title="`原始数据 (${Object.keys(d.evidence).length} 字段)`">
-                        <pre class="decision-evidence">{{ JSON.stringify(d.evidence, null, 2) }}</pre>
-                      </el-collapse-item>
-                    </el-collapse>
-                  </div>
-                </el-timeline-item>
-              </el-timeline>
+                  </el-timeline-item>
+                </el-timeline>
+              </div>
               <el-empty v-if="replay.decisions.length === 0" description="无决策记录" />
             </el-tab-pane>
 
@@ -198,7 +205,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { useRoute } from "vue-router"
 import {
   listConversations,
@@ -317,6 +324,7 @@ function confClass(v: number | null) {
 
 // ── 决策链可读化: action 中文化+语义配色 / evidence 关键字段摘要 ──
 const ACTION_META: Record<string, { label: string; tag: string; dot: string; color?: string }> = {
+  turn_start: { label: "消息出队", tag: "info", dot: "" },
   intent_classify: { label: "意图分类", tag: "primary", dot: "primary" },
   tool_call: { label: "工具执行", tag: "success", dot: "success" },
   rag_retrieve: { label: "知识检索", tag: "primary", dot: "primary" },
@@ -332,6 +340,7 @@ const ACTION_META: Record<string, { label: string; tag: string; dot: string; col
   outbound_guard: { label: "出站拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
   context_reply_pass: { label: "回话放行", tag: "info", dot: "" },
   mis_kill_candidate: { label: "误杀排查", tag: "warning", dot: "warning" },
+  topic_track: { label: "诉求跟踪", tag: "info", dot: "" },
 }
 const AGENT_LABELS: Record<string, string> = {
   bot_agent: "编排大脑",
@@ -344,6 +353,23 @@ function decisionMeta(action: string) {
 function agentLabel(name: string) {
   return AGENT_LABELS[name] ?? name
 }
+// ── 决策链按轮分组: 同一 turn_id 的决策归为一轮 (turn_id 由消息出队时绑定贯穿) ──
+const turnGroups = computed(() => {
+  const decisions = replay.value?.decisions ?? []
+  const groups: Array<{ turnId: string; decisions: typeof decisions; totalMs: number | null }> = []
+  const byTurn = new Map<string, typeof decisions>()
+  for (const d of decisions) {
+    const key = d.turn_id || "-"
+    if (!byTurn.has(key)) byTurn.set(key, [])
+    byTurn.get(key)!.push(d)
+  }
+  for (const [turnId, ds] of byTurn) {
+    const done = ds.find((x) => x.action === "chain_complete" && typeof x.latency_ms === "number")
+    groups.push({ turnId, decisions: ds, totalMs: done ? done.latency_ms : null })
+  }
+  return groups
+})
+
 // evidence 关键字段 → 人话摘要 (只挑审阅者关心的; 原始 JSON 仍可展开)
 const EV_KEYS: Record<string, string> = {
   intent: "意图",
@@ -364,7 +390,10 @@ const EV_KEYS: Record<string, string> = {
   fast_conf: "快路径置信",
   fast_intent: "快路径意图",
   missing_params: "缺参",
-  chain: "链",
+  queue_wait_ms: "排队",
+  mcp_ms: "工具调用",
+  summarize_ms: "摘要生成",
+  route: "路由",
   reason: "原因",
 }
 const VALUE_ZH: Record<string, string> = {
@@ -377,15 +406,20 @@ const VALUE_ZH: Record<string, string> = {
 }
 function fmtVal(k: string, v: unknown): string {
   if (typeof v === "string" && VALUE_ZH[v]) return VALUE_ZH[v]
-  if (typeof v === "number") return k === "confidence" || k === "fast_conf" ? `${Math.round(v * 100)}%` : String(Math.round(v * 100) / 100)
+  if (typeof v === "number") {
+    if (k === "confidence" || k === "fast_conf") return `${Math.round(v * 100)}%`
+    if (k.endsWith("_ms")) return v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}ms`
+    return String(Math.round(v * 100) / 100)
+  }
   if (typeof v === "boolean") return v ? "是" : "否"
   if (Array.isArray(v)) return v.slice(0, 3).join("、") + (v.length > 3 ? ` 等${v.length}项` : "")
+  if (typeof v === "object") return JSON.stringify(v).slice(0, 60)
   if (v == null) return "-"
   return String(v).slice(0, 40)
 }
 function evidenceSummary(ev: Record<string, unknown> | null): Array<{ k: string; v: string; bad?: boolean }> {
   if (!ev) return []
-  const priority = ["intent", "confidence", "tool", "arguments", "cache_hit", "hit", "traffic_class", "is_error", "result_preview", "missing_params", "citations", "query", "direct"]
+  const priority = ["intent", "confidence", "queue_wait_ms", "tool", "arguments", "cache_hit", "hit", "traffic_class", "is_error", "result_preview", "missing_params", "mcp_ms", "summarize_ms", "citations", "query", "direct"]
   const out: Array<{ k: string; v: string; bad?: boolean }> = []
   const seen = new Set<string>()
   for (const k of priority) {
@@ -449,7 +483,7 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
       return out
     }
     case "tool_call": {
-      // 三种工具决策: 链B查询直连 / 高置信办理直连 / 编排循环内的工具执行
+      // 三种工具决策: 查询直达 / 高置信办理直连 / 编排循环内的工具执行
       if (ev.direct) {
         return `识别把握很高，跳过 AI 决策环节，直接调用「${ev.tool}」为客户办理（更快更稳定）`
       }
@@ -592,6 +626,40 @@ onMounted(() => {
   color: var(--color-text-secondary);
 }
 .meta-time {
+  font-size: var(--fs-xs, 12px);
+  color: var(--color-text-secondary);
+}
+// 决策链按轮分组: 每轮一个卡片块 (轮次徽标 + 全程耗时 + 该轮步骤时间线)
+.turn-group {
+  margin-bottom: var(--space-4);
+  padding: var(--space-3);
+  background: var(--color-bg-page);
+  border-radius: var(--radius-md);
+}
+.turn-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.turn-badge {
+  padding: 1px 8px;
+  font-size: var(--fs-xs, 12px);
+  font-weight: 600;
+  color: var(--color-primary);
+  background: var(--color-primary-light-9, rgba(64, 158, 255, 0.1));
+  border-radius: 10px;
+}
+.turn-time {
+  font-size: var(--fs-xs, 12px);
+  color: var(--color-text-secondary);
+}
+.turn-total {
+  font-size: var(--fs-xs, 12px);
+  color: var(--color-success, #67c23a);
+}
+.turn-steps {
+  margin-left: auto;
   font-size: var(--fs-xs, 12px);
   color: var(--color-text-secondary);
 }

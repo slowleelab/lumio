@@ -5,8 +5,8 @@
     五域 (IntentDomain) → 子域组 (GroupKey) → 叶子意图 (既有 IntentLabel)
 
 五域与两级路由 TrafficClass 直接对齐:
-    query 查询域(非金融) → READ_ONLY_QUERY → 链 B
-    transaction 交易域(金融类) → FINANCIAL_TRANSACTION → 链 A
+    query 查询域(非金融) → READ_ONLY_QUERY → 查询直达
+    transaction 交易域(金融类) → FINANCIAL_TRANSACTION → 交易链路
     consulting 咨询域 → CONSULTING → 决策二
     service 服务域(人工转接/投诉) → HIGH_RISK → 人工
     chitchat 闲聊域 → CONSULTING/兜底
@@ -107,7 +107,7 @@ _GROUP_OVERRIDES: dict[IntentLabel, str] = {
 # 域级显式覆盖 (组覆盖但旧域名不一致的意图, 两级保持一致)
 # 定义句式 (概念咨询, 会话 2b3b2613/9d64b59 根治): "X是什么/什么是X/什么叫X"
 # 是概念咨询而非个人账户数据查询 —— L3 LLM 高频把这类误判成 limit_query 进
-# 查询域 → 链 B 反问卡号死循环。句式命中强制咨询域。
+# 查询域 → 查询直达 反问卡号死循环。句式命中强制咨询域。
 _DEFINITION_SUFFIX = "是什么"
 _DEFINITION_PREFIX = "什么是"
 _DEFINITION_PREFIX_ALT = "什么叫"

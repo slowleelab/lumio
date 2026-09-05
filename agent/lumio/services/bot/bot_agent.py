@@ -219,7 +219,7 @@ class LumioAgent:
         # 工具执行器（MCP_ENABLED=False 时为 None，走原有降级链，零回归）
         self._tool_executor = tool_executor
 
-        # 目标架构: 链 B 查询轻链路 + ⑦ 出站合规闸门 + ⑥ 引用标题缓存
+        # 目标架构: 查询直达 查询轻链路 + ⑦ 出站合规闸门 + ⑥ 引用标题缓存
         from lumio.services.bot.outbound_guard import OutboundGuard
         from lumio.services.bot.query_chain import QueryChain
 
@@ -431,7 +431,7 @@ class LumioAgent:
                                 reasoning=f"FAQ 直出 ({faq_res['match_type']})",
                                 evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
                                 latency_ms=0.0,
-                                turn_id=uuid_module.uuid4().hex[:16],
+                                turn_id="",  # 继承本轮 turn_id (contextvar)
                                 customer_id=customer_id,
                             )
                         except Exception:
@@ -482,7 +482,7 @@ class LumioAgent:
                         "fast_intent": intent_result.fast_intent.value if intent_result.fast_intent else None,
                     },
                     latency_ms=_intent_ms,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                     customer_id=customer_id,
                 )
             except Exception:
@@ -571,7 +571,7 @@ class LumioAgent:
                             reasoning=f"出站拦截({verdict.reason})",
                             evidence={"reason": verdict.reason},
                             latency_ms=0.0,
-                            turn_id=uuid_module.uuid4().hex[:16],
+                            turn_id="",  # 继承本轮 turn_id (contextvar)
                             customer_id=customer_id,
                         )
                     except Exception:
@@ -592,7 +592,7 @@ class LumioAgent:
                             "total_ms": round(total_ms, 1),
                         },
                         latency_ms=total_ms,
-                        turn_id=uuid_module.uuid4().hex[:16],
+                        turn_id="",  # 继承本轮 turn_id (contextvar)
                         customer_id=customer_id,
                     )
                 except Exception:
@@ -786,7 +786,7 @@ class LumioAgent:
     ) -> dict[str, Any]:
         """④ 两级路由决策
 
-        决策一: 交易性质三分流 (高风险转人工 / 金融交易链 A / 查询链 B);
+        决策一: 交易性质三分流 (高风险转人工 / 金融交易链路 / 查询直达链路);
         决策二: 只读咨询四分流 (并行竞速 / 复合意图 / RAG 链路)。
         任何链内部失败均回落既有知识/业务路径, 不产生无回复出口。
         """
@@ -801,11 +801,11 @@ class LumioAgent:
         intent = intent_result.primary_intent
         confidence = intent_result.primary_confidence
 
-        # 裸槽位回归 (第二轮模拟 compliance_alert 根因): 上轮链B反问槽位后, 本轮
+        # 裸槽位回归 (第二轮模拟 compliance_alert 根因): 上轮查询直达反问槽位后, 本轮
         # 裸给值被分类成低置信 faq — 噪声门的 awaiting_hit 兜底位于各 handler 内部,
         # 而分派先于 handler 把请求抢走, 落进知识链/竞速后被出站闸拦成"没太理解"。
         # 此处等价补位: 有等待快照 + 本轮低置信 → 换回等待意图按其流量性质分派
-        # (等待意图多为查询类 → 链 B → _load_slot_prompt 消费快照与本轮槽值直查)。
+        # (等待意图多为查询类 → 查询直达 → _load_slot_prompt 消费快照与本轮槽值直查)。
         if confidence < CLARIFY_CONFIDENCE_FLOOR:
             try:
                 await_intent, awaiting = await self._session_awaiting_slots(session_id)
@@ -837,7 +837,12 @@ class LumioAgent:
         # tuple == 枚举恒 False, 三分支全落空直奔决策二 (单测只测了函数本身没测
         # 分派比较, 分派联调时暴露)
         traffic_domain, traffic = classify_traffic(intent)
-        composite = detect_composite(intent, list(intent_result.alternatives or []), user_input)
+        composite = detect_composite(
+            intent,
+            list(intent_result.alternatives or []),
+            user_input,
+            list(intent_result.alternative_scores or []),
+        )
         logger.debug(
             "dispatch: traffic=%s composite=%s intent=%s alts=%s",
             traffic.value if traffic else "consulting",
@@ -866,7 +871,7 @@ class LumioAgent:
                     "composite": composite,
                     "alternatives": [a.value for a in (intent_result.alternatives or [])],
                 },
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
                 customer_id=customer_id,
             )
         except Exception:
@@ -882,7 +887,7 @@ class LumioAgent:
         if traffic == TrafficClass.FINANCIAL_TRANSACTION:
             # 高置信确定性直连 (qa_scan 挂账: 挂失链 LLM 编排本地时延 20-40s 超时
             # 回落知识链): 意图置信 ≥0.9 且意图→工具映射唯一时, 跳过 LLM 编排循环
-            # 直接执行工具 (卡号注入/配额/脱敏/审计同源)。失败回落链 A。
+            # 直接执行工具 (卡号注入/配额/脱敏/审计同源)。失败回落交易链路。
             # 阈值 0.8: 挂失为保护性操作 (误挂可解挂), LLM 慢路径分类多落 0.76-0.85。
             # 咨询句式豁免直连 (第八轮质检挂账: "信用卡找不到了, 怎么办呢"客户在问
             # 流程, 直连把挂失办了 — 体验激进): 问"怎么办/怎么挂失"类走知识链答
@@ -921,7 +926,7 @@ class LumioAgent:
                                 action=DecisionAction.TOOL_CALL,
                                 reasoning=f"高置信确定性直连: {intent.value}@{confidence:.2f} → {direct_tools[0]} (跳过 LLM 编排)",
                                 evidence={"tool": direct_tools[0], "direct": True, "confidence": confidence},
-                                turn_id=uuid_module.uuid4().hex[:16],
+                                turn_id="",  # 继承本轮 turn_id (contextvar)
                                 customer_id=customer_id,
                             )
                         except Exception:
@@ -935,8 +940,8 @@ class LumioAgent:
                             confidence,
                         )
                     except Exception as exc:
-                        logger.warning("工具直连失败, 回落链 A 编排: tool=%s err=%s", direct_tools[0], exc)
-            # 链 A · 交易链路: 工具编排 + 敏感确认状态机; 无工具回落知识
+                        logger.warning("工具直连失败, 回落交易链路 编排: tool=%s err=%s", direct_tools[0], exc)
+            # 交易链路 · 交易链路: 工具编排 + 敏感确认状态机; 无工具回落知识
             if self._tool_executor is not None and self._tool_executor.has_tools():
                 return await self._handle_tool(
                     session_id, user_input, intent_result, history, entities, sentiment, customer_id
@@ -944,25 +949,25 @@ class LumioAgent:
             return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
         if traffic == TrafficClass.READ_ONLY_QUERY:
             # 定义句式 (概念咨询) 直送知识链 (qa_scan 第五轮: "什么是临时额度"被
-            # 链 B 直查答成"您当前没有临时额度" — 客户问概念, 机器人答账户状态)。
+            # 查询直达 直查答成"您当前没有临时额度" — 客户问概念, 机器人答账户状态)。
             # domain_of_with_text 的定义句式强制咨询域只作用于 L2 向量判定块,
             # 两级分派走 domain_of 无文本修正 — 此处补齐; "我的额度是什么"类
             # 含个人数据诉求词的由 is_definition_query 自身排除, 仍走查询。
             from lumio.shared.intent_taxonomy import is_definition_query
 
             if is_definition_query(user_input):
-                logger.info("定义句式直送知识链 (链B前置拦截): input=%r", user_input[:24])
+                logger.info("定义句式直送知识链 (查询直达前置拦截): input=%r", user_input[:24])
                 return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
-            # 复合意图 (查询 + 解释/FAQ 诉求) 优先走链 C: 纯定义类问题会被
+            # 复合意图 (查询 + 解释/FAQ 诉求) 优先走复合级联: 纯定义类问题会被
             # 查询链路的缺参反问卡死 (会话 2b3b2613 实测: "信用额度是什么"三连问
-            # 卡号, 用户永远出不去)。链 C 缺参/无工具时自然回落知识路径。
+            # 卡号, 用户永远出不去)。复合级联 缺参/无工具时自然回落知识路径。
             if composite:
                 comp = await self._handle_composite(
                     session_id, user_input, intent_result, history, entities, sentiment, customer_id
                 )
                 if comp is not None:
                     return comp
-            # 链 B · 查询轻链路: 直连工具 + 缓存; 无工具/链失败回落
+            # 查询直达 · 查询轻链路: 直连工具 + 缓存; 无工具/链失败回落
             if self._tool_executor is not None and self._tool_executor.has_tools():
                 try:
                     qc = await self._handle_query_chain(
@@ -971,11 +976,11 @@ class LumioAgent:
                 except Exception as exc:
                     import traceback
 
-                    logger.warning("链B异常: %s\n%s", exc, traceback.format_exc()[-600:])
+                    logger.warning("查询直达异常: %s\n%s", exc, traceback.format_exc()[-600:])
                     qc = None
                 if qc is not None:
                     return qc
-            # 无可用工具 (链 B 不可达) → 回落知识链, 与交易分支"无工具回落知识"对齐
+            # 无可用工具 (查询直达 不可达) → 回落知识链, 与交易分支"无工具回落知识"对齐
             if self._tool_executor is not None and self._tool_executor.has_tools():
                 return await self._handle_tool(
                     session_id, user_input, intent_result, history, entities, sentiment, customer_id
@@ -1008,7 +1013,7 @@ class LumioAgent:
                         "confidence": confidence,
                         "chitchat_redirect": True,
                     },
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                     customer_id=customer_id,
                 )
             except Exception:
@@ -1038,7 +1043,7 @@ class LumioAgent:
         sentiment: SentimentLabel,
         customer_id: str | None,
     ) -> dict[str, Any] | None:
-        """链 B · 查询轻链路: 槽位参数 → 直连工具 → 单次摘要。
+        """查询直达 · 查询轻链路: 槽位参数 → 直连工具 → 单次摘要。
 
         Returns: None = 链路不适用 (无工具/失败), 调用方回落; 非 None = 已产出回复。
         """
@@ -1066,34 +1071,42 @@ class LumioAgent:
             customer_id=customer_id,
             history=history,
         )
-        # E2 可解释 (用户反馈: 回放缺执行过程): 链B工具执行/缓存命中落决策日志
+        # E2 可解释 (用户反馈: 回放缺执行过程): 查询直达工具执行/缓存命中落决策日志
+        from lumio.shared.entity_sandbox import mask_pii_in_text
+
+        def _mask_args(a: dict) -> dict:
+            return {k: (mask_pii_in_text(str(v)) if isinstance(v, str) else v) for k, v in (a or {}).items()}
+
         try:
             log_decision(
                 session_id=session_id,
                 agent_name="query_chain",
                 action=DecisionAction.TOOL_CALL,
                 reasoning=(
-                    f"链B直连: {qc.tool_name}"
+                    f"查询直达: {qc.tool_name}"
                     f"{' (缓存命中)' if qc.cache_hit else ''}"
                     f"{' 缺参: ' + ','.join(qc.missing_params) if qc.missing_params else ''}"
                     if qc.tool_name
-                    else "链B未选到工具"
+                    else "查询直达未选到工具"
                 ),
                 evidence={
                     "tool": qc.tool_name,
-                    "arguments": qc.tool_args,
+                    "arguments": _mask_args(qc.tool_args),
                     "cache_hit": qc.cache_hit,
-                    "result_preview": (
+                    "result_preview": mask_pii_in_text(
                         (qc.raw_result if (qc.raw_result and qc.raw_result != "(cache)") else (qc.content or "")) or ""
                     )[:200],
                     "missing_params": qc.missing_params,
-                    "chain": "B",
+                    "route": "query",
+                    "mcp_ms": round(qc.mcp_ms, 1),
+                    "summarize_ms": round(qc.summarize_ms, 1),
                 },
-                turn_id=uuid_module.uuid4().hex[:16],
+                latency_ms=round(qc.total_ms, 1),
+                turn_id="",
                 customer_id=customer_id,
             )
         except Exception:
-            logger.debug("链B决策日志失败(不阻断): session=%s", session_id)
+            logger.debug("查询直达决策日志失败(不阻断): session=%s", session_id)
         if qc.error:
             logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
             return None
@@ -1138,6 +1151,9 @@ class LumioAgent:
                 entities=entities,
                 sentiment=sentiment,
             )
+        # 工具结果随结果带回 (retrieval_context): 复合意图级联据此把取数注入
+        # 知识生成 (会话 smoke-qa-1788567861 复盘: 此前恒空, 复合取数后被废弃
+        # 回落重跑); 缓存命中时退回复读文本, 审计回放走默认脱敏。
         return self._build_result(
             session_id,
             user_input,
@@ -1147,6 +1163,7 @@ class LumioAgent:
             intent_result.primary_confidence,
             entities=entities,
             sentiment=sentiment,
+            retrieval_context=(qc.raw_result if qc.raw_result and qc.raw_result != "(cache)" else (qc.content or "")),
         )
 
     async def _handle_parallel_race(
@@ -1158,7 +1175,7 @@ class LumioAgent:
         entities: list[Entity] | None,
         sentiment: SentimentLabel,
     ) -> dict[str, Any]:
-        """链 D · 低置信并行竞速: FAQ 与 RAG 双路并发, 归并取高分。"""
+        """低置信并行竞速: FAQ 与 RAG 双路并发, 归并取高分。"""
         from lumio.services.bot.parallel_race import race
 
         embedding_provider = (
@@ -1214,7 +1231,7 @@ class LumioAgent:
         sentiment: SentimentLabel,
         customer_id: str | None,
     ) -> dict[str, Any] | None:
-        """链 C · 复合意图: 查询取数 → 数据注入 RAG → 联合生成。
+        """复合意图级联: 查询取数 → 数据注入 RAG → 联合生成。
 
         Returns: None = 查询链不适用 (无工具/缺参数), 调用方回落纯知识路径。
         """
@@ -1295,7 +1312,7 @@ class LumioAgent:
                     action=DecisionAction.NOISE_BLOCKED,
                     reasoning=f"噪声门拦截({gate_reason})",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -1372,7 +1389,7 @@ class LumioAgent:
                     action=DecisionAction.CONTEXT_REPLY_PASS,
                     reasoning="多轮回话判定放行",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -1433,7 +1450,7 @@ class LumioAgent:
                     "query": user_input[:60],
                     "citations": (self._last_citation_docids or [])[:5],
                 },
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
                 latency_ms=(time.monotonic() - _rag_t0) * 1000,
             )
         except Exception:
@@ -1573,7 +1590,7 @@ class LumioAgent:
                     "citations": citation_titles[:5],
                 },
                 latency_ms=_llm_ms,
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -1863,7 +1880,7 @@ class LumioAgent:
                 reasoning=f"business 生成, 来源={getattr(result, 'source', '')}",
                 evidence={"source": getattr(result, "source", ""), "domain": "business", "rag_used": bool(context)},
                 latency_ms=_llm_ms,
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -2437,7 +2454,7 @@ class LumioAgent:
                     action=DecisionAction.NOISE_BLOCKED,
                     reasoning=f"噪声门拦截({gate_reason})",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -2487,7 +2504,7 @@ class LumioAgent:
                     action=DecisionAction.CONTEXT_REPLY_PASS,
                     reasoning="多轮回话判定放行",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -2557,7 +2574,7 @@ class LumioAgent:
                 reasoning=f"fallback 生成, 来源={getattr(result, 'source', '')}",
                 evidence={"source": getattr(result, "source", ""), "domain": "chitchat"},
                 latency_ms=_llm_ms,
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -3240,7 +3257,7 @@ class LumioAgent:
                         ][:5],
                         "followup_sent": bool(revisit_note),
                     },
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
         except Exception as exc:
             # 版本冲突等: 放弃本轮写回, 下一轮自愈 — 诉求跟踪失败绝不影响主回复
@@ -3799,7 +3816,7 @@ class LumioAgent:
                 action=DecisionAction.MIS_KILL_CANDIDATE,
                 reasoning=f"疑似误杀: 上轮回话放行后本轮被噪声门拦({gate_reason})",
                 evidence={"prev_reply_input": prev["input"], "reblocked_reason": gate_reason},
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("疑似误杀标记失败(不阻断): session=%s", session_id)

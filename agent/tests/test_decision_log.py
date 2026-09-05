@@ -216,3 +216,35 @@ def test_singleton_and_helper():
         turn_id="t1",
     )
     assert decision_id
+
+
+def test_turn_context_inheritance(monkeypatch):
+    """turn_id 按轮贯穿: 绑定后留空的 log_decision 自动继承本轮 ID
+
+    会话回放决策链按轮分组依赖此行为 (此前每条决策独立 uuid4, 无法归组)。
+    """
+    from lumio.services.common.decision_log import bind_turn_context, current_turn_id
+
+    bind_turn_context("turn-abc")
+    assert current_turn_id() == "turn-abc"
+    captured: list[DecisionRecord] = []
+    def _fake_record(self, **kw):
+        captured.append(DecisionRecord(decision_id=f"d{len(captured)}", **kw))
+        return "id"
+
+    monkeypatch.setattr(DecisionLogger, "record", _fake_record)
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.TURN_START, reasoning="出队")
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.INTENT_CLASSIFY, reasoning="分类", turn_id="")
+    # 显式指定的 turn_id 优先于上下文
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.TOOL_CALL, reasoning="工具", turn_id="manual")
+    assert [r.turn_id for r in captured] == ["turn-abc", "turn-abc", "manual"]
+
+    # 新一轮重新绑定后旧值不泄漏 (串行 worker 语义)
+    bind_turn_context("turn-xyz")
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.CHAIN_COMPLETE, reasoning="完成")
+    assert captured[-1].turn_id == "turn-xyz"
+
+
+def test_turn_start_action_value():
+    """出队留痕动作存在 (排队耗时归因)"""
+    assert DecisionAction.TURN_START.value == "turn_start"

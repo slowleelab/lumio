@@ -43,7 +43,7 @@ def schema_declares_card_no(input_schema: dict) -> str | None:
 
     返回 schema 实际声明的键名（'card_no' / 'cardNo'），未声明返回 None —
     注入时用返回的键名, 避免 snake_case 注入 camelCase schema 导致缺参
-    (链 B 首跑实测: 注入 card_no 而 query_card_bill 要求 cardNo)。
+    (查询直达 首跑实测: 注入 card_no 而 query_card_bill 要求 cardNo)。
     挂失/投诉等用其他参数名（如 card）的工具不注入, 避免污染入参。
     """
     properties = (input_schema or {}).get("properties") or {}

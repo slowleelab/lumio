@@ -710,7 +710,7 @@ class TestBotAgentBranches:
                 "",
             )
         )
-        # 有工具: 链 A 接管 (直连/编排), 不转人工
+        # 有工具: 交易链路 接管 (直连/编排), 不转人工
         te = MagicMock()
         te.has_tools = MagicMock(return_value=True)
         te.run_conversation = AsyncMock(return_value=ToolExecutionResult(content="已为您挂失", source="tool"))
@@ -2253,7 +2253,7 @@ class TestIntentRetrievalAugmentation:
 
 
 class TestDispatchDefinitionGuard:
-    """定义句式直送知识链 (qa_scan 第五轮: "什么是临时额度"被链 B 答成账户状态)"""
+    """定义句式直送知识链 (qa_scan 第五轮: "什么是临时额度"被查询直达 答成账户状态)"""
 
     def _make_agent(self) -> LumioAgent:
         classifier = MagicMock()
@@ -2294,7 +2294,7 @@ class TestDispatchDefinitionGuard:
         te = MagicMock()
         te.has_tools = MagicMock(return_value=True)
         agent._tool_executor = te
-        # 链 B 缺参/失败返回 None → 落 _handle_tool 兜底 (查询语义出口, 不进知识链)
+        # 查询直达 缺参/失败返回 None → 落 _handle_tool 兜底 (查询语义出口, 不进知识链)
         agent._handle_query_chain = AsyncMock(return_value=None)
         agent._handle_tool = AsyncMock(return_value={"response": "额度 5 万", "response_source": "tool"})
         result = await agent._dispatch(

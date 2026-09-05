@@ -387,7 +387,7 @@ class ToolCallingExecutor:
         高置信意图 + 工具映射唯一时由分派层调用 (qa_scan 挂账: 挂失链 LLM
         编排在本地时延下 20-40s 超时回落知识链 — card_loss@0.96 的目标工具
         是确定的, 无需 LLM 决策)。卡号注入/配额/重试/脱敏/审计与编排路径
-        完全同源 (_execute_and_audit)。异常上抛由调用方回落链 A。
+        完全同源 (_execute_and_audit)。异常上抛由调用方回落交易链路。
         """
         tool_call = ToolCall(id=f"direct-{uuid4().hex[:12]}", name=tool_name, arguments=dict(arguments or {}))
         tool_message = await self._execute_and_audit(

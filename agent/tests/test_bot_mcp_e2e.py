@@ -81,7 +81,7 @@ class _FakeSessionManager:
     def __init__(self, state: SessionState | None = None, history: list[Any] | None = None) -> None:
         self._state = state
         self._history = history or []
-        # LumioAgent.__init__ 会取 session_manager._redis 组装链 B QueryChain; None=无缓存
+        # LumioAgent.__init__ 会取 session_manager._redis 组装查询直达 QueryChain; None=无缓存
         self._redis = None
 
     async def get_session(self, session_id: str) -> SessionState | None:
@@ -166,8 +166,8 @@ def _patch_settings(
     """两级路由设置注入.
 
     confirm=True: 恢复敏感工具两段式核验 (产品默认核实通过直连执行, 合规环境置 true)。
-    drop_query_tools: 从 intent_tool_map 裁掉查询意图 → 链 B 报 no_query_tool 回落
-    工具编排 — 用于验证编排链路本身 (生产中链 B 不可用同因回落)。
+    drop_query_tools: 从 intent_tool_map 裁掉查询意图 → 查询直达 报 no_query_tool 回落
+    工具编排 — 用于验证编排链路本身 (生产中查询直达 不可用同因回落)。
     """
     settings = Settings()
     settings.mcp.progressive_disclosure_enabled = disclosure
@@ -183,7 +183,7 @@ class TestBotMcpE2E:
     """LumioAgent.run() 触发真实 MCP 工具调用的端到端链路"""
 
     async def test_run_triggers_real_nonsensitive_tool(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """主路径: 积分查询意图 → run() → 链 B 直连 → 真实 query_points 执行 (零 LLM 编排)"""
+        """主路径: 积分查询意图 → run() → 查询直达 直连 → 真实 query_points 执行 (零 LLM 编排)"""
         _patch_settings(monkeypatch)
         server = build_reference_server()
         async with connect_in_memory(server._mcp_server) as session:
@@ -209,12 +209,12 @@ class TestBotMcpE2E:
 
             assert result["response_source"] == "tool"
             assert "积分" in result["response"]
-            assert llm.calls == 0  # 链 B 直连: 不进 LLM 工具编排循环
+            assert llm.calls == 0  # 查询直达 直连: 不进 LLM 工具编排循环
 
     async def test_run_sensitive_tool_pending_then_confirm_executes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """敏感工具 adjust_temp_credit_limit: run() 短路为核验态 → 核验通过 → "确认" → 真实执行
 
-        (裁掉 limit_query 查询工具使链 B 回落编排; confirm=True 恢复合规两段式核验)
+        (裁掉 limit_query 查询工具使查询直达 回落编排; confirm=True 恢复合规两段式核验)
         """
         _patch_settings(monkeypatch, confirm=True, drop_query_tools=("limit_query",))
         server = build_reference_server()
@@ -463,7 +463,7 @@ class TestToolRouteAuditAndRagFallback:
     """会话 48882b05 修复回归: 工具编排路由留痕 + 索参数轮 RAG 知识兜底 + 等待快照"""
 
     async def test_tool_interception_logs_actual_route_decision(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """决策日志必须记录查询意图的实际路由 (链 B 直连), 不让映射表域名误导审计"""
+        """决策日志必须记录查询意图的实际路由 (查询直达 直连), 不让映射表域名误导审计"""
         from lumio.services.common.decision_log import DecisionAction
 
         _patch_settings(monkeypatch)
@@ -494,9 +494,9 @@ class TestToolRouteAuditAndRagFallback:
         route_calls = [
             r
             for r in recorded
-            if r.get("action") == DecisionAction.TOOL_CALL and r.get("evidence", {}).get("chain") == "B"
+            if r.get("action") == DecisionAction.TOOL_CALL and r.get("evidence", {}).get("route") == "query"
         ]
-        assert route_calls, f"未记录链 B 直连路由决策, recorded={[r.get('action') for r in recorded]}"
+        assert route_calls, f"未记录查询直达 直连路由决策, recorded={[r.get('action') for r in recorded]}"
         assert route_calls[0]["agent_name"] == "query_chain"
         assert route_calls[0]["evidence"]["tool"] == "query_points"
 
@@ -537,8 +537,8 @@ class TestToolRouteAuditAndRagFallback:
         assert not [
             r
             for r in recorded
-            if r.get("action") == DecisionAction.TOOL_CALL and r.get("evidence", {}).get("chain") == "B"
-        ], "裸『分期』不应触发链 B 直连工具"
+            if r.get("action") == DecisionAction.TOOL_CALL and r.get("evidence", {}).get("route") == "query"
+        ], "裸『分期』不应触发查询直达 直连工具"
         # 走知识问答: RAG 检索被消费, 由 knowledge 生成链路出答复
         retrieve_mock.assert_awaited_once()
         assert result["response_source"] in ("llm", "knowledge")
