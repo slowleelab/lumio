@@ -474,7 +474,7 @@ const NOISE_ZH: Record<string, string> = {
   ood_unknown: "这句话不属于客服知识范围",
   noise: "输入内容像乱码或误触",
   fast_slow_disagreement: "两套识别结果互相矛盾，稳妥起见不作答",
-  subword_ambiguous: "只输入了孤立的词语（如"信用"），看不出具体诉求",
+  subword_ambiguous: "只输入了孤立的词语（如『信用』），看不出具体诉求",
 }
 function intentZh(v: unknown): string {
   const t = String(v ?? "")
