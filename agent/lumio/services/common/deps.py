@@ -68,7 +68,7 @@ RedisClient = Annotated[Redis, Depends(get_redis_client)]
 async def init_embedding(app: FastAPI) -> None:
     """初始化嵌入服务，存储到 app.state"""
     settings = get_settings()
-    ollama_base = settings.llm.base_url.replace("/v1", "").rstrip("/")
+    ollama_base = settings.rag.ollama_base_url.rstrip("/")  # 独立于 LLM (LLM 可切远程 API)
     provider = create_embedding_provider(
         provider_type=settings.rag.embedding_provider,
         ollama_base_url=ollama_base,
@@ -113,7 +113,7 @@ async def close_embedding(app: FastAPI) -> None:
 async def init_reranker(app: FastAPI) -> None:
     """初始化重排服务，存储到 app.state"""
     settings = get_settings()
-    ollama_base = settings.llm.base_url.replace("/v1", "").rstrip("/")
+    ollama_base = settings.rag.ollama_base_url.rstrip("/")  # 独立于 LLM (LLM 可切远程 API)
     provider = create_reranker_provider(
         provider_type=settings.rag.reranker_provider,
         ollama_base_url=ollama_base,

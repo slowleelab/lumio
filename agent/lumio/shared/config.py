@@ -463,6 +463,9 @@ class RAGSettings(BaseSettings):
     embedding_dim: int = 1024
     embedding_batch_size: int = 128  # TEI 批量大小
     tei_base_url: str = "http://localhost:8080"  # TEI 服务地址
+    # Ollama 服务地址 (embed/reranker 独立于 LLM): LLM 切远程 API 后本地小模型仍
+    # 留 Ollama — 此前从 llm.base_url 推导, 切换 LLM 会连带把嵌入指到远程 API
+    ollama_base_url: str = "http://localhost:11434"
     # 摄入批量向量化受 GPU 抢占影响大, 10s 在本地 Ollama + LLM 并发时偶发超时
     embedding_timeout: float = 30.0  # 嵌入请求超时（秒）
     # 2026-08-31: embed/reranker 固定 CPU (num_gpu=0), qwen 独占 GPU —— 统一内存

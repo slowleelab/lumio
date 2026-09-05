@@ -732,3 +732,61 @@ def _async_ctx(session):
             return False
 
     return _Ctx()
+
+
+class TestBm25CoverageGate:
+    """BM25 主体词覆盖门 (会话 sf2 复盘: "信用卡逾期后果"仅凭"信用卡"命中年费 FAQ@7.74)"""
+
+    def test_coverage_rejects_single_term_overlap(self) -> None:
+        """主体词 3 个只覆盖 1 个 (信用卡) → 拒绝"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        # 主体词: 信用卡/逾期/后果; 命中文本只含"信用卡"
+        assert _bm25_coverage_ok(["信用卡", "逾期", "后果"], "信用卡年费是多少？") is False
+
+    def test_coverage_passes_full_overlap(self) -> None:
+        """主体词全覆盖 → 放行"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        assert _bm25_coverage_ok(["信用卡", "挂失"], "信用卡丢失了怎么挂失？") is True
+        assert _bm25_coverage_ok(["积分", "兑换", "礼品"], "积分怎么兑换礼品") is True
+
+    def test_coverage_two_of_three_passes(self) -> None:
+        """2/3 覆盖 (≥2 词且 ≥50%) → 放行 (变体措辞容忍)"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        assert _bm25_coverage_ok(["信用卡", "逾期", "后果"], "信用卡逾期一次会不会上征信") is True
+
+    def test_coverage_skipped_for_short_queries(self) -> None:
+        """主体词 <2 (单词问句) → 不拦, 交分数门"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        assert _bm25_coverage_ok(["年费"], "信用卡年费是多少") is True
+        assert _bm25_coverage_ok(None, "随便") is True
+
+    def test_bm25_match_applies_coverage(self) -> None:
+        """_bm25_faq_match 集成: 高分单词共现被覆盖门拦下"""
+        import lumio.services.common.faq_service as fs
+
+        class FakeES:
+            async def search(self, **kw):
+                return {
+                    "hits": {
+                        "hits": [
+                            {"_score": 7.74, "_source": {"doc_id": "d1", "content": "信用卡年费是多少？"}},
+                            {"_score": 2.0, "_source": {"doc_id": "d2", "content": "其他"}},
+                        ]
+                    }
+                }
+
+            class _Indices:
+                @staticmethod
+                async def analyze(**kw):
+                    return {"tokens": [{"token": "信用卡"}, {"token": "逾期"}, {"token": "后果"}]}
+
+            indices = _Indices()
+
+        import asyncio
+
+        faq_id, score = asyncio.run(fs._bm25_faq_match(FakeES(), "信用卡逾期了会有什么后果"))
+        assert faq_id is None and score == 0.0

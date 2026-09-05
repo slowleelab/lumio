@@ -105,17 +105,54 @@ async def _index_faq_to_es(es_client: Any, faq: KbFaq) -> int:
     return written
 
 
+# BM25 覆盖门停用词: 礼貌前缀/疑问衬字/单字 — 不计入"主体词" (分词后过滤)
+_BM25_STOP_TOKENS = frozenset(
+    "的 了 是 有 我 你 他 她 它 们 在 和 与 就 都 也 很 请 请问 请教 一下 那个 这个 "
+    "怎么 怎样 如何 什么 为什么 哪 哪个 哪些 吗 呢 吧 啊 呀 哈 嘛 哦 嗯 呗 罢 了 "
+    "能 可以 会 要 想 没 不 还 又 再 说 问 查 帮 麻烦 您 你们 我们 他们".split()
+)
+
+
+async def _query_key_terms(es_client: Any, query: str) -> list[str] | None:
+    """IK 分词取查询主体词 (停用词滤除)。_analyze 不可用返回 None → 覆盖门跳过。"""
+    try:
+        resp = await es_client.indices.analyze(index=_FAQ_ES_INDEX, body={"analyzer": "ik_smart", "text": query})
+        tokens = [
+            t["token"].strip()
+            for t in resp.get("tokens", [])
+            if len(t.get("token", "").strip()) >= 2 and t["token"].strip() not in _BM25_STOP_TOKENS
+        ]
+        return list(dict.fromkeys(tokens)) or None
+    except Exception:
+        return None
+
+
+def _bm25_coverage_ok(key_terms: list[str] | None, hit_text: str, min_terms: int = 2, min_ratio: float = 0.5) -> bool:
+    """主体词覆盖门: 命中文档须实际包含查询的主体词 (单词共现不算命中)。
+
+    会话 sf2 复盘: "信用卡逾期了会有什么后果"仅凭"信用卡"一词命中"信用卡年费
+    是多少？"@7.74 (短文档 BM25 长度归一化放大单词命中, 高分段又豁免区分度
+    检查) — 直出了年费标准表。门规: 主体词 ≥2 个时须命中 ≥min_terms 个且
+    覆盖率 ≥min_ratio; 主体词 <2 (本身即单词问句) 不拦, 交既有分数门。
+    """
+    if not key_terms or len(key_terms) < 2:
+        return True
+    hit = sum(1 for t in key_terms if t in hit_text)
+    return hit >= min_terms and hit / len(key_terms) >= min_ratio
+
+
 async def _bm25_faq_match(
     es_client: Any, query: str, min_score: float = 3.5, margin: float = 1.3
 ) -> tuple[str | None, float]:
     """BM25 词法检索 FAQ (变体免疫主力通道)
 
     Returns: (faq_id, score) — 未命中返回 (None, 0)。
-    门槛双保险 (暴力集实测校准, 零自研词表):
+    门槛三保险 (暴力集实测校准, 零自研词表):
     - min_score 绝对分门槛: BM25 的 IDF 已把高频礼貌前缀权重压到极低,
       业务词共现决定分数 — 真命中 3.7~9.5, 无关句 <1。不用 msm (词覆盖率
       要求把前缀算进分母, 叠加变体「请问一下哈那个积分咋兑换礼品呢」被误杀)
     - margin 跨 FAQ 区分度: 与不同 FAQ 次名分数比 ≥1.3 (同 FAQ 变体竞争不拦)
+    - coverage 主体词覆盖门: 高分段单词共现 (仅"信用卡"即 7.74) 不再直出
     """
     if es_client is None or not query.strip():
         return None, 0.0
@@ -125,7 +162,7 @@ async def _bm25_faq_match(
             body={
                 "query": {"match": {"content": {"query": query}}},
                 "size": 3,
-                "_source": ["doc_id"],
+                "_source": ["doc_id", "content"],
             },
         )
         hits = resp["hits"]["hits"]
@@ -133,6 +170,16 @@ async def _bm25_faq_match(
             return None, 0.0
         top = hits[0]
         if float(top["_score"]) < min_score:
+            return None, 0.0
+        # 主体词覆盖门: 单词共现的高分假命中拦下 (sf2: 逾期问题→年费答案)
+        key_terms = await _query_key_terms(es_client, query)
+        if not _bm25_coverage_ok(key_terms, str(top["_source"].get("content") or "")):
+            logger.info(
+                "FAQ BM25 覆盖门拦截 (主体词共现不足): query=%r hit=%r terms=%s",
+                query[:24],
+                str(top["_source"].get("content") or "")[:24],
+                key_terms,
+            )
             return None, 0.0
         # 区分度判别: 比较对象是"不同 FAQ"的次名 — 同一 FAQ 的多条变体
         # (doc_id 相同) 分数接近恰恰说明命中一致, 不参与 margin (暴力测试实证:

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Fixed
+- **LLM 切换远程 API 时嵌入/重排连带断链**：embed/reranker 的 Ollama 地址此前从 `llm.base_url` 推导，LLM 切远程（如硅基流动）后嵌入被指向远程 API 导致 embedding down — 新增独立配置 `RAG_OLLAMA_BASE_URL`（默认 localhost:11434）解耦
+- **FAQ BM25 主体词覆盖门（会话 sf2 复盘）**："信用卡逾期了会有什么后果"仅凭"信用卡"一词命中"信用卡年费是多少？"@7.74（短文档 BM25 长度归一化放大单词命中，高分段又豁免区分度检查）直出错答案；新增覆盖门：IK 分词取查询主体词（停用词滤除），命中文档须实际包含 ≥2 个且 ≥50%（单词问句不拦交分数门），_analyze 不可用时降级回旧行为
+
+### Changed
+- **LLM 切换硅基流动 THUDM/GLM-4-9B-0414（本地 qwen2.5:7b 卸载）**：嵌入（mxbai-embed-large）与重排（bge-reranker-v2-m3）留本地 Ollama（换云端嵌入需重建全量索引）；知识生成 10.5s（本地冷态）→ 1.6s（远程）；Milvus 首查集合懒加载 ~8s 为一次性冷启动
+
 ### Added
 - **意图体系 Phase 3 收官：子词碎片显式出路 + OOD 阈值重标定（会话 79572c98 "信用"复盘）**
   - faq 残差类拆解完成：faq 种子审核确认 34 条均为真实"通用政策咨询"（种子干净，残差是模型行为）；同数据重训经论证为无效操作（md5 证实管线产物与部署模型同一）——补全的是机制而非权重
