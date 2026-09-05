@@ -203,6 +203,58 @@ async def test_get_db_factory_failure_cached(monkeypatch):
     assert logger._db_session_factory is False
 
 
+async def test_write_pg_uses_call_time_not_flush_time(monkeypatch):
+    """PG 行 created_at = log_decision 调用时刻, 而非后台 task 执行时刻
+
+    每条决策一个独立后台 task, 执行顺序微秒级会颠倒 — 同批留痕的语义顺序
+    (意图分类→路由决策) 曾被打乱 (会话 smoke-qa4 复盘)。
+    """
+    from datetime import UTC, datetime
+
+    logger = DecisionLogger()
+    rows: list = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def add(self, row):
+            rows.append(row)
+
+        async def commit(self):
+            return None
+
+    class FakeFactory:
+        def __call__(self):
+            return FakeSession()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    async def fake_factory():
+        return FakeFactory()
+
+    monkeypatch.setattr(logger, "_db_session_factory", FakeFactory())
+    rec = DecisionRecord(
+        decision_id="d1",
+        session_id="s1",
+        turn_id="t1",
+        agent_name="bot",
+        action=DecisionAction.INTENT_CLASSIFY,
+        reasoning="分类",
+        created_at=1000000000.5,
+    )
+    await logger._write_pg(rec)
+    assert rows, "应写入 PG 行"
+    assert rows[0].created_at == datetime.fromtimestamp(1000000000.5, tz=UTC)
+
+
 def test_singleton_and_helper():
     """单例 + 便捷函数"""
     g1 = get_decision_logger()

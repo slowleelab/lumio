@@ -234,6 +234,10 @@ class DecisionLogger:
                         reasoning=record.reasoning,
                         evidence_json=record.evidence or None,
                         latency_ms=record.latency_ms,
+                        # created_at 用 log_decision 调用时刻 (record 构造时), 而非
+                        # 后台 task 执行时刻: 每条决策一个独立 task, 执行顺序在微秒级
+                        # 会颠倒, 同批留痕的语义顺序 (如 意图分类→路由决策) 被打乱
+                        created_at=datetime.fromtimestamp(record.created_at, tz=UTC),
                     )
                     session.add(row)
                     await session.commit()
