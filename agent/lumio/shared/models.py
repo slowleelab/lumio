@@ -417,6 +417,10 @@ class IntentResult(BaseModel):
     # 而快路径只给 limit_query@0.39, 见会话 e33d1fa8). None = 无慢路径覆盖.
     fast_conf: float | None = Field(default=None, exclude=True)
     fast_intent: IntentLabel | None = Field(default=None, exclude=True)
+    # 单次结构化裁决 (架构整改): LLM 慢路径分类与"业务/闲聊/噪声"仲裁合并为同一次
+    # 调用, 此字段即仲裁结论 ("business"|"chitchat"|"noise"). None = 本次结果未经
+    # LLM 慢路径 (快路径短路/慢路径失败兜底), 噪声门需要仲裁时再独立调用兜底。
+    llm_input_class: str | None = Field(default=None, exclude=True)
 
 
 class SentimentResult(BaseModel):

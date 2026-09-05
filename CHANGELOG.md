@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Changed
+- **前置 FAQ 层移除，检索统一进路由后知识网关（架构整改）**
+  - 分类前 FAQ 匹配会劫持敏感输入（"钱包被偷了"命中"数字人民币硬钱包"词条）与个人化查询（a7f6e73 截胡根因：检索跑在理解之前）——该层整体移除
+  - FAQ 与文档统一为知识库双通道：`_try_faq_direct` 在咨询域知识路径内优先跑 FAQ 通道（精确 Redis/语义 Milvus/BM25 三路），命中直出标准答案，未命中续文档 RAG；交易/查询流量上游走工具直达，FAQ 从结构上不可能再截胡
+  - 紧急标记与敏感重路由轮守卫保留（敏感诉求不被字面相似词条劫持）
+- **LLM 单次结构化裁决：分类与噪声仲裁合并为同一次调用**
+  - 分类 prompt 新增 `input_class`（business/chitchat/noise）输出，IntentResult 透传 `llm_input_class`；噪声门直接复用，不再为同一输入打第二次仲裁 LLM（会话 smoke-qa4 复盘：分类 5.2s + 仲裁 4.3s 串行 → 单次调用）
+  - 快路径短路/慢路径失败兜底（无 llm_input_class）时仍走独立仲裁兜底，拦截语义不变
+
 ### Fixed
 - **决策链整改（会话 smoke-qa-1788567861 复盘，5 项）**
   - 复合意图级联断链修复：查询直达成功返回此前不携带工具结果（retrieval_context 恒空），复合级联取数后永远放弃回落重跑（全库 28/76 会话双执行）；现在工具结果随结果带回注入知识生成，级联真正可达

@@ -1826,6 +1826,59 @@ class TestNoiseGateMultiTurn:
         llm.arbitrate.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_gate_reuses_slow_classify_verdict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """单次结构化裁决: 慢路径已带 input_class 时噪声门直接复用, 不打第二次仲裁 LLM
+
+        会话 smoke-qa4 复盘: 分类 5.2s + 仲裁 4.3s 串行 = 弱证据闲聊整轮 10s;
+        合并后同一次 LLM 调用同时产出意图与 业务/闲聊/噪声 判定。
+        """
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.llm_arbiter_enabled = True
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        llm = MagicMock()
+        llm.arbitrate = AsyncMock(side_effect=AssertionError("有 llm_input_class 不应再调仲裁"))
+        clf = MagicMock()
+        clf._llm = llm
+        agent._classifier = clf
+        # BERT faq@0.45 → LLM 慢路径 faq@0.72 + input_class=chitchat
+        intent = IntentResult(
+            primary_intent=IntentLabel.FAQ,
+            primary_confidence=0.72,
+            fast_conf=0.45,
+            fast_intent=IntentLabel.FAQ,
+            llm_input_class="noise",
+        )
+        reason, evidence = await agent._evaluate_noise_gate("s1", "卡皮巴拉", intent, [], [])
+        assert reason == "arbiter_noise"
+        assert evidence["arbiter_domain"] == "noise"
+        llm.arbitrate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_gate_arbiter_fallback_without_input_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """无 llm_input_class (快路径短路/慢路径失败兜底) → 仍走独立仲裁兜底."""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.llm_arbiter_enabled = True
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        llm = MagicMock()
+        llm.arbitrate = AsyncMock(return_value={"domain": "business", "confidence": 0.7, "structured": True})
+        clf = MagicMock()
+        clf._llm = llm
+        agent._classifier = clf
+        intent = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.72, fast_conf=0.45)
+        reason, evidence = await agent._evaluate_noise_gate("s1", "含糊输入", intent, [], [])
+        assert reason is None
+        assert evidence["arbiter_domain"] == "business"
+        llm.arbitrate.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_gate_input_gate_blocks_corroborated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """P2: noise_gate_enabled + energy 模糊(ambiguous)+ 惊讶度异常 → InputGate 拦截.
         (IST门关闭时这些个例本应放行, 现由多信号佐证截住.)
@@ -2459,3 +2512,68 @@ class TestConsultativeLossGuard:
             )
         agent._tool_executor.execute_direct.assert_awaited_once()
         agent._handle_knowledge.assert_not_called()
+
+
+class TestFaqGateway:
+    """统一知识检索网关 · FAQ 通道 (路由后, _try_faq_direct)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(
+                IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5),
+                [],
+                MagicMock(),
+                "",
+            )
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_faq_hit_returns_direct_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FAQ 通道命中 → 直出标准答案 (response_source=faq)"""
+        agent = self._make_agent()
+
+        async def fake_search(**kw):
+            return {"match_type": "exact", "results": [{"faq_id": "f1#0", "question": "年费多少钱", "answer": "普卡年费 80 元/年"}]}
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", fake_search)
+        result = await agent._try_faq_direct("s1", "年费多少钱")
+        assert result is not None
+        assert result["response"] == "普卡年费 80 元/年"
+        assert result["response_source"] == "faq"
+
+    @pytest.mark.asyncio
+    async def test_faq_miss_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FAQ 通道未命中 → None, 调用方继续文档 RAG 通道"""
+        agent = self._make_agent()
+
+        async def fake_search(**kw):
+            return {"match_type": "none", "results": []}
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", fake_search)
+        assert await agent._try_faq_direct("s1", "随便问点库里的") is None
+
+    @pytest.mark.asyncio
+    async def test_faq_error_degrades_to_doc_channel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FAQ 通道异常 → 不阻断, 降级继续文档检索"""
+        agent = self._make_agent()
+
+        async def boom(**kw):
+            raise RuntimeError("es down")
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", boom)
+        assert await agent._try_faq_direct("s1", "年费多少钱") is None

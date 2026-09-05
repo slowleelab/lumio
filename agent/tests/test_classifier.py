@@ -118,6 +118,60 @@ async def test_llm_classify_fallback_on_error() -> None:
         await classifier.classify("随便什么")
 
 
+@pytest.mark.asyncio
+async def test_llm_classify_parses_input_class() -> None:
+    """单次结构化裁决: 同次分类输出的 业务/闲聊/噪声 判定透传到 IntentResult
+
+    噪声门据此复用裁决结论, 免去第二次独立仲裁 LLM 调用 (弱证据输入 10s 减半)。
+    非法/缺失 input_class 归 None (调用方走仲裁兜底)。
+    """
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value={
+            "intent": "faq",
+            "confidence": 0.3,
+            "entities": [],
+            "sentiment": "neutral",
+            "input_class": "chitchat",
+        }
+    )
+    classifier = LLMClassifier(mock_llm)
+    intent, _, _ = await classifier.classify("卡皮巴拉")
+    assert intent.llm_input_class == "chitchat"
+
+    # 非法值 → None
+    mock_llm.classify = AsyncMock(
+        return_value={"intent": "faq", "confidence": 0.4, "entities": [], "sentiment": "neutral", "input_class": "银行"}
+    )
+    intent, _, _ = await classifier.classify("乱出的")
+    assert intent.llm_input_class is None
+
+    # 缺失 → None
+    mock_llm.classify = AsyncMock(return_value={"intent": "bill_query", "confidence": 0.9, "entities": [], "sentiment": "neutral"})
+    intent, _, _ = await classifier.classify("查账单")
+    assert intent.llm_input_class is None
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_input_class_cached() -> None:
+    """分类缓存命中时 input_class 一并复用 (model_copy 深拷贝不丢字段)"""
+    from lumio.shared.config import get_settings
+
+    get_settings().llm.classify_cache_enabled = True
+    try:
+        mock_llm = MagicMock()
+        mock_llm.classify = AsyncMock(
+            return_value={"intent": "faq", "confidence": 0.4, "entities": [], "sentiment": "neutral", "input_class": "noise"}
+        )
+        classifier = LLMClassifier(mock_llm)
+        _, _, _ = await classifier.classify("hjfw 什么")
+        mock_llm.classify = AsyncMock(side_effect=AssertionError("缓存命中不应再调 LLM"))
+        intent, _, _ = await classifier.classify("hjfw 什么")
+        assert intent.llm_input_class == "noise"
+    finally:
+        get_settings().llm.classify_cache_enabled = True
+
+
 # ── IntentClassifier (双通道) ──
 
 

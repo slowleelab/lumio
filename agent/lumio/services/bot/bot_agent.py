@@ -371,74 +371,11 @@ class LumioAgent:
                 except Exception as exc:
                     logger.debug("告别结束会话失败 (不阻断回复): session=%s err=%s", session_id, exc)
             return self._build_result(session_id, user_input, FAREWELL_RESPONSE, "template", "chitchat")
-        # ── FAQ 三路匹配优先 (精确 Redis / 语义 Milvus faq_qa) ──
-        # 命中直接返回标准答案, 免意图分类/检索/LLM; 检索日志落 kb_faq_search_log
-        # (控制台 FAQ 命中率指标数据源)。此前客户链路从不调 search_faq, 发布的
-        # FAQ 实际不参与应答 (语义索引写入也是桩函数, 一并修复)。
-        # 位置: 危机/护栏/问候告别之后、意图分类之前 —— 业务域问题 (如积分有效期)
-        # 会被路由进工具编排, 埋在 _retrieve 内永远走不到。
-        # 紧急意图豁免 (qa_scan 首轮复盘): FAQ 短路发生在意图分类之前, 敏感输入
-        # 会被字面相似FAQ劫持 —— "钱包被偷了,卡也在里面"0.2s命中"数字人民币硬钱包"
-        # 条目, 挂失规则 (0.96) 永远没机会跑。含紧急标记的输入跳过短路进分类。
-        if _has_emergency_marker(user_input):
-            logger.info("紧急意图豁免 FAQ 短路: input=%r", user_input[:30])
-        else:
-            try:
-                from lumio.services.common.faq_service import get_faq, search_faq
-
-                session_manager = self._session_manager
-                faq_embedding = (
-                    self._embedding_breaker.provider
-                    if self._embedding_breaker and self._embedding_breaker.is_available
-                    else None
-                )
-                faq_res = await search_faq(
-                    query=user_input,
-                    redis_client=session_manager._redis if session_manager else None,
-                    embedding_provider=faq_embedding,
-                    milvus_collection=self._milvus_collection,
-                    es_client=self._es_client,
-                    user_role="customer",
-                    session_factory=(
-                        session_manager._resolve_factory()
-                        if session_manager is not None and hasattr(session_manager, "_resolve_factory")
-                        else None
-                    ),
-                    session_id=session_id,
-                )
-                if faq_res["match_type"] in ("exact", "semantic", "bm25") and faq_res["results"]:
-                    top = faq_res["results"][0]
-                    answer = top.get("answer")
-                    if not answer and top.get("faq_id"):
-                        from lumio.services.common.faq_service import get_faq
-
-                        faq_sf = (
-                            session_manager._resolve_factory()
-                            if session_manager is not None and hasattr(session_manager, "_resolve_factory")
-                            else None
-                        )
-                        # chunk_id 带变体序号后缀 (faqid#0), 回查前剥离取真实 FAQ UUID
-                        real_id = top["faq_id"].split("#", 1)[0]
-                        detail = await get_faq(faq_sf, real_id) if faq_sf else None
-                        answer = detail.get("answer") if detail else None
-                    if answer:
-                        logger.info("FAQ 短路命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
-                        try:
-                            log_decision(
-                                session_id=session_id,
-                                agent_name="bot_agent",
-                                action=DecisionAction.FAQ_DIRECT,
-                                reasoning=f"FAQ 直出 ({faq_res['match_type']})",
-                                evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
-                                latency_ms=0.0,
-                                turn_id="",  # 继承本轮 turn_id (contextvar)
-                                customer_id=customer_id,
-                            )
-                        except Exception:
-                            logger.debug("decision_log 记录失败(不阻断)")
-                        return self._build_result(session_id, user_input, answer, "faq", "faq")
-            except Exception as faq_err:
-                logger.warning("FAQ 优先匹配失败, 走常规流程: %s", faq_err)
+        # 前置 FAQ 短路层已移除 (架构整改): 分类前跑 FAQ 匹配会劫持敏感输入
+        # (qa_scan 首轮复盘: "钱包被偷了"0.2s命中"数字人民币硬钱包"词条) 和
+        # 个人化查询 (a7f6e73 截胡修复的根因 — 检索跑在理解之前)。FAQ 与文档
+        # 统一进路由后的知识检索网关 (_try_faq_direct, 见 _handle_knowledge):
+        # 咨询流量 FAQ 通道优先, 交易/查询流量先走工具永不被 FAQ 截胡。
 
         try:
             # 闭环 P1 感知缝: 提供会话/客户归属 (采样器被动读取, 业务不感知采样逻辑)
@@ -1435,6 +1372,15 @@ class LumioAgent:
                 intent.primary_intent.value,
                 intent.primary_confidence,
             )
+        # ── 统一知识检索网关 · FAQ 通道 (架构整改) ──
+        # FAQ 与文档同属知识库, 检索统一在路由之后: 本路径只承接咨询域流量,
+        # 交易/查询意图上游已走工具直达。FAQ 通道优先于文档 RAG — 人工审核过的
+        # 标准答案高于模型生成答案; 未命中继续文档通道。紧急标记输入跳过 FAQ
+        # (敏感诉求不得被字面相似词条劫持), 敏感重路由轮跳过 (防二次绕开状态机)。
+        if not _sensitive_rerouted and not _has_emergency_marker(user_input):
+            faq_hit = await self._try_faq_direct(session_id, user_input)
+            if faq_hit is not None:
+                return faq_hit
         _rag_t0 = time.monotonic()
         context = await self._retrieve(user_input, intent=intent.primary_intent, confidence=intent.primary_confidence)
         if extra_context:
@@ -2699,6 +2645,78 @@ class LumioAgent:
         )
         return re.sub(r"[\s,?,.!;:；：]+", "", t)
 
+    async def _try_faq_direct(
+        self,
+        session_id: str,
+        user_input: str,
+        customer_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """统一知识检索网关 · FAQ 通道 (路由后): 三路匹配命中 → 直出标准答案。
+
+        只在咨询域知识路径调用 — 交易/查询流量上游已走工具直达, FAQ 从结构上
+        不可能再截胡个人化查询 (a7f6e73 前置截胡的根因是检索跑在理解之前)。
+        返回 None = 未命中, 调用方继续文档 RAG 通道; 检索日志落
+        kb_faq_search_log (控制台 FAQ 命中率指标数据源)。
+        """
+        _t0 = time.monotonic()
+        try:
+            from lumio.services.common.faq_service import get_faq, search_faq
+
+            session_manager = self._session_manager
+            faq_embedding = (
+                self._embedding_breaker.provider
+                if self._embedding_breaker and self._embedding_breaker.is_available
+                else None
+            )
+            faq_res = await search_faq(
+                query=user_input,
+                redis_client=session_manager._redis if session_manager else None,
+                embedding_provider=faq_embedding,
+                milvus_collection=self._milvus_collection,
+                es_client=self._es_client,
+                user_role="customer",
+                session_factory=(
+                    session_manager._resolve_factory()
+                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                    else None
+                ),
+                session_id=session_id,
+            )
+            if faq_res["match_type"] not in ("exact", "semantic", "bm25") or not faq_res["results"]:
+                return None
+            top = faq_res["results"][0]
+            answer = top.get("answer")
+            if not answer and top.get("faq_id"):
+                faq_sf = (
+                    session_manager._resolve_factory()
+                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                    else None
+                )
+                # chunk_id 带变体序号后缀 (faqid#0), 回查前剥离取真实 FAQ UUID
+                real_id = top["faq_id"].split("#", 1)[0]
+                detail = await get_faq(faq_sf, real_id) if faq_sf else None
+                answer = detail.get("answer") if detail else None
+            if not answer:
+                return None
+            logger.info("FAQ 通道命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.FAQ_DIRECT,
+                    reasoning=f"FAQ 直出 ({faq_res['match_type']})",
+                    evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
+                    latency_ms=(time.monotonic() - _t0) * 1000,
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
+                    customer_id=customer_id,
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断)")
+            return self._build_result(session_id, user_input, answer, "faq", "faq")
+        except Exception as faq_err:
+            logger.warning("FAQ 通道匹配失败, 继续文档检索: %s", faq_err)
+            return None
+
     async def _retrieve(self, query: str, *, intent: IntentLabel | None = None, confidence: float = 0.0) -> str:
         """RAG 检索 (P0-3 上下文工程: 接线 reranker + 相关性阈值 + 首尾重排 + RAG 预算截算)
 
@@ -3741,7 +3759,20 @@ class LumioAgent:
             and self._classifier is not None
             and getattr(self._classifier, "_llm", None) is not None
         ):
-            verdict_domain = await self._arbitrate_domain(user_input, getattr(self._classifier, "_llm", None))
+            # 单次结构化裁决 (架构整改): 慢路径分类已同一次调用输出 业务/闲聊/噪声
+            # 判定, 直接复用 — 不再为同一输入打第二次仲裁 LLM (会话 smoke-qa4 复盘:
+            # 分类 5.2s + 仲裁 4.3s 串行, 弱证据闲聊整轮 10s)。仅快路径短路/慢路径
+            # 失败兜底 (无 llm_input_class) 时才独立调用仲裁兜底。
+            prior_class = getattr(intent, "llm_input_class", None)
+            if prior_class in ("business", "chitchat", "noise"):
+                verdict_domain = {
+                    "domain": prior_class,
+                    "confidence": intent.primary_confidence,
+                    "structured": True,
+                    "reused_slow_classify": True,
+                }
+            else:
+                verdict_domain = await self._arbitrate_domain(user_input, getattr(self._classifier, "_llm", None))
             evidence["arbiter_domain"] = verdict_domain["domain"]
             if verdict_domain["domain"] == "noise":
                 return "arbiter_noise", evidence

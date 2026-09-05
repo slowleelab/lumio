@@ -521,7 +521,8 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
   "intent": "意图标签",
   "confidence": 0.0-1.0的置信度,
   "entities": [{"entity_type": "类型", "value": "值"}],
-  "sentiment": "positive/neutral/negative/angry"
+  "sentiment": "positive/neutral/negative/angry",
+  "input_class": "business|chitchat|noise"
 }
 ```
 
@@ -537,18 +538,27 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 - transfer_agent: 转人工
 - chitchat: 闲聊
 
+## input_class 判定（与意图分类同一次输出，独立打分）
+- business: 与银行业务相关的真实诉求（查账/分期/挂失/投诉/额度/积分/转人工等）
+- chitchat: 闲聊/寒暄/玩笑/与银行业务无关的话题（如动物名、天气、表情）
+- noise: 乱码/按键误触/无意义输入
+- 拿不准、或像是在接上文的数字/金额/卡号回话但语义不明 → business（保守，宁放过不误拦）
+
 ## 示例
 用户: 我上个月花了多少钱
-输出: {"intent": "bill_query", "confidence": 0.9, "entities": [{"entity_type": "time_range", "value": "上个月"}], "sentiment": "neutral"}
+输出: {"intent": "bill_query", "confidence": 0.9, "entities": [{"entity_type": "time_range", "value": "上个月"}], "sentiment": "neutral", "input_class": "business"}
 
 用户: 额度太低了能不能提一下
-输出: {"intent": "limit_query", "confidence": 0.85, "entities": [{"entity_type": "action", "value": "提额"}], "sentiment": "neutral"}
+输出: {"intent": "limit_query", "confidence": 0.85, "entities": [{"entity_type": "action", "value": "提额"}], "sentiment": "neutral", "input_class": "business"}
 
 用户: 你们的年费怎么这么贵，我要投诉
-输出: {"intent": "complaint", "confidence": 0.95, "entities": [{"entity_type": "topic", "value": "年费"}], "sentiment": "angry"}
+输出: {"intent": "complaint", "confidence": 0.95, "entities": [{"entity_type": "topic", "value": "年费"}], "sentiment": "angry", "input_class": "business"}
 
 用户: 你好呀
-输出: {"intent": "chitchat", "confidence": 0.9, "entities": [], "sentiment": "positive"}
+输出: {"intent": "chitchat", "confidence": 0.9, "entities": [], "sentiment": "positive", "input_class": "chitchat"}
+
+用户: 卡皮巴拉
+输出: {"intent": "faq", "confidence": 0.3, "entities": [], "sentiment": "neutral", "input_class": "chitchat"}
 
 ## 要求
 - 只输出 JSON，不要其他文字
@@ -766,9 +776,17 @@ class LLMClassifier:
         confidence = result.get("confidence", 0.0)
         entities = _parse_entities(result.get("entities", []))
         sentiment = _parse_sentiment(result.get("sentiment", ""))
+        # 单次结构化裁决: 同一次调用顺带输出 业务/闲聊/噪声 判定, 噪声门直接复用
+        # (此前需第二次独立仲裁 LLM 调用, 弱证据输入整轮 10s 中一半花在这)
+        raw_input_class = str(result.get("input_class") or "").strip().lower()
+        input_class = raw_input_class if raw_input_class in ("business", "chitchat", "noise") else None
 
         parsed = (
-            IntentResult(primary_intent=intent_label, primary_confidence=confidence),
+            IntentResult(
+                primary_intent=intent_label,
+                primary_confidence=confidence,
+                llm_input_class=input_class,
+            ),
             entities,
             sentiment,
         )
