@@ -267,7 +267,7 @@ async def test_capture_dedup_aggregates_same_input() -> None:
     assert len(store["badcases"]) == 1, "重复信号应聚合到既有行"
     assert second is first
     assert second.signal_detail["occurrences"] == 2
-    assert second.signal_detail["last_seen_at"] == "s"
+    assert second.signal_detail["last_seen_session"] == "s"
 
     # 不同信号源 → 各自一行
     await capture_badcase(factory, trace_id="t", session_id="s", signal_source="negative_feedback", user_input="我的卡丢了, 要挂失")

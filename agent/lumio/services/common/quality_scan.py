@@ -7,8 +7,10 @@
 - 会话源: dialogue_log 全量 (≥2 轮的真实交互), 已检会话 Redis 判定去重
 - 质检员: GLM 裁判读原始对话逐项审查 (答非所问/幻觉编造/越界承诺/漏转人工/
   未解决无引导), 判定与生产质检坐席同口径
-- fail → 采入 badcase (signal_source=qa_scan), 走既有归因/修复闭环;
-  pass/warn 只记 Redis 判定 (合格率统计), 不打扰工作台
+- 全量判定 (pass/warn/fail) 落 quality_record 表 — 每一个会话都进工作台
+  质检记录列表 (按会话时间倒序); 此前 pass/warn 只写 Redis (30 天 TTL),
+  会话清单不可见, "全量纳入"无从谈起
+- fail → 采入 badcase (signal_source=qa_scan), 走既有归因/修复闭环
 - 成本护栏: 单轮巡检 n=1 采样 (fail 项后续由工作台批量归因做 n=3 复核),
   会话级限流 + 后台任务持有引用防 GC (项目规范)
 """
@@ -26,7 +28,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from lumio.shared.orm_models import DialogueLog
+from lumio.shared.orm_models import DialogueLog, QualityRecord
 
 logger = logging.getLogger(__name__)
 
@@ -115,13 +117,14 @@ async def _load_sessions(
     exclude_checked: bool = False,
     redis_client: Any = None,
     offset: int = 0,
-) -> tuple[list[tuple[str, list[str, Any]]] | list, int, int]:
+) -> tuple[list[tuple[str, list[dict[str, Any]], datetime | None]], int, int]:
     """取待检会话: 近 N 小时、≥min_turns 轮、按最后活跃倒序, 可抽样, 排除已检
 
     轮数过滤在取回轮次后做 (group_by + having count 的关联子查询写法跨库易错,
     且会话体量在万级以内, 取回过滤成本可接受)。
     exclude_checked: 跳过已有 30 天检定 verdict 的会话 (全量补扫模式);
     返回 (会话列表, 本批因已检而跳过的个数) — 跳过数供调用方累计翻页偏移。
+    会话列表元素为 (session_id, 轮次列表, 会话时间=最后一轮 timestamp)。
     """
     since = datetime.now(UTC) - timedelta(hours=lookback_hours)
     async with session_factory() as session:
@@ -171,12 +174,14 @@ async def _load_sessions(
             )
         ).all()
     by_sid: dict[str, list[dict[str, Any]]] = {}
+    last_ts: dict[str, datetime] = {}
     for r in turn_rows:
         by_sid.setdefault(r.session_id, []).append(
             {"speaker": r.speaker, "content": r.content, "intent": r.intent, "response_source": r.response_source}
         )
+        last_ts[r.session_id] = r.timestamp
     return (
-        [(sid, turns) for sid, turns in by_sid.items() if len(turns) >= min_turns][:limit],
+        [(sid, turns, last_ts.get(sid)) for sid, turns in by_sid.items() if len(turns) >= min_turns][:limit],
         skipped,
         raw_n,
     )
@@ -189,8 +194,12 @@ async def scan_session(
     session_id: str,
     turns: list[dict[str, Any]],
     model: str,
+    session_time: datetime | None = None,
 ) -> dict[str, Any]:
-    """单会话质检: 裁判判定 → fail 采集 badcase, 全部判定写 Redis 去重"""
+    """单会话质检: 裁判判定 → 判定落 quality_record (全量) → fail 采集 badcase
+
+    session_time: 会话最后一轮对话时间 (质检记录按对话发生顺序排列的锚点)。
+    """
     transcript = build_transcript(turns)
     try:
         raw = await judge_llm.chat_json(
@@ -231,7 +240,7 @@ async def scan_session(
             )
         from lumio.services.common.badcase_store import capture_badcase
 
-        await capture_badcase(
+        bc = await capture_badcase(
             session_factory,
             trace_id=session_id,
             session_id=session_id,
@@ -253,7 +262,33 @@ async def scan_session(
                     for t in turns[:20]
                 ],
             },
+            session_time=session_time,
         )
+        badcase_id = str(bc.id)
+    else:
+        badcase_id = None
+        first_customer = next((t["content"] for t in turns if t.get("speaker") == "customer"), "")
+
+    # 全量判定落库 (质检记录列表的每会话一条) — 失败不阻断巡检:
+    # Redis 判定已写, 重启/补扫时可由 backfill_redis_verdicts 重新入库
+    if session_factory is not None:
+        try:
+            from lumio.services.common.badcase_store import record_quality
+
+            await record_quality(
+                session_factory,
+                session_id=session_id,
+                verdict=verdict["verdict"],
+                problems=verdict["problems"],
+                summary=verdict["summary"],
+                preview=first_customer,
+                judge_model=model,
+                turns=len(turns),
+                session_time=session_time,
+                badcase_id=badcase_id,
+            )
+        except Exception as exc:
+            logger.warning("qa_scan 判定落库失败 (不阻断): session=%s err=%s", session_id, exc)
     return verdict
 
 
@@ -283,10 +318,10 @@ async def _scan_task(
     stats = {"n_pass": 0, "n_warn": 0, "n_fail": 0, "n_error": 0, "done": 0}
     verdict_key = {"pass": "n_pass", "warn": "n_warn", "fail": "n_fail", "error": "n_error"}
 
-    async def one(sid: str, turns: list[dict[str, Any]]) -> None:
+    async def one(sid: str, turns: list[dict[str, Any]], session_time: datetime | None) -> None:
         async with sem:
             try:
-                v = await scan_session(session_factory, judge_llm, redis_client, sid, turns, model)
+                v = await scan_session(session_factory, judge_llm, redis_client, sid, turns, model, session_time=session_time)
                 async with lock:
                     stats[verdict_key.get(v["verdict"], "n_error")] += 1
             except Exception as exc:
@@ -328,7 +363,7 @@ async def _scan_task(
             if not sessions:
                 continue  # 本批全为已检占位, 翻下一页
             _scan_state.update(total=_scan_state["total"] + len(sessions))
-            await asyncio.gather(*(one(sid, turns) for sid, turns in sessions))
+            await asyncio.gather(*(one(sid, turns, session_time) for sid, turns, session_time in sessions))
             scanned += len(sessions)
     except Exception as exc:
         _scan_state["error_msg"] = str(exc)[:300]
@@ -389,3 +424,187 @@ async def last_run(redis_client: Any) -> dict[str, Any] | None:
         return json.loads(raw) if raw else None
     except Exception:
         return None
+
+
+# ── 裁判构造 / 单会话钩子 / 存量回填 ──
+
+
+def build_judge_llm(llm_client: Any, settings: Any) -> Any:
+    """质检裁判 LLM: 配置了跨家族远程裁判则 RemoteJudgeClient (失败自动回退
+    本地), 否则本地; llm_client 未就绪返回 None (调用方静默跳过)"""
+    if llm_client is None:
+        return None
+    if settings.llm.judge_base_url and settings.llm.judge_api_key:
+        from lumio.services.common.judge_client import RemoteJudgeClient
+
+        return RemoteJudgeClient(fallback_llm=llm_client)
+    return llm_client
+
+
+def judge_model_name(settings: Any) -> str:
+    """裁判模型名 (审计记录用): 远程裁判记 judge_model, 本地兜底记 primary_model"""
+    if settings.llm.judge_base_url and settings.llm.judge_api_key:
+        return str(settings.llm.judge_model)
+    return str(settings.llm.primary_model)
+
+
+async def _load_session_turns(
+    session_factory: async_sessionmaker[AsyncSession],
+    session_id: str,
+) -> tuple[list[dict[str, Any]], datetime | None]:
+    """取单会话全部对话轮 + 会话时间锚点 (最后一轮 timestamp)"""
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(
+                    DialogueLog.speaker,
+                    DialogueLog.content,
+                    DialogueLog.intent,
+                    DialogueLog.response_source,
+                    DialogueLog.timestamp,
+                )
+                .where(DialogueLog.session_id == session_id)
+                .order_by(DialogueLog.timestamp)
+            )
+        ).all()
+    turns = [
+        {"speaker": r.speaker, "content": r.content, "intent": r.intent, "response_source": r.response_source}
+        for r in rows
+    ]
+    return turns, (rows[-1].timestamp if rows else None)
+
+
+async def scan_session_by_id(
+    session_factory: async_sessionmaker[AsyncSession],
+    judge_llm: Any,
+    redis_client: Any,
+    session_id: str,
+    model: str,
+) -> dict[str, Any] | None:
+    """按需单会话巡检 (chat_end 自动质检钩子)。
+
+    已检 (Redis 30 天去重) 或对话不足 2 轮 (问候/噪声会话) 返回 None 跳过。
+    """
+    if redis_client is not None:
+        try:
+            if await redis_client.get(_VERDICT_KEY.format(sid=session_id)):
+                return None
+        except Exception:
+            pass
+    turns, session_time = await _load_session_turns(session_factory, session_id)
+    if len(turns) < 2:
+        return None
+    return await scan_session(session_factory, judge_llm, redis_client, session_id, turns, model, session_time=session_time)
+
+
+def _parse_redis_verdict(session_id: str, raw: str | bytes) -> dict[str, Any] | None:
+    """Redis 判定 JSON → quality_record 入库参数 (scanned_at 缺失/解析失败返回
+    None — scanned_at 是幂等去重键, 缺了宁可不回填也不重复插入)"""
+    try:
+        d = json.loads(raw)
+        verdict = str(d.get("verdict") or "")
+        if verdict not in ("pass", "warn", "fail") or not d.get("scanned_at"):
+            return None
+        turns = d.get("turns")
+        return {
+            "session_id": session_id,
+            "verdict": verdict,
+            "problems": d.get("problems") or [],
+            "summary": (str(d.get("summary") or "")[:200]) or None,
+            "judge_model": d.get("model"),
+            "turns": int(turns) if isinstance(turns, int | float) else None,            "scanned_at": datetime.fromisoformat(str(d["scanned_at"])),
+        }
+    except Exception:
+        return None
+
+
+async def backfill_redis_verdicts(
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    redis_client: Any,
+) -> int:
+    """存量 Redis 判定 → quality_record 一次性回填 (幂等, 服务启动时跑)
+
+    判定此前只存 Redis (30 天 TTL), "每一个会话都纳入质检列表"要求判定
+    成为可查询资产; 已入库 (同 session_id + scanned_at) 的跳过。
+    """
+    if session_factory is None or redis_client is None:
+        return 0
+    try:
+        pairs: list[tuple[str, Any]] = []
+        async for key in redis_client.scan_iter(match=_VERDICT_KEY.format(sid="*")):
+            sid = str(key).rsplit(":", 1)[-1]
+            raw = await redis_client.get(key)
+            if raw:
+                pairs.append((sid, raw))
+        rows = [p for p in (_parse_redis_verdict(sid, raw) for sid, raw in pairs) if p]
+        if not rows:
+            return 0
+        inserted = 0
+        async with session_factory() as session:
+            sids = list({r["session_id"] for r in rows})
+            # 会话时间锚点 + 首轮客户输入预览 (批量回查 dialogue_log)
+            ts_map: dict[str, datetime] = {}
+            preview_map: dict[str, str] = {}
+            turn_rows = (
+                await session.execute(
+                    select(DialogueLog.session_id, DialogueLog.speaker, DialogueLog.content, DialogueLog.timestamp)
+                    .where(DialogueLog.session_id.in_(sids))
+                    .order_by(DialogueLog.timestamp)
+                )
+            ).all()
+            for r in turn_rows:
+                ts_map[r.session_id] = r.timestamp
+                if r.session_id not in preview_map and r.speaker == "customer" and (r.content or "").strip():
+                    preview_map[r.session_id] = r.content.strip()[:160]
+            # 存量 fail 的闭环关联: 同会话已采集的 qa_scan badcase (最新一条)
+            fail_sids = [r["session_id"] for r in rows if r["verdict"] == "fail"]
+            badcase_map: dict[str, str] = {}
+            if fail_sids:
+                from lumio.shared.orm_models import Badcase
+
+                bc_rows = (
+                    await session.execute(
+                        select(Badcase.id, Badcase.session_id)
+                        .where(Badcase.signal_source == "qa_scan", Badcase.session_id.in_(set(fail_sids)))
+                        .order_by(Badcase.created_at.desc())
+                    )
+                ).all()
+                for r in bc_rows:
+                    badcase_map.setdefault(r.session_id, str(r.id))
+            existing = {
+                (r[0], r[1])
+                for r in (
+                    await session.execute(
+                        select(QualityRecord.session_id, QualityRecord.scanned_at).where(
+                            QualityRecord.session_id.in_(sids)
+                        )
+                    )
+                ).all()
+            }
+            for r in rows:
+                key = (r["session_id"], r["scanned_at"])
+                if key in existing:
+                    continue
+                sid = r["session_id"]
+                session.add(
+                    QualityRecord(
+                        session_id=sid,
+                        verdict=r["verdict"],
+                        problems=r["problems"] or None,
+                        summary=r["summary"],
+                        preview=preview_map.get(sid),
+                        judge_model=r["judge_model"],
+                        turns=r["turns"],
+                        session_time=ts_map.get(sid),
+                        scanned_at=r["scanned_at"],
+                        badcase_id=badcase_map.get(sid) if r["verdict"] == "fail" else None,
+                    )
+                )
+                inserted += 1
+            await session.commit()
+        if inserted:
+            logger.info("qa_scan Redis 判定回填: %d 条 → quality_record", inserted)
+        return inserted
+    except Exception as exc:
+        logger.warning("qa_scan Redis 判定回填失败 (不阻断): %s", exc)
+        return 0

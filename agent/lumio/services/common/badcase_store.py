@@ -14,7 +14,7 @@ from lumio.services.common.badcase_loop import (
     BadcaseJudge,
     dedup_key,
 )
-from lumio.shared.orm_models import Badcase
+from lumio.shared.orm_models import Badcase, DialogueLog, QualityRecord
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,12 @@ async def capture_badcase(
     signal_detail: dict[str, Any] | None = None,
     snapshot: dict[str, Any] | None = None,
     fix_status: str = "pending",
+    session_time: datetime | None = None,
 ) -> Badcase:
     """信号采集: 五路信号 → badcase 落库。
+
+    session_time: 会话时间锚点 (该会话最后一轮对话时间) — 工作台按对话
+    发生顺序排列, 不受巡检/采集时刻影响。
 
     去重聚合: 同 (dedup_group_id + signal_source) 且未处置 (fix_status=pending)
     的既有条目只累加出现次数 (signal_detail.occurrences + 最近一次现场快照),
@@ -58,7 +62,7 @@ async def capture_badcase(
         if existing is not None:
             detail = dict(existing.signal_detail or {})
             detail["occurrences"] = int(detail.get("occurrences", 1)) + 1
-            detail["last_seen_at"] = session_id
+            detail["last_seen_session"] = session_id
             existing.signal_detail = detail
             if snapshot:
                 merged = dict(existing.snapshot or {})
@@ -66,6 +70,9 @@ async def capture_badcase(
                 existing.snapshot = merged
             if bot_output:
                 existing.bot_output = bot_output
+            # 去重组跨会话复现: 会话时间锚点取最近一次 (问题最近何时仍发生)
+            if session_time is not None and (existing.session_time is None or session_time > existing.session_time):
+                existing.session_time = session_time
             await session.commit()
             await session.refresh(existing)
             logger.info(
@@ -85,6 +92,7 @@ async def capture_badcase(
             dedup_group_id=group,
             needs_human_review=True,
             fix_status=fix_status,
+            session_time=session_time,
         )
         session.add(bc)
         await session.commit()
@@ -127,8 +135,14 @@ async def list_badcases(
         count_q = count_q.where(*conds)
 
     total = (await session.execute(count_q)).scalar() or 0
+    # 按会话时间倒序 (对话发生顺序): created_at 只是采集/巡检时刻, qa_scan
+    # 批量回扫会打乱现场时序; 无 session_time 的旧数据退回 created_at
     rows = (
-        (await session.execute(query.order_by(Badcase.created_at.desc()).limit(limit).offset(offset)))
+        (
+            await session.execute(
+                query.order_by(func.coalesce(Badcase.session_time, Badcase.created_at).desc()).limit(limit).offset(offset)
+            )
+        )
         .scalars()
         .all()
     )
@@ -160,6 +174,7 @@ def _to_dict(b: Badcase) -> dict[str, Any]:
         "fix_note": b.fix_note,
         "resolved_at": b.resolved_at.isoformat() if b.resolved_at else None,
         "created_at": b.created_at.isoformat() if b.created_at else None,
+        "session_time": b.session_time.isoformat() if b.session_time else None,
         "occurrences": int((b.signal_detail or {}).get("occurrences", 1)),
     }
 
@@ -174,6 +189,135 @@ async def get_badcase(session_factory: async_sessionmaker[AsyncSession], badcase
     async with session_factory() as session:
         result = await session.execute(select(Badcase).where(Badcase.id == pk))
         return result.scalar_one_or_none()
+
+
+# ── 质检记录 (qa_scan 全量判定持久化: pass/warn/fail 每会话一条) ──
+
+
+async def record_quality(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    session_id: str,
+    verdict: str,
+    problems: list[dict[str, Any]] | None = None,
+    summary: str | None = None,
+    preview: str | None = None,
+    judge_model: str | None = None,
+    turns: int | None = None,
+    session_time: datetime | None = None,
+    badcase_id: str | None = None,
+    scanned_at: datetime | None = None,
+) -> QualityRecord:
+    """落一条质检判定记录 (每个被巡检会话一条, append-only)"""
+    async with session_factory() as session:
+        rec = QualityRecord(
+            session_id=session_id,
+            verdict=verdict,
+            problems=problems or None,
+            summary=summary,
+            preview=(preview or "")[:160] or None,
+            judge_model=judge_model,
+            turns=turns,
+            session_time=session_time,
+            badcase_id=badcase_id,
+            scanned_at=scanned_at or datetime.now(UTC),
+        )
+        session.add(rec)
+        await session.commit()
+        await session.refresh(rec)
+        return rec
+
+
+def quality_record_to_dict(r: QualityRecord) -> dict[str, Any]:
+    return {
+        "id": str(r.id),
+        "session_id": r.session_id,
+        "verdict": r.verdict,
+        "problems": r.problems or [],
+        "summary": r.summary,
+        "preview": r.preview,
+        "judge_model": r.judge_model,
+        "turns": r.turns,
+        "session_time": r.session_time.isoformat() if r.session_time else None,
+        "scanned_at": r.scanned_at.isoformat() if r.scanned_at else None,
+        "badcase_id": r.badcase_id,
+    }
+
+
+async def list_quality_records(
+    session: AsyncSession,
+    *,
+    verdict: str | None = None,
+    keyword: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """质检记录列表, 按会话时间倒序 (对话发生顺序; 无锚点退回质检时刻)"""
+    conds = []
+    if verdict:
+        conds.append(QualityRecord.verdict == verdict)
+    if keyword:
+        conds.append(QualityRecord.preview.ilike(f"%{keyword}%") | QualityRecord.session_id.ilike(f"%{keyword}%"))
+
+    query = select(QualityRecord)
+    count_q = select(func.count()).select_from(QualityRecord)
+    if conds:
+        query = query.where(*conds)
+        count_q = count_q.where(*conds)
+
+    total = (await session.execute(count_q)).scalar() or 0
+    rows = (
+        (
+            await session.execute(
+                query.order_by(func.coalesce(QualityRecord.session_time, QualityRecord.scanned_at).desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [quality_record_to_dict(r) for r in rows], total
+
+
+async def quality_coverage_stats(
+    session: AsyncSession,
+    *,
+    lookback_hours: int = 720,
+    min_turns: int = 2,
+) -> dict[str, Any]:
+    """质检覆盖统计: 窗口内应检会话 (dialogue_log ≥min_turns 轮) vs 已检会话"""
+    from datetime import timedelta
+
+    since = datetime.now(UTC) - timedelta(hours=lookback_hours)
+    eligible = (
+        select(DialogueLog.session_id)
+        .where(DialogueLog.timestamp >= since)
+        .group_by(DialogueLog.session_id)
+        .having(func.count() >= min_turns)
+        .subquery()
+    )
+    total_sessions = (await session.execute(select(func.count()).select_from(eligible))).scalar() or 0
+    scanned = (
+        await session.execute(
+            select(func.count(func.distinct(QualityRecord.session_id))).where(QualityRecord.scanned_at >= since)
+        )
+    ).scalar() or 0
+    verdict_rows = (
+        await session.execute(
+            select(QualityRecord.verdict, func.count()).where(QualityRecord.scanned_at >= since).group_by(QualityRecord.verdict)
+        )
+    ).all()
+    by_verdict = {str(k): v for k, v in verdict_rows}
+    judged = by_verdict.get("pass", 0) + by_verdict.get("warn", 0) + by_verdict.get("fail", 0)
+    return {
+        "lookback_hours": lookback_hours,
+        "total_sessions": total_sessions,
+        "scanned_sessions": scanned,
+        "coverage": round(scanned / total_sessions, 4) if total_sessions else None,
+        "by_verdict": by_verdict,
+        "pass_rate": round(by_verdict.get("pass", 0) / judged, 4) if judged else None,
+    }
 
 
 def coerce_uuid(value: str):

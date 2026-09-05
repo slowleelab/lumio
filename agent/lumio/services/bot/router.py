@@ -1757,6 +1757,31 @@ class ChatEndRequest(BaseModel):
     session_id: str
 
 
+# ── 会话结束自动质检 (全量纳入口径) ─────────────────────────────
+
+# 后台巡检 task 引用 (项目规范: 防 asyncio GC 在 await 期间回收)
+_qa_end_tasks: set[asyncio.Task] = set()
+
+
+async def _qa_scan_after_end(session_factory, judge_llm, redis_client, session_id: str) -> None:
+    """客户结束会话后立即单会话巡检 (后台, 失败只记日志不阻塞)"""
+    try:
+        from lumio.services.common import quality_scan
+
+        settings = get_settings()
+        await quality_scan.scan_session_by_id(
+            session_factory,
+            judge_llm,
+            redis_client,
+            session_id,
+            quality_scan.judge_model_name(settings),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("会话结束自动质检失败 (不阻断): session=%s err=%s", session_id, exc)
+
+
 @router.post("/chat/end")
 async def chat_end(body: ChatEndRequest, req: Request, user: CurrentUser):
     """客户主动结束会话"""
@@ -1770,6 +1795,24 @@ async def chat_end(body: ChatEndRequest, req: Request, user: CurrentUser):
                 SessionPhase.ENDED,
                 reason="customer_ended",
             )
+
+    # 会话结束即自动质检: 每一个会话都纳入质检记录 (不等人工点全量巡检)。
+    # 单会话一次裁判调用; 已检会话走 30 天 Redis 去重; LLM/DB 未就绪静默跳过。
+    settings = get_settings()
+    if settings.llm.qa_scan_on_session_end:
+        sf = getattr(req.app.state, "db_session_factory", None)
+        judge_llm = None
+        with contextlib.suppress(Exception):
+            from lumio.services.common import quality_scan as _qs
+
+            judge_llm = _qs.build_judge_llm(getattr(req.app.state, "llm_client", None), settings)
+        if sf is not None and judge_llm is not None:
+            task = asyncio.create_task(
+                _qa_scan_after_end(sf, judge_llm, getattr(req.app.state, "redis_client", None), body.session_id)
+            )
+            _qa_end_tasks.add(task)
+            task.add_done_callback(_qa_end_tasks.discard)
+
     return {"status": "ok", "session_id": body.session_id}
 
 

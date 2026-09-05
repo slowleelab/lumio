@@ -355,6 +355,18 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
     }
 
 
+@router.get("/badcases/{badcase_id}")
+async def get_badcase_endpoint(badcase_id: str, user: AdminAgentUser, request: Request) -> dict[str, Any]:
+    """单条 Badcase 详情 (质检记录 fail 项 → 整改闭环跳转用; 注意注册在
+    /badcases/stats 之后, 防止 stats 被当成 path 参数吞掉)"""
+    from lumio.services.common.badcase_store import _to_dict
+
+    bc = await get_badcase(request.app.state.db_session_factory, badcase_id)
+    if bc is None:
+        raise LumioError(code=2001, message=f"Badcase 不存在: {badcase_id}")
+    return _to_dict(bc)
+
+
 @router.get("/health-metrics")
 async def closed_loop_health(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
     """闭环健康度七指标 (方案 §8.1): 转人工率/修复时长/复现率等聚合
@@ -441,7 +453,7 @@ async def start_quality_scan(
         sf,
         judge_llm,
         redis_client,
-        get_settings().llm.judge_model if get_settings().llm.judge_base_url else get_settings().llm.primary_model,
+        quality_scan.judge_model_name(get_settings()),
         limit=limit,
         sample_rate=sample_rate,
         lookback_hours=lookback_hours,
@@ -463,14 +475,43 @@ async def quality_scan_status(user: AdminAgentUser, request: Request) -> dict[st
     return status
 
 
+@router.get("/quality/records")
+async def quality_records_endpoint(
+    user: AdminAgentUser,
+    db: DbSession,
+    verdict: str | None = None,
+    keyword: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """质检记录列表: 每一个被巡检会话一条判定 (pass/warn/fail 全量),
+    按会话时间倒序 (对话发生顺序) — 工作台"质检记录"页签数据源"""
+    from lumio.services.common.badcase_store import list_quality_records
+
+    if verdict and verdict not in ("pass", "warn", "fail"):
+        raise LumioError(code=2001, message=f"verdict 非法: {verdict}")
+    items, total = await list_quality_records(db, verdict=verdict, keyword=keyword, limit=limit, offset=offset)
+    return {"total": total, "records": items}
+
+
+@router.get("/quality/coverage")
+async def quality_coverage_endpoint(
+    user: AdminAgentUser,
+    db: DbSession,
+    lookback_hours: int = Query(720, ge=1, le=24 * 90),
+) -> dict[str, Any]:
+    """质检覆盖统计: 窗口内应检会话 vs 已检会话 + 判定分布/合格率"""
+    from lumio.services.common.badcase_store import quality_coverage_stats
+
+    return await quality_coverage_stats(db, lookback_hours=lookback_hours)
+
+
 def _build_judge_llm_only(request: Request) -> Any:
     """质检巡检裁判: 远程 GLM 优先 (与归因裁判同源), 未配置走本地"""
-    from lumio.services.common.judge_client import RemoteJudgeClient
+    from lumio.services.common import quality_scan
 
     settings = get_settings()
     llm_client = getattr(request.app.state, "llm_client", None)
     if llm_client is None:
         raise LumioError(code=5001, message="LLM 未就绪")
-    if settings.llm.judge_base_url and settings.llm.judge_api_key:
-        return RemoteJudgeClient(fallback_llm=llm_client)
-    return llm_client
+    return quality_scan.build_judge_llm(llm_client, settings)

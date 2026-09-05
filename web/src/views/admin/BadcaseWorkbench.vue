@@ -1,7 +1,7 @@
 <template>
   <div class="badcase-page">
     <div class="page-header">
-      <h2>智能质检 <span class="page-subtitle">问题案例归因与整改闭环</span></h2>
+      <h2>智能质检 <span class="page-subtitle">全量会话质检记录 · 问题案例归因整改闭环</span></h2>
       <div class="header-actions">
         <el-tooltip placement="left" effect="light">
           <template #content>
@@ -55,7 +55,6 @@
       · 不合格 {{ scan.lastRun.n_fail }} 已采入待复核 ({{ scan.lastRun.finished_at?.slice(5, 16).replace("T", " ") }})
     </div>
 
-    <!-- 统计卡 (可点击联动筛选) -->
     <!-- 批量归因进度条 -->
     <el-progress
       v-if="batch.running"
@@ -73,6 +72,103 @@
         </span>
       </template>
     </el-progress>
+
+    <el-tabs v-model="activeTab" class="qa-tabs">
+      <!-- ══ 页签一: 质检记录 (每一个被巡检会话一条判定, 按会话时间倒序) ══ -->
+      <el-tab-pane name="records">
+        <template #label>质检记录 <span class="tab-hint">全量会话</span></template>
+        <div v-if="coverage" class="coverage-line">
+          近 30 天应检会话 <b>{{ coverage.total_sessions }}</b> · 已质检 <b class="ok">{{ coverage.scanned_sessions }}</b>
+          · 覆盖率 <b>{{ fmtPct(coverage.coverage) }}</b> · 合格率 <b>{{ fmtPct(coverage.pass_rate) }}</b>
+          <span class="muted"> (不合格 {{ coverage.by_verdict.fail ?? 0 }} / 提醒 {{ coverage.by_verdict.warn ?? 0 }})</span>
+        </div>
+        <div class="filters">
+          <el-select v-model="recFilters.verdict" placeholder="判定" clearable size="small" style="width: 110px" @change="reloadRecords">
+            <el-option label="合格" value="pass" />
+            <el-option label="提醒" value="warn" />
+            <el-option label="不合格" value="fail" />
+          </el-select>
+          <el-input
+            v-model="recFilters.keyword"
+            placeholder="搜索会话 ID / 首轮客户输入…"
+            clearable
+            size="small"
+            style="width: 220px"
+            :prefix-icon="Search"
+            @keyup.enter="reloadRecords"
+            @clear="reloadRecords"
+          />
+          <el-button size="small" @click="reloadRecords">查询</el-button>
+          <el-button v-if="recFilters.verdict || recFilters.keyword" size="small" link @click="clearRecFilters">清除筛选</el-button>
+        </div>
+
+        <el-table :data="records" v-loading="recLoading" stripe size="small" style="margin-top: 12px" @row-click="openRecord">
+          <el-table-column label="会话时间" width="150">
+            <template #default="{ row }">
+              <span :title="row.session_time ? `质检于 ${fmtTime(row.scanned_at)}` : `无会话时间锚点 · 质检于 ${fmtTime(row.scanned_at)}`">
+                {{ fmtTime(row.session_time || row.scanned_at) }}
+              </span>
+            </template>
+          </el-table-column>
+          <el-table-column label="首轮客户输入" min-width="220" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span class="input-text">{{ row.preview || "(无客户输入)" }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="轮数" width="58" align="center">
+            <template #default="{ row }">{{ row.turns ?? "-" }}</template>
+          </el-table-column>
+          <el-table-column label="判定" width="84">
+            <template #default="{ row }">
+              <el-tag size="small" :type="verdictType(row.verdict)">{{ verdictLabel(row.verdict) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="问题" min-width="170">
+            <template #default="{ row }">
+              <template v-if="row.problems?.length">
+                <el-tooltip
+                  v-for="(p, i) in row.problems"
+                  :key="i"
+                  :content="`${p.turn ? `第 ${p.turn} 轮 · ` : ''}${p.reason || ''}`"
+                  placement="top"
+                >
+                  <el-tag size="small" type="danger" effect="plain" class="problem-tag">{{ problemLabel(p.type) }}</el-tag>
+                </el-tooltip>
+              </template>
+              <span v-else class="muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="裁判" width="96" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span v-if="row.judge_model" class="model-tag">{{ shortModel(row.judge_model) }}</span>
+              <span v-else class="muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="170" fixed="right">
+            <template #default="{ row }">
+              <el-button link type="primary" size="small" @click.stop="gotoAuditSession(row.session_id)">会话回放</el-button>
+              <el-button v-if="row.badcase_id" link type="warning" size="small" @click.stop="openBadcaseById(row.badcase_id)">整改闭环</el-button>
+            </template>
+          </el-table-column>
+          <template #empty>
+            <el-empty description="暂无质检记录 — 点右上角「全量质检」扫描全部会话; 新会话结束会自动质检" :image-size="64" />
+          </template>
+        </el-table>
+        <el-pagination
+          v-model:current-page="recPage"
+          v-model:page-size="recPageSize"
+          :total="recTotal"
+          :page-sizes="[20, 50, 100]"
+          layout="total, sizes, prev, pager, next"
+          style="margin-top: 14px; justify-content: flex-end"
+          @current-change="loadRecords"
+          @size-change="reloadRecords"
+        />
+      </el-tab-pane>
+
+      <!-- ══ 页签二: 问题案例 (信号 + 质检 fail 的归因整改闭环) ══ -->
+      <el-tab-pane name="cases">
+        <template #label>问题案例 <span class="tab-hint">整改闭环</span></template>
 
     <div class="stat-cards">
       <div class="stat-card" :class="{ active: filters.needs_review === true }" @click="toggleStatFilter('needs_review', true)">
@@ -203,9 +299,9 @@
           <el-tag size="small" :type="fixStatusType(row.fix_status)">{{ fixStatusLabel(row.fix_status) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="时间" width="92">
+      <el-table-column label="会话时间" width="104">
         <template #default="{ row }">
-          <span :title="row.created_at">{{ relTime(row.created_at) }}</span>
+          <span :title="`会话 ${fmtTime(row.session_time)} · 采集 ${fmtTime(row.created_at)}`">{{ relTime(row.session_time || row.created_at) }}</span>
         </template>
       </el-table-column>
       <el-table-column label="操作" width="150" fixed="right">
@@ -234,6 +330,8 @@
       @current-change="load"
       @size-change="onSizeChange"
     />
+      </el-tab-pane>
+    </el-tabs>
 
     <!-- 详情抽屉 -->
     <el-drawer v-model="detailVisible" size="58%" destroy-on-close>
@@ -248,6 +346,9 @@
           <el-descriptions-item label="信号源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
           <el-descriptions-item label="出现次数">{{ detail.occurrences ?? 1 }} 次</el-descriptions-item>
           <el-descriptions-item label="采集时间">{{ fmtTime(detail.created_at) }}</el-descriptions-item>
+          <el-descriptions-item label="会话时间">
+            <span :title="`会话最后一轮对话时间; 采集时间是信号落库/巡检时刻`">{{ fmtTime(detail.session_time) }}</span>
+          </el-descriptions-item>
           <el-descriptions-item label="会话">
             <el-link type="primary" :underline="false" @click="gotoAudit(detail)">{{ detail.session_id?.slice(0, 24) }}…</el-link>
           </el-descriptions-item>
@@ -292,8 +393,46 @@
         </template>
         <div v-else class="section-title muted">尚未归因 — 点击下方「GLM 裁判归因」开始 (约 20-40 秒)</div>
 
-        <div class="section-title">八层现场快照</div>
-        <pre class="snapshot">{{ snapshotPretty }}</pre>
+        <!-- 质检判定 (qa_scan 采集的案例: 裁判指出的具体问题项) -->
+        <template v-if="qaVerdict">
+          <div class="section-title">
+            质检判定
+            <span class="muted section-hint">(全量质检巡检 · 与人工坐席质检同口径)</span>
+          </div>
+          <div class="qa-verdict">
+            <el-tag :type="verdictType(qaVerdict)" size="small">{{ verdictLabel(qaVerdict) }}</el-tag>
+            <span v-if="qaSummary" class="qa-summary">{{ qaSummary }}</span>
+          </div>
+          <div v-for="(p, i) in qaProblems" :key="i" class="qa-problem">
+            <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
+            <span class="qa-reason"><template v-if="p.turn">第 {{ p.turn }} 轮 · </template>{{ p.reason || "-" }}</span>
+          </div>
+        </template>
+
+        <div class="section-title">
+          采集现场快照
+          <span class="muted section-hint">(按问答链路分层展示; 原始数据可折叠查看)</span>
+        </div>
+        <el-descriptions v-if="snapRows.length" :column="2" border size="small">
+          <el-descriptions-item v-for="r in snapRows" :key="r.label" :label="r.label">{{ r.value }}</el-descriptions-item>
+        </el-descriptions>
+        <div v-if="snapTurnsMeta.length" class="turns-meta">
+          <div class="turns-meta-title">逐轮元数据 (对话走向: 每轮意图与回复来源)</div>
+          <div v-for="(t, i) in snapTurnsMeta" :key="i" class="turn-meta-row">
+            <span class="turn-idx">{{ i + 1 }}</span>
+            <span class="turn-speaker" :class="{ 'is-customer': t.speaker === 'customer' }">{{ t.speaker === "customer" ? "客户" : "Bot" }}</span>
+            <span class="turn-intent">意图: {{ t.intent || "-" }}</span>
+            <span class="turn-src">来源: {{ t.src || "-" }}</span>
+          </div>
+        </div>
+        <pre v-if="snapTranscript" class="snapshot transcript">{{ snapTranscript }}</pre>
+        <el-collapse v-if="detail.snapshot && Object.keys(detail.snapshot).length" class="raw-snap">
+          <el-collapse-item name="raw">
+            <template #title><span class="muted">查看原始快照数据 (调试用)</span></template>
+            <pre class="snapshot">{{ snapshotPretty }}</pre>
+          </el-collapse-item>
+        </el-collapse>
+        <div v-if="!detail.snapshot || !Object.keys(detail.snapshot).length" class="muted">(采集时未携带快照)</div>
 
         <div class="section-title">处理操作</div>
         <div class="action-grid">
@@ -330,13 +469,22 @@ import {
   getBatchAttributionStatus,
   expandGoldenSet,
   getBadcaseStats,
+  getBadcase,
   startQualityScan,
   getQualityScanStatus,
+  listQualityRecords,
+  getQualityCoverage,
   type Badcase,
+  type QualityRecord,
+  type QualityCoverage,
+  type QualityProblem,
   type QualityScanStatus,
 } from "@/api/closedLoop"
 
 const router = useRouter()
+
+// ── 页签: 质检记录 (全量会话判定) / 问题案例 (归因整改闭环) ──
+const activeTab = ref<"records" | "cases">("records")
 
 const badcases = ref<Badcase[]>([])
 const total = ref(0)
@@ -351,6 +499,87 @@ const filters = ref<{ signal_source: string; root_cause_layer: string; fix_statu
   keyword: "",
   needs_review: null,
 })
+
+// ── 质检记录列表 (页签一) ──
+const records = ref<QualityRecord[]>([])
+const recTotal = ref(0)
+const recPage = ref(1)
+const recPageSize = ref(50)
+const recLoading = ref(false)
+const recFilters = ref<{ verdict: string; keyword: string }>({ verdict: "", keyword: "" })
+const coverage = ref<QualityCoverage | null>(null)
+
+async function loadRecords() {
+  recLoading.value = true
+  try {
+    const res = await listQualityRecords({
+      verdict: recFilters.value.verdict || undefined,
+      keyword: recFilters.value.keyword || undefined,
+      limit: recPageSize.value,
+      offset: (recPage.value - 1) * recPageSize.value,
+    })
+    records.value = res.records
+    recTotal.value = res.total
+  } catch {
+    /* handled */
+  } finally {
+    recLoading.value = false
+  }
+}
+
+function reloadRecords() {
+  recPage.value = 1
+  loadRecords()
+}
+
+function clearRecFilters() {
+  recFilters.value = { verdict: "", keyword: "" }
+  reloadRecords()
+}
+
+async function loadCoverage() {
+  try {
+    coverage.value = await getQualityCoverage()
+  } catch {
+    /* handled */
+  }
+}
+
+function verdictLabel(v: string) {
+  return { pass: "合格", warn: "提醒", fail: "不合格" }[v] ?? v
+}
+function verdictType(v: string): string {
+  return { pass: "success", warn: "warning", fail: "danger" }[v] ?? "info"
+}
+const PROBLEM_LABELS: Record<string, string> = {
+  A: "答非所问",
+  B: "幻觉编造",
+  C: "越界承诺",
+  D: "漏转人工",
+  E: "未解决无引导",
+}
+function problemLabel(t?: string) {
+  return t ? (PROBLEM_LABELS[t] ?? t) : "-"
+}
+
+function gotoAuditSession(sessionId: string) {
+  router.push({ path: "/admin/audit", query: { session_id: sessionId } })
+}
+
+// 质检记录行点击: fail 且已采入闭环 → 打开对应问题案例; 否则跳会话回放
+function openRecord(row: QualityRecord) {
+  if (row.badcase_id) openBadcaseById(row.badcase_id)
+  else gotoAuditSession(row.session_id)
+}
+
+async function openBadcaseById(badcaseId: string) {
+  try {
+    const bc = await getBadcase(badcaseId)
+    if (bc) openDetail(bc)
+  } catch {
+    /* handled */
+  }
+}
 
 const hasActiveFilter = computed(() =>
   Boolean(filters.value.signal_source || filters.value.root_cause_layer || filters.value.fix_status || filters.value.keyword || filters.value.needs_review !== null),
@@ -509,6 +738,52 @@ const snapshotPretty = computed(() => {
   const snap = detail.value?.snapshot
   return snap && Object.keys(snap).length ? JSON.stringify(snap, null, 2) : "(采集时未携带快照)"
 })
+
+// ── 快照中文分层对照: 采集时的链路状态字段 → 人话 ──
+const SNAP_FIELD_LABELS: Record<string, string> = {
+  intent: "命中意图",
+  confidence: "意图置信度",
+  traffic_class: "流量分类",
+  response_source: "回复来源",
+  rag_hit: "RAG 检索",
+  context_len: "上下文轮数",
+  guard_reason: "护栏动作",
+  stage_detail: "阶段明细",
+}
+function snapFieldValue(key: string, v: unknown): string {
+  if (key === "confidence") return typeof v === "number" ? `${Math.round(v * 100)}%` : String(v ?? "-")
+  if (key === "rag_hit") return v ? "已命中知识库/工具" : "未命中"
+  if (v == null || v === "") return "-"
+  return typeof v === "object" ? JSON.stringify(v) : String(v)
+}
+const snapRows = computed(() => {
+  const snap = detail.value?.snapshot
+  if (!snap) return []
+  const rows: { label: string; value: string }[] = []
+  for (const [key, label] of Object.entries(SNAP_FIELD_LABELS)) {
+    if (key in snap) rows.push({ label, value: snapFieldValue(key, snap[key]) })
+  }
+  // 未收录的标量字段也照常显示 (兜底, 防止新增字段被吞)
+  for (const [key, v] of Object.entries(snap)) {
+    if (key in SNAP_FIELD_LABELS || key === "transcript" || key === "turns_meta") continue
+    if (typeof v !== "object") rows.push({ label: key, value: snapFieldValue(key, v) })
+  }
+  return rows
+})
+const snapTurnsMeta = computed(() => {
+  const meta = detail.value?.snapshot?.turns_meta
+  return Array.isArray(meta) ? (meta as { speaker: string; intent?: string; src?: string }[]) : []
+})
+const snapTranscript = computed(() => {
+  const t = detail.value?.snapshot?.transcript
+  return typeof t === "string" && t.trim() ? t : ""
+})
+
+// ── 质检判定 (qa_scan 采集的案例: signal_detail 里裁判结论) ──
+const qaDetail = computed(() => detail.value?.signal_detail as { verdict?: string; summary?: string; problems?: QualityProblem[] } | null)
+const qaVerdict = computed(() => qaDetail.value?.verdict ?? "")
+const qaSummary = computed(() => qaDetail.value?.summary ?? "")
+const qaProblems = computed<QualityProblem[]>(() => qaDetail.value?.problems ?? [])
 
 async function refreshAfterAction(msg: string) {
   ElMessage.success(msg)
@@ -716,7 +991,7 @@ async function pollScan() {
       }
       if (st.total > 0) {
         ElMessage.success(`全量质检完成: 不合格 ${st.n_fail} 已采入待复核 (合格率 ${((st.last_run?.pass_rate ?? 0) * 100).toFixed(1)}%)`)
-        await Promise.all([load(), loadStats()])
+        await Promise.all([load(), loadStats(), loadRecords(), loadCoverage()])
       }
     }
   } catch {
@@ -744,7 +1019,7 @@ async function addToGolden(row: Badcase) {
 }
 
 function gotoAudit(row: Badcase) {
-  router.push({ path: "/admin/audit", query: { session_id: row.session_id } })
+  gotoAuditSession(row.session_id)
 }
 
 // ── 展示工具 ──
@@ -805,6 +1080,8 @@ onMounted(() => {
   load()
   pollBatch()
   loadStats()
+  loadRecords() // 默认页签: 质检记录
+  loadCoverage()
 })
 onUnmounted(() => {
   if (batchTimer) clearInterval(batchTimer)
@@ -865,6 +1142,54 @@ onUnmounted(() => {
 }
 
 .batch-progress-text { font-size: var(--fs-sm); color: var(--color-text-secondary); }
+.qa-tabs {
+  margin-top: 8px;
+  .tab-hint { font-size: var(--fs-xs, 11px); color: var(--color-text-placeholder); margin-left: 4px; }
+}
+.coverage-line {
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+  padding: 4px 2px 0;
+  b { color: var(--color-text-primary); margin: 0 2px; }
+  b.ok { color: var(--el-color-success); }
+}
+.problem-tag { margin-right: 4px; margin-bottom: 2px; cursor: default; }
+.qa-verdict {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  .qa-summary { font-size: var(--fs-sm); color: var(--color-text-primary); }
+}
+.qa-problem {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--el-color-danger-light-9, #fef0f0);
+  margin-bottom: 4px;
+  font-size: var(--fs-sm);
+  .qa-reason { color: var(--color-text-primary); }
+}
+.turns-meta {
+  margin: 8px 0;
+  .turns-meta-title { font-size: var(--fs-xs, 11px); margin-bottom: 4px; color: var(--color-text-secondary); }
+  .turn-meta-row {
+    display: flex;
+    gap: 10px;
+    font-size: var(--fs-xs, 12px);
+    padding: 3px 8px;
+    border-radius: 4px;
+    &:nth-child(odd) { background: var(--el-fill-color-extra-light); }
+    .turn-idx { width: 22px; color: var(--color-text-placeholder); }
+    .turn-speaker { width: 30px; font-weight: 600; color: var(--color-text-secondary); &.is-customer { color: var(--el-color-primary); } }
+    .turn-intent { width: 130px; }
+    .turn-src, .turn-intent { color: var(--color-text-secondary); }
+  }
+}
+.snapshot.transcript { margin-top: 8px; max-height: 260px; overflow: auto; }
+.raw-snap { margin-top: 8px; }
 .filters {
   display: flex;
   gap: var(--space-2);

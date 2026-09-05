@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ## [Unreleased]
 
 ### Added
+- **智能质检工作台整改：全量会话纳入 + 会话时间排序 + 快照分层展示**（架构师 UI 复核逐项落地）
+  - 全量纳入：新增 `quality_record` 表持久化每一次质检判定（合格/提醒/不合格全覆盖，此前合格/提醒只存 Redis 30 天 TTL、工作台不可见）；会话结束自动质检钩子 `qa_scan_on_session_end`（chat_end 后台巡检, Redis 去重）+ 启动时 `backfill_redis_verdicts` 存量判定幂等回填（含首轮客户输入 preview 与 fail→badcase 关联）
+  - 会话时间锚点：`badcase.session_time` 新列（该会话最后一轮对话时间）+ `ix_badcase_session_time` 索引；列表按 `coalesce(session_time, scanned_at/created_at) DESC` 排序 — 批量回扫的 created_at 只是巡检时刻, 不能代表对话发生顺序；alembic `e8f9a0b1c2d3` 迁移含 dialogue_log 存量回填
+  - 新端点：`GET /admin/closed-loop/quality/records`（判定筛选/关键词搜索/分页）、`GET /admin/closed-loop/quality/coverage`（应检/已检/覆盖率/合格率统计）、`GET /admin/closed-loop/badcases/{id}`（质检记录→整改闭环直达；注册在 stats 路由之后防吞匹配）
+  - 工作台双页签重构：「质检记录（全量会话）」默认页 = 覆盖率横幅 + 判定筛选 + 会话时间倒序表格（首轮客户输入/轮数/问题标签/裁判/整改闭环直达）；「问题案例」保留归因整改闭环
+  - 现场快照可读化：原八层原始 JSON 改为「采集现场快照」中文分层展示 — 逐轮元数据（每轮意图/回复来源走向）+ 完整对话原文 + 关键字段说明, 原始数据折叠进「调试用」collapse
+
+### Added
 - **客户端模拟 Agent + 对话模拟管理页**（虚拟客户黑盒压测, 喂闭环/验链路/测延迟）
   - `services/common/simulator.py`：12 个场景剧本（账单查询槽位补齐/挂失确认链/分期 RAG/定义句式/复合意图/投诉/主动转人工/闲聊/乱码噪声/FAQ 直出/知识缺口+差评等）× N 并发虚拟客户；黑盒走自身 HTTP 链路 send→poll→feedback, 速率可配（用户数/间隔）, 期望命中/延迟 P95/差评计数实时统计
   - `/admin/simulator/{scenarios,start,stop,status}` 管理端点 + 前端「对话模拟」页（启停按钮/场景勾选/并发与间隔配置/统计卡/实时轮次表 3s 轮询）

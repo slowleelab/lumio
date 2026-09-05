@@ -209,6 +209,10 @@ class LLMSettings(BaseSettings):
     # 严格模式: 远程裁判失败重试耗尽后直接判该条失败, 绝不回退本地 (全程纯 GLM
     # 审计); 默认关 = 失败回退本地兜底, 闭环不断粮
     judge_strict: bool = False
+    # 会话结束自动质检 (chat_end 钩子): 每个客户主动结束的会话立即后台巡检,
+    # 不等人工点"全量质检" — 保证"每一个会话都纳入质检列表" (2026-09-03 整改)。
+    # 单会话一次裁判调用, 已检会话走 30 天 Redis 去重; 关闭后仅剩手动全量巡检。
+    qa_scan_on_session_end: bool = True
     # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
     # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
     classify_cache_enabled: bool = True

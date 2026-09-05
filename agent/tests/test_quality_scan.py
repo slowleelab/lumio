@@ -66,9 +66,12 @@ class TestScanSession:
         """fail → 采集 badcase (signal_source=qa_scan), 判定写 Redis 去重"""
         captured: dict = {}
 
+        recorded = MagicMock()
+        recorded.id = "bc-1"
+
         async def fake_capture(sf, **kw):
             captured.update(kw)
-            return MagicMock()
+            return recorded
 
         monkeypatch.setattr("lumio.services.common.badcase_store.capture_badcase", fake_capture)
 
@@ -87,32 +90,113 @@ class TestScanSession:
             {"speaker": "customer", "content": "帮我查账单", "intent": "bill_query", "response_source": None},
             {"speaker": "bot", "content": "信用卡挂失请致电客服热线。", "intent": None, "response_source": "knowledge"},
         ]
-        v = await scan_session(MagicMock(), judge, redis, "s1", turns, model="GLM-5.3-Flash")
+        rec_mock = AsyncMock()
+        monkeypatch.setattr("lumio.services.common.badcase_store.record_quality", rec_mock)
+
+        from datetime import UTC, datetime
+
+        session_time = datetime.now(UTC)
+        v = await scan_session(MagicMock(), judge, redis, "s1", turns, model="GLM-5.3-Flash", session_time=session_time)
 
         assert v["verdict"] == "fail"
         assert captured["signal_source"] == "qa_scan"
         assert captured["user_input"] == "帮我查账单"
         assert "挂失" in captured["bot_output"]
         assert captured["signal_detail"]["judge_model"] == "GLM-5.3-Flash"
+        assert captured["session_time"] == session_time, "会话时间锚点应透传到 badcase"
         assert redis.setex.await_count == 1
+        # fail 判定同时落质检记录 (badcase_id 关联), 每一个会话都进质检列表
+        assert rec_mock.await_count == 1
+        kw = rec_mock.await_args.kwargs
+        assert kw["verdict"] == "fail"
+        assert kw["badcase_id"] == "bc-1"
+        assert kw["session_time"] == session_time
+        assert kw["preview"] == "帮我查账单"
 
     @pytest.mark.asyncio
-    async def test_pass_no_capture(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_pass_no_capture_but_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """pass 不采集 badcase, 但判定照样落质检记录 (全量纳入口径)"""
         async def fake_capture(sf, **kw):
             raise AssertionError("pass 不应采集")
 
         monkeypatch.setattr("lumio.services.common.badcase_store.capture_badcase", fake_capture)
+        rec_mock = AsyncMock()
+        monkeypatch.setattr("lumio.services.common.badcase_store.record_quality", rec_mock)
         judge = MagicMock()
-        judge.chat_json = AsyncMock(return_value={"verdict": "pass", "problems": [], "summary": "ok"})
-        v = await scan_session(MagicMock(), judge, MagicMock(), "s2", [{"speaker": "customer", "content": "x"}], "m")
-        assert v["verdict"] == "pass"
+        judge.chat_json = AsyncMock(return_value={"verdict": "warn", "problems": [{"type": "E", "reason": "引导不足"}], "summary": "ok"})
+        v = await scan_session(MagicMock(), judge, MagicMock(), "s2", [{"speaker": "customer", "content": "怎么分期"}], "m")
+        assert v["verdict"] == "warn"
+        assert rec_mock.await_count == 1
+        kw = rec_mock.await_args.kwargs
+        assert kw["verdict"] == "warn"
+        assert kw["badcase_id"] is None
+        assert kw["preview"] == "怎么分期"
 
     @pytest.mark.asyncio
     async def test_judge_error_returns_error_verdict(self) -> None:
+        """裁判调用失败 → error 判定, 不写 Redis/不落库 (下轮重扫)"""
         judge = MagicMock()
         judge.chat_json = AsyncMock(side_effect=RuntimeError("judge down"))
         v = await scan_session(MagicMock(), judge, None, "s3", [{"speaker": "customer", "content": "x"}], "m")
         assert v["verdict"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_by_id_skips_already_scanned(self) -> None:
+        """chat_end 钩子: 30 天内已检会话直接跳过 (不打 DB)"""
+        redis = MagicMock()
+        redis.get = AsyncMock(return_value='{"verdict": "pass"}')
+        factory = MagicMock()
+        v = await quality_scan.scan_session_by_id(factory, MagicMock(), redis, "s9", "m")
+        assert v is None
+        factory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_by_id_skips_short_session(self) -> None:
+        """对话不足 2 轮 (问候/噪声) 不进质检"""
+        redis = MagicMock()
+        redis.get = AsyncMock(return_value=None)
+
+        async def fake_load_turns(sf, sid):
+            return [{"speaker": "customer", "content": "你好"}], None
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(quality_scan, "_load_session_turns", fake_load_turns)
+            v = await quality_scan.scan_session_by_id(MagicMock(), MagicMock(), redis, "s10", "m")
+        assert v is None
+
+
+class TestJudgeHelpers:
+    def _settings(self, remote: bool) -> object:
+        from types import SimpleNamespace
+
+        llm = SimpleNamespace(
+            judge_base_url="https://x" if remote else "",
+            judge_api_key="k" if remote else "",
+            judge_model="GLM-5.3-Flash",
+            primary_model="qwen2.5:7b",
+        )
+        return SimpleNamespace(llm=llm)
+
+    def test_judge_model_name_remote_vs_local(self) -> None:
+        assert quality_scan.judge_model_name(self._settings(True)) == "GLM-5.3-Flash"
+        assert quality_scan.judge_model_name(self._settings(False)) == "qwen2.5:7b"
+
+    def test_build_judge_llm_none_when_not_ready(self) -> None:
+        assert quality_scan.build_judge_llm(None, self._settings(True)) is None
+
+
+class TestRedisBackfill:
+    def test_parse_redis_verdict_ok(self) -> None:
+        raw = '{"verdict": "pass", "problems": [], "summary": "ok", "model": "GLM-5.3-Flash", "turns": 4, "scanned_at": "2026-09-01T10:00:00+00:00"}'
+        r = quality_scan._parse_redis_verdict("s1", raw)
+        assert r is not None
+        assert r["verdict"] == "pass" and r["turns"] == 4 and r["judge_model"] == "GLM-5.3-Flash"
+
+    def test_parse_redis_verdict_rejects_bad(self) -> None:
+        assert quality_scan._parse_redis_verdict("s1", "not-json") is None
+        assert quality_scan._parse_redis_verdict("s1", '{"verdict": "BANANA", "scanned_at": "2026-09-01T10:00:00+00:00"}') is None
+        # scanned_at 缺失 = 幂等键缺失, 宁可不回填
+        assert quality_scan._parse_redis_verdict("s1", '{"verdict": "pass"}') is None
 
 
 def test_rubric_mentions_all_dimensions() -> None:

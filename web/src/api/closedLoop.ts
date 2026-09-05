@@ -26,6 +26,7 @@ export interface Badcase {
   resolved_at: string | null
   snapshot: Record<string, unknown> | null
   created_at: string | null
+  session_time?: string | null
   occurrences?: number
 }
 
@@ -58,6 +59,10 @@ export function listBadcases(params?: {
   offset?: number
 }): Promise<BadcaseListResponse> {
   return client.get("/admin/closed-loop/badcases", { params })
+}
+
+export function getBadcase(badcaseId: string): Promise<Badcase> {
+  return client.get(`/admin/closed-loop/badcases/${badcaseId}`)
 }
 
 export function attributeBadcase(badcaseId: string): Promise<Record<string, unknown>> {
@@ -150,4 +155,53 @@ export function startQualityScan(opts?: {
 
 export function getQualityScanStatus(): Promise<QualityScanStatus> {
   return client.get("/admin/closed-loop/quality/scan/status")
+}
+
+// ── 质检记录 (每个被巡检会话一条判定, 按会话时间倒序) ──
+
+export interface QualityProblem {
+  type: string // A 答非所问 / B 幻觉编造 / C 越界承诺 / D 漏转人工 / E 未解决无引导
+  turn?: number
+  reason?: string
+}
+
+export interface QualityRecord {
+  id: string
+  session_id: string
+  verdict: "pass" | "warn" | "fail"
+  problems: QualityProblem[]
+  summary: string | null
+  preview: string | null
+  judge_model: string | null
+  turns: number | null
+  session_time: string | null
+  scanned_at: string | null
+  badcase_id: string | null
+}
+
+export interface QualityRecordListResponse {
+  total: number
+  records: QualityRecord[]
+}
+
+export function listQualityRecords(params?: {
+  verdict?: string
+  keyword?: string
+  limit?: number
+  offset?: number
+}): Promise<QualityRecordListResponse> {
+  return client.get("/admin/closed-loop/quality/records", { params })
+}
+
+export interface QualityCoverage {
+  lookback_hours: number
+  total_sessions: number
+  scanned_sessions: number
+  coverage: number | null
+  by_verdict: Record<string, number>
+  pass_rate: number | null
+}
+
+export function getQualityCoverage(lookbackHours = 720): Promise<QualityCoverage> {
+  return client.get("/admin/closed-loop/quality/coverage", { params: { lookback_hours: lookbackHours } })
 }

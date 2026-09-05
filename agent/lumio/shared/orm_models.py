@@ -1208,6 +1208,10 @@ class Badcase(Base):
     fix_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
+    # 会话时间锚点 (该会话最后一轮对话时间): 工作台按对话发生顺序排列,
+    # 而非采集时间 (qa_scan 批量回扫时 created_at 只是巡检时刻, 会打乱现场时序)
+    session_time: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
     input_embedding: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     dedup_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
@@ -1228,5 +1232,46 @@ class Badcase(Base):
         Index("ix_badcase_fix_status", "fix_status"),
         Index("ix_badcase_root_layer", "root_cause_layer"),
         Index("ix_badcase_created", "created_at"),
+        Index("ix_badcase_session_time", "session_time"),
         Index("ix_badcase_trace", "trace_id"),
+    )
+
+
+class QualityRecord(Base):
+    """质检记录表 (qa_scan 全量会话质检的持久化层)
+
+    每个被巡检会话一条判定记录 (pass/warn/fail 全量落库):
+    - pass/warn 此前只写 Redis (30 天 TTL) — 会话清单在工作台不可见,
+      "每一个会话都纳入质检列表"无从谈起; 本表把判定变成可查询资产
+    - fail 额外采集 badcase (badcase_id 关联), 走归因/修复闭环
+    - 同会话 reinspect 会产生多条记录 (append-only 审计口径)
+    """
+
+    __tablename__ = "quality_record"
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)  # pass/warn/fail
+    problems: Mapped[list | None] = mapped_column(JSON, nullable=True)  # [{type,turn,reason}]
+    summary: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 代表性话轮预览 (首个客户输入, 列表页直读, 免回放 transcript)
+    preview: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    judge_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 会话时间锚点 (对话最后一轮时间) + 质检时间
+    session_time: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    scanned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
+    )
+    badcase_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index("ix_quality_record_session", "session_id"),
+        Index("ix_quality_record_verdict", "verdict"),
+        Index("ix_quality_record_session_time", "session_time"),
+        Index("ix_quality_record_scanned", "scanned_at"),
     )
