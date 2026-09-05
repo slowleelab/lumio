@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ## [Unreleased]
 
 ### Added
+- **意图体系 Phase 3 收官：子词碎片显式出路 + OOD 阈值重标定（会话 79572c98 "信用"复盘）**
+  - faq 残差类拆解完成：faq 种子审核确认 34 条均为真实"通用政策咨询"（种子干净，残差是模型行为）；同数据重训经论证为无效操作（md5 证实管线产物与部署模型同一）——补全的是机制而非权重
+  - 子词碎片短路：规则/BERT 均无法采纳、规则层亦无信号（<0.5）的 ≤2 字裸词（"信用"/"卡片"/"年费"），在向量通道之前短路（L2 会把碎片语义猜测成 faq 种子抬过采纳线，E2E 实测），标记 source=subword 交噪声门确定性拦回澄清——零 LLM 零检索；规则信号词豁免（"挂失"@0.56/"投诉"@0.62 照走级联）
+  - OOD 池 v1.1（29→40 条：+无意义名词 +子词碎片探针）+ 能量阈值重标定：known 线锚定生产值 -3.70 不变（零新增仲裁），unknown 线 -2.70→-2.90（语义 OOD 卡皮巴拉@-2.88/天气@-2.82 全部划入确定性拦截）；.env CLS_OOD_ENERGY_THRESHOLD=-3.30 / CLS_OOD_AMBIGUOUS_BAND=0.4
+  - E2E：'信用' 23.4s→**0.7s**（0 LLM）确定性澄清；账单查询 0.5s；FAQ 词条 0.1s 直出；能量不可分子词由 subword 门兜底（入池诚实报告其命中率≈0）
 - **意图体系 Phase 3/4 落地（架构整改续篇）**
   - 分类状态透明化：`IntentResult.classification_source` 透传真识别（bert/vector/rule/llm）与弱识别/兜底（fallback/bert:lowconf/bert:ood）；兜底轮审计叙事改为"未识别（按兜底意图落档）…交噪声门拦截澄清"，不再伪装成"识别为知识咨询"（faq 四职合一的观感来源）
   - 按类快路径阈值：`scripts/intent_threshold_calibrate.py` 用种子金标集（191 例，BERT top-1 精度 99.5%）逐类校准采纳阈值写入 `fast_path_thresholds.json`；运行时按预测类查表（缺类沿用实例默认）。当前口径 floor=0.7 = 只允许比全局更严，放宽需生产标注数据背书；闭环坏例回流积累后重跑即逐类收紧

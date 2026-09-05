@@ -3772,6 +3772,11 @@ class LumioAgent:
         # "信用卡额度是什么"这类真问题。
         if _fast_slow_disagreement(intent) and _disagreement_is_dangerous(intent):
             return "fast_slow_disagreement", evidence
+        # Phase 3 · 子词碎片确定性拦截: ≤2 字裸词 ("信用"/"卡片") 被分类器标记
+        # source=subword (规则/BERT/能量都给不出可靠信号, LLM 只会幻觉 faq@0.6x)。
+        # 回话/等槽豁免已在上方返回, 到这里的裸词直接确定性澄清, 零 LLM。
+        if getattr(intent, "classification_source", None) == "subword":
+            return "subword_ambiguous", evidence
         # P1: 模糊带宽仲裁 — 语义吃不准(BERT 中段 energy / 低置信但非噪声)时交 LLM 裁决.
         # LLM 结果作为弱信号投票, 不单独放行: 仅当 LLM 明确判 business 时结合实体/槽位放行,
         # 判 noise 则拦截; chitchat/unknown 交由下方既有语义路径(不硬拦, 也不硬答).

@@ -2593,3 +2593,29 @@ class TestFaqGateway:
         # 非精确模式 (知识路径网关) 语义命中正常直出
         hit = await agent._try_faq_direct("s1", "临时需要用卡怎么办")
         assert hit is not None and hit["response_source"] == "faq"
+
+
+class TestSubwordGate:
+    """Phase 3 · 子词碎片噪声门确定性拦截"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_subword_blocked(self) -> None:
+        """裸词 source=subword → 确定性拦截澄清, 零 LLM"""
+        agent = self._make_agent()
+        intent = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.61, classification_source="subword")
+        reason, _ = await agent._evaluate_noise_gate("s1", "信用", intent, [], [])
+        assert reason == "subword_ambiguous"

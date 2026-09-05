@@ -1257,3 +1257,64 @@ async def test_fallback_merge_keeps_llm_verdict() -> None:
     assert intent.primary_intent == IntentLabel.INSTALLMENT_INQUIRY
     # 但 LLM 裁决结论必须保留 — 噪声门据此免二次仲裁
     assert intent.llm_input_class == "business"
+
+
+# ── Phase 3 · 子词碎片显式出路 ──
+
+
+@pytest.mark.asyncio
+async def test_subword_short_circuits_slow_path() -> None:
+    """≤2 字裸词 ("信用") 不进 LLM 慢路径 — source=subword 交噪声门确定性澄清
+
+    会话 79572c98: LLM 对裸词只会幻觉 faq@0.6x (6s 超时 + 长篇大论 23.4s)。
+    """
+    fake_bert = _fake_bert(IntentLabel.FAQ, 0.61)  # BERT 弱识别, 不够快路径采纳
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(side_effect=AssertionError("子词不应进 LLM 慢路径"))
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("信用")
+    assert source == "subword"
+    assert intent.classification_source == "subword"
+    mock_llm.classify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_subword_spared_for_rule_signaled_action_word() -> None:
+    """规则层有意图信号的动作词 ("挂失"@0.56) 不受子词短路 — 照走慢路径识别"""
+    fake_bert = _fake_bert(IntentLabel.FAQ, 0.5)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.85, llm_input_class="business"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("挂失")
+    assert source == "llm"
+    assert intent.primary_intent == IntentLabel.CARD_LOSS
+    assert intent.llm_input_class == "business"
+
+
+@pytest.mark.asyncio
+async def test_full_sentence_not_subword() -> None:
+    """正常完整句不触发子词短路 (长度>2), 弱置信照走慢路径"""
+    fake_bert = _fake_bert(IntentLabel.FAQ, 0.61)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.8, llm_input_class="business"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, bert_classifier=fake_bert
+    )
+    _, _, _, source = await classifier.classify("信用卡的年费政策是什么样的")
+    assert source in ("llm", "fallback")

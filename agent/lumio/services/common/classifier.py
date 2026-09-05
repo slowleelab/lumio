@@ -1013,6 +1013,31 @@ class IntentClassifier:
             fast_result = self._rule.classify(text)
             self._last_energy = None
 
+        # 规则判定统一上提 (子词豁免 + 后续覆盖判定共用; 纯正则 <1ms, 上提零成本)
+        rule_fast = self._rule.classify(text)
+
+        # Phase 3 · 子词碎片显式出路 (会话 79572c98 复盘): 规则/BERT 都没能高置信
+        # 采纳、且规则层也无意图信号的 ≤2 字裸词 ("信用"@faq0.0/"卡片"/"年费") —
+        # 能量检测原理上分不开 (域内词汇构成, "信用"@-3.71 比真业务句中位能量更
+        # 深), L2 向量会把碎片语义猜测成 faq 种子抬过采纳线 (p4sub E2E 实测),
+        # LLM 慢路径也只会幻觉 faq@0.6x。在向量通道之前短路, 标记 source=subword
+        # 交噪声门确定性拦回澄清, 零 LLM 零检索。
+        # 豁免: 规则置信 ≥0.5 的动作词 ("挂失"@0.56/"投诉"@0.62) 有明确意图信号,
+        # 照走级联; 高置信查询词 ("额度"@0.95) 由上方快路径结果直接采纳。
+        import re as _re_subword
+
+        _stripped_subword = _re_subword.sub(r"[\s，。、；：！？!?,.;:·…～~#@*&%$()（）\"'\-]+", "", text)
+        if len(_stripped_subword) <= 2 and rule_fast.primary_confidence < 0.5:
+            logger.info(
+                "子词碎片短路 (len=%d): intent=%s@%.2f → 噪声门确定性澄清 (text=%r)",
+                len(_stripped_subword),
+                fast_result.primary_intent.value,
+                fast_result.primary_confidence,
+                text[:12],
+            )
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "subword")
+            return fast_result, extract_entities(text), self._rule_sentiment(text), "subword"
+
         # ── L2 向量检索意图 (目标架构 ③: L1 规则 → L2 向量 → L3 LLM) ──
         # L1 未强命中时, 与种子语料余弦检索取意图; 置信不足才落 L3 LLM。
         # BERT 保留为证据信号 (fast_conf/fast_intent 透传审计), 不再单独定路由。
@@ -1063,7 +1088,7 @@ class IntentClassifier:
         # 后会经工具编排真执行提额确认链, 违背"办理交官方渠道, 机器人返回办理介绍"。
         # 规则层高置信 (≥0.95) 命中办理词时以规则意图覆盖快路径; 仅覆盖这两个意图,
         # 其余分类零回归。BERT 关闭时 rule==rule 为空操作。
-        rule_fast = self._rule.classify(text)
+        # (rule_fast 已在级联头部统一计算)
         # 同意图置信提升 (闭环挂账: "卡好像被盗了" BERT 判 card_loss@0.5x、规则
         # 判 0.96 — 意图相同不触发旧覆盖条件, 低置信落 LLM 慢路径 0.76 错过
         # 直连阈值): 敏感意图规则高置信而快路径置信不足时, 用规则置信 —
