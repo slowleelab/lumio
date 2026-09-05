@@ -131,9 +131,11 @@
             </el-tab-pane>
 
             <el-tab-pane :label="`决策链 (${replay.decisions.length})`" name="decisions">
-              <div v-for="(g, gi) in turnGroups" :key="g.turnId" class="turn-group">
+              <div v-for="g in turnGroups" :key="g.turnId" class="turn-group">
                 <div class="turn-group-head">
-                  <span class="turn-badge">第 {{ gi + 1 }} 轮</span>
+                  <span class="turn-badge" :class="{ 'turn-badge-legacy': g.legacy }">
+                    {{ g.legacy ? "历史记录 · 未分轮" : `第 ${g.newIndex} 轮` }}
+                  </span>
                   <span class="turn-time">{{ formatTime(g.decisions[0].created_at) }}</span>
                   <span v-if="g.totalMs != null" class="turn-total">全程 {{ g.totalMs >= 1000 ? (g.totalMs / 1000).toFixed(1) + 's' : Math.round(g.totalMs) + 'ms' }}</span>
                   <span class="turn-steps">{{ g.decisions.length }} 步</span>
@@ -354,20 +356,37 @@ function agentLabel(name: string) {
   return AGENT_LABELS[name] ?? name
 }
 // ── 决策链按轮分组: 同一 turn_id 的决策归为一轮 (turn_id 由消息出队时绑定贯穿) ──
+// 存量兼容: 修复前的决策每条独立 uuid4 (无 turn_start 特征), 按轮分组会把
+// 一轮的 N 步拆成 N 个假轮次 — 合并为一个「历史记录 · 未分轮」组如实展示。
 const turnGroups = computed(() => {
   const decisions = replay.value?.decisions ?? []
-  const groups: Array<{ turnId: string; decisions: typeof decisions; totalMs: number | null }> = []
+  type Group = { turnId: string; decisions: typeof decisions; totalMs: number | null; legacy: boolean; newIndex: number }
   const byTurn = new Map<string, typeof decisions>()
   for (const d of decisions) {
     const key = d.turn_id || "-"
     if (!byTurn.has(key)) byTurn.set(key, [])
     byTurn.get(key)!.push(d)
   }
+  const legacy: typeof decisions = []
+  const fresh: Group[] = []
   for (const [turnId, ds] of byTurn) {
-    const done = ds.find((x) => x.action === "chain_complete" && typeof x.latency_ms === "number")
-    groups.push({ turnId, decisions: ds, totalMs: done ? done.latency_ms : null })
+    if (ds.some((x) => x.action === "turn_start")) {
+      const done = ds.find((x) => x.action === "chain_complete" && typeof x.latency_ms === "number")
+      fresh.push({ turnId, decisions: ds, totalMs: done ? done.latency_ms : null, legacy: false, newIndex: 0 })
+    } else {
+      legacy.push(...ds)
+    }
   }
-  return groups
+  const out: Group[] = []
+  if (legacy.length) {
+    const done = legacy.find((x) => x.action === "chain_complete" && typeof x.latency_ms === "number")
+    out.push({ turnId: "legacy", decisions: legacy, totalMs: done ? done.latency_ms : null, legacy: true, newIndex: 0 })
+  }
+  fresh.forEach((g, i) => {
+    g.newIndex = i + 1
+    out.push(g)
+  })
+  return out
 })
 
 // evidence 关键字段 → 人话摘要 (只挑审阅者关心的; 原始 JSON 仍可展开)
@@ -649,6 +668,10 @@ onMounted(() => {
   color: var(--color-primary);
   background: var(--color-primary-light-9, rgba(64, 158, 255, 0.1));
   border-radius: 10px;
+}
+.turn-badge-legacy {
+  color: var(--color-text-secondary);
+  background: var(--color-fill, rgba(0, 0, 0, 0.06));
 }
 .turn-time {
   font-size: var(--fs-xs, 12px);
