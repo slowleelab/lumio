@@ -1226,6 +1226,10 @@ class IntentClassifier:
             )
             await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
             fast_result.energy = self._last_energy
+            # 单次裁决完整性 (会话 79572c98 复盘): 慢路径 LLM 已付代价跑完并给出
+            # 业务/闲聊/噪声判定, 回退快路径意图时裁决结论必须随行 — 否则噪声门
+            # 见不到 llm_input_class, 对同一输入再打一次仲裁 LLM (6.5s+6.3s 双花)。
+            fast_result.llm_input_class = llm_result.llm_input_class
             return fast_result, extract_entities(text), SentimentLabel.NEUTRAL, "fallback"
 
         # LLM 结果置信度也很低时，标记来源为 fallback

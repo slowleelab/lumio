@@ -1228,3 +1228,32 @@ async def test_classification_source_transparent() -> None:
     intent2, _, _, source2 = await classifier2.classify("这个怎么弄")
     assert source2 == "fallback"
     assert intent2.classification_source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_fallback_merge_keeps_llm_verdict() -> None:
+    """慢路径被回退时裁决结论随行 (会话 79572c98 复盘)
+
+    慢路径 LLM 已跑完并输出 input_class, 回退快路径意图若丢掉该结论,
+    噪声门会对同一输入再打一次仲裁 LLM (6.5s+6.3s 双花, 全程 23.4s 的元凶)。
+    """
+    from lumio.services.common.bert_classifier import BertIntentClassifier  # noqa: F401  (仅示类型来源)
+
+    fake_bert = _fake_bert(IntentLabel.INSTALLMENT_INQUIRY, 0.6)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5, llm_input_class="business"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("分期的事情")
+    # 快路径业务意图 0.6 > 慢路径 faq@0.5 → 回退快路径
+    assert source == "fallback"
+    assert intent.primary_intent == IntentLabel.INSTALLMENT_INQUIRY
+    # 但 LLM 裁决结论必须保留 — 噪声门据此免二次仲裁
+    assert intent.llm_input_class == "business"
