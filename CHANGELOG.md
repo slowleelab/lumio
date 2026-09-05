@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 ## [Unreleased]
 
 ### Fixed
+- **紧急诉求 OOD 豁免（对话模拟第一轮复盘，switch_topic_mid 31% 澄清率）**：等待补卡号期间"先别查了, 我要挂失"被 OOD 门拦成"没太明白"——向量通道把挂失句吸到 faq@0.85、BERT 弱信号 card_loss@0.29 才是对的，快慢分歧标记反而成为拦截理由；紧急标记（挂失/被盗类）输入不再按 ood_unknown 拦截，交知识/敏感链路给出挂失指引（与 FAQ 通道紧急豁免同纪律）
+
+### Fixed
 - **LLM 切换远程 API 时嵌入/重排连带断链**：embed/reranker 的 Ollama 地址此前从 `llm.base_url` 推导，LLM 切远程（如硅基流动）后嵌入被指向远程 API 导致 embedding down — 新增独立配置 `RAG_OLLAMA_BASE_URL`（默认 localhost:11434）解耦
 - **FAQ BM25 主体词覆盖门（会话 sf2 复盘）**："信用卡逾期了会有什么后果"仅凭"信用卡"一词命中"信用卡年费是多少？"@7.74（短文档 BM25 长度归一化放大单词命中，高分段又豁免区分度检查）直出错答案；新增覆盖门：IK 分词取查询主体词（停用词滤除），命中文档须实际包含 ≥2 个且 ≥50%（单词问句不拦交分数门），_analyze 不可用时降级回旧行为
 

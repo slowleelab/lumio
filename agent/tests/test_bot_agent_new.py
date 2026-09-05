@@ -2619,3 +2619,64 @@ class TestSubwordGate:
         intent = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.61, classification_source="subword")
         reason, _ = await agent._evaluate_noise_gate("s1", "信用", intent, [], [])
         assert reason == "subword_ambiguous"
+
+
+class TestEmergencyOodExemption:
+    """模拟复盘: 等待补槽期间的紧急挂失诉求不得被 OOD 门拦成"没太明白\""""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_emergency_not_blocked_by_ood(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """能量 unknown + 快慢分歧 + 紧急标记 → 不按 ood_unknown 拦 (交知识/敏感链路)"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = 0.0
+        settings.classification.ood_ambiguous_band = 1.0  # energy=2.0 → unknown
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        intent = IntentResult(
+            primary_intent=IntentLabel.FAQ,
+            primary_confidence=0.85,
+            energy=2.0,
+            fast_conf=0.29,
+            fast_intent=IntentLabel.CARD_LOSS,  # 快慢分歧 (向量 faq@0.85 vs BERT card_loss@0.29)
+        )
+        reason, _ = await agent._evaluate_noise_gate("s1", "先别查了, 我要挂失", intent, [], [])
+        assert reason != "ood_unknown"
+
+    @pytest.mark.asyncio
+    async def test_non_emergency_ood_still_blocked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """无紧急标记的 unknown 输入照拦 (豁免只给紧急诉求)"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = 0.0
+        settings.classification.ood_ambiguous_band = 1.0
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        intent = IntentResult(
+            primary_intent=IntentLabel.FAQ,
+            primary_confidence=0.5,  # 弱置信 → strong_business 不成立
+            energy=2.0,
+            fast_conf=0.29,
+        )
+        reason, _ = await agent._evaluate_noise_gate("s1", "卡皮巴拉是什么呀", intent, [], [])
+        assert reason == "ood_unknown"

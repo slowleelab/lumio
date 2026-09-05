@@ -3751,7 +3751,12 @@ class LumioAgent:
                 and get_domain(intent.primary_intent) not in ("fallback",)
                 and not _fast_slow_disagreement(intent)
             )
-            if not strong_business:
+            # 紧急诉求豁免 (模拟复盘: 等待补卡号期间"先别查了, 我要挂失"被 OOD
+            # 拦成"没太明白"—— 快慢分歧标记反而成为拦截理由, 而分歧真相是向量
+            # 通道把挂失句吸到 faq@0.85、BERT 弱信号 card_loss@0.29 才是对的)。
+            # 挂失/被盗类输入即使能量判 unknown 也不按 OOD 拦, 交知识/敏感链路
+            # 给出挂失指引 — 与 FAQ 通道紧急豁免同纪律。
+            if not strong_business and not _has_emergency_marker(user_input):
                 return "ood_unknown", evidence
         if low_conf:
             # 分类器失败兜底 (conf=0.0) 不拦: 放行走 RAG, 由检索 grounding/

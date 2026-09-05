@@ -130,6 +130,7 @@ async def test_chat_full_flow_single_message(bot_client: httpx.AsyncClient):
         "rag",
         "retrieval",
         "llm",
+        "knowledge",  # RAG 命中后的知识生成 (合法终态来源)
         "fallback",
         "template",
         "faq",
