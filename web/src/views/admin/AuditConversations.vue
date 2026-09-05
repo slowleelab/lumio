@@ -327,6 +327,7 @@ function confClass(v: number | null) {
 // ── 决策链可读化: action 中文化+语义配色 / evidence 关键字段摘要 ──
 const ACTION_META: Record<string, { label: string; tag: string; dot: string; color?: string }> = {
   turn_start: { label: "消息出队", tag: "info", dot: "" },
+  route_decision: { label: "路由决策", tag: "warning", dot: "warning" },
   intent_classify: { label: "意图分类", tag: "primary", dot: "primary" },
   tool_call: { label: "工具执行", tag: "success", dot: "success" },
   rag_retrieve: { label: "知识检索", tag: "primary", dot: "primary" },
@@ -482,6 +483,16 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
   const ev = d.evidence ?? {}
   const conf = typeof ev.confidence === "number" ? `${Math.round(ev.confidence * 100)}%` : null
   switch (d.action) {
+    case "route_decision": {
+      // 两级路由判定 (新动作): 决策一交易性质 / 决策二咨询分流 / 闲聊短路
+      if (ev.chitchat_redirect) {
+        return "识别为闲聊或无效输入，直接用固定话术引导客户说明业务需求（不检索、不 AI 生成）"
+      }
+      if (ev.traffic_class != null) {
+        return `根据识别结果选择处理方式：${TRAFFIC_ZH[String(ev.traffic_class)] ?? String(ev.traffic_class)}`
+      }
+      return "意图属于咨询类，进入知识问答流程（检索知识库 + AI 组织回答）"
+    }
     case "intent_classify": {
       // 路由预备决策 (traffic_class 存在) vs 纯意图决策
       if ("traffic_class" in ev && ev.traffic_class != null) {
@@ -506,7 +517,7 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
       if (ev.direct) {
         return `识别把握很高，跳过 AI 决策环节，直接调用「${ev.tool}」为客户办理（更快更稳定）`
       }
-      if (ev.chain === "B") {
+      if (ev.chain === "B" || ev.route === "query") {
         const parts = [`直接调用查询工具「${ev.tool ?? "?"}」查系统数据（不走 AI 对话）`]
         parts.push(ev.cache_hit ? "，结果来自近期缓存，未重复查询" : "")
         if (Array.isArray(ev.missing_params) && ev.missing_params.length) parts.push(`；还缺信息：${(ev.missing_params as string[]).join("、")}`)

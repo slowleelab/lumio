@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
   - 回复缓存键加归一化问题：此前按 工具+参数 缓存最终回复，同卡不同问题会拿到错配答案
   - turn_id 按轮贯穿：每条决策独立 uuid4 无法按轮分组；出队时绑定轮次上下文（contextvar）全链继承，并新增 turn_start 出队留痕（排队耗时此前完全不可见）
   - 查询直达分段计时（mcp_ms/summarize_ms 随决策落库）+ 决策证据卡号/金额 PII 脱敏（复用 mask_pii_in_text）
+  - 路由决策专用动作 route_decision：两级路由留痕此前借用 TOOL_CALL，审计链把路由判定标成"工具执行"（与真正工具执行混淆，用户实测反馈）；闲聊短路留痕同步归位
 
 ### Changed
 - **决策链展示重构（对话审计回放）**：决策链按"第 N 轮"分组（轮徽标 + 全程耗时 + 步数），新增消息出队/诉求跟踪动作中文化，排队/工具调用/摘要生成分段耗时直读，dict 证据对象渲染修复

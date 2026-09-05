@@ -248,3 +248,8 @@ def test_turn_context_inheritance(monkeypatch):
 def test_turn_start_action_value():
     """出队留痕动作存在 (排队耗时归因)"""
     assert DecisionAction.TURN_START.value == "turn_start"
+
+
+def test_route_decision_action_value():
+    """路由决策专用动作存在 — 此前借用 TOOL_CALL, 审计链把路由判定标成"工具执行\""""
+    assert DecisionAction.ROUTE_DECISION.value == "route_decision"

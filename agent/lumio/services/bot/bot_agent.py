@@ -854,7 +854,9 @@ class LumioAgent:
             log_decision(
                 session_id=session_id,
                 agent_name="bot_agent",
-                action=DecisionAction.TOOL_CALL if traffic is not None else DecisionAction.INTENT_CLASSIFY,
+                # 路由决策专用动作: 此前借用 TOOL_CALL/INTENT_CLASSIFY, 审计链上
+                # 路由判定被标成"工具执行", 与真正的工具执行混淆 (用户实测反馈)
+                action=DecisionAction.ROUTE_DECISION,
                 reasoning=(
                     "两级路由：第一级判定="
                     + (
@@ -1005,7 +1007,7 @@ class LumioAgent:
                 log_decision(
                     session_id=session_id,
                     agent_name="bot_agent",
-                    action=DecisionAction.INTENT_CLASSIFY,
+                    action=DecisionAction.ROUTE_DECISION,
                     reasoning="闲聊域轻回复引导(决策二短路), 不检索不生成",
                     evidence={
                         "traffic_class": None,
