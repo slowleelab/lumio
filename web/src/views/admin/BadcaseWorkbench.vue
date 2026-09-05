@@ -226,10 +226,10 @@
       </el-select>
       <el-input
         v-model="filters.keyword"
-        placeholder="搜索用户输入…"
+        placeholder="搜索会话 ID / 用户输入…"
         clearable
         size="small"
-        style="width: 200px"
+        style="width: 230px"
         :prefix-icon="Search"
         @keyup.enter="reload"
         @clear="reload"
@@ -297,6 +297,11 @@
       <el-table-column label="状态" width="82">
         <template #default="{ row }">
           <el-tag size="small" :type="fixStatusType(row.fix_status)">{{ fixStatusLabel(row.fix_status) }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="会话 ID" width="126" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span class="session-id" :title="`点击行查看详情 · ${row.session_id}`">{{ row.session_id }}</span>
         </template>
       </el-table-column>
       <el-table-column label="会话时间" width="104">
@@ -1200,6 +1205,11 @@ onUnmounted(() => {
 .filter-spacer { flex: 1; }
 .muted { color: var(--color-text-secondary); }
 .input-text { cursor: pointer; }
+.session-id {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
 .model-tag {
   font-size: var(--fs-xs, 11px);
   border: 1px solid var(--el-border-color-light);

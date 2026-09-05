@@ -6,7 +6,8 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+import uuid_utils
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lumio.services.common.badcase_loop import (
@@ -126,7 +127,9 @@ async def list_badcases(
     if needs_review is not None:
         conds.append(Badcase.needs_human_review.is_(needs_review))
     if keyword:
-        conds.append(Badcase.user_input.ilike(f"%{keyword}%"))
+        # 关键词同时匹配 用户输入 与 会话 ID — 支持从审计/质检记录复制会话 ID
+        # 直接查该会话的全部问题案例 (与质检记录页搜索口径一致)
+        conds.append(or_(Badcase.user_input.ilike(f"%{keyword}%"), Badcase.session_id.ilike(f"%{keyword}%")))
 
     query = select(Badcase)
     count_q = select(func.count()).select_from(Badcase)
@@ -136,11 +139,18 @@ async def list_badcases(
 
     total = (await session.execute(count_q)).scalar() or 0
     # 按会话时间倒序 (对话发生顺序): created_at 只是采集/巡检时刻, qa_scan
-    # 批量回扫会打乱现场时序; 无 session_time 的旧数据退回 created_at
+    # 批量回扫会打乱现场时序; 无 session_time 的旧数据退回 created_at。
+    # 次序键 created_at/id 保证同锚点并列行 (同会话多条) 分页稳定
     rows = (
         (
             await session.execute(
-                query.order_by(func.coalesce(Badcase.session_time, Badcase.created_at).desc()).limit(limit).offset(offset)
+                query.order_by(
+                    func.coalesce(Badcase.session_time, Badcase.created_at).desc(),
+                    Badcase.created_at.desc(),
+                    Badcase.id.desc(),
+                )
+                .limit(limit)
+                .offset(offset)
             )
         )
         .scalars()
@@ -320,9 +330,7 @@ async def quality_coverage_stats(
     }
 
 
-def coerce_uuid(value: str):
-    import uuid_utils
-
+def coerce_uuid(value: str) -> uuid_utils.UUID | None:
     try:
         return uuid_utils.UUID(str(value))
     except ValueError:

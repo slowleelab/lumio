@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
   - 新端点：`GET /admin/closed-loop/quality/records`（判定筛选/关键词搜索/分页）、`GET /admin/closed-loop/quality/coverage`（应检/已检/覆盖率/合格率统计）、`GET /admin/closed-loop/badcases/{id}`（质检记录→整改闭环直达；注册在 stats 路由之后防吞匹配）
   - 工作台双页签重构：「质检记录（全量会话）」默认页 = 覆盖率横幅 + 判定筛选 + 会话时间倒序表格（首轮客户输入/轮数/问题标签/裁判/整改闭环直达）；「问题案例」保留归因整改闭环
   - 现场快照可读化：原八层原始 JSON 改为「采集现场快照」中文分层展示 — 逐轮元数据（每轮意图/回复来源走向）+ 完整对话原文 + 关键字段说明, 原始数据折叠进「调试用」collapse
+  - 问题案例页同口径：keyword 扩展为 用户输入/会话 ID 双匹配（从审计/质检记录复制会话 ID 即可查该会话全部坏例）+ 新增会话 ID 列 + 排序补 created_at/id 次序键（同会话多条并列时分页稳定）
 
 ### Added
 - **客户端模拟 Agent + 对话模拟管理页**（虚拟客户黑盒压测, 喂闭环/验链路/测延迟）

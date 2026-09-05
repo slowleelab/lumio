@@ -275,6 +275,48 @@ async def test_capture_dedup_aggregates_same_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_orders_by_session_time_and_searches_session() -> None:
+    """列表查询: 会话时间锚点倒序 (含分页稳定次序键) + keyword 同时匹配 用户输入/会话 ID"""
+    from sqlalchemy.dialects import postgresql
+
+    from lumio.services.common.badcase_store import list_badcases
+
+    captured: list = []
+
+    class FakeResult:
+        def scalar(self):
+            return 0
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, q):
+            captured.append(q)
+            return FakeResult()
+
+    items, total = await list_badcases(Session(), keyword="sim-123", limit=10)
+    assert (items, total) == ([], 0)
+    # str(Select) 对长查询会截断成省略号, 用 literal_binds 完整渲染
+    sql = str(
+        captured[-1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    ).lower()
+    # 会话时间锚点排序: coalesce(session_time, created_at) 为主序 + created_at 次序键
+    assert "coalesce" in sql and "session_time" in sql
+    # 按会话查询: keyword 命中 用户输入 或 会话 ID
+    assert "user_input ilike" in sql and "session_id ilike" in sql and " or " in sql
+
+
+@pytest.mark.asyncio
 async def test_capture_reopens_after_resolved() -> None:
     """处置过 (fix_status != pending) 的组重新开新行, 保留修复前后对照"""
     factory, store = _sf_smart()

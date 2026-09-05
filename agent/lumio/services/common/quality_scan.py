@@ -512,7 +512,8 @@ def _parse_redis_verdict(session_id: str, raw: str | bytes) -> dict[str, Any] | 
             "problems": d.get("problems") or [],
             "summary": (str(d.get("summary") or "")[:200]) or None,
             "judge_model": d.get("model"),
-            "turns": int(turns) if isinstance(turns, int | float) else None,            "scanned_at": datetime.fromisoformat(str(d["scanned_at"])),
+            "turns": int(turns) if isinstance(turns, int | float) else None,
+            "scanned_at": datetime.fromisoformat(str(d["scanned_at"])),
         }
     except Exception:
         return None
@@ -552,12 +553,12 @@ async def backfill_redis_verdicts(
                     .order_by(DialogueLog.timestamp)
                 )
             ).all()
-            for r in turn_rows:
-                ts_map[r.session_id] = r.timestamp
-                if r.session_id not in preview_map and r.speaker == "customer" and (r.content or "").strip():
-                    preview_map[r.session_id] = r.content.strip()[:160]
+            for t in turn_rows:
+                ts_map[t.session_id] = t.timestamp
+                if t.session_id not in preview_map and t.speaker == "customer" and (t.content or "").strip():
+                    preview_map[t.session_id] = t.content.strip()[:160]
             # 存量 fail 的闭环关联: 同会话已采集的 qa_scan badcase (最新一条)
-            fail_sids = [r["session_id"] for r in rows if r["verdict"] == "fail"]
+            fail_sids = [p["session_id"] for p in rows if p["verdict"] == "fail"]
             badcase_map: dict[str, str] = {}
             if fail_sids:
                 from lumio.shared.orm_models import Badcase
@@ -569,11 +570,11 @@ async def backfill_redis_verdicts(
                         .order_by(Badcase.created_at.desc())
                     )
                 ).all()
-                for r in bc_rows:
-                    badcase_map.setdefault(r.session_id, str(r.id))
+                for b in bc_rows:
+                    badcase_map.setdefault(b.session_id, str(b.id))
             existing = {
-                (r[0], r[1])
-                for r in (
+                (e[0], e[1])
+                for e in (
                     await session.execute(
                         select(QualityRecord.session_id, QualityRecord.scanned_at).where(
                             QualityRecord.session_id.in_(sids)
@@ -581,23 +582,23 @@ async def backfill_redis_verdicts(
                     )
                 ).all()
             }
-            for r in rows:
-                key = (r["session_id"], r["scanned_at"])
+            for rec in rows:
+                key = (rec["session_id"], rec["scanned_at"])
                 if key in existing:
                     continue
-                sid = r["session_id"]
+                sid = rec["session_id"]
                 session.add(
                     QualityRecord(
                         session_id=sid,
-                        verdict=r["verdict"],
-                        problems=r["problems"] or None,
-                        summary=r["summary"],
+                        verdict=rec["verdict"],
+                        problems=rec["problems"] or None,
+                        summary=rec["summary"],
                         preview=preview_map.get(sid),
-                        judge_model=r["judge_model"],
-                        turns=r["turns"],
+                        judge_model=rec["judge_model"],
+                        turns=rec["turns"],
                         session_time=ts_map.get(sid),
-                        scanned_at=r["scanned_at"],
-                        badcase_id=badcase_map.get(sid) if r["verdict"] == "fail" else None,
+                        scanned_at=rec["scanned_at"],
+                        badcase_id=badcase_map.get(sid) if rec["verdict"] == "fail" else None,
                     )
                 )
                 inserted += 1
