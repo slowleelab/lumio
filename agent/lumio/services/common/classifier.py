@@ -32,6 +32,45 @@ logger = logging.getLogger(__name__)
 # 规则分类器阈值：Fast Path 置信度 >= 此值直接使用
 _FAST_PATH_THRESHOLD = 0.7
 
+# ── 快路径按类采纳阈值 (架构整改 Phase 3: 数据驱动替代全局常数) ──────────
+# 各意图类的 softmax 可分性不同, 一刀切全局阈值两头误伤。校准产物
+# fast_path_thresholds.json 由 scripts/intent_threshold_calibrate.py 用种子
+# 金标集生成 (--floor 即下限, 当前口径 0.7 = 只允许比全局更严, 放宽需生产
+# 标注数据背书), 闭环坏例回流积累后重跑即可逐类收紧。缺类/缺文件沿用全局。
+_FAST_THRESHOLD_PATH = "data/intent_classification/fast_path_thresholds.json"
+_fast_thresholds_cache: dict[str, float] | None = None
+
+
+def _load_fast_thresholds(path: str | None = None) -> dict[str, float]:
+    """加载按类阈值; path 注入仅供测试 (不污染进程缓存)。失败返回空 dict 沿用全局。"""
+    global _fast_thresholds_cache
+    if path is not None:
+        try:
+            import json
+            from pathlib import Path
+
+            file = Path(__file__).resolve().parents[3] / path
+            return {k: float(v) for k, v in (json.loads(file.read_text()).get("thresholds") or {}).items()}
+        except Exception:
+            return {}
+    if _fast_thresholds_cache is None:
+        try:
+            import json
+            from pathlib import Path
+
+            file = Path(__file__).resolve().parents[3] / _FAST_THRESHOLD_PATH
+            _fast_thresholds_cache = {
+                k: float(v) for k, v in (json.loads(file.read_text()).get("thresholds") or {}).items()
+            }
+        except Exception:
+            _fast_thresholds_cache = {}
+    return _fast_thresholds_cache
+
+
+def _fast_accept_threshold(label: IntentLabel, default: float = _FAST_PATH_THRESHOLD) -> float:
+    """快路径采纳阈值: 按预测类查表, 缺类沿用调用方默认 (实例 fast_threshold)。"""
+    return _load_fast_thresholds().get(label.value, default)
+
 # 办理词规则覆盖 (会话 48882b05 同型消歧): BERT 标签空间是旧扁平 10 类, 发不出
 # 写类主名意图; 规则层对这些意图高置信命中时覆盖 BERT 快路径结果。仅收办理动作词
 # (提额/降额), 覆盖阈值取两规则置信 0.96 之下、其余规则最高置信 0.95 之上。
@@ -912,6 +951,7 @@ class IntentClassifier:
         Returns:
             (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback"|"bert:lowconf")
         """
+        _t_start = time.monotonic()
         intent_result, entities, sentiment, source = await self._classify_impl(text, history)
         # 闲聊/噪声置信封顶 (会话 8700a2ea): 无论快慢路径, NB_CHITCHAT/NB_NOISE 的
         # primary_confidence 一律压到 _NONBUSINESS_CONF_CAP — LLM 自评通胀的 0.7+
@@ -928,6 +968,18 @@ class IntentClassifier:
                 text[:20],
             )
             intent_result.primary_confidence = _NONBUSINESS_CONF_CAP
+        # 分类状态随结果透传 (意图体系拆分·路由层): 区分 真识别(bert/vector/llm/rule)
+        # 与 弱识别/兜底(fallback/bert:lowconf/bert:ood) — 此前兜底轮在审计里被
+        # 记成"识别意图: faq（知识咨询）", faq 四职合一的观感即来源于此。
+        intent_result.classification_source = source
+        # 级联分层埋点 (架构整改 Phase 4): 各层终态计数 + 分层延迟
+        try:
+            from lumio.shared.metrics import INTENT_TIER_LATENCY, INTENT_TIER_REQUESTS
+
+            INTENT_TIER_REQUESTS.labels(source=source).inc()
+            INTENT_TIER_LATENCY.labels(source=source).observe(time.monotonic() - _t_start)
+        except Exception:
+            pass
         return intent_result, entities, sentiment, source
 
     async def _classify_impl(
@@ -1078,7 +1130,7 @@ class IntentClassifier:
             )
             fast_source = "rule:query"
 
-        if fast_result.primary_confidence >= self._threshold:
+        if fast_result.primary_confidence >= _fast_accept_threshold(fast_result.primary_intent, self._threshold):
             logger.debug(
                 "Fast Path 命中: intent=%s, confidence=%.2f, source=%s",
                 fast_result.primary_intent.value,

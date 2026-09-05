@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+- **意图体系 Phase 3/4 落地（架构整改续篇）**
+  - 分类状态透明化：`IntentResult.classification_source` 透传真识别（bert/vector/rule/llm）与弱识别/兜底（fallback/bert:lowconf/bert:ood）；兜底轮审计叙事改为"未识别（按兜底意图落档）…交噪声门拦截澄清"，不再伪装成"识别为知识咨询"（faq 四职合一的观感来源）
+  - 按类快路径阈值：`scripts/intent_threshold_calibrate.py` 用种子金标集（191 例，BERT top-1 精度 99.5%）逐类校准采纳阈值写入 `fast_path_thresholds.json`；运行时按预测类查表（缺类沿用实例默认）。当前口径 floor=0.7 = 只允许比全局更严，放宽需生产标注数据背书；闭环坏例回流积累后重跑即逐类收紧
+  - 级联分层埋点：`lumio_intent_tier_requests_total{source}` / `lumio_intent_tier_latency_seconds{source}` — 快路径采纳率 vs 兜底占比、分层延迟进 Prometheus
+  - 查询直达链逐字精确 FAQ 出口（E2E 回归修复）：客户原句与运营标准问完全一致（变体归一化查表，非语义猜测）时直接给标准答案 — 防分类抖动把标准问句带去查工具答非所问（"临时需要用卡怎么办？"被抖成 limit_query 查临时额度）；语义/BM25 永不在此路径截胡查询流量
+
 ### Changed
 - **前置 FAQ 层移除，检索统一进路由后知识网关（架构整改）**
   - 分类前 FAQ 匹配会劫持敏感输入（"钱包被偷了"命中"数字人民币硬钱包"词条）与个人化查询（a7f6e73 截胡根因：检索跑在理解之前）——该层整体移除

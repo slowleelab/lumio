@@ -1156,3 +1156,75 @@ async def test_ood_unknown_business_intent_still_uses_llm(monkeypatch: pytest.Mo
 
     assert source == "llm"
     mock_llm.classify.assert_awaited_once()
+
+
+# ── 按类快路径阈值 (架构整改 Phase 3) ──
+
+
+def test_fast_thresholds_loader_and_fallback(tmp_path) -> None:
+    """按类阈值加载: 注入 path 读取; 缺类/缺文件沿用全局 0.7"""
+    from lumio.services.common.classifier import _load_fast_thresholds
+
+    f = tmp_path / "t.json"
+    f.write_text('{"thresholds": {"chitchat": 0.9, "faq": 0.75}}')
+    ts = _load_fast_thresholds(path=str(f))
+    assert ts == {"chitchat": 0.9, "faq": 0.75}
+
+    # 缺文件 → 空 dict (沿用全局)
+    assert _load_fast_thresholds(path=str(tmp_path / "missing.json")) == {}
+
+
+def test_fast_accept_threshold_uses_per_class_value(monkeypatch, tmp_path) -> None:
+    """快路径采纳按预测类查表: chitchat 收紧到 0.9, 其余类保持全局"""
+    from lumio.services.common import classifier as clf
+
+    f = tmp_path / "t.json"
+    f.write_text('{"thresholds": {"chitchat": 0.9}}')
+    monkeypatch.setattr(clf, "_FAST_THRESHOLD_PATH", str(f))
+    monkeypatch.setattr(clf, "_fast_thresholds_cache", None)  # 重置进程缓存
+
+    assert clf._fast_accept_threshold(IntentLabel.CHITCHAT) == 0.9
+    assert clf._fast_accept_threshold(IntentLabel.BILL_QUERY, default=0.6) == 0.6  # 缺类用实例默认
+
+
+@pytest.mark.asyncio
+async def test_fast_path_blocked_by_tightened_class_threshold(monkeypatch, tmp_path) -> None:
+    """chitchat 阈值收紧到 0.9 后, BERT chitchat@0.75 不再快路径短路 → 落慢路径"""
+    from lumio.services.common import classifier as clf
+
+    f = tmp_path / "t.json"
+    f.write_text('{"thresholds": {"chitchat": 0.9}}')
+    monkeypatch.setattr(clf, "_FAST_THRESHOLD_PATH", str(f))
+    monkeypatch.setattr(clf, "_fast_thresholds_cache", None)
+
+    fake_bert = _fake_bert(IntentLabel.CHITCHAT, 0.75)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.8, llm_input_class="chitchat"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = clf.IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("哈哈你好呀")
+    # 收紧后 0.75 < 0.9 → 慢路径接管
+    assert source == "llm"
+    mock_llm_classifier.classify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_classification_source_transparent() -> None:
+    """分类状态透传: 快路径命中 source=bert; 兜底 source=fallback — 供审计区分真假识别"""
+    fake_bert = _fake_bert(IntentLabel.BILL_QUERY, 0.95)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake_bert)
+    intent, _, _, source = await classifier.classify("查账单")
+    assert source == "bert"
+    assert intent.classification_source == "bert"
+
+    classifier2 = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None)
+    intent2, _, _, source2 = await classifier2.classify("这个怎么弄")
+    assert source2 == "fallback"
+    assert intent2.classification_source == "fallback"

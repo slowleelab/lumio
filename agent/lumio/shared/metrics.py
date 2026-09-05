@@ -360,6 +360,22 @@ INTENT_REGISTRY_HITS = Counter(
     ["slug", "state"],
 )
 
+# ── 意图级联分层指标 (架构整改 Phase 4: 每级采纳率/延迟可观测) ──
+# source: 终态分类来源 — bert/vector/rule/rule:query/llm = 真识别,
+# fallback/bert:lowconf/bert:ood = 弱识别/兜底。采纳率 = source 计数占比,
+# 兜底占比升高 = 级联上游漂移的告警信号。
+INTENT_TIER_REQUESTS = Counter(
+    "lumio_intent_tier_requests_total",
+    "意图级联各层终态来源计数（快路径采纳/向量采纳/LLM 裁决/兜底）",
+    ["source"],
+)
+INTENT_TIER_LATENCY = Histogram(
+    "lumio_intent_tier_latency_seconds",
+    "意图级联分层延迟（含各级耗时, 快路径毫秒级 / LLM 秒级）",
+    ["source"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 15),
+)
+
 INTENT_INDEX_REBUILDS = Counter(
     "lumio_intent_index_rebuilds_total",
     "L2 意图索引蓝绿重建结果",

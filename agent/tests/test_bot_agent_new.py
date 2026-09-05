@@ -2577,3 +2577,19 @@ class TestFaqGateway:
 
         monkeypatch.setattr(fs, "search_faq", boom)
         assert await agent._try_faq_direct("s1", "年费多少钱") is None
+
+    @pytest.mark.asyncio
+    async def test_exact_only_rejects_semantic_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """查询直达的精确出口: 语义命中不算 (exact_only 只认逐字查表)"""
+        agent = self._make_agent()
+
+        async def fake_search(**kw):
+            return {"match_type": "semantic", "results": [{"faq_id": "f1#0", "question": "临时用卡", "answer": "标准答案"}]}
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", fake_search)
+        assert await agent._try_faq_direct("s1", "临时需要用卡怎么办", exact_only=True) is None
+        # 非精确模式 (知识路径网关) 语义命中正常直出
+        hit = await agent._try_faq_direct("s1", "临时需要用卡怎么办")
+        assert hit is not None and hit["response_source"] == "faq"

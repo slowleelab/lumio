@@ -398,18 +398,28 @@ class LumioAgent:
             history = await self._load_history(session_id)
 
             # E2 决策可解释: 记录意图分类决策 (涵盖每轮实际路由, 供监管/客户审计)
+            # 意图体系拆分·路由层: 弱识别/兜底轮如实叙事 — 兜底的 faq 标签只是
+            # 存储兼容残差, 不再伪装成"识别为知识咨询" (faq 四职合一的观感来源)。
+            _cls_src = intent_result.classification_source
+            _unrecognized = _cls_src in ("fallback", "bert:lowconf", "bert:ood") or _cls_src is None
             try:
                 log_decision(
                     session_id=session_id,
                     agent_name="bot_agent",
                     action=DecisionAction.INTENT_CLASSIFY,
                     reasoning=(
-                        f"识别意图：{intent_result.primary_intent.value}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
+
+                            f"未识别（{'分类器异常' if _cls_src is None else _cls_src}，按兜底意图落档），置信度 {intent_result.primary_confidence:.0%} — 输入超出已知意图范围，交噪声门拦截澄清"
+                            if _unrecognized
+                            else f"识别意图：{intent_result.primary_intent.value}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
+
                     ),
                     evidence={
                         "intent": intent_result.primary_intent.value,
                         "confidence": intent_result.primary_confidence,
                         "domain": domain,
+                        "classification_source": _cls_src,
+                        "classification_state": "unrecognized" if _unrecognized else "recognized",
                         # P: 记录候补意图 - 敏感/转人工穿透分析此前因缺失候补而无据可查,
                         # 本次会话 4d22 靠复现才定位, 现补进决策日志供事后审计直接锁定.
                         "alternatives": [a.value for a in (intent_result.alternatives or [])],
@@ -987,6 +997,15 @@ class LumioAgent:
         Returns: None = 链路不适用 (无工具/失败), 调用方回落; 非 None = 已产出回复。
         """
         from lumio.services.bot.tool_selection import select_tools_for_intent
+
+        # 逐字精确 FAQ 出口 (防分类抖动, E2E p3faq 复盘): 客户原句与运营标准问
+        # 完全一致 (变体归一化查表, 非语义猜测) 时直接给标准答案 — 分类把标准
+        # 问句抖成查询意图时, 工具答的是账户数据而非问题本身 ("临时需要用卡
+        # 怎么办?"→查临时额度, 答非所问)。语义/BM25 不在此截胡; 紧急标记跳过。
+        if not _has_emergency_marker(user_input):
+            exact_hit = await self._try_faq_direct(session_id, user_input, customer_id, exact_only=True)
+            if exact_hit is not None:
+                return exact_hit
 
         # 填槽并持久化 (跨轮继承/历史反填复用既有机制), 再读回槽位值
         await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
@@ -2650,13 +2669,20 @@ class LumioAgent:
         session_id: str,
         user_input: str,
         customer_id: str | None = None,
+        *,
+        exact_only: bool = False,
     ) -> dict[str, Any] | None:
-        """统一知识检索网关 · FAQ 通道 (路由后): 三路匹配命中 → 直出标准答案。
+        """统一知识检索网关 · FAQ 通道 (路由后): 匹配命中 → 直出标准答案。
 
         只在咨询域知识路径调用 — 交易/查询流量上游已走工具直达, FAQ 从结构上
         不可能再截胡个人化查询 (a7f6e73 前置截胡的根因是检索跑在理解之前)。
         返回 None = 未命中, 调用方继续文档 RAG 通道; 检索日志落
         kb_faq_search_log (控制台 FAQ 命中率指标数据源)。
+
+        exact_only: 只接受逐字/变体归一化精确命中 (查表, 非语义猜测) — 供查询
+        直达链防分类抖动: 客户原句与运营标准问逐字一致时给标准答案, 而非被
+        抖动分类带去查工具答非所问 (会话 p3faq: "临时需要用卡怎么办?"被判
+        limit_query 查了临时额度)。语义/BM25 永不在此路径截胡查询流量。
         """
         _t0 = time.monotonic()
         try:
@@ -2682,7 +2708,8 @@ class LumioAgent:
                 ),
                 session_id=session_id,
             )
-            if faq_res["match_type"] not in ("exact", "semantic", "bm25") or not faq_res["results"]:
+            accepted = ("exact",) if exact_only else ("exact", "semantic", "bm25")
+            if faq_res["match_type"] not in accepted or not faq_res["results"]:
                 return None
             top = faq_res["results"][0]
             answer = top.get("answer")

@@ -421,6 +421,10 @@ class IntentResult(BaseModel):
     # 调用, 此字段即仲裁结论 ("business"|"chitchat"|"noise"). None = 本次结果未经
     # LLM 慢路径 (快路径短路/慢路径失败兜底), 噪声门需要仲裁时再独立调用兜底。
     llm_input_class: str | None = Field(default=None, exclude=True)
+    # 分类状态 (意图体系拆分·路由层): "bert"|"vector"|"rule"|"rule:query"|"llm" =
+    # 真识别; "fallback"|"bert:lowconf"|"bert:ood" = 弱识别/兜底; None = 分类器
+    # 异常未识别。兜底轮的 faq 标签是存储兼容残差, 不代表"识别为知识咨询"。
+    classification_source: str | None = Field(default=None, exclude=True)
 
 
 class SentimentResult(BaseModel):
