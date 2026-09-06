@@ -549,3 +549,41 @@ async def test_quality_records_session_dimension() -> None:
     assert "row_number()" in sql and "partition by" in sql and "session_id" in sql, "应按会话窗口去重取最新判定"
     assert "scanned_at desc" in sql, "会话内取最新一次判定"
     assert "rn = 1" in sql or "rn=1" in sql, "外层只取每会话最新一条"
+
+
+@pytest.mark.asyncio
+async def test_qc_sessions_unified_query_semantics() -> None:
+    """统一会话列表: 判定⟕案例全外联 + 每会话最新去重 + 分类 CASE"""
+    from sqlalchemy.dialects import postgresql
+
+    from lumio.services.common.badcase_store import list_qc_sessions
+
+    captured: list = []
+
+    class FakeResult:
+        def scalar(self):
+            return 0
+
+        def mappings(self):
+            return self
+
+        def __iter__(self):
+            return iter([])
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, q):
+            captured.append(q)
+            return FakeResult()
+
+    items, total = await list_qc_sessions(Session(), category="pending_review", limit=10)
+    assert (items, total) == ([], 0)
+    sql = str(captured[-1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})).lower()
+    assert "full outer join" in sql, "判定与案例应全外联"
+    assert "row_number()" in sql and "partition by" in sql, "两侧均按会话取最新"
+    assert "pending_review" in sql, "分类 CASE 应含待人工判定"

@@ -305,6 +305,106 @@ async def list_quality_records(
     return [quality_record_to_dict(r) for r in rows], total
 
 
+async def list_qc_sessions(
+    session: AsyncSession,
+    *,
+    category: str = "all",
+    keyword: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """统一会话质检列表 · 会话维度: 最新质检判定 ⟕ 最新问题案例 (全外联)。
+
+    分类 (category): all | pass | warn | fail | pending_review | unscanned
+    - pending_review: 有待人工复核的问题案例 (归因闸门未过) — 待判断口径
+    - unscanned: 有问题案例但尚无质检判定 (如会话未结束先被信号采集)
+    排序锚: 会话时间 → 质检时刻 → 采集时刻。
+    """
+    from sqlalchemy import and_, case
+    qr_sub = (
+        select(
+            QualityRecord,
+            func.row_number()
+            .over(partition_by=QualityRecord.session_id, order_by=QualityRecord.scanned_at.desc())
+            .label("rn"),
+        )
+    ).subquery()
+
+    bc_sub = (
+        select(
+            Badcase,
+            func.row_number()
+            .over(partition_by=Badcase.session_id, order_by=Badcase.created_at.desc())
+            .label("rn"),
+        )
+    ).subquery()
+
+    sid = func.coalesce(qr_sub.c.session_id, bc_sub.c.session_id)
+    order_anchor = func.coalesce(qr_sub.c.session_time, qr_sub.c.scanned_at, bc_sub.c.created_at)
+    category_expr = case(
+        (
+            and_(bc_sub.c.needs_human_review.is_(True), bc_sub.c.fix_status == "pending"),
+            "pending_review",
+        ),
+        (qr_sub.c.verdict.is_(None), "unscanned"),
+        else_=qr_sub.c.verdict,
+    )
+
+    conds: list[Any] = [(qr_sub.c.rn == 1) | (qr_sub.c.rn.is_(None)), (bc_sub.c.rn == 1) | (bc_sub.c.rn.is_(None))]
+    if category and category != "all":
+        conds.append(category_expr == category)
+    if keyword:
+        kw = f"%{keyword}%"
+        conds.append(
+            (qr_sub.c.preview.ilike(kw))
+            | (qr_sub.c.session_id.ilike(kw))
+            | (bc_sub.c.user_input.ilike(kw))
+        )
+
+    joined = qr_sub.join(bc_sub, qr_sub.c.session_id == bc_sub.c.session_id, full=True)
+
+    total = (await session.execute(select(func.count()).select_from(joined).where(*conds))).scalar() or 0
+    rows = (
+        await session.execute(
+            select(
+                sid.label("session_id"),
+                qr_sub.c.verdict,
+                qr_sub.c.problems,
+                qr_sub.c.summary,
+                qr_sub.c.turns,
+                qr_sub.c.session_time,
+                qr_sub.c.scanned_at,
+                qr_sub.c.judge_model,
+                qr_sub.c.preview,
+                bc_sub.c.id.label("badcase_id"),
+                bc_sub.c.signal_source,
+                bc_sub.c.root_cause_layer,
+                bc_sub.c.human_confirmed_layer,
+                bc_sub.c.fix_status,
+                bc_sub.c.needs_human_review,
+                bc_sub.c.attribution_confidence,
+                bc_sub.c.created_at.label("collected_at"),
+                category_expr.label("category"),
+                order_anchor.label("order_ts"),
+            )
+            .select_from(joined)
+            .where(*conds)
+            .order_by(order_anchor.desc(), qr_sub.c.scanned_at.desc().nullslast())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).mappings()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["badcase_id"] = str(d["badcase_id"]) if d.get("badcase_id") else None
+        for k in ("session_time", "scanned_at", "collected_at"):
+            d[k] = d[k].isoformat() if d.get(k) else None
+        d.pop("order_ts", None)
+        out.append(d)
+    return out, total
+
+
 async def quality_coverage_stats(
     session: AsyncSession,
     *,

@@ -480,12 +480,15 @@ async def scan_session_by_id(
     redis_client: Any,
     session_id: str,
     model: str,
+    *,
+    force: bool = False,
 ) -> dict[str, Any] | None:
     """按需单会话巡检 (chat_end 自动质检钩子)。
 
     已检 (Redis 30 天去重) 或对话不足 2 轮 (问候/噪声会话) 返回 None 跳过。
+    force=True 绕过去重 (人工复检: 整改效果验证, 新判定追加落库)。
     """
-    if redis_client is not None:
+    if not force and redis_client is not None:
         try:
             if await redis_client.get(_VERDICT_KEY.format(sid=session_id)):
                 return None

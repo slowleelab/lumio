@@ -494,6 +494,55 @@ async def quality_records_endpoint(
     return {"total": total, "records": items}
 
 
+@router.get("/quality/sessions")
+async def quality_sessions_endpoint(
+    user: AdminAgentUser,
+    db: DbSession,
+    category: str = Query("all"),
+    keyword: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """统一会话质检列表: 最新判定 ⟕ 最新问题案例 (全外联), 会话维度一行。
+
+    category: all | pass | warn | fail | pending_review(待人工判定) | unscanned
+    """
+    from lumio.services.common.badcase_store import list_qc_sessions
+
+    if category not in ("all", "pass", "warn", "fail", "pending_review", "unscanned"):
+        raise LumioError(code=2001, message=f"category 非法: {category}")
+    items, total = await list_qc_sessions(db, category=category, keyword=keyword, limit=limit, offset=offset)
+    return {"total": total, "sessions": items}
+
+
+@router.post("/quality/rescan")
+async def quality_rescan_endpoint(user: AdminAgentUser, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """单会话强制复检: 绕过 30 天 Redis 去重重跑裁判 (整改效果验证)。
+
+    新判定追加落库, 会话维度列表自动展示最新一条。
+    """
+    import lumio.services.common.quality_scan as quality_scan
+    from lumio.shared.config import get_settings
+
+    session_id = str((body or {}).get("session_id") or "").strip()
+    if not session_id:
+        raise LumioError(code=2001, message="session_id 必填")
+    judge_llm = _build_judge_llm_only(request)
+    sf = getattr(request.app.state, "db_session_factory", None)
+    redis = getattr(request.app.state, "redis_client", None)
+    result = await quality_scan.scan_session_by_id(
+        sf, judge_llm, redis, session_id, quality_scan.judge_model_name(get_settings()), force=True
+    )
+    if result is None:
+        return {"status": "skipped", "message": "对话不足 2 轮或无判定产出"}
+    return {
+        "status": "ok",
+        "verdict": result.get("verdict"),
+        "problems": result.get("problems"),
+        "summary": result.get("summary"),
+    }
+
+
 @router.get("/quality/coverage")
 async def quality_coverage_endpoint(
     user: AdminAgentUser,

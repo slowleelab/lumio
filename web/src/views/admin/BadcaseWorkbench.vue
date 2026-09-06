@@ -73,116 +73,30 @@
       </template>
     </el-progress>
 
-    <el-tabs v-model="activeTab" class="qa-tabs">
-      <!-- ══ 页签一: 质检记录 (每一个被巡检会话一条判定, 按会话时间倒序) ══ -->
-      <el-tab-pane name="records">
-        <template #label>质检记录 <span class="tab-hint">全量会话</span></template>
         <div v-if="coverage" class="coverage-line">
-          近 30 天应检会话 <b>{{ coverage.total_sessions }}</b> · 已质检 <b class="ok">{{ coverage.scanned_sessions }}</b>
-          · 覆盖率 <b>{{ fmtPct(coverage.coverage) }}</b> · 合格率 <b>{{ fmtPct(coverage.pass_rate) }}</b>
-          <span class="muted"> (不合格 {{ coverage.by_verdict.fail ?? 0 }} / 提醒 {{ coverage.by_verdict.warn ?? 0 }})</span>
-        </div>
-        <div class="filters">
-          <el-select v-model="recFilters.verdict" placeholder="判定" clearable size="small" style="width: 110px" @change="reloadRecords">
-            <el-option label="合格" value="pass" />
-            <el-option label="提醒" value="warn" />
-            <el-option label="不合格" value="fail" />
-          </el-select>
-          <el-input
-            v-model="recFilters.keyword"
-            placeholder="搜索会话 ID…"
-            clearable
-            size="small"
-            style="width: 220px"
-            :prefix-icon="Search"
-            @keyup.enter="reloadRecords"
-            @clear="reloadRecords"
-          />
-          <el-button size="small" @click="reloadRecords">查询</el-button>
-          <el-button v-if="recFilters.verdict || recFilters.keyword" size="small" link @click="clearRecFilters">清除筛选</el-button>
-        </div>
-
-        <el-table :data="records" v-loading="recLoading" stripe size="small" style="margin-top: 12px" @row-click="openRecord">
-          <el-table-column label="会话时间" width="150">
-            <template #default="{ row }">
-              <span :title="row.session_time ? `质检于 ${fmtTime(row.scanned_at)}` : `无会话时间锚点 · 质检于 ${fmtTime(row.scanned_at)}`">
-                {{ fmtTime(row.session_time || row.scanned_at) }}
-              </span>
-            </template>
-          </el-table-column>
-          <el-table-column label="会话 ID" width="150" show-overflow-tooltip>
-            <template #default="{ row }">
-              <span class="session-id">{{ row.session_id }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="轮数" width="58" align="center">
-            <template #default="{ row }">{{ row.turns ?? "-" }}</template>
-          </el-table-column>
-          <el-table-column label="判定" width="84">
-            <template #default="{ row }">
-              <el-tag size="small" :type="verdictType(row.verdict)">{{ verdictLabel(row.verdict) }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="问题" min-width="170">
-            <template #default="{ row }">
-              <template v-if="row.problems?.length">
-                <el-tooltip
-                  v-for="(p, i) in row.problems"
-                  :key="i"
-                  :content="`${p.turn ? `第 ${p.turn} 轮 · ` : ''}${p.reason || ''}`"
-                  placement="top"
-                >
-                  <el-tag size="small" type="danger" effect="plain" class="problem-tag">{{ problemLabel(p.type) }}</el-tag>
-                </el-tooltip>
-              </template>
-              <span v-else class="muted">-</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="裁判" width="96" show-overflow-tooltip>
-            <template #default="{ row }">
-              <span v-if="row.judge_model" class="model-tag">{{ shortModel(row.judge_model) }}</span>
-              <span v-else class="muted">-</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="120" fixed="right">
-            <template #default="{ row }">
-              <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
-              <el-button link size="small" @click.stop="gotoAuditSession(row.session_id)">回放</el-button>
-            </template>
-          </el-table-column>
-          <template #empty>
-            <el-empty description="暂无质检记录 — 点右上角「全量质检」扫描全部会话; 新会话结束会自动质检" :image-size="64" />
-          </template>
-        </el-table>
-        <el-pagination
-          v-model:current-page="recPage"
-          v-model:page-size="recPageSize"
-          :total="recTotal"
-          :page-sizes="[20, 50, 100]"
-          layout="total, sizes, prev, pager, next"
-          style="margin-top: 14px; justify-content: flex-end"
-          @current-change="loadRecords"
-          @size-change="reloadRecords"
-        />
-      </el-tab-pane>
-
-      <!-- ══ 页签二: 问题案例 (信号 + 质检 fail 的归因整改闭环) ══ -->
-      <el-tab-pane name="cases">
-        <template #label>问题案例 <span class="tab-hint">整改闭环</span></template>
+      近 30 天应检会话 <b>{{ coverage.total_sessions }}</b> · 已质检 <b class="ok">{{ coverage.scanned_sessions }}</b>
+      · 覆盖率 <b>{{ fmtPct(coverage.coverage) }}</b> · 合格率 <b>{{ fmtPct(coverage.pass_rate) }}</b>
+      <span class="muted"> (不合格 {{ coverage.by_verdict.fail ?? 0 }} / 提醒 {{ coverage.by_verdict.warn ?? 0 }})</span>
+    </div>
 
     <div class="stat-cards">
-      <div class="stat-card" :class="{ active: filters.needs_review === true }" @click="toggleStatFilter('needs_review', true)">
+      <div class="stat-card" :class="{ active: qcFilters.category === 'pending_review' }" @click="setCategory('pending_review')">
         <span class="label">待复核</span>
         <span class="num warn">{{ stats?.pending_review ?? "-" }}</span>
-        <span class="hint">点击查看待复核队列</span>
+        <span class="hint">点击查看待人工判定会话</span>
       </div>
-      <div class="stat-card" :class="{ active: filters.needs_review === false }" @click="toggleStatFilter('needs_review', false)">
-        <span class="label">已确认</span>
-        <span class="num">{{ stats?.confirmed ?? "-" }}</span>
-        <span class="hint">点击查看已归因确认</span>
+      <div class="stat-card" :class="{ active: qcFilters.category === 'fail' }" @click="setCategory('fail')">
+        <span class="label">判定有问题</span>
+        <span class="num danger">{{ coverage?.by_verdict?.fail ?? "-" }}</span>
+        <span class="hint">质检不合格会话</span>
+      </div>
+      <div class="stat-card" :class="{ active: qcFilters.category === 'pass' }" @click="setCategory('pass')">
+        <span class="label">正常</span>
+        <span class="num ok">{{ coverage?.by_verdict?.pass ?? "-" }}</span>
+        <span class="hint">质检合格会话</span>
       </div>
       <div class="stat-card">
-        <span class="label">今日新增</span>
+        <span class="label">今日新增案例</span>
         <span class="num">{{ stats?.today_new ?? "-" }}</span>
         <span class="hint">近 24 小时采集</span>
       </div>
@@ -211,31 +125,25 @@
     </div>
 
     <div class="filters">
-      <el-select v-model="filters.signal_source" placeholder="信号源" clearable size="small" style="width: 140px" @change="reload">
-        <el-option v-for="(label, key) in SIGNAL_LABELS" :key="key" :label="label" :value="key" />
-      </el-select>
-      <el-select v-model="filters.root_cause_layer" placeholder="根因层" clearable size="small" style="width: 140px" @change="reload">
-        <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" />
-      </el-select>
-      <el-select v-model="filters.fix_status" placeholder="修复状态" clearable size="small" style="width: 120px" @change="reload">
-        <el-option label="待修" value="pending" />
-        <el-option label="修复中" value="fixing" />
-        <el-option label="已灰度" value="canary" />
-        <el-option label="已全量" value="deployed" />
-        <el-option label="已驳回" value="rejected" />
+      <el-select v-model="qcFilters.category" placeholder="分类" clearable size="small" style="width: 130px" @change="reloadQc">
+        <el-option label="正常" value="pass" />
+        <el-option label="提醒" value="warn" />
+        <el-option label="判定有问题" value="fail" />
+        <el-option label="待人工判定" value="pending_review" />
+        <el-option label="未质检" value="unscanned" />
       </el-select>
       <el-input
-        v-model="filters.keyword"
+        v-model="qcFilters.keyword"
         placeholder="搜索会话 ID / 用户输入…"
         clearable
         size="small"
         style="width: 230px"
         :prefix-icon="Search"
-        @keyup.enter="reload"
-        @clear="reload"
+        @keyup.enter="reloadQc"
+        @clear="reloadQc"
       />
-      <el-button size="small" @click="reload">查询</el-button>
-      <el-button v-if="hasActiveFilter" size="small" link @click="clearFilters">清除筛选</el-button>
+      <el-button size="small" @click="reloadQc">查询</el-button>
+      <el-button v-if="qcFilters.category || qcFilters.keyword" size="small" link @click="clearQcFilters">清除筛选</el-button>
       <div class="filter-spacer"></div>
       <template v-if="selected.length">
         <el-button size="small" type="success" plain @click="batchConfirm">批量确认 ({{ selected.length }})</el-button>
@@ -244,24 +152,55 @@
     </div>
 
     <el-table
-      :data="badcases"
-      v-loading="loading"
+      :data="qcRows"
+      v-loading="qcLoading"
       stripe
       size="small"
       style="margin-top: 12px"
       @selection-change="onSelection"
-      @row-click="openDetail"
+      @row-click="openQcDetail"
     >
-      <el-table-column type="selection" width="38" />
-      <el-table-column label="用户输入" min-width="200" show-overflow-tooltip>
+      <el-table-column type="selection" width="38" :selectable="(row: QcSessionRow) => !!row.badcase_id" />
+      <el-table-column label="会话时间" width="150">
         <template #default="{ row }">
-          <span class="input-text">{{ row.user_input }}</span>
-          <el-tag v-if="(row.occurrences ?? 1) > 1" size="small" type="warning" style="margin-left: 4px">×{{ row.occurrences }}</el-tag>
+          <span :title="sessionTimeTitle(row)">
+            {{ fmtTime(row.session_time || row.scanned_at || row.collected_at) }}
+          </span>
+        </template>
+      </el-table-column>
+      <el-table-column label="会话 ID" width="150" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span class="session-id">{{ row.session_id }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="轮数" width="54" align="center">
+        <template #default="{ row }">{{ row.turns ?? "-" }}</template>
+      </el-table-column>
+      <el-table-column label="判定" width="110">
+        <template #default="{ row }">
+          <el-tag size="small" :type="verdictType(row.verdict || '')">{{ verdictLabel(row.verdict || "") || "未质检" }}</el-tag>
+          <el-tag v-if="row.category === 'pending_review'" size="small" type="warning" style="margin-left: 2px">待人工</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="质检问题" min-width="160">
+        <template #default="{ row }">
+          <template v-if="row.problems?.length">
+            <el-tooltip
+              v-for="(p, i) in row.problems"
+              :key="i"
+              :content="`${p.turn ? `第 ${p.turn} 轮 · ` : ''}${p.reason || ''}`"
+              placement="top"
+            >
+              <el-tag size="small" type="danger" effect="plain" class="problem-tag">{{ problemLabel(p.type) }}</el-tag>
+            </el-tooltip>
+          </template>
+          <span v-else class="muted">-</span>
         </template>
       </el-table-column>
       <el-table-column label="信号" width="92">
         <template #default="{ row }">
-          <el-tag size="small" :type="signalType(row.signal_source)">{{ signalLabel(row.signal_source) }}</el-tag>
+          <el-tag v-if="row.signal_source" size="small" :type="signalType(row.signal_source)">{{ signalLabel(row.signal_source) }}</el-tag>
+          <span v-else class="muted">-</span>
         </template>
       </el-table-column>
       <el-table-column label="根因层" width="112">
@@ -270,73 +209,38 @@
           <el-tag v-else-if="row.root_cause_layer" size="small" :type="row.root_cause_layer === 'uncertain' ? 'warning' : 'primary'">
             {{ layerLabel(row.root_cause_layer) }}
           </el-tag>
-          <span v-else class="muted">未归因</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="置信" width="62" align="center">
-        <template #default="{ row }">
-          <span v-if="row.attribution_confidence != null">{{ Math.round(row.attribution_confidence * 100) }}%</span>
+          <span v-else-if="row.badcase_id" class="muted">未归因</span>
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="裁判" width="96" show-overflow-tooltip>
+      <el-table-column label="修复状态" width="82">
         <template #default="{ row }">
-          <span v-if="row.attribution_model" class="model-tag">{{ shortModel(row.attribution_model) }}</span>
+          <el-tag v-if="row.fix_status" size="small" :type="fixStatusType(row.fix_status)">{{ fixStatusLabel(row.fix_status) }}</el-tag>
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="复核" width="74" align="center">
+      <el-table-column label="操作" width="130" fixed="right">
         <template #default="{ row }">
-          <el-tag v-if="row.needs_human_review" size="small" type="warning">待人工</el-tag>
-          <el-tag v-else size="small" type="success">已确认</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="分流表" width="104">
-        <template #default="{ row }">{{ fixTableLabel(row.fix_table) }}</template>
-      </el-table-column>
-      <el-table-column label="状态" width="82">
-        <template #default="{ row }">
-          <el-tag size="small" :type="fixStatusType(row.fix_status)">{{ fixStatusLabel(row.fix_status) }}</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="会话 ID" width="126" show-overflow-tooltip>
-        <template #default="{ row }">
-          <span class="session-id" :title="`点击行查看详情 · ${row.session_id}`">{{ row.session_id }}</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="会话时间" width="104">
-        <template #default="{ row }">
-          <span :title="`会话 ${fmtTime(row.session_time)} · 采集 ${fmtTime(row.created_at)}`">{{ relTime(row.session_time || row.created_at) }}</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="操作" width="150" fixed="right">
-        <template #default="{ row }">
-          <el-button link type="primary" size="small" @click.stop="openDetail(row)">详情</el-button>
-          <el-button v-if="!row.root_cause_layer" link type="warning" size="small" @click.stop="runAttribution(row)">GLM 裁判</el-button>
-          <el-button
-            v-else-if="row.needs_human_review"
-            link type="success" size="small"
-            @click.stop="openDetail(row)"
-          >复核</el-button>
+          <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
+          <el-button link size="small" @click.stop="gotoAuditSession(row.session_id)">回放</el-button>
+          <el-button v-if="row.badcase_id" link type="warning" size="small" @click.stop="openBadcaseById(row.badcase_id)">整改</el-button>
         </template>
       </el-table-column>
       <template #empty>
-        <el-empty description="暂无坏例 — 跑一轮对话模拟喂入信号，或清除筛选条件" :image-size="64" />
+        <el-empty description="暂无会话 — 跑一轮全量质检或对话模拟; 新会话结束会自动质检" :image-size="64" />
       </template>
     </el-table>
 
     <el-pagination
-      v-model:current-page="page"
-      v-model:page-size="pageSize"
-      :total="total"
+      v-model:current-page="qcPage"
+      v-model:page-size="qcPageSize"
+      :total="qcTotal"
       :page-sizes="[20, 50, 100]"
       layout="total, sizes, prev, pager, next"
       style="margin-top: 14px; justify-content: flex-end"
-      @current-change="load"
-      @size-change="onSizeChange"
+      @current-change="loadQc"
+      @size-change="reloadQc"
     />
-      </el-tab-pane>
-    </el-tabs>
 
     <!-- 详情抽屉 -->
     <el-drawer v-model="detailVisible" size="58%" destroy-on-close>
@@ -459,43 +363,78 @@
       </div>
     </el-drawer>
 
-    <!-- ══ 质检详情抽屉 (问题导向: 判定 → 什么问题 → 定位轮次 → 下钻) ══ -->
-    <el-drawer v-model="qcDetailVisible" size="46%" destroy-on-close>
+    <!-- ══ 质检详情抽屉 (问题导向: 判定 → 问题 → 现场还原 → 链路 → 处置) ══ -->
+    <el-drawer v-model="qcDetailVisible" size="52%" destroy-on-close>
       <template #header>
         <div class="drawer-title">
-          <el-tag :type="verdictType(qcDetail?.verdict || '')" effect="dark">{{ verdictLabel(qcDetail?.verdict || '') }}</el-tag>
+          <el-tag :type="verdictType(qcDetail?.verdict || '')" effect="dark">{{ verdictLabel(qcDetail?.verdict || "") || "未质检" }}</el-tag>
           <span class="session-id">{{ qcDetail?.session_id }}</span>
+          <el-tag v-if="qcDetail?.category === 'pending_review'" size="small" type="warning">待人工判定</el-tag>
         </div>
       </template>
-      <div v-if="qcDetail" class="qc-detail">
+      <div v-if="qcDetail" class="qc-detail" v-loading="qcReplayLoading">
         <div v-if="qcDetail.summary" class="qc-summary">{{ qcDetail.summary }}</div>
-        <div v-else class="qc-summary muted">裁判未给出摘要</div>
+        <div v-else-if="qcDetail.verdict" class="qc-summary muted">裁判未给出摘要</div>
 
-        <div class="section-title">问题定位</div>
         <template v-if="qcDetail.problems?.length">
+          <div class="section-title">问题定位 · 现场还原</div>
           <div v-for="(p, i) in qcDetail.problems" :key="i" class="qc-problem">
             <div class="qc-problem-head">
               <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
               <span v-if="p.turn" class="muted">第 {{ p.turn }} 轮</span>
             </div>
             <div class="qc-problem-reason">{{ p.reason || "(未说明原因)" }}</div>
+            <template v-if="problemTurnDialog(p.turn)">
+              <div class="scene-bubble customer">{{ problemTurnDialog(p.turn)!.customer }}</div>
+              <div class="scene-bubble bot">
+                {{ problemTurnDialog(p.turn)!.bot }}
+                <el-tag v-if="problemTurnDialog(p.turn)!.source" size="small" type="info" class="scene-src">{{ problemTurnDialog(p.turn)!.source }}</el-tag>
+              </div>
+              <div v-if="qcTurnChains[rowRound(p.turn!) - 1]" class="qc-turn-chain">
+                该轮链路: {{ qcTurnChains[rowRound(p.turn!) - 1].steps.join(" → ") }}
+              </div>
+            </template>
+            <div v-else-if="p.turn && qcReplay" class="muted" style="font-size: 12px">第 {{ p.turn }} 轮内容超出回放范围</div>
           </div>
         </template>
-        <el-empty v-else description="未发现问题" :image-size="56" />
+
+        <div class="section-title">会话全景</div>
+        <el-collapse v-if="qcPanorama.length">
+          <el-collapse-item :title="`共 ${qcPanorama.length} 轮对话 (点击展开)`">
+            <div
+              v-for="r in qcPanorama"
+              :key="r.round"
+              class="pano-round"
+              :class="{ 'pano-problem': r.problem }"
+            >
+              <span class="pano-round-no">{{ r.round }}</span>
+              <div class="pano-text">
+                <div class="pano-customer">{{ r.customer }}</div>
+                <div class="pano-bot">{{ r.bot }}<el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag></div>
+              </div>
+            </div>
+          </el-collapse-item>
+        </el-collapse>
+        <div v-else class="muted">无对话记录 (可能仅被信号采集, 尚未质检)</div>
 
         <div class="section-title">质检信息</div>
         <el-descriptions :column="2" size="small" border>
           <el-descriptions-item label="判定">
-            <el-tag size="small" :type="verdictType(qcDetail.verdict)">{{ verdictLabel(qcDetail.verdict) }}</el-tag>
+            <el-tag size="small" :type="verdictType(qcDetail.verdict || '')">{{ verdictLabel(qcDetail.verdict || "") || "未质检" }}</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="对话轮数">{{ qcDetail.turns ?? "-" }}</el-descriptions-item>
           <el-descriptions-item label="裁判模型">{{ shortModel(qcDetail.judge_model || "") || "-" }}</el-descriptions-item>
           <el-descriptions-item label="会话时间">{{ fmtTime(qcDetail.session_time || qcDetail.scanned_at) }}</el-descriptions-item>
+          <el-descriptions-item v-if="qcDetail.signal_source" label="案例信号" :span="2">
+            {{ signalLabel(qcDetail.signal_source) }}
+            <span v-if="qcDetail.fix_status"> · 修复状态: {{ fixStatusLabel(qcDetail.fix_status) }}</span>
+          </el-descriptions-item>
         </el-descriptions>
 
         <div class="qc-actions">
           <el-button type="primary" @click="gotoAuditSession(qcDetail.session_id)">会话回放</el-button>
           <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
+          <el-button :loading="qcRescanning" @click="doRescan">复检此会话</el-button>
         </div>
       </div>
     </el-drawer>
@@ -508,7 +447,6 @@ import { useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
 import {
-  listBadcases,
   attributeBadcase,
   resolveBadcase,
   startBatchAttribution,
@@ -518,69 +456,68 @@ import {
   getBadcase,
   startQualityScan,
   getQualityScanStatus,
-  listQualityRecords,
+  listQcSessions,
+  rescanQualitySession,
+  type QcSessionRow,
   getQualityCoverage,
   type Badcase,
-  type QualityRecord,
   type QualityCoverage,
   type QualityProblem,
   type QualityScanStatus,
 } from "@/api/closedLoop"
+import { getConversationReplay, type ReplayResponse } from "@/api/console"
 
 const router = useRouter()
 
 // ── 页签: 质检记录 (全量会话判定) / 问题案例 (归因整改闭环) ──
-const activeTab = ref<"records" | "cases">("records")
-
-const badcases = ref<Badcase[]>([])
-const total = ref(0)
-const page = ref(1)
-const pageSize = ref(50)
-const loading = ref(false)
-const selected = ref<Badcase[]>([])
-const filters = ref<{ signal_source: string; root_cause_layer: string; fix_status: string; keyword: string; needs_review: boolean | null }>({
-  signal_source: "",
-  root_cause_layer: "",
-  fix_status: "",
-  keyword: "",
-  needs_review: null,
-})
-
-// ── 质检记录列表 (页签一) ──
-const records = ref<QualityRecord[]>([])
-const recTotal = ref(0)
-const recPage = ref(1)
-const recPageSize = ref(50)
-const recLoading = ref(false)
-const recFilters = ref<{ verdict: string; keyword: string }>({ verdict: "", keyword: "" })
+// ── 统一会话质检列表 (判定 ⟕ 问题案例, 会话维度一行) ──
+const qcRows = ref<QcSessionRow[]>([])
+const qcTotal = ref(0)
+const qcPage = ref(1)
+const qcPageSize = ref(50)
+const qcLoading = ref(false)
+const qcFilters = ref<{ category: string; keyword: string }>({ category: "", keyword: "" })
+const selected = ref<QcSessionRow[]>([])
 const coverage = ref<QualityCoverage | null>(null)
 
-async function loadRecords() {
-  recLoading.value = true
+async function loadQc() {
+  qcLoading.value = true
   try {
-    const res = await listQualityRecords({
-      verdict: recFilters.value.verdict || undefined,
-      keyword: recFilters.value.keyword || undefined,
-      limit: recPageSize.value,
-      offset: (recPage.value - 1) * recPageSize.value,
+    const res = await listQcSessions({
+      category: qcFilters.value.category || undefined,
+      keyword: qcFilters.value.keyword || undefined,
+      limit: qcPageSize.value,
+      offset: (qcPage.value - 1) * qcPageSize.value,
     })
-    records.value = res.records
-    recTotal.value = res.total
+    qcRows.value = res.sessions
+    qcTotal.value = res.total
   } catch {
     /* handled */
   } finally {
-    recLoading.value = false
+    qcLoading.value = false
   }
 }
 
-function reloadRecords() {
-  recPage.value = 1
-  loadRecords()
+function reloadQc() {
+  qcPage.value = 1
+  loadQc()
 }
 
-function clearRecFilters() {
-  recFilters.value = { verdict: "", keyword: "" }
-  reloadRecords()
+function clearQcFilters() {
+  qcFilters.value = { category: "", keyword: "" }
+  reloadQc()
+}
+
+function setCategory(cat: string) {
+  qcFilters.value.category = qcFilters.value.category === cat ? "" : cat
+  reloadQc()
+}
+
+function sessionTimeTitle(row: QcSessionRow): string {
+  const parts = [`会话 ${fmtTime(row.session_time)}`]
+  if (row.scanned_at) parts.push(`质检 ${fmtTime(row.scanned_at)}`)
+  if (row.collected_at) parts.push(`案例采集 ${fmtTime(row.collected_at)}`)
+  return parts.join(" · ")
 }
 
 async function loadCoverage() {
@@ -613,15 +550,115 @@ function gotoAuditSession(sessionId: string) {
 }
 
 // 质检记录行点击: fail 且已采入闭环 → 打开对应问题案例; 否则跳会话回放
-function openRecord(row: QualityRecord) {
-  openQcDetail(row)
-}
-
 const qcDetailVisible = ref(false)
-const qcDetail = ref<QualityRecord | null>(null)
-function openQcDetail(row: QualityRecord) {
+const qcDetail = ref<QcSessionRow | null>(null)
+const qcReplay = ref<ReplayResponse | null>(null)
+const qcReplayLoading = ref(false)
+const qcRescanning = ref(false)
+
+async function openQcDetail(row: QcSessionRow) {
   qcDetail.value = row
   qcDetailVisible.value = true
+  qcReplay.value = null
+  qcReplayLoading.value = true
+  try {
+    qcReplay.value = await getConversationReplay(row.session_id)
+  } catch {
+    /* 回放拉取失败时抽屉降级为仅判定视图 */
+  } finally {
+    qcReplayLoading.value = false
+  }
+}
+
+// 轮号口径: QA 裁判的 turn N 数的是对话日志行 (客户/客服各算一行)。
+// rowRound(n) = 第 n 行(1-based)所属的客户轮序 (每遇客户行 +1)
+function rowRound(n: number): number {
+  const ts = qcReplay.value?.turns ?? []
+  let r = 0
+  for (let i = 0; i < n && i < ts.length; i++) if (ts[i].speaker === "customer") r++
+  return r
+}
+
+// 问题轮现场: 定位第 N 行 → 向前取客户句 / 向后取客服句
+function problemTurnDialog(turn?: number | null): { customer: string; bot: string; source: string | null } | null {
+  if (!turn || !qcReplay.value) return null
+  const ts = qcReplay.value.turns
+  if (turn < 1 || turn > ts.length) return null
+  let ci = ts[turn - 1].speaker === "customer" ? turn - 1 : -1
+  for (let i = turn - 1; i >= 0 && ci < 0; i--) if (ts[i].speaker === "customer") ci = i
+  let bi = ts[turn - 1].speaker === "bot" ? turn - 1 : -1
+  for (let i = turn - 1; i < ts.length && bi < 0; i++) if (ts[i].speaker === "bot") bi = i
+  if (ci < 0) return null
+  return { customer: ts[ci].content, bot: bi >= 0 ? ts[bi].content : "", source: bi >= 0 ? ts[bi].response_source : null }
+}
+
+// 会话决策链按轮分组 (turn_start 起组, 组序 = 轮序)
+const qcTurnChains = computed(() => {
+  const ds = qcReplay.value?.decisions ?? []
+  const groups: { round: number; steps: string[] }[] = []
+  for (const d of ds) {
+    if (d.action === "turn_start" || !groups.length) groups.push({ round: groups.length + 1, steps: [] })
+    if (d.action !== "turn_start") groups[groups.length - 1]?.steps.push(ACTION_STEP[d.action] ?? d.action)
+  }
+  return groups
+})
+const ACTION_STEP: Record<string, string> = {
+  intent_classify: "意图分类",
+  route_decision: "路由",
+  tool_call: "工具",
+  rag_retrieve: "检索",
+  llm_generate: "生成",
+  noise_blocked: "噪声拦截",
+  faq_direct: "FAQ直出",
+  chain_complete: "完成",
+  topic_track: "诉求跟踪",
+  context_reply_pass: "回话放行",
+  outbound_guard: "出站闸门",
+}
+
+// 会话全景: 客户轮 → 客服回复配对
+const qcPanorama = computed(() => {
+  const ts = qcReplay.value?.turns ?? []
+  const rounds: { round: number; customer: string; bot: string; source: string | null; problem: boolean }[] = []
+  let round = 0
+  for (const t of ts) {
+    if (t.speaker === "customer") {
+      round += 1
+      const bot = ts[ts.indexOf(t) + 1]
+      rounds.push({
+        round,
+        customer: t.content,
+        bot: bot?.speaker === "bot" ? bot.content : "",
+        source: bot?.response_source ?? null,
+        problem: (qcDetail.value?.problems ?? []).some((p) => p.turn != null && rowRound(p.turn) === round),
+      })
+    }
+  }
+  return rounds
+})
+
+async function doRescan() {
+  if (!qcDetail.value) return
+  qcRescanning.value = true
+  try {
+    const r = await rescanQualitySession(qcDetail.value.session_id)
+    if (r.status === "ok" && qcDetail.value) {
+      qcDetail.value = {
+        ...qcDetail.value,
+        verdict: (r.verdict as QcSessionRow["verdict"]) ?? qcDetail.value.verdict,
+        problems: r.problems ?? qcDetail.value.problems,
+        summary: r.summary ?? qcDetail.value.summary,
+      }
+      await Promise.all([loadQc(), loadCoverage()])
+      ElMessage.success(`复检完成: ${verdictLabel(r.verdict ?? "")}`)
+    } else {
+      ElMessage.info(r.status === "skipped" ? "对话不足 2 轮, 跳过" : "复检完成")
+    }
+  } catch {
+    ElMessage.error("复检失败")
+  } finally {
+    qcRescanning.value = false
+  }
 }
 
 async function openBadcaseById(badcaseId: string) {
@@ -632,10 +669,6 @@ async function openBadcaseById(badcaseId: string) {
     /* handled */
   }
 }
-
-const hasActiveFilter = computed(() =>
-  Boolean(filters.value.signal_source || filters.value.root_cause_layer || filters.value.fix_status || filters.value.keyword || filters.value.needs_review !== null),
-)
 
 // ── 统计与分布 ──
 const stats = ref<(Awaited<ReturnType<typeof getBadcaseStats>>) | null>(null)
@@ -686,40 +719,12 @@ function distWidth(count: number) {
 }
 
 // ── 列表 ──
-async function load() {
-  loading.value = true
-  try {
-    const res = await listBadcases({
-      signal_source: filters.value.signal_source || undefined,
-      root_cause_layer: filters.value.root_cause_layer || undefined,
-      fix_status: filters.value.fix_status || undefined,
-      needs_review: filters.value.needs_review ?? undefined,
-      keyword: filters.value.keyword || undefined,
-      limit: pageSize.value,
-      offset: (page.value - 1) * pageSize.value,
-    })
-    badcases.value = res.badcases
-    total.value = res.total
-  } catch {
-    /* handled */
-  } finally {
-    loading.value = false
-  }
+function onSelection(rows: QcSessionRow[]) {
+  // 批量操作作用于问题案例: 行携带 badcase_id 才可选 (模板 :selectable 已限)
+  selected.value = rows.filter((r) => r.badcase_id)
 }
-
-function reload() {
-  page.value = 1
-  load()
-}
-
-function clearFilters() {
-  filters.value = { signal_source: "", root_cause_layer: "", fix_status: "", keyword: "", needs_review: null }
-  reload()
-}
-
-function toggleStatFilter(key: "needs_review", value: boolean) {
-  filters.value[key] = filters.value[key] === value ? null : value
-  reload()
+function fixTableFor(_row: QcSessionRow): string | undefined {
+  return undefined // 统一行不携带分流表; 后端 resolve 按根因层自动落表
 }
 
 async function loadStats() {
@@ -728,15 +733,6 @@ async function loadStats() {
   } catch {
     /* handled */
   }
-}
-
-function onSizeChange() {
-  page.value = 1
-  load()
-}
-
-function onSelection(rows: Badcase[]) {
-  selected.value = rows
 }
 
 // ── 详情抽屉 ──
@@ -750,9 +746,14 @@ const contextLoading = ref(false)
 
 const nextIdx = computed(() => {
   if (!detail.value) return null
-  const i = badcases.value.findIndex((b) => b.id === detail.value!.id)
-  return i >= 0 && i < badcases.value.length - 1 ? i + 1 : null
+  const i = qcRows.value.findIndex((b) => b.badcase_id === detail.value!.id)
+  return i >= 0 && i < qcRows.value.length - 1 ? i + 1 : null
 })
+
+function openNext() {
+  const row = qcRows.value[nextIdx.value!]
+  if (row?.badcase_id) openBadcaseById(row.badcase_id)
+}
 
 function openDetail(row: Badcase) {
   detail.value = row
@@ -760,10 +761,6 @@ function openDetail(row: Badcase) {
   judgedTable.value = row.fix_table || ""
   detailVisible.value = true
   loadContext(row)
-}
-
-function openNext() {
-  if (nextIdx.value != null) openDetail(badcases.value[nextIdx.value])
 }
 
 async function loadContext(row: Badcase) {
@@ -840,7 +837,7 @@ const qaProblems = computed<QualityProblem[]>(() => qaDetail.value?.problems ?? 
 async function refreshAfterAction(msg: string) {
   ElMessage.success(msg)
   detailVisible.value = false
-  await Promise.all([load(), loadStats()])
+  await Promise.all([loadQc(), loadStats()])
 }
 
 async function runAttribution(row: Badcase) {
@@ -848,9 +845,9 @@ async function runAttribution(row: Badcase) {
   try {
     const r = (await attributeBadcase(row.id)) as { root_cause_layer?: string; needs_human_review?: boolean }
     ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
-    await Promise.all([load(), loadStats()])
+    await Promise.all([loadQc(), loadStats()])
     if (detailVisible.value && detail.value?.id === row.id) {
-      const fresh = badcases.value.find((b) => b.id === row.id)
+      const fresh = await getBadcase(row.id)
       if (fresh) openDetail(fresh)
     }
   } catch {
@@ -924,14 +921,14 @@ async function batchConfirm() {
   let ok = 0
   for (const r of rows) {
     try {
-      await resolveBadcase(r.id, { fix_status: "fixing", fix_table: r.fix_table || undefined, human_confirmed_layer: r.root_cause_layer!, note: "批量确认" })
+      await resolveBadcase(r.badcase_id!, { fix_status: "fixing", fix_table: fixTableFor(r), human_confirmed_layer: r.root_cause_layer!, note: "批量确认" })
       ok++
     } catch {
       /* skip */
     }
   }
   ElMessage.success(`批量确认完成: ${ok}/${rows.length}`)
-  await Promise.all([load(), loadStats()])
+  await Promise.all([loadQc(), loadStats()])
 }
 
 async function batchTransition(status: string) {
@@ -940,14 +937,14 @@ async function batchTransition(status: string) {
   let ok = 0
   for (const r of rows) {
     try {
-      await resolveBadcase(r.id, { fix_status: status, note: "批量流转" })
+      await resolveBadcase(r.badcase_id!, { fix_status: status, note: "批量流转" })
       ok++
     } catch {
       /* skip */
     }
   }
   ElMessage.success(`批量流转完成: ${ok}/${rows.length}`)
-  await Promise.all([load(), loadStats()])
+  await Promise.all([loadQc(), loadStats()])
 }
 
 // ── 批量归因 (后台任务轮询, 跟随当前筛选范围) ──
@@ -986,7 +983,7 @@ async function pollBatch() {
       }
       if (st.total > 0) {
         ElMessage.success(`批量归因完成: 成功 ${st.done} / 失败 ${st.failed} / 共 ${st.total}`)
-        await Promise.all([load(), loadStats()])
+        await Promise.all([loadQc(), loadStats()])
       }
     }
   } catch {
@@ -996,8 +993,7 @@ async function pollBatch() {
 
 async function doBatchAttribution() {
   const scope: { signal_source?: string; keyword?: string } = {}
-  if (filters.value.signal_source) scope.signal_source = filters.value.signal_source
-  if (filters.value.keyword) scope.keyword = filters.value.keyword
+  if (qcFilters.value.keyword) scope.keyword = qcFilters.value.keyword
   const scopeText = Object.keys(scope).length ? " (按当前筛选范围)" : ""
   try {
     await startBatchAttribution(200, scope)
@@ -1043,7 +1039,7 @@ async function pollScan() {
       }
       if (st.total > 0) {
         ElMessage.success(`全量质检完成: 不合格 ${st.n_fail} 已采入待复核 (合格率 ${((st.last_run?.pass_rate ?? 0) * 100).toFixed(1)}%)`)
-        await Promise.all([load(), loadStats(), loadRecords(), loadCoverage()])
+        await Promise.all([loadQc(), loadStats(), loadCoverage()])
       }
     }
   } catch {
@@ -1095,9 +1091,6 @@ function layerLabel(s?: string | null) {
 function categoryLabel(s?: string | null) {
   return s ? (CATEGORY_LABELS[s] ?? s) : ""
 }
-function fixTableLabel(s?: string | null) {
-  return s ? (FIX_TABLE_LABELS[s] ?? s) : "-"
-}
 function fixStatusLabel(s: string) {
   const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "已灰度", deployed: "已全量", rejected: "已驳回" }
   return m[s] ?? s
@@ -1118,21 +1111,11 @@ function fmtPct(v: number | null | undefined) {
 function fmtTime(iso?: string | null) {
   return iso ? iso.slice(0, 19).replace("T", " ") : "-"
 }
-function relTime(iso?: string | null) {
-  if (!iso) return "-"
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000
-  if (diff < 60) return "刚刚"
-  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
-  return `${Math.floor(diff / 86400)} 天前`
-}
-
 onMounted(() => {
   pollScan() // 恢复可能进行中的全量质检进度
-  load()
+  loadQc()
   pollBatch()
   loadStats()
-  loadRecords() // 默认页签: 质检记录
   loadCoverage()
 })
 onUnmounted(() => {
@@ -1341,4 +1324,57 @@ onUnmounted(() => {
   gap: var(--space-2);
   margin-top: var(--space-4);
 }
+/* 问题轮现场还原 */
+.scene-bubble {
+  max-width: 92%;
+  padding: 6px 10px;
+  margin: 4px 0;
+  font-size: 13px;
+  line-height: 1.6;
+  border-radius: 8px;
+}
+.scene-bubble.customer {
+  align-self: flex-start;
+  background: var(--color-fill, rgba(0, 0, 0, 0.05));
+}
+.scene-bubble.bot {
+  align-self: flex-end;
+  margin-left: auto;
+  background: var(--color-primary-light-9, rgba(64, 158, 255, 0.1));
+}
+.scene-src { margin-left: 6px; }
+.qc-turn-chain {
+  margin-top: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-page);
+  border-radius: 6px;
+}
+.pano-round {
+  display: flex;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.pano-round.pano-problem {
+  background: rgba(245, 108, 108, 0.08);
+}
+.pano-round-no {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  font-size: 11px;
+  line-height: 20px;
+  text-align: center;
+  color: var(--color-text-secondary);
+  background: var(--color-fill, rgba(0, 0, 0, 0.05));
+  border-radius: 50%;
+}
+.pano-problem .pano-round-no {
+  color: #fff;
+  background: var(--el-color-danger, #f56c6c);
+}
+.pano-customer { font-size: 13px; }
+.pano-bot { margin-top: 2px; font-size: 12px; color: var(--color-text-secondary); }
 </style>

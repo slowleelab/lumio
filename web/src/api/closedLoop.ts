@@ -184,6 +184,50 @@ export interface QualityRecordListResponse {
   records: QualityRecord[]
 }
 
+export interface QcSessionRow {
+  session_id: string
+  verdict: "pass" | "warn" | "fail" | null
+  problems: QualityProblem[] | null
+  summary: string | null
+  turns: number | null
+  session_time: string | null
+  scanned_at: string | null
+  judge_model: string | null
+  preview: string | null
+  badcase_id: string | null
+  signal_source: string | null
+  root_cause_layer: string | null
+  human_confirmed_layer: string | null
+  fix_status: string | null
+  needs_human_review: boolean | null
+  attribution_confidence: number | null
+  collected_at: string | null
+  category: "pass" | "warn" | "fail" | "pending_review" | "unscanned"
+}
+
+export interface QcSessionListResponse {
+  total: number
+  sessions: QcSessionRow[]
+}
+
+export function listQcSessions(params?: {
+  category?: string
+  keyword?: string
+  limit?: number
+  offset?: number
+}): Promise<QcSessionListResponse> {
+  return client.get("/admin/closed-loop/quality/sessions", { params })
+}
+
+export function rescanQualitySession(sessionId: string): Promise<{
+  status: string
+  verdict?: string
+  problems?: QualityProblem[]
+  summary?: string
+}> {
+  return client.post("/admin/closed-loop/quality/rescan", { session_id: sessionId })
+}
+
 export function listQualityRecords(params?: {
   verdict?: string
   keyword?: string
