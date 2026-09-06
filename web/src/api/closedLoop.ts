@@ -219,6 +219,14 @@ export function listQcSessions(params?: {
   return client.get("/admin/closed-loop/quality/sessions", { params })
 }
 
+export function replayQualitySession(sessionId: string): Promise<{ status: string; new_session_id: string; total_rounds: number }> {
+  return client.post("/admin/closed-loop/quality/replay", { session_id: sessionId })
+}
+
+export function endChatSession(sessionId: string): Promise<{ status: string }> {
+  return client.post("/chat/end", { session_id: sessionId })
+}
+
 export function rescanQualitySession(sessionId: string): Promise<{
   status: string
   verdict?: string

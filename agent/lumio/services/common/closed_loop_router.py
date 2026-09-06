@@ -174,7 +174,7 @@ async def _batch_attribute_task(request: Request, limit: int, flt: dict[str, Any
         from lumio.shared.orm_models import Badcase
 
         async with sf() as db:
-            conds = [Badcase.root_cause_layer.is_(None)]
+            conds: list[Any] = [Badcase.root_cause_layer.is_(None)]
             if flt.get("signal_source"):
                 conds.append(Badcase.signal_source == flt["signal_source"])
             if flt.get("keyword"):
@@ -322,17 +322,14 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
     deployed = (
         await db.execute(select(func.count()).select_from(Badcase).where(Badcase.fix_status == "deployed"))
     ).scalar() or 0
-    llm_auto = (
-        confirmed
-        - (
-            await db.execute(
-                select(func.count())
-                .select_from(Badcase)
-                .where(Badcase.needs_human_review.is_(False) & Badcase.human_confirmed_layer.is_not(None))
-            )
-        ).scalar()
-        or 0
-    )
+    human_confirmed = (
+        await db.execute(
+            select(func.count())
+            .select_from(Badcase)
+            .where(Badcase.needs_human_review.is_(False) & Badcase.human_confirmed_layer.is_not(None))
+        )
+    ).scalar() or 0
+    llm_auto = confirmed - human_confirmed
     pass_rate = (llm_auto / confirmed) if confirmed else None
     # 分布聚合 (质检工作台概览条)
     layer_rows = (
@@ -530,6 +527,8 @@ async def quality_rescan_endpoint(user: AdminAgentUser, request: Request, body: 
     judge_llm = _build_judge_llm_only(request)
     sf = getattr(request.app.state, "db_session_factory", None)
     redis = getattr(request.app.state, "redis_client", None)
+    if sf is None or redis is None:
+        raise LumioError(code=5001, message="DB/Redis 未就绪")
     result = await quality_scan.scan_session_by_id(
         sf, judge_llm, redis, session_id, quality_scan.judge_model_name(get_settings()), force=True
     )
@@ -541,6 +540,69 @@ async def quality_rescan_endpoint(user: AdminAgentUser, request: Request, body: 
         "problems": result.get("problems"),
         "summary": result.get("summary"),
     }
+
+
+@router.post("/quality/replay")
+async def quality_replay_endpoint(user: AdminAgentUser, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """重放执行: 取原会话全部客户消息, 按原顺序重新发给机器人 (新会话)。
+
+    修复验证口径 — 同样的输入过当前链路, 逐轮对比新旧回复 (前端轮询新会话
+    回放直至客服轮数齐, 再结束会话触发自动质检)。走真实消息管线 (审计/闸门
+    /队列全量生效), per-session worker 串行消费保证轮序。
+    """
+    import asyncio as _asyncio
+    import contextlib as _cl
+    import time as _time
+    import uuid as _uuid
+
+    from lumio.services.bot.router import CHAT_STREAM_KEY
+    from lumio.services.common.audit import write_chat_message
+    from lumio.shared.orm_models import DialogueLog
+
+    session_id = str((body or {}).get("session_id") or "").strip()
+    if not session_id:
+        raise LumioError(code=2001, message="session_id 必填")
+    sf = getattr(request.app.state, "db_session_factory", None)
+    redis = getattr(request.app.state, "redis_client", None)
+    if sf is None or redis is None:
+        raise LumioError(code=5001, message="DB/Redis 未就绪")
+
+    async with sf() as db:
+        msgs = (
+            (
+                await db.execute(
+                    select(DialogueLog.content)
+                    .where(DialogueLog.session_id == session_id, DialogueLog.speaker == "customer")
+                    .order_by(DialogueLog.timestamp)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    msgs = [m for m in msgs if (m or "").strip()][:30]
+    if not msgs:
+        raise LumioError(code=2001, message="原会话无客户消息, 无法重放")
+
+    new_sid = f"replay-{session_id[:20]}-{int(_time.time() * 1000) % 100000}"
+    for msg in msgs:
+        message_id = _uuid.uuid4().hex
+        with _cl.suppress(Exception):  # 审计失败不阻断重放
+            await write_chat_message(sf, session_id=new_sid, message_id=message_id, content=msg, customer_id="replay-bot")
+        await redis.xadd(
+            CHAT_STREAM_KEY,
+            {
+                "session_id": new_sid,
+                "message_id": message_id,
+                "message": msg,
+                "verification_result": "",
+                "_trace_context": "",
+                "_enqueue_time": _asyncio.get_event_loop().time(),
+                "customer_id": "replay-bot",
+                "customer_name": "重放执行",
+                "channel": "web",
+            },
+        )
+    return {"status": "ok", "new_session_id": new_sid, "total_rounds": len(msgs)}
 
 
 @router.get("/quality/coverage")

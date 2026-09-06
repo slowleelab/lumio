@@ -222,7 +222,7 @@
       <el-table-column label="操作" width="130" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
-          <el-button link size="small" @click.stop="gotoAuditSession(row.session_id)">回放</el-button>
+          <el-button link size="small" @click.stop="openQcDetail(row, true)">回放</el-button>
           <el-button v-if="row.badcase_id" link type="warning" size="small" @click.stop="openBadcaseById(row.badcase_id)">整改</el-button>
         </template>
       </el-table-column>
@@ -427,9 +427,9 @@
           </div>
         </template>
 
-        <div class="section-title">会话全景</div>
-        <el-collapse v-if="qcPanorama.length">
-          <el-collapse-item :title="`共 ${qcPanorama.length} 轮对话 (点击展开)`">
+        <div class="section-title">会话回放 <span class="muted section-hint">({{ qcPanorama.length }} 轮 · 问题轮标红 · 含每轮链路)</span></div>
+        <el-collapse v-if="qcPanorama.length" v-model="panoActiveNames">
+          <el-collapse-item name="pano" :title="panoActiveNames.length ? '收起回放' : `共 ${qcPanorama.length} 轮对话 (点击展开)`">
             <div
               v-for="r in qcPanorama"
               :key="r.round"
@@ -439,12 +439,55 @@
               <span class="pano-round-no">{{ r.round }}</span>
               <div class="pano-text">
                 <div class="pano-customer">{{ r.customer }}</div>
-                <div class="pano-bot">{{ r.bot }}<el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag></div>
+                <div class="pano-bot">
+                  {{ r.bot }}
+                  <el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag>
+                </div>
+                <div v-if="qcTurnChains[r.round - 1]" class="qc-turn-chain">
+                  链路: {{ qcTurnChains[r.round - 1].steps.join(" → ") }}
+                </div>
               </div>
             </div>
           </el-collapse-item>
         </el-collapse>
         <div v-else class="muted">无对话记录 (可能仅被信号采集, 尚未质检)</div>
+
+        <!-- 重放执行: 原客户消息按序重发, 修复前后逐轮对比 -->
+        <div class="section-title">重放验证 <span class="muted section-hint">(用原客户消息再走一遍当前链路)</span></div>
+        <div v-if="!replayState.running && !replayState.newSessionId" class="replay-idle">
+          <el-button size="small" type="primary" plain @click="doReplay">重放执行 ({{ qcPanorama.length }} 轮)</el-button>
+        </div>
+        <div v-else class="replay-panel">
+          <div v-if="replayState.running" class="replay-progress">
+            <el-progress :percentage="replayProgressPct" :stroke-width="8" striped striped-flow status="success" />
+            <span class="muted">重放中 {{ replayState.done }}/{{ replayState.total }} 轮 · 新会话 {{ replayState.newSessionId?.slice(0, 28) }}…</span>
+          </div>
+          <template v-if="!replayState.running && replayCompare.length">
+            <div class="replay-compare-head">
+              <span>原会话 ({{ fmtTime(qcDetail.session_time) }})</span>
+              <span>重放会话 ({{ fmtTime(replayState.finishedAt) }})</span>
+            </div>
+            <div v-for="c in replayCompare" :key="c.round" class="replay-row">
+              <span class="pano-round-no" :class="{ 'is-problem': c.changed }">{{ c.round }}</span>
+              <div class="replay-cells">
+                <div class="replay-cell">
+                  <div class="replay-customer">{{ c.customer }}</div>
+                  <div class="pano-bot">{{ c.oldBot }} <el-tag v-if="c.oldSource" size="small" type="info" class="scene-src">{{ c.oldSource }}</el-tag></div>
+                </div>
+                <div class="replay-cell" :class="{ 'replay-changed': c.changed }">
+                  <div class="pano-bot">{{ c.newBot || "…" }} <el-tag v-if="c.newSource" size="small" :type="c.changed ? 'success' : 'info'" class="scene-src">{{ c.newSource }}</el-tag></div>
+                </div>
+              </div>
+            </div>
+            <div class="replay-summary">
+              <template v-if="replayChangedCount > 0">
+                <el-tag type="success" size="small">{{ replayChangedCount }}/{{ replayCompare.length }} 轮回复变化</el-tag>
+                已自动结束重放会话并触发质检 — 稍后可在列表搜 <span class="session-id">{{ replayState.newSessionId }}</span> 查看新判定
+              </template>
+              <el-tag v-else type="info" size="small">回复与原会话一致</el-tag>
+            </div>
+          </template>
+        </div>
 
         <div class="section-title">质检信息</div>
         <el-descriptions :column="2" size="small" border>
@@ -461,7 +504,7 @@
         </el-descriptions>
 
         <div class="qc-actions">
-          <el-button type="primary" @click="gotoAuditSession(qcDetail.session_id)">会话回放</el-button>
+          <el-button type="primary" @click="expandReplayView">展开会话回放</el-button>
           <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
           <el-button :loading="qcRescanning" @click="doRescan">复检此会话</el-button>
         </div>
@@ -487,6 +530,8 @@ import {
   getQualityScanStatus,
   listQcSessions,
   rescanQualitySession,
+  replayQualitySession,
+  endChatSession,
   type QcSessionRow,
   getQualityCoverage,
   type Badcase,
@@ -585,11 +630,14 @@ const qcReplay = ref<ReplayResponse | null>(null)
 const qcReplayLoading = ref(false)
 const qcRescanning = ref(false)
 
-async function openQcDetail(row: QcSessionRow) {
+async function openQcDetail(row: QcSessionRow, expandReplay = false) {
   qcDetail.value = row
   qcDetailVisible.value = true
   qcReplay.value = null
   qcReplayLoading.value = true
+  panoActiveNames.value = expandReplay ? ["pano"] : []
+  replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null }
+  replayNewReplay.value = null
   try {
     qcReplay.value = await getConversationReplay(row.session_id)
   } catch {
@@ -665,6 +713,91 @@ const qcPanorama = computed(() => {
   }
   return rounds
 })
+
+// 内嵌回放展开 (操作列"回放"或处置按钮自动展开)
+const panoActiveNames = ref<string[]>([])
+function expandReplayView() {
+  panoActiveNames.value = ["pano"]
+  document.querySelector(".qc-detail")?.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" })
+  document.querySelector(".qc-detail .el-collapse")?.scrollIntoView({ behavior: "smooth", block: "center" })
+}
+
+// 重放执行: 原客户消息按序重发 → 轮询完成 → 结束会话触发质检 → 前后对比
+const replayState = ref<{
+  running: boolean
+  newSessionId: string | null
+  total: number
+  done: number
+  finishedAt: string | null
+}>({ running: false, newSessionId: null, total: 0, done: 0, finishedAt: null })
+const replayNewReplay = ref<ReplayResponse | null>(null)
+let replayTimer: ReturnType<typeof setInterval> | null = null
+
+const replayProgressPct = computed(() =>
+  replayState.value.total ? Math.min(100, Math.round((replayState.value.done / replayState.value.total) * 100)) : 0,
+)
+
+const replayCompare = computed(() => {
+  const oldRounds = qcPanorama.value
+  const newTurns = replayNewReplay.value?.turns ?? []
+  const newRounds: { customer: string; bot: string; source: string | null }[] = []
+  let round = 0
+  for (const t of newTurns) {
+    if (t.speaker === "customer") {
+      round += 1
+      const bot = newTurns[newTurns.indexOf(t) + 1]
+      newRounds.push({ customer: t.content, bot: bot?.speaker === "bot" ? bot.content : "", source: bot?.response_source ?? null })
+    }
+  }
+  return oldRounds.map((o, i) => {
+    const n = newRounds[i]
+    return {
+      round: o.round,
+      customer: o.customer,
+      oldBot: o.bot,
+      oldSource: o.source,
+      newBot: n?.bot ?? "",
+      newSource: n?.source ?? null,
+      changed: !!n && (n.bot !== o.bot || n.source !== o.source),
+    }
+  })
+})
+const replayChangedCount = computed(() => replayCompare.value.filter((c) => c.changed).length)
+
+async function doReplay() {
+  if (!qcDetail.value || replayState.value.running) return
+  replayState.value = { running: true, newSessionId: null, total: 0, done: 0, finishedAt: null }
+  replayNewReplay.value = null
+  try {
+    const r = await replayQualitySession(qcDetail.value.session_id)
+    replayState.value.newSessionId = r.new_session_id
+    replayState.value.total = r.total_rounds
+    let waited = 0
+    replayTimer = setInterval(async () => {
+      waited += 3
+      try {
+        const nr = await getConversationReplay(r.new_session_id)
+        replayNewReplay.value = nr
+        const doneCount = nr.turns.filter((t) => t.speaker === "bot").length
+        replayState.value.done = doneCount
+        if (doneCount >= r.total_rounds || waited > 120) {
+          clearInterval(replayTimer!)
+          replayTimer = null
+          replayState.value.running = false
+          replayState.value.finishedAt = new Date().toISOString()
+          // 结束重放会话 → 触发自动质检, 新判定稍后可查
+          endChatSession(r.new_session_id).catch(() => {})
+          ElMessage.success(waited > 120 ? "重放超时收尾 (已尽力)" : "重放完成, 已触发新会话质检")
+        }
+      } catch {
+        /* 新会话回放未就绪, 继续等 */
+      }
+    }, 3000)
+  } catch {
+    replayState.value.running = false
+    ElMessage.error("重放启动失败")
+  }
+}
 
 async function doRescan() {
   if (!qcDetail.value) return
@@ -1215,6 +1348,7 @@ onMounted(() => {
   loadCoverage()
 })
 onUnmounted(() => {
+  if (replayTimer) clearInterval(replayTimer)
   if (batchTimer) clearInterval(batchTimer)
 })
 </script>
@@ -1477,4 +1611,47 @@ onUnmounted(() => {
 .fix-steps { margin-bottom: 16px; }
 .reject-alert { margin-bottom: 12px; }
 .fix-guide { margin-top: 8px; }
+/* 重放验证 */
+.replay-idle { padding: 4px 0 8px; }
+.replay-progress { margin-bottom: 10px; }
+.replay-compare-head {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+.replay-row {
+  display: flex;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px dashed var(--color-border-lighter, #ebeef5);
+}
+.replay-cells {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  flex: 1;
+}
+.replay-cell {
+  padding: 4px 8px;
+  font-size: 13px;
+  background: var(--color-bg-page);
+  border-radius: 6px;
+}
+.replay-cell.replay-changed {
+  background: rgba(103, 194, 58, 0.1);
+}
+.replay-customer { font-size: 13px; margin-bottom: 2px; }
+.pano-round-no.is-problem { color: #fff; background: var(--el-color-success, #67c23a); }
+.replay-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
 </style>
