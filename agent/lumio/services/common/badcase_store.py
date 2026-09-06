@@ -262,24 +262,39 @@ async def list_quality_records(
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
-    """质检记录列表, 按会话时间倒序 (对话发生顺序; 无锚点退回质检时刻)"""
+    """质检记录列表 · 会话维度: 每会话取最新一次判定 (复检多行只展示最新),
+    按会话时间倒序 (对话发生顺序; 无锚点退回质检时刻)。
+
+    筛选 (判定/关键词) 作用于记录后再按会话去重 — 判"不合格"筛选时展示的是
+    该会话最新一条不合格记录 (曾不合格复检转合格的会话仍可被检索到)。
+    """
     conds = []
     if verdict:
         conds.append(QualityRecord.verdict == verdict)
     if keyword:
         conds.append(QualityRecord.preview.ilike(f"%{keyword}%") | QualityRecord.session_id.ilike(f"%{keyword}%"))
 
-    query = select(QualityRecord)
-    count_q = select(func.count()).select_from(QualityRecord)
-    if conds:
-        query = query.where(*conds)
-        count_q = count_q.where(*conds)
+    from sqlalchemy.orm import aliased
 
-    total = (await session.execute(count_q)).scalar() or 0
+    # 会话去重取最新: row_number 窗口 (方言中立, 等价 PG DISTINCT ON)
+    sub = (
+        select(
+            QualityRecord,
+            func.row_number()
+            .over(partition_by=QualityRecord.session_id, order_by=QualityRecord.scanned_at.desc())
+            .label("rn"),
+        )
+        .where(*conds)
+    ).subquery()
+    qr = aliased(QualityRecord, sub)
+
+    total = (await session.execute(select(func.count()).select_from(qr).where(sub.c.rn == 1))).scalar() or 0
     rows = (
         (
             await session.execute(
-                query.order_by(func.coalesce(QualityRecord.session_time, QualityRecord.scanned_at).desc())
+                select(qr)
+                .where(sub.c.rn == 1)
+                .order_by(func.coalesce(qr.session_time, qr.scanned_at).desc(), qr.scanned_at.desc())
                 .limit(limit)
                 .offset(offset)
             )

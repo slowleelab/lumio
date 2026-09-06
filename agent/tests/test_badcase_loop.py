@@ -511,3 +511,41 @@ class TestOutboundSensitiveSolicitation:
         assert v.passed is True
         v = g.check("挂失补卡需在网点办理, 携带本人身份证即可。")
         assert v.passed is True
+
+
+@pytest.mark.asyncio
+async def test_quality_records_session_dimension() -> None:
+    """质检列表会话维度: DISTINCT ON 每会话最新判定 + 会话时间倒序"""
+    from sqlalchemy.dialects import postgresql
+
+    from lumio.services.common.badcase_store import list_quality_records
+
+    captured: list = []
+
+    class FakeResult:
+        def scalar(self):
+            return 0
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def execute(self, q):
+            captured.append(q)
+            return FakeResult()
+
+    items, total = await list_quality_records(Session(), verdict="fail", limit=20)
+    assert (items, total) == ([], 0)
+    sql = str(captured[-1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})).lower()
+    assert "row_number()" in sql and "partition by" in sql and "session_id" in sql, "应按会话窗口去重取最新判定"
+    assert "scanned_at desc" in sql, "会话内取最新一次判定"
+    assert "rn = 1" in sql or "rn=1" in sql, "外层只取每会话最新一条"

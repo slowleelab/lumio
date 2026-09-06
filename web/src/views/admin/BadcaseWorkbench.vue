@@ -90,7 +90,7 @@
           </el-select>
           <el-input
             v-model="recFilters.keyword"
-            placeholder="搜索会话 ID / 首轮客户输入…"
+            placeholder="搜索会话 ID…"
             clearable
             size="small"
             style="width: 220px"
@@ -110,9 +110,9 @@
               </span>
             </template>
           </el-table-column>
-          <el-table-column label="首轮客户输入" min-width="220" show-overflow-tooltip>
+          <el-table-column label="会话 ID" width="150" show-overflow-tooltip>
             <template #default="{ row }">
-              <span class="input-text">{{ row.preview || "(无客户输入)" }}</span>
+              <span class="session-id">{{ row.session_id }}</span>
             </template>
           </el-table-column>
           <el-table-column label="轮数" width="58" align="center">
@@ -144,10 +144,10 @@
               <span v-else class="muted">-</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="170" fixed="right">
+          <el-table-column label="操作" width="120" fixed="right">
             <template #default="{ row }">
-              <el-button link type="primary" size="small" @click.stop="gotoAuditSession(row.session_id)">会话回放</el-button>
-              <el-button v-if="row.badcase_id" link type="warning" size="small" @click.stop="openBadcaseById(row.badcase_id)">整改闭环</el-button>
+              <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
+              <el-button link size="small" @click.stop="gotoAuditSession(row.session_id)">回放</el-button>
             </template>
           </el-table-column>
           <template #empty>
@@ -458,6 +458,47 @@
         </template>
       </div>
     </el-drawer>
+
+    <!-- ══ 质检详情抽屉 (问题导向: 判定 → 什么问题 → 定位轮次 → 下钻) ══ -->
+    <el-drawer v-model="qcDetailVisible" size="46%" destroy-on-close>
+      <template #header>
+        <div class="drawer-title">
+          <el-tag :type="verdictType(qcDetail?.verdict || '')" effect="dark">{{ verdictLabel(qcDetail?.verdict || '') }}</el-tag>
+          <span class="session-id">{{ qcDetail?.session_id }}</span>
+        </div>
+      </template>
+      <div v-if="qcDetail" class="qc-detail">
+        <div v-if="qcDetail.summary" class="qc-summary">{{ qcDetail.summary }}</div>
+        <div v-else class="qc-summary muted">裁判未给出摘要</div>
+
+        <div class="section-title">问题定位</div>
+        <template v-if="qcDetail.problems?.length">
+          <div v-for="(p, i) in qcDetail.problems" :key="i" class="qc-problem">
+            <div class="qc-problem-head">
+              <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
+              <span v-if="p.turn" class="muted">第 {{ p.turn }} 轮</span>
+            </div>
+            <div class="qc-problem-reason">{{ p.reason || "(未说明原因)" }}</div>
+          </div>
+        </template>
+        <el-empty v-else description="未发现问题" :image-size="56" />
+
+        <div class="section-title">质检信息</div>
+        <el-descriptions :column="2" size="small" border>
+          <el-descriptions-item label="判定">
+            <el-tag size="small" :type="verdictType(qcDetail.verdict)">{{ verdictLabel(qcDetail.verdict) }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="对话轮数">{{ qcDetail.turns ?? "-" }}</el-descriptions-item>
+          <el-descriptions-item label="裁判模型">{{ shortModel(qcDetail.judge_model || "") || "-" }}</el-descriptions-item>
+          <el-descriptions-item label="会话时间">{{ fmtTime(qcDetail.session_time || qcDetail.scanned_at) }}</el-descriptions-item>
+        </el-descriptions>
+
+        <div class="qc-actions">
+          <el-button type="primary" @click="gotoAuditSession(qcDetail.session_id)">会话回放</el-button>
+          <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
+        </div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -573,8 +614,14 @@ function gotoAuditSession(sessionId: string) {
 
 // 质检记录行点击: fail 且已采入闭环 → 打开对应问题案例; 否则跳会话回放
 function openRecord(row: QualityRecord) {
-  if (row.badcase_id) openBadcaseById(row.badcase_id)
-  else gotoAuditSession(row.session_id)
+  openQcDetail(row)
+}
+
+const qcDetailVisible = ref(false)
+const qcDetail = ref<QualityRecord | null>(null)
+function openQcDetail(row: QualityRecord) {
+  qcDetail.value = row
+  qcDetailVisible.value = true
 }
 
 async function openBadcaseById(badcaseId: string) {
@@ -1262,5 +1309,36 @@ onUnmounted(() => {
   padding: 8px 12px;
   border-radius: 6px;
   font-size: var(--fs-sm);
+}
+/* 质检详情抽屉 (问题导向) */
+.qc-summary {
+  padding: var(--space-3);
+  font-size: 14px;
+  line-height: 1.7;
+  background: var(--color-bg-page);
+  border-left: 3px solid var(--color-primary, #409eff);
+  border-radius: var(--radius-md);
+}
+.qc-problem {
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  background: var(--color-bg-page);
+  border-radius: var(--radius-md);
+}
+.qc-problem-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.qc-problem-reason {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+}
+.qc-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
 }
 </style>
