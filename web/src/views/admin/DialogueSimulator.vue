@@ -33,6 +33,7 @@
         <div class="stat"><b>{{ status.stats.latency_p95_ms || "-" }}</b><span>P95 ms</span></div>
         <div class="stat"><b class="warn">{{ status.stats.feedbacks }}</b><span>差评(喂闭环)</span></div>
         <div class="stat"><b>{{ status.stats.abandoned }}</b><span>中途挂断</span></div>
+        <div class="stat"><b class="warn">{{ status.stats.timeouts ?? 0 }}</b><span>超时自动结束</span></div>
         <div class="stat"><b class="warn">{{ status.stats.errors }}</b><span>错误</span></div>
       </div>
     </div>
@@ -109,7 +110,7 @@ const status = ref<SimulatorStatus>({
   config: { scenario_keys: [], users: 2, interval: 8 },
   stats: {
     started_at: 0, sessions: 0, turns: 0, expect_hits: 0, expect_checks: 0,
-    feedbacks: 0, errors: 0, abandoned: 0, latency_avg_ms: 0, latency_p95_ms: 0,
+    feedbacks: 0, errors: 0, abandoned: 0, timeouts: 0, latency_avg_ms: 0, latency_p95_ms: 0,
   },
   recent: [],
 })

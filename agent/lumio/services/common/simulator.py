@@ -33,7 +33,13 @@ from lumio.shared.logger import get_logger
 
 logger = get_logger(__name__)
 
-POLL_TIMEOUT = 60.0  # 单轮等待回复上限 (交易编排预算 40s + 余量; 本地慢 LLM)
+# 单轮等待回复上限: 超过即视为服务无响应 — 主动结束会话 (服务端立即回收 +
+# 触发会话结束质检) 并按超时挂断计, 不再无限等 (用户口径 120s)
+POLL_TIMEOUT = 120.0
+
+
+class ReplyTimeoutError(Exception):
+    """单轮等待回复超过 POLL_TIMEOUT — 会话已被主动结束, 场景应终止。"""
 TURN_GAP = 2.0  # 轮间隔 (秒), 模拟人打字
 
 # ── 会话级行为概率 (真实客户不总是走完剧本) ──
@@ -453,6 +459,7 @@ class SimulatorStats:
     feedbacks: int = 0
     errors: int = 0
     abandoned: int = 0
+    timeouts: int = 0
     latencies: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -467,6 +474,7 @@ class SimulatorStats:
             "feedbacks": self.feedbacks,
             "errors": self.errors,
             "abandoned": self.abandoned,
+            "timeouts": self.timeouts,
             "latency_avg_ms": round(sum(lat) / n * 1000, 1) if n else 0,
             "latency_p95_ms": round(lat[int(n * 0.95)] * 1000, 1) if n else 0,
         }
@@ -516,37 +524,59 @@ class SimCustomer:
         self._session_id = ""
         self._rng = rng or random.Random(random.random())
 
+    async def _end_session(self, client: httpx.AsyncClient, *, reason: str = "scenario_complete") -> None:
+        """主动结束会话: 服务端立即回收 + 触发会话结束自动质检 (质检覆盖闭环)。"""
+        try:
+            r = await client.post(
+                f"{self._base}/api/chat/end", json={"session_id": self._session_id, "reason": reason}
+            )
+            if r.status_code == 200:
+                logger.debug("模拟会话已主动结束: session=%s reason=%s", self._session_id, reason)
+            else:
+                logger.debug("模拟会话结束请求失败(%s): session=%s", r.status_code, self._session_id)
+        except Exception as exc:
+            logger.debug("模拟会话结束请求异常(不阻断): %s", exc)
+
     async def run_scenario(self, sc: Scenario, *, chained: bool = False) -> list[TurnRecord]:
         """跑一个场景。chained=True 表示同一会话顺带追问的第二个主题。"""
         records: list[TurnRecord] = []
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            if not chained:
-                self._session_id = f"sim-{sc.key}-{int(time.time() * 1000)}-{self._rng.randint(100, 999)}"
-                if self._rng.random() < GREETING_RATE:
-                    records.append(await self._one_turn(client, sc, 0, self._rng.choice(_GREETING_VARIANTS), None))
-            for i, turn in enumerate(sc.turns, start=1):
-                records.append(await self._one_turn(client, sc, i, pick_turn_text(turn, self._rng), turn.get("expect")))
-                # 中途挂断: 剧本没走完就消失 (真实客户行为; 最后一轮之后不算挂断)
-                if i < len(sc.turns) and self._rng.random() < ABANDON_RATE:
-                    state.stats.abandoned += 1
-                    logger.debug("模拟客户中途挂断: session=%s 场景=%s 第 %d 轮", self._session_id, sc.key, i)
-                    state.stats.sessions += 1
-                    return records
-            if (
-                sc.final_feedback == "down"
-                and records
-                and self._reply_is_bad(records[-1].reply)
-                and await self._send_feedback(client, records[-1])
-            ):
-                state.stats.feedbacks += 1
-            # 多主题连问: 本主题没转人工时, 概率性在同一会话再问一个轻量主题
-            transferred = any(k in (rec.reply or "") for rec in records for k in ("转接", "人工", "专员"))
-            if not chained and self._rng.random() < MULTI_TOPIC_RATE and not transferred:
-                keys = [k for k in _CHAINABLE_KEYS if k in SCENARIO_MAP]
-                if keys:
-                    second = SCENARIO_MAP[self._rng.choice(keys)]
-                    records += await self.run_scenario(second, chained=True)
-                    state.stats.sessions -= 1  # 连问不重复计会话
+            try:
+                if not chained:
+                    self._session_id = f"sim-{sc.key}-{int(time.time() * 1000)}-{self._rng.randint(100, 999)}"
+                    if self._rng.random() < GREETING_RATE:
+                        records.append(await self._one_turn(client, sc, 0, self._rng.choice(_GREETING_VARIANTS), None))
+                for i, turn in enumerate(sc.turns, start=1):
+                    records.append(await self._one_turn(client, sc, i, pick_turn_text(turn, self._rng), turn.get("expect")))
+                    # 中途挂断: 剧本没走完就消失 (真实客户行为; 最后一轮之后不算挂断)
+                    if i < len(sc.turns) and self._rng.random() < ABANDON_RATE:
+                        state.stats.abandoned += 1
+                        logger.debug("模拟客户中途挂断: session=%s 场景=%s 第 %d 轮", self._session_id, sc.key, i)
+                        state.stats.sessions += 1
+                        return records
+                if (
+                    sc.final_feedback == "down"
+                    and records
+                    and self._reply_is_bad(records[-1].reply)
+                    and await self._send_feedback(client, records[-1])
+                ):
+                    state.stats.feedbacks += 1
+                # 多主题连问: 本主题没转人工时, 概率性在同一会话再问一个轻量主题
+                transferred = any(k in (rec.reply or "") for rec in records for k in ("转接", "人工", "专员"))
+                if not chained and self._rng.random() < MULTI_TOPIC_RATE and not transferred:
+                    keys = [k for k in _CHAINABLE_KEYS if k in SCENARIO_MAP]
+                    if keys:
+                        second = SCENARIO_MAP[self._rng.choice(keys)]
+                        records += await self.run_scenario(second, chained=True)
+                        state.stats.sessions -= 1  # 连问不重复计会话
+                # 对话完成主动结束会话: 服务端立即回收 + 触发会话结束自动质检
+                # (挂断/超时路径不走到这 — 挂断模拟真实客户消失, 超时已在轮询层结束)
+                if not chained:
+                    await self._end_session(client, reason="scenario_complete")
+            except ReplyTimeoutError:
+                # 会话已在轮询层结束并计数; 已收到的轮次照常入档 (超时前的话术
+                # 仍是有效观测样本)
+                pass
         if not chained:
             state.stats.sessions += 1
         return records
@@ -596,7 +626,12 @@ class SimCustomer:
             if data.get("has_message"):
                 return str(data.get("reply") or "")
             await asyncio.sleep(1.0)
-        return "(超时未收到回复)"
+        # 会话超时监控 (120s 无回复): 主动结束会话 — 服务端立即回收 + 触发会话
+        # 结束质检, 客户端按超时挂断计并终止本场景 (死会话不值得继续轮询)
+        state.stats.timeouts += 1
+        await self._end_session(client, reason="reply_timeout")
+        logger.warning("会话超时无回复自动结束: session=%s 上轮输入=%r", self._session_id, text[:24])
+        raise ReplyTimeoutError(self._session_id)
 
     # 拒答话术特征: 命中才值得差评 (第二轮模拟假阳性根因: 答对了也差评)
     _BAD_REPLY_MARKERS = _BAD_REPLY_MARKERS

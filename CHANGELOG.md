@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/lang/zh-CN/
 
 ## [Unreleased]
 
+### Added
+- **模拟器会话生命周期（用户口径）**：对话完成主动结束会话（触发服务端回收 + 会话结束自动质检，模拟流量正式纳入质检覆盖）；单轮等待上限 60s→**120s**，超时主动结束会话并按 `timeouts` 计数终止场景（不再无限轮询死会话）；前端新增"超时自动结束"统计卡。中途挂断路径保持不结束（模拟真实客户消失，由服务端超时回收）。E2E：模拟会话结束即入 quality_record（6/6 pass）
+
 ### Fixed
 - **紧急诉求 OOD 豁免（对话模拟第一轮复盘，switch_topic_mid 31% 澄清率）**：等待补卡号期间"先别查了, 我要挂失"被 OOD 门拦成"没太明白"——向量通道把挂失句吸到 faq@0.85、BERT 弱信号 card_loss@0.29 才是对的，快慢分歧标记反而成为拦截理由；紧急标记（挂失/被盗类）输入不再按 ood_unknown 拦截，交知识/敏感链路给出挂失指引（与 FAQ 通道紧急豁免同纪律）
 

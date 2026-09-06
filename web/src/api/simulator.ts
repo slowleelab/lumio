@@ -22,6 +22,7 @@ export interface SimulatorStats {
   feedbacks: number
   errors: number
   abandoned: number
+  timeouts: number
   latency_avg_ms: number
   latency_p95_ms: number
 }

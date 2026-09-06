@@ -242,3 +242,88 @@ class TestWorkerProcessManagement:
 
 
 import json  # noqa: E402  (测试块内多处使用, 统一顶部化由 ruff-isort 兜底)
+
+
+async def test_scenario_completion_ends_session() -> None:
+    """对话完成 → 主动结束会话 (服务端回收 + 触发会话结束质检)"""
+    import httpx
+
+    from lumio.services.common.simulator import SimCustomer
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/api/chat/send":
+            return httpx.Response(200, json={"accepted": True})
+        if request.url.path == "/api/chat/poll":
+            return httpx.Response(200, json={"has_message": True, "reply": "标准回复内容"})
+        if request.url.path == "/api/chat/end":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *a, **k):  # type: ignore[no-untyped-def]
+        k["transport"] = transport
+        orig_init(self, *a, **k)
+
+    httpx.AsyncClient.__init__ = patched_init  # type: ignore[method-assign]
+    try:
+        state._stop_event.clear()
+        sc = SCENARIO_MAP["knowledge_gap"]
+        rng = random.Random(0)
+        rng.random = lambda: 0.99  # type: ignore[method-assign]
+        customer = SimCustomer("http://fake", "sim-test-end", rng=rng)
+        await customer.run_scenario(sc)
+    finally:
+        httpx.AsyncClient.__init__ = orig_init  # type: ignore[method-assign]
+
+    assert "/api/chat/end" in calls, "对话完成后应主动结束会话"
+
+
+async def test_reply_timeout_ends_session_and_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """120s 无回复 → 主动结束会话 + timeouts 计数 + 场景终止 (ReplyTimeout)"""
+    import httpx
+
+    import lumio.services.common.simulator as sim
+    from lumio.services.common.simulator import ReplyTimeoutError, SimCustomer
+
+    monkeypatch.setattr(sim, "POLL_TIMEOUT", 0.2)  # 测试缩短等待窗
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/api/chat/send":
+            return httpx.Response(200, json={"accepted": True})
+        if request.url.path == "/api/chat/poll":
+            return httpx.Response(200, json={"has_message": False})  # 永远无回复
+        if request.url.path == "/api/chat/end":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *a, **k):  # type: ignore[no-untyped-def]
+        k["transport"] = transport
+        orig_init(self, *a, **k)
+
+    httpx.AsyncClient.__init__ = patched_init  # type: ignore[method-assign]
+    state._stop_event.clear()
+    state.stats.timeouts = 0
+    try:
+        rng = random.Random(0)
+        rng.random = lambda: 0.99  # type: ignore[method-assign]
+        customer = SimCustomer("http://fake", "sim-test-timeout", rng=rng)
+        customer._session_id = "sim-timeout-test"
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(ReplyTimeoutError):
+                await customer._send_and_poll(client, "查账单")
+    finally:
+        httpx.AsyncClient.__init__ = orig_init  # type: ignore[method-assign]
+
+    assert state.stats.timeouts == 1
+    assert "/api/chat/end" in calls, "超时应主动结束会话"
