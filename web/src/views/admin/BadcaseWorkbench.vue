@@ -246,11 +246,21 @@
     <el-drawer v-model="detailVisible" size="58%" destroy-on-close>
       <template #header>
         <div class="drawer-title">
-          <span>{{ detail?.user_input?.slice(0, 28) }}</span>
+          <el-tag :type="fixStatusType(detail?.fix_status || '')" effect="dark">{{ fixStatusLabel(detail?.fix_status || "") }}</el-tag>
+          <el-tag size="small" :type="signalType(detail?.signal_source || '')">{{ signalLabel(detail?.signal_source || "") }}</el-tag>
+          <span class="muted" style="font-size: 12px">出现 {{ detail?.occurrences ?? 1 }} 次</span>
           <el-button size="small" link :disabled="!nextIdx" @click="openNext">下一条 ›</el-button>
         </div>
       </template>
       <div v-if="detail" class="detail-body">
+        <!-- 整改进度步骤条: 处置状态机一眼可见 -->
+        <el-steps :active="fixStepActive" align-center size="small" finish-status="success" class="fix-steps">
+          <el-step title="归因" :description="detail.root_cause_layer ? layerLabel(detail.root_cause_layer) : '待裁判'" />
+          <el-step title="人工确认" :description="detail.needs_human_review ? '待复核' : detail.root_cause_layer ? '已确认' : '-'" />
+          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已全量', rejected: '已驳回' }[detail.fix_status] || '-'" />
+          <el-step title="验证" :description="detail.fix_status === 'deployed' ? '可复检' : '复检待上线'" />
+        </el-steps>
+        <el-alert v-if="detail.fix_status === 'rejected'" type="info" :closable="false" class="reject-alert" :title="`已驳回 — ${detail.fix_note || ''}`" />
         <el-descriptions :column="3" border size="small">
           <el-descriptions-item label="信号源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
           <el-descriptions-item label="出现次数">{{ detail.occurrences ?? 1 }} 次</el-descriptions-item>
@@ -286,19 +296,31 @@
         </div>
 
         <template v-if="detail.root_cause_layer">
-          <div class="section-title">LLM 归因 <span class="muted section-hint">(可人工改判后确认)</span></div>
+          <div class="section-title">根因归因 <span class="muted section-hint">(裁判结论 · 可人工改判后确认)</span></div>
           <div class="attrib-row">
             <el-select v-model="judgedLayer" size="small" style="width: 150px">
               <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" />
             </el-select>
-            <el-select v-model="judgedTable" size="small" style="width: 140px" placeholder="修复分流表">
-              <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key" />
+            <el-select v-model="judgedTable" size="small" style="width: 170px" placeholder="修复分流表">
+              <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key">
+                <el-tooltip :content="FIX_TABLE_TIPS[key] || ''" placement="right" :disabled="!FIX_TABLE_TIPS[key]">
+                  <span>{{ label }}</span>
+                </el-tooltip>
+              </el-option>
             </el-select>
             <span class="muted attrib-meta">
               {{ categoryLabel(detail.root_cause_category) }} · 置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
             </span>
           </div>
           <div class="evidence">{{ detail.attribution_evidence }}</div>
+          <!-- 修复指引: 分流表 → 去哪里改什么 -->
+          <el-alert v-if="fixGuide" type="success" :closable="false" class="fix-guide">
+            <template #title>
+              修复指引 · {{ FIX_TABLE_LABELS[judgedTable || detail.fix_table || ""] || "分流表" }}:
+              {{ fixGuide.text }}
+              <el-link v-if="fixGuide.to" type="primary" :underline="false" style="margin-left: 6px" @click="router.push(fixGuide.to!)">前往处理 ›</el-link>
+            </template>
+          </el-alert>
         </template>
         <div v-else class="section-title muted">尚未归因 — 点击下方「GLM 裁判归因」开始 (约 20-40 秒)</div>
 
@@ -343,15 +365,22 @@
         </el-collapse>
         <div v-if="!detail.snapshot || !Object.keys(detail.snapshot).length" class="muted">(采集时未携带快照)</div>
 
-        <div class="section-title">处理操作</div>
+        <div class="section-title">处理操作 <span class="muted section-hint">(流转需填备注, 供事后追溯)</span></div>
         <div class="action-grid">
-          <el-button v-if="!detail.root_cause_layer" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因</el-button>
+          <!-- 主推进: 按当前状态只亮下一步 -->
+          <el-button v-if="!detail.root_cause_layer" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">① GLM 裁判归因</el-button>
           <el-button v-if="detail.needs_human_review" size="small" type="success" :loading="acting" @click="confirmResolve">
-            确认归因并进入修复
+            ② 确认归因并进入修复
           </el-button>
-          <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">转灰度</el-button>
-          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">全量上线</el-button>
-          <el-button size="small" @click="addToGolden(detail)">以该输入扩充金标集</el-button>
+          <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">③ 修复完成 · 转灰度</el-button>
+          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">④ 灰度验证通过 · 全量上线</el-button>
+          <!-- 验证闭环: 上线后复检原会话确认修复生效 -->
+          <el-button
+            v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
+            size="small" type="primary" plain :loading="rescanningBadcase" @click="rescanFromBadcase"
+          >{{ detail.fix_status === 'deployed' ? "⑤" : "灰度" }}复检原会话</el-button>
+          <!-- 次要操作 -->
+          <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
           <el-button size="small" @click="gotoAudit(detail)">会话审计</el-button>
           <el-button size="small" type="danger" plain :loading="acting" @click="rejectCase">驳回此例</el-button>
         </div>
@@ -857,6 +886,86 @@ async function runAttribution(row: Badcase) {
   }
 }
 
+// 整改进度步骤条: 0 归因 → 1 确认 → 2 修复(含灰度) → 3 验证
+const fixStepActive = computed(() => {
+  const d = detail.value
+  if (!d) return 0
+  if (d.fix_status === "deployed") return 4
+  if (d.fix_status === "canary") return 3
+  if (d.fix_status === "fixing") return 2
+  if (d.root_cause_layer && !d.needs_human_review) return 2
+  if (d.root_cause_layer) return 1
+  return 0
+})
+
+// 分流表说明 (下拉 tooltip) 与修复指引 (去哪里改什么)
+const FIX_TABLE_TIPS: Record<string, string> = {
+  A_knowledge: "知识缺口/检索不命中 → 补知识内容",
+  B_intent: "意图/语义误判 → 意图库与种子语料",
+  C_rule: "规则/路由/会话配置 → 规则与映射表",
+  D_model: "生成幻觉/Prompt 失效 → 提示词与模型",
+  none: "无需改表 (流程/工程问题)",
+}
+const FIX_TABLE_GUIDES: Record<string, { text: string; to?: string }> = {
+  A_knowledge: { text: "到 FAQ 管理补标准问答对, 或在文档管理补充知识文档并重新摄入", to: "/admin/faq" },
+  B_intent: { text: "到意图库管理页维护规则词/种子语料, 重跑评测闸门后激活", to: "/admin/intent-library" },
+  C_rule: { text: "核对意图注册表与流量分类映射 (归并表), 走代码评审", to: "/admin/intent-library" },
+  D_model: { text: "调整回复生成系统提示词与出站闸门话术, 走代码评审", to: "" },
+  none: { text: "流程或工程问题, 在代码/配置侧定位处理", to: "" },
+}
+const fixGuide = computed(() => {
+  const key = judgedTable.value || detail.value?.fix_table || ""
+  return FIX_TABLE_GUIDES[key] ?? null
+})
+
+// 流转带备注 (供 fix_note 追溯)
+async function transition(status: string) {
+  if (!detail.value) return
+  let note = ""
+  try {
+    const r = await ElMessageBox.prompt("流转备注 (可选, 默认状态名):", `流转 → ${fixStatusLabel(status)}`, {
+      inputPlaceholder: "如: 已补 FAQ 词条 / 种子语料已重训",
+      inputValue: "",
+    })
+    note = (r.value || "").trim()
+  } catch {
+    return /* 取消 */
+  }
+  acting.value = true
+  try {
+    await resolveBadcase(detail.value.id, {
+      fix_status: status,
+      note: note ? `${fixStatusLabel(status)} · ${note}` : `状态流转 → ${fixStatusLabel(status)}`,
+    })
+    await refreshAfterAction(`已${fixStatusLabel(status)}`)
+  } catch {
+    /* handled */
+  } finally {
+    acting.value = false
+  }
+}
+
+// 复检原会话 (从整改闭环侧验证修复效果)
+const rescanningBadcase = ref(false)
+async function rescanFromBadcase() {
+  if (!detail.value?.session_id) return
+  rescanningBadcase.value = true
+  try {
+    const r = await rescanQualitySession(detail.value.session_id)
+    if (r.status === "ok") {
+      const v = verdictLabel(r.verdict ?? "")
+      const ok = r.verdict === "pass" || r.verdict === "warn"
+      ElMessage[ok ? "success" : "warning"](`复检完成: ${v}${ok ? " — 修复验证通过" : " — 仍有问题, 建议回退排查"}`)
+    } else {
+      ElMessage.info("对话不足 2 轮, 无法复检")
+    }
+  } catch {
+    ElMessage.error("复检失败")
+  } finally {
+    rescanningBadcase.value = false
+  }
+}
+
 async function confirmResolve() {
   if (!detail.value) return
   acting.value = true
@@ -868,19 +977,6 @@ async function confirmResolve() {
       note: `人工确认${judgedLayer.value !== detail.value.root_cause_layer ? " (改判)" : ""}`,
     })
     await refreshAfterAction("归因已确认，进入修复跟踪")
-  } catch {
-    /* handled */
-  } finally {
-    acting.value = false
-  }
-}
-
-async function transition(status: string) {
-  if (!detail.value) return
-  acting.value = true
-  try {
-    await resolveBadcase(detail.value.id, { fix_status: status, note: `状态流转 → ${fixStatusLabel(status)}` })
-    await refreshAfterAction(`已${fixStatusLabel(status)}`)
   } catch {
     /* handled */
   } finally {
@@ -1377,4 +1473,8 @@ onUnmounted(() => {
 }
 .pano-customer { font-size: 13px; }
 .pano-bot { margin-top: 2px; font-size: 12px; color: var(--color-text-secondary); }
+/* 整改闭环抽屉优化 */
+.fix-steps { margin-bottom: 16px; }
+.reject-alert { margin-bottom: 12px; }
+.fix-guide { margin-top: 8px; }
 </style>
