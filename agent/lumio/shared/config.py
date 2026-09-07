@@ -178,7 +178,9 @@ class LLMSettings(BaseSettings):
     temperature: float = 0.2
     # 生成输出上限: 实测本地 qwen2.5:7b RAG 答复多为 60~90 token, 2048 上限
     # 不收益且给解码预留过大解码预算; 512 有 6x 余量, 并限制异常长解码拖慢一轮。
-    max_tokens: int = 256
+    # 生成输出上限: M1 decode 26 tok/s, 每 token 都是真金白银的秒数 — 中文回复
+    # 已限 100 字 (~150-170 tok), 192 留格式余量, 相比 256 省 ~2.5s/轮
+    max_tokens: int = 192
     timeout_seconds: float = 60.0
 
     # 健康探测
@@ -195,6 +197,22 @@ class LLMSettings(BaseSettings):
     # 多轮 >3s → faq@0.0 → 低置信误澄清), 抬到 6s: 慢而成功的分类一次走完,
     # 仍由 wait_for 封顶, 超时兜底 FAQ@0.0 → 下游 low_conf 闸回澄清不变.
     classify_timeout: float = 6.0
+    # 模块 A 归因 judge 模型 — 固定 GLM-5.3-Flash (方案 §9.3 跨家族选型:
+    # 生成 qwen / 裁判 GLM, 消除自我偏好偏差)。远程不可达时的本地兜底
+    # 走 primary_model (本地无 GLM 权重), 审计标记"回退本地"。
+    judge_model: str = "GLM-5.3-Flash"
+    # 跨家族远程裁判 (Anthropic Messages 协议, 如 GLM coding plan):
+    # 留空则用本地 base_url 的 primary_model; 配置后归因走远程, 失败自动回退本地。
+    judge_base_url: str = ""
+    judge_api_key: str = ""
+    judge_timeout: float = 90.0
+    # 严格模式: 远程裁判失败重试耗尽后直接判该条失败, 绝不回退本地 (全程纯 GLM
+    # 审计); 默认关 = 失败回退本地兜底, 闭环不断粮
+    judge_strict: bool = False
+    # 会话结束自动质检 (chat_end 钩子): 每个客户主动结束的会话立即后台巡检,
+    # 不等人工点"全量质检" — 保证"每一个会话都纳入质检列表" (2026-09-03 整改)。
+    # 单会话一次裁判调用, 已检会话走 30 天 Redis 去重; 关闭后仅剩手动全量巡检。
+    qa_scan_on_session_end: bool = True
     # 慢路径分类结果缓存: 相同输入(TTL 内)复用上次分类, 免二次 LLM 分类调用 (#7 降本
     # 第一段; 完整"分类+生成合一"需改造生成链路, 见 docs/意图识别_优化方案.md)。
     classify_cache_enabled: bool = True
@@ -379,10 +397,12 @@ class ClassificationSettings(BaseSettings):
     # 五域阈值: 0.72 采信判对的 consulting (会话 2b3b2613 根治); 定义句式另由
     # domain_of_with_text 强制咨询域兜底。误判风险由下游 grounding 门把关。
     vector_intent_threshold: float = 0.72
-    ood_enabled: bool = False  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
-    # energy 阈值: energy 高于此 → 认为"认识"可用(信任 BERT); 低于 → "不认"倾向 OOD/噪声.
-    # energy 数值尺度取决于 logits 绝对值, 需在部署环境用验证集标定, 这里给保守初值.
-    ood_energy_threshold: float = 0.0
+    # OOD 落地闭环 (2026-09-02 校准, scripts/calibrate_ood_threshold.py):
+    # ID(seed 191 例).p99=-2.913 / OOD(badcase 实录 27 例).p5=-3.493, 分布部分重叠
+    # → 能量门一律双信号使用 (意图+能量), 单信号处已收窄 (噪声门 strong_business 放行)。
+    # 阈值 = ID.p99 与 OOD.p5 中点: ID 误杀 4.2%, OOD 捕获 88.9%。换模型/扩种子集后重跑校准。
+    ood_enabled: bool = True  # 开关: 用 energy 分替代裸 softmax 置信作"认不认"闸
+    ood_energy_threshold: float = -3.203
     # 温度缩放: logits / temperature 后再 softmax. 1.0 = 不缩放. 用验证集一维标定,
     # 把置信度校准到与准确率匹配(>1 更保守、压低过拟合 BERT 的虚高置信).
     ood_temperature: float = 1.0
@@ -443,8 +463,15 @@ class RAGSettings(BaseSettings):
     embedding_dim: int = 1024
     embedding_batch_size: int = 128  # TEI 批量大小
     tei_base_url: str = "http://localhost:8080"  # TEI 服务地址
+    # Ollama 服务地址 (embed/reranker 独立于 LLM): LLM 切远程 API 后本地小模型仍
+    # 留 Ollama — 此前从 llm.base_url 推导, 切换 LLM 会连带把嵌入指到远程 API
+    ollama_base_url: str = "http://localhost:11434"
     # 摄入批量向量化受 GPU 抢占影响大, 10s 在本地 Ollama + LLM 并发时偶发超时
     embedding_timeout: float = 30.0  # 嵌入请求超时（秒）
+    # 2026-08-31: embed/reranker 固定 CPU (num_gpu=0), qwen 独占 GPU —— 统一内存
+    # 带宽争抢导致分类/生成 7~10s 抖动; 小模型 CPU 推理延迟可接受 (检索场景不敏感)
+    embedding_num_gpu: int = 0
+    rerank_num_gpu: int = 0
     embedding_max_retries: int = 2  # 最大重试次数
     # 分块参数
     chunk_size: int = 1500  # 字符数，约 750 中文字 ≈ 1000+ tokens
@@ -471,6 +498,12 @@ class SafetySettings(BaseSettings):
 
 class SessionSettings(BaseSettings):
     """会话状态配置"""
+
+    # 诉求跟踪 (2026-09-04 多轮会话管理): 断档(紧急诉求切话题蒸发)与
+    # 带偏(旧话题影响新轮)的同根源修复。关闭即完全回滚旧行为。
+    topic_tracking_enabled: bool = True
+    # 同一高紧急诉求的最大回访次数 (防骚扰)
+    topic_revisit_max: int = 2
 
     model_config = SettingsConfigDict(env_prefix="SESSION_")
 
@@ -506,9 +539,6 @@ class BotSettings(BaseSettings):
     max_session_queue: int = 20
     # P2-16: 同一客户同时进行的活跃会话数上限 (多设备/多标签页防资源耗尽)
     max_sessions_per_customer: int = 3
-    # 目标架构 v2 两级路由决策 (决策一交易性质 / 决策二只读四分流)。
-    # 默认关: 开启需显式 BOT_ROUTING_V2_ENABLED=true (灰度开关, 关闭时走旧链路回滚保底)。
-    routing_v2_enabled: bool = False
 
 
 class AssistSettings(BaseSettings):
@@ -676,15 +706,22 @@ class MCPSettings(BaseSettings):
     默认 ``enabled=False``：编排大脑行为与现状完全一致（零回归）。
     """
 
+    # 敏感工具"核验+确认"两段式总开关 (2026-09-03 产品决策: 默认审核核实视为
+    # 已通过 — 关闭时敏感写工具直接执行, 不走核验弹框/文本确认; 生产按合规
+    # 要求置 MCP_SENSITIVE_CONFIRM_ENABLED=true 恢复完整核验链)
+    sensitive_confirm_enabled: bool = False
+
     model_config = SettingsConfigDict(env_prefix="MCP_")
 
     # 总开关：关闭时不加载任何工具，bot 走原有 RAG/LLM 生成路径
     enabled: bool = False
-    # 单后端传输协议: streamable-http(默认, 经 Higress) | sse(直连 Java MCP Server :8090)
-    transport: str = "streamable-http"
-    # Higress MCP 入口 URL（经 Nacos MCP Registry 发现的工具经此暴露）。
-    # 默认指向 Higress AI 网关统一 MCP 入口（streamable-http）；本地联调可改指参考 Server（:8080/mcp）。
-    endpoint: str = "http://localhost:10000/mcp/credit-card"
+    # 单后端传输协议: sse(默认, 直连 Java MCP Server :8090) | streamable-http(经 Higress)
+    # 2026-09-03 定向: MCP 不过网关, 默认直连 —— Higress 链路多一跳且非必需,
+    # 网关仅在生产需要统一治理 (鉴权/限流/脱敏) 时按 gateway profile 选配启用。
+    transport: str = "sse"
+    # Java MCP Server SSE 端点 (22 个信用卡工具, mock 数据)。生产接真实核心系统时
+    # 换端点即可; 若需经 Higress 治理, transport 改 streamable-http 并指向网关入口。
+    endpoint: str = "http://127.0.0.1:8090/sse"
     # 工具调用超时（秒）
     timeout_seconds: float = 10.0
     # ── 路由模式：多 MCP 后端（host 侧合并 + 分发）──
@@ -745,6 +782,8 @@ class MCPSettings(BaseSettings):
                 "cancel_installment",
             ],
             "reward_query": ["query_points", "query_card_benefits", "redeem_points"],
+            # 挂失: 意图→工具唯一确定, 高置信时分派层直连 (跳过 LLM 编排循环)
+            "card_loss": ["report_card_lost"],
         }
     )
 

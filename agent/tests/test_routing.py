@@ -1,11 +1,10 @@
-"""目标架构 v2 两级路由 + 执行链 + 出站闸门测试"""
+"""目标架构 ④ 两级路由 + 执行链 + 出站闸门测试"""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
 
 from lumio.services.bot.outbound_guard import OutboundGuard
 from lumio.services.bot.parallel_race import race
@@ -15,8 +14,8 @@ from lumio.services.bot.routing import (
     classify_traffic,
     decision_two,
     detect_composite,
+    is_chitchat_redirect,
 )
-from lumio.shared.auth import AuthUser, get_current_user
 from lumio.shared.models import IntentLabel
 from lumio.shared.safety import SafetyFilter
 
@@ -42,7 +41,10 @@ class TestTrafficClassification:
         }
         for intent, (want_domain, want_traffic) in cases.items():
             domain, traffic = classify_traffic(intent)
-            assert (domain.value, traffic.value if traffic else None) == (want_domain, want_traffic.value if want_traffic else None)
+            assert (domain.value, traffic.value if traffic else None) == (
+                want_domain,
+                want_traffic.value if want_traffic else None,
+            )
         # 咨询域无交易性质 → (consulting, None), 进决策二
         assert classify_traffic(IntentLabel.FAQ) == ("consulting", None)
 
@@ -57,8 +59,24 @@ class TestTrafficClassification:
         assert not detect_composite(IntentLabel.LIMIT_QUERY, [], "我的额度是多少")
         assert not detect_composite(IntentLabel.FAQ, [], "为什么会调整")  # 非查询主意图不算复合
 
+    def test_composite_weak_alternative_filtered(self) -> None:
+        """弱次选分数线: 对冲性 CONSULTING 次选 (<0.30) 不触发复合级联
 
-# ── ③ 链 D 并行竞速 ──
+        会话 smoke-qa-1788567861 复盘: "账单日是几号" 挂 installment_inquiry 弱次选
+        被误判复合 → 级联取数后被废弃回落重跑 (决策链出现双 tool_call)。
+        """
+        alts = [IntentLabel.TRANSACTION_QUERY, IntentLabel.INSTALLMENT_INQUIRY]
+        # 弱次选 (0.08 < 0.30) → 不算复合
+        assert not detect_composite(IntentLabel.BILL_QUERY, alts, "我的信用卡账单日是几号", [0.08, 0.05])
+        # 强次选 (≥0.30) → 复合
+        assert detect_composite(IntentLabel.BILL_QUERY, alts, "我的信用卡账单日是几号", [0.4, 0.35])
+        # 分数缺失 → 保守按强处理 (不弱化复合保护)
+        assert detect_composite(IntentLabel.BILL_QUERY, alts, "我的信用卡账单日是几号")
+        # 文本含解释词 → 与次选无关, 恒复合
+        assert detect_composite(IntentLabel.BILL_QUERY, [], "账单日为什么是这天", [0.01])
+
+
+# ── ③ 低置信并行竞速 ──
 
 
 class TestParallelRace:
@@ -107,7 +125,7 @@ class TestParallelRace:
         assert out.winner == "rag" and out.faq_error
 
 
-# ── ④ 链 B 查询轻链路 ──
+# ── ④ 查询直达链路 ──
 
 
 def _mock_mcp(schema: dict, sensitive: bool = False) -> MagicMock:
@@ -175,6 +193,64 @@ class TestQueryChain:
         mcp.call_tool.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_cache_isolated_by_question(self) -> None:
+        """缓存按 (工具+参数+归一化问题) 隔离: 同工具同卡的不同问题不串答案
+
+        复盘: 缓存只按 工具+参数 键、存的是最终回复 — "账单日是几号"的缓存
+        会错配给同卡"最低还款多少"。修复后不同问题各查各的。
+        """
+        schema = {"properties": {"period": {"type": "string"}}, "required": ["period"]}
+        mcp = _mock_mcp(schema)
+        mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "工具结果"})
+        deg = MagicMock()
+        deg.generate_with_fallback = AsyncMock(return_value=MagicMock(content="按问题生成的回复"))
+        store: dict = {}
+
+        async def _get(k):
+            return store.get(k)
+
+        async def _set(k, v, **kw):
+            store[k] = v
+
+        redis = MagicMock()
+        redis.get = _get
+        redis.set = _set
+        chain = QueryChain(mcp_client=mcp, redis_client=redis, degradation_mgr=deg)
+        await chain.run(
+            intent_label="account_bill_query",
+            user_input="账单日是几号",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        # 同参数的另一个问题: 缓存不命中 (key 含问题), 重新调用工具
+        out2 = await chain.run(
+            intent_label="account_bill_query",
+            user_input="最低还款多少",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        assert not out2.cache_hit
+        assert mcp.call_tool.await_count == 2
+        # 同一问题书写差异 (空格/大小写) → 归一化后命中
+        out3 = await chain.run(
+            intent_label="account_bill_query",
+            user_input="账单日 是几号",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        assert out3.cache_hit and out3.content == "按问题生成的回复"
+
+    def test_stage_timings_recorded(self) -> None:
+        """分段耗时字段存在 (mcp_ms/summarize_ms/total_ms), 决策链归因用"""
+        from lumio.services.bot.query_chain import QueryChainResult
+
+        r = QueryChainResult(content="ok", mcp_ms=120.5, summarize_ms=3000.0, total_ms=3120.5)
+        assert r.mcp_ms == 120.5 and r.total_ms == 3120.5
+
+    @pytest.mark.asyncio
     async def test_sensitive_tool_skipped(self) -> None:
         mcp = _mock_mcp({"properties": {}}, sensitive=True)
         chain = QueryChain(mcp_client=mcp, redis_client=None, degradation_mgr=None)
@@ -212,27 +288,68 @@ class TestOutboundGuard:
         assert v.passed
 
 
-# ── ② 分派冒烟: 开关开启时走 v2 ──
+class TestChitchatRedirect:
+    """闲聊域轻回复判定 (会话 8700a2ea: "锄禾日当午"进 RAG 链答非所问)"""
+
+    def test_pure_chitchat_redirects(self) -> None:
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, []) is True
+        assert is_chitchat_redirect(IntentLabel.NB_NOISE, []) is True
+        # LLM 慢路径自评通胀的高置信同样拦 (置信封顶兜底之外的域级短路)
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, []) is True
+
+    def test_business_alternative_passes_through(self) -> None:
+        # 混合句 "哈哈帮我查下账单": alternatives 携带业务域意图 → 不拦
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, [IntentLabel.BILL_QUERY]) is False
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, [IntentLabel.TRANSFER_AGENT]) is False
+
+    def test_nonbusiness_alternative_still_redirects(self) -> None:
+        # FAQ/闲聊类 alternatives 不是业务诉求, 照拦
+        assert is_chitchat_redirect(IntentLabel.NB_CHITCHAT, [IntentLabel.FAQ]) is True
+
+    def test_consulting_primary_never_redirects(self) -> None:
+        # 咨询/查询主意图与闲聊判定无关
+        assert is_chitchat_redirect(IntentLabel.FAQ, []) is False
+        assert is_chitchat_redirect(IntentLabel.BILL_QUERY, []) is False
+
+    def test_legacy_alias_intent_redirects(self) -> None:
+        """旧 flat 别名 CHITCHAT ("chitchat") 与 NB_CHITCHAT 同判 (E2E 实测走别名)"""
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, []) is True
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.FAQ]) is True
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY]) is False
+
+    def test_weak_business_alt_score_redirects(self) -> None:
+        """弱次选 (<0.30, softmax 对冲) 不再挡闲聊短路 — 会话 22ad 根治"""
+        assert (
+            is_chitchat_redirect(
+                IntentLabel.CHITCHAT, [IntentLabel.TRANSFER_AGENT, IntentLabel.TRANSACTION_QUERY], [0.18, 0.12]
+            )
+            is True
+        )
+
+    def test_strong_business_alt_score_passes_through(self) -> None:
+        """强次选 (≥0.30, 真混合句) 仍放行, 保护「哈哈帮我查下账单」"""
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY], [0.45]) is False
+
+    def test_missing_scores_conservative_passthrough(self) -> None:
+        """无分数 (旧调用方) 保持保守放行, 不弱化混合句保护"""
+        assert is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY]) is False
+        # 部分带分数: 有分数的按分数, 缺分数的按强处理
+        assert (
+            is_chitchat_redirect(IntentLabel.CHITCHAT, [IntentLabel.BILL_QUERY, IntentLabel.COMPLAINT], [0.1]) is False
+        )
 
 
-class TestDispatchV2:
-    def _patch_v2(self, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
-        from lumio.shared.config import Settings
+class TestEmergencyFaqExemption:
+    """紧急意图豁免 FAQ 前置短路 (qa_scan 复盘: "钱包被偷"被硬钱包 FAQ 0.2s 劫持)"""
 
-        settings = Settings()
-        settings.bot.routing_v2_enabled = enabled
-        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+    def test_markers(self) -> None:
+        from lumio.services.bot.bot_agent import _has_emergency_marker
 
-    def _make_app(self, monkeypatch: pytest.MonkeyPatch, enabled: bool) -> FastAPI:
-        from lumio.services.bot.bot_agent import LumioAgent  # noqa: F401
-
-        self._patch_v2(monkeypatch, enabled)
-        app = FastAPI()
-        app.dependency_overrides[get_current_user] = lambda: AuthUser(user_id="a", role="admin", session_id=None)
-        return app
-
-    def test_v2_flag_default_off(self) -> None:
-        from lumio.shared.config import Settings
-
-        s = Settings(_env_file=())
-        assert s.bot.routing_v2_enabled is False
+        assert _has_emergency_marker("钱包被偷了, 卡也在里面") is True
+        assert _has_emergency_marker("我的卡丢了, 要挂失啊") is True
+        assert _has_emergency_marker("卡好像被盗了, 赶紧给我停了") is True
+        assert _has_emergency_marker("信用卡怎么挂失") is True
+        # 无紧急标记的常规咨询不受影响
+        assert _has_emergency_marker("账单日是哪天") is False
+        assert _has_emergency_marker("数字人民币硬钱包没电怎么办") is False
+        assert _has_emergency_marker("") is False

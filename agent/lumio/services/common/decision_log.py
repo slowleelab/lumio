@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -24,6 +25,24 @@ from typing import Any
 from lumio.shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# ── 轮次上下文 (P1-3: turn_id 按轮贯穿) ─────────────────────────────
+# 会话回放的决策链按"轮"分组展示: 同一轮 (客户一条消息 → bot 一次回复) 的全部
+# 决策共用一个 turn_id。处理入口 (router._run_agent) 绑定后, 链路上所有
+# log_decision 调用 (含嵌套 handler) 自动继承, 无需逐处透传。
+# 此前每条决策独立 uuid4 — 字段名叫 turn_id 却标识不了轮次, 多轮会话的
+# 决策混在一起无法归组 (会话 smoke-qa-1788567861 复盘)。
+_current_turn_id: ContextVar[str] = ContextVar("lumio_decision_turn_id", default="")
+
+
+def bind_turn_context(turn_id: str) -> None:
+    """绑定当前轮次 ID — 之后本轮内的 log_decision 默认继承该值."""
+    _current_turn_id.set(turn_id)
+
+
+def current_turn_id() -> str:
+    """读取当前轮次 ID (未绑定为空串)."""
+    return _current_turn_id.get()
 
 
 class DecisionAction(str, Enum):
@@ -43,8 +62,12 @@ class DecisionAction(str, Enum):
     MIS_KILL_CANDIDATE = "mis_kill_candidate"  # P3 疑似误杀(放行后又澄清/重问)回流探针
     # 多轮噪声/闲聊治理 (P0): 噪声被拦截 / 上下文回应放行
     NOISE_BLOCKED = "noise_blocked"
+    # 诉求跟踪 (多轮会话管理): 诉求状态流转 / 高紧急回访
+    TOPIC_TRACK = "topic_track"
     CONTEXT_REPLY_PASS = "context_reply_pass"
-    # 全链路监控 (输入→输出关键步骤): FAQ 直出 / 出站闸门 / 链路完成(含总耗时)
+    # 全链路监控 (输入→输出关键步骤): 消息出队 / 路由决策 / FAQ 直出 / 出站闸门 / 链路完成(含总耗时)
+    TURN_START = "turn_start"
+    ROUTE_DECISION = "route_decision"
     FAQ_DIRECT = "faq_direct"
     OUTBOUND_GUARD = "outbound_guard"
     CHAIN_COMPLETE = "chain_complete"
@@ -211,6 +234,10 @@ class DecisionLogger:
                         reasoning=record.reasoning,
                         evidence_json=record.evidence or None,
                         latency_ms=record.latency_ms,
+                        # created_at 用 log_decision 调用时刻 (record 构造时), 而非
+                        # 后台 task 执行时刻: 每条决策一个独立 task, 执行顺序在微秒级
+                        # 会颠倒, 同批留痕的语义顺序 (如 意图分类→路由决策) 被打乱
+                        created_at=datetime.fromtimestamp(record.created_at, tz=UTC),
                     )
                     session.add(row)
                     await session.commit()
@@ -370,7 +397,12 @@ def log_decision(
     latency_ms: float = 0.0,
     customer_id: str | None = None,
 ) -> str:
-    """便捷函数: 同步记录决策."""
+    """便捷函数: 同步记录决策.
+
+    turn_id 留空时自动继承当前轮上下文 (bind_turn_context), 无上下文再独立生成。
+    """
+    if not turn_id:
+        turn_id = _current_turn_id.get() or uuid.uuid4().hex[:16]
     return get_decision_logger().record(
         session_id=session_id,
         turn_id=turn_id,

@@ -1,9 +1,9 @@
 {
   "meta": {
-    "version": "1.0.0",
-    "purpose": "energy-OOD 阈值标定的独立评估池: 封闭10类之外的噪声/乱码/无关问法. 只评测不训练.",
+    "version": "1.1.0",
+    "purpose": "energy-OOD 阈值标定的独立评估池: 封闭10类之外的噪声/乱码/无关问法. 只评测不训练. v1.1: 补无意义名词与子词碎片探针 (会话 1cf13353/79572c98 复盘); subword 类预期 energy 不可分, 由分类器 subword 短路兜底.",
     "counts": {
-      "examples": 29
+      "examples": 40
     }
   },
   "examples": [
@@ -122,6 +122,50 @@
     {
       "text": "帮我百度一下某某",
       "type": "unrelated"
+    },
+    {
+      "text": "卡皮巴拉",
+      "type": "nonsense_noun"
+    },
+    {
+      "text": "可达鸭",
+      "type": "nonsense_noun"
+    },
+    {
+      "text": "yyds",
+      "type": "nonsense_noun"
+    },
+    {
+      "text": "信用",
+      "type": "subword"
+    },
+    {
+      "text": "卡片",
+      "type": "subword"
+    },
+    {
+      "text": "额度",
+      "type": "subword"
+    },
+    {
+      "text": "账单",
+      "type": "subword"
+    },
+    {
+      "text": "分期",
+      "type": "subword"
+    },
+    {
+      "text": "积分",
+      "type": "subword"
+    },
+    {
+      "text": "年费",
+      "type": "subword"
+    },
+    {
+      "text": "还款",
+      "type": "subword"
     }
   ]
 }

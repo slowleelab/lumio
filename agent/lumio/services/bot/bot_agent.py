@@ -12,19 +12,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import re
 import time
 import uuid as uuid_module
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from lumio.services.bot.input_gate import InputGate
 from lumio.services.bot.prompts import (
     _SUMMARIZE_SYSTEM_PROMPT,
     BUSINESS_SYSTEM_PROMPT,
     BUSINESS_TRANSFER_TEMPLATE,
+    CHITCHAT_REDIRECT_RESPONSE,
     CLARIFY_RESPONSE,
     CLARIFY_RESPONSES,
     CONFIRM_FOLLOWUP_RESPONSE,
@@ -37,13 +37,16 @@ from lumio.services.bot.prompts import (
 )
 from lumio.services.bot.slot_tracker import _ENTITY_TO_SLOT, SlotTracker
 from lumio.services.bot.tool_executor import ConfirmDecision, ToolCallingExecutor, detect_confirmation
-from lumio.services.bot.tool_selection import TOOL_INTENTS, select_tools_for_intent
+from lumio.services.bot.tool_selection import select_tools_for_intent
 from lumio.services.common.bert_classifier import ood_verdict
 from lumio.services.common.classifier import IntentClassifier, get_domain
 from lumio.services.common.decision_log import DecisionAction, log_decision
 from lumio.services.common.degradation import DegradationManager
 from lumio.services.common.transfer import TRANSFER_CONFIDENT_CONF, TransferChecker
 from lumio.shared.config import get_settings
+from lumio.shared.lexicon import lexicon_map as _lex_map
+from lumio.shared.lexicon import lexicon_values as _lex
+from lumio.shared.logger import setup_logger
 from lumio.shared.metrics import TOOL_CONFIRMATIONS
 from lumio.shared.models import (
     SENSITIVE_INTENTS,
@@ -56,6 +59,7 @@ from lumio.shared.models import (
     RetrieveResponse,
     SentimentLabel,
     SessionPhase,
+    TopicRequest,
     TransferTriggerLevel,
     VerificationRequest,
     VerificationResult,
@@ -64,6 +68,30 @@ from lumio.shared.models import (
 from lumio.shared.pii import pan_to_tail
 from lumio.shared.token_utils import estimate_tokens as _token_estimate  # P1-8 统一入口
 from lumio.shared.tracing import traced
+
+# 决策留痕中文化 (用户反馈: "决策二预备"/"域=query" 看不懂 — 留痕原文也要可读)
+_DOMAIN_ZH: dict[str, str] = {
+    "business": "业务办理",
+    "knowledge": "知识咨询",
+    "fallback": "闲聊/兜底",
+    "risk": "风险操作",
+    "complain": "投诉",
+    "transfer": "转人工",
+    "query": "查询",
+    "consulting": "咨询",
+    "transaction": "交易",
+    "service": "人工服务",
+    "chitchat": "闲聊",
+}
+_TRAFFIC_ZH_LOG: dict[str, str] = {
+    "financial_transaction": "交易办理（走业务工具）",
+    "read_only_query": "查询直达（直接查系统）",
+    "high_risk": "高风险（优先人工）",
+}
+
+
+def _domain_zh(domain: str) -> str:
+    return _DOMAIN_ZH.get(domain, domain)
 
 
 def _effective_knowledge_source(raw_source: str, context: str) -> str:
@@ -94,7 +122,10 @@ if TYPE_CHECKING:
     from lumio.services.common.session import SessionManager
     from lumio.shared.models import PendingAction
 
-logger = logging.getLogger(__name__)
+# P0 日志修复: 此前裸 getLogger — 无 handler 无级别, 本模块全部 INFO 被静默吞掉
+# (L2 域命中/路由分派/查询链路回落等关键链路日志在服务进程从未出现过, 排障只能靠
+# 决策日志旁证)。setup_logger 顶部导入, 此处仅建实例。
+logger = setup_logger(__name__)
 
 
 # ── Token 估算（统一委托 lumio.shared.token_utils，避免分叉实现） ──
@@ -188,7 +219,7 @@ class LumioAgent:
         # 工具执行器（MCP_ENABLED=False 时为 None，走原有降级链，零回归）
         self._tool_executor = tool_executor
 
-        # 目标架构 v2: 链 B 查询轻链路 + ⑦ 出站合规闸门 + ⑥ 引用标题缓存
+        # 目标架构: 查询直达 查询轻链路 + ⑦ 出站合规闸门 + ⑥ 引用标题缓存
         from lumio.services.bot.outbound_guard import OutboundGuard
         from lumio.services.bot.query_chain import QueryChain
 
@@ -199,7 +230,16 @@ class LumioAgent:
         )
         from lumio.shared.safety import safety_filter as _safety_filter
 
-        self._outbound_guard = OutboundGuard(_safety_filter, CLARIFY_RESPONSE)
+        # 索敏整体替换的兜底话术: 紧急挂失场景给渠道引导+转人工邀约,
+        # 不用通用澄清 ("您的意思我还没太理解") 二次伤害紧急客户
+        self._outbound_guard = OutboundGuard(
+            _safety_filter,
+            CLARIFY_RESPONSE,
+            emergency_reply=(
+                "您的卡片疑似丢失, 请立即拨打24小时客服热线400-888-8888、"
+                "登录手机银行APP或前往就近网点办理挂失。如需协助, 回复『转人工』为您转接专属客服。"
+            ),
+        )
         self._citation_title_cache: dict[str, str] = {}
         self._last_citation_docids: list[str] = []
         # P0-3: 精排器 (loss-in-middle 缓解 + 相关性阈值过滤)
@@ -331,67 +371,11 @@ class LumioAgent:
                 except Exception as exc:
                     logger.debug("告别结束会话失败 (不阻断回复): session=%s err=%s", session_id, exc)
             return self._build_result(session_id, user_input, FAREWELL_RESPONSE, "template", "chitchat")
-        # ── FAQ 三路匹配优先 (精确 Redis / 语义 Milvus faq_qa) ──
-        # 命中直接返回标准答案, 免意图分类/检索/LLM; 检索日志落 kb_faq_search_log
-        # (控制台 FAQ 命中率指标数据源)。此前客户链路从不调 search_faq, 发布的
-        # FAQ 实际不参与应答 (语义索引写入也是桩函数, 一并修复)。
-        # 位置: 危机/护栏/问候告别之后、意图分类之前 —— 业务域问题 (如积分有效期)
-        # 会被路由进工具编排, 埋在 _retrieve 内永远走不到。
-        try:
-            from lumio.services.common.faq_service import get_faq, search_faq
-
-            session_manager = self._session_manager
-            faq_embedding = (
-                self._embedding_breaker.provider
-                if self._embedding_breaker and self._embedding_breaker.is_available
-                else None
-            )
-            faq_res = await search_faq(
-                query=user_input,
-                redis_client=session_manager._redis if session_manager else None,
-                embedding_provider=faq_embedding,
-                milvus_collection=self._milvus_collection,
-                user_role="customer",
-                session_factory=(
-                    session_manager._resolve_factory()
-                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
-                    else None
-                ),
-                session_id=session_id,
-            )
-            if faq_res["match_type"] in ("exact", "semantic") and faq_res["results"]:
-                top = faq_res["results"][0]
-                answer = top.get("answer")
-                if not answer and top.get("faq_id"):
-                    from lumio.services.common.faq_service import get_faq
-
-                    faq_sf = (
-                        session_manager._resolve_factory()
-                        if session_manager is not None and hasattr(session_manager, "_resolve_factory")
-                        else None
-                    )
-                    # chunk_id 带变体序号后缀 (faqid#0), 回查前剥离取真实 FAQ UUID
-                    real_id = top["faq_id"].split("#", 1)[0]
-                    detail = await get_faq(faq_sf, real_id) if faq_sf else None
-                    answer = detail.get("answer") if detail else None
-                if answer:
-                    logger.info("FAQ 短路命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
-                    try:
-                        log_decision(
-                            session_id=session_id,
-                            agent_name="bot_agent",
-                            action=DecisionAction.FAQ_DIRECT,
-                            reasoning=f"FAQ 直出 ({faq_res['match_type']})",
-                            evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
-                            latency_ms=0.0,
-                            turn_id=uuid_module.uuid4().hex[:16],
-                            customer_id=customer_id,
-                        )
-                    except Exception:
-                        logger.debug("decision_log 记录失败(不阻断)")
-                    return self._build_result(session_id, user_input, answer, "faq", "faq")
-        except Exception as faq_err:
-            logger.warning("FAQ 优先匹配失败, 走常规流程: %s", faq_err)
+        # 前置 FAQ 短路层已移除 (架构整改): 分类前跑 FAQ 匹配会劫持敏感输入
+        # (qa_scan 首轮复盘: "钱包被偷了"0.2s命中"数字人民币硬钱包"词条) 和
+        # 个人化查询 (a7f6e73 截胡修复的根因 — 检索跑在理解之前)。FAQ 与文档
+        # 统一进路由后的知识检索网关 (_try_faq_direct, 见 _handle_knowledge):
+        # 咨询流量 FAQ 通道优先, 交易/查询流量先走工具永不被 FAQ 截胡。
 
         try:
             # 闭环 P1 感知缝: 提供会话/客户归属 (采样器被动读取, 业务不感知采样逻辑)
@@ -414,16 +398,28 @@ class LumioAgent:
             history = await self._load_history(session_id)
 
             # E2 决策可解释: 记录意图分类决策 (涵盖每轮实际路由, 供监管/客户审计)
+            # 意图体系拆分·路由层: 弱识别/兜底轮如实叙事 — 兜底的 faq 标签只是
+            # 存储兼容残差, 不再伪装成"识别为知识咨询" (faq 四职合一的观感来源)。
+            _cls_src = intent_result.classification_source
+            _unrecognized = _cls_src in ("fallback", "bert:lowconf", "bert:ood") or _cls_src is None
             try:
                 log_decision(
                     session_id=session_id,
                     agent_name="bot_agent",
                     action=DecisionAction.INTENT_CLASSIFY,
-                    reasoning=f"意图={intent_result.primary_intent.value} 置信={intent_result.primary_confidence:.2f} 域={domain}",
+                    reasoning=(
+
+                            f"未识别（{'分类器异常' if _cls_src is None else _cls_src}，按兜底意图落档），置信度 {intent_result.primary_confidence:.0%} — 输入超出已知意图范围，交噪声门拦截澄清"
+                            if _unrecognized
+                            else f"识别意图：{intent_result.primary_intent.value}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
+
+                    ),
                     evidence={
                         "intent": intent_result.primary_intent.value,
                         "confidence": intent_result.primary_confidence,
                         "domain": domain,
+                        "classification_source": _cls_src,
+                        "classification_state": "unrecognized" if _unrecognized else "recognized",
                         # P: 记录候补意图 - 敏感/转人工穿透分析此前因缺失候补而无据可查,
                         # 本次会话 4d22 靠复现才定位, 现补进决策日志供事后审计直接锁定.
                         "alternatives": [a.value for a in (intent_result.alternatives or [])],
@@ -433,7 +429,7 @@ class LumioAgent:
                         "fast_intent": intent_result.fast_intent.value if intent_result.fast_intent else None,
                     },
                     latency_ms=_intent_ms,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                     customer_id=customer_id,
                 )
             except Exception:
@@ -445,91 +441,38 @@ class LumioAgent:
             # 此前各 handler 调 _build_result 时不传 entities, 落库实体恒空,
             # 历史实体池(last_entities)从不累积, 指代消解与"[已知实体]"内存全部空转.
             result = None
-            routing_v2 = get_settings().bot.routing_v2_enabled
-            if routing_v2:
-                # 目标架构 ④ 两级路由决策: 决策一交易性质 / 决策二只读四分流。
-                # 既有闸门 (噪声门/敏感回话/等待快照) 均在 handler 内部, 位置不动。
-                result = await self._dispatch_v2(
+            # 目标架构 ④ 两级路由决策: 决策一交易性质 / 决策二只读四分流。
+            # 既有闸门 (噪声门/敏感回话/等待快照) 均在 handler 内部, 位置不动。
+            result = await self._dispatch(
+                session_id,
+                user_input,
+                intent_result,
+                history,
+                entities,
+                sentiment,
+                domain,
+                customer_id,
+            )
+            # P0 多轮治理: 噪声门回话豁免所需"上文缺槽快照", 提前到 domain 分派前读取,
+            # 避免各 handler 内 _load_slot_prompt 因意图切换重置 tracker 而清掉"上文在等什么"。
+            # 分派覆盖全部域 — 决策一三分支 + 决策二 + chitchat 短路 + 各 handler 内部
+            # 噪声门。此处仅防御性兜底: dispatch 异常返回 None 时走 fallback 噪声门。
+            if result is None:
+                result = await self._handle_fallback(
                     session_id,
                     user_input,
                     intent_result,
                     history,
                     entities,
                     sentiment,
-                    domain,
-                    customer_id,
                 )
-            elif (
-                get_settings().mcp.progressive_disclosure_enabled
-                and self._tool_executor is not None
-                and self._tool_executor.has_tools()
-                and normalize_intent(intent_result.primary_intent.value) in TOOL_INTENTS
-            ):
-                # 会话 48882b05 复盘: 本拦截在 domain 分派之前, 上面的 intent_classify 决策
-                # 记的 域=knowledge(映射表) 与实际走工具编排不符, 审计会误判 "该走 RAG 却
-                # 没走"。此处补一条实际路由决策, 显式声明劫持发生及原因。
-                try:
-                    log_decision(
-                        session_id=session_id,
-                        agent_name="bot_agent",
-                        action=DecisionAction.TOOL_CALL,
-                        reasoning=f"工具编排接管路由: intent={intent_result.primary_intent.value} 置信={intent_result.primary_confidence:.2f}",
-                        evidence={
-                            "actual_route": "tool_orchestration",
-                            "declared_domain": domain,
-                            "intent": intent_result.primary_intent.value,
-                            "confidence": intent_result.primary_confidence,
-                        },
-                        turn_id=uuid_module.uuid4().hex[:16],
-                        customer_id=customer_id,
-                    )
-                except Exception:
-                    logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
-                result = await self._handle_tool(
-                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
-                )
-
-            # P0 多轮治理: 噪声门回话豁免所需"上文缺槽快照", 提前到 domain 分派前读取,
-            # 避免各 handler 内 _load_slot_prompt 因意图切换重置 tracker 而清掉"上文在等什么"。
-            if result is None:
-                gate_missing_slots: list[tuple[str, str]] = []
-                if get_settings().classification.rephrase_guard_enabled:
-                    gate_missing_slots = await self._missing_required_slots(session_id, intent_result.primary_intent)
-
-                if domain == "knowledge":
-                    result = await self._handle_knowledge(
-                        session_id,
-                        user_input,
-                        intent_result,
-                        history,
-                        entities,
-                        sentiment,
-                        missing_slots=gate_missing_slots,
-                    )
-                elif domain in ("business", "risk", "complain", "transfer"):
-                    # risk/complain/transfer 域与 business 同走 _handle_business:
-                    # 敏感写直排人工/建工单、transfer 派发、工具编排的逻辑都在其中
-                    # (draft-0.3 §2 下游契约; 域细分不改派发行为)
-                    result = await self._handle_business(
-                        session_id, user_input, intent_result, history, entities, sentiment, customer_id
-                    )
-                else:
-                    result = await self._handle_fallback(
-                        session_id,
-                        user_input,
-                        intent_result,
-                        history,
-                        entities,
-                        sentiment,
-                        missing_slots=gate_missing_slots,
-                    )
 
             # 统一把增强后的实体写回 result, 保证 slot 填充/噪声门/持久化共用同一份数据
             if result and entities:
                 result["entities"] = entities
 
-            # ⑦ 出站合规闸门 (v2): 生成类回复过敏感词/幻觉检查, 拦截替换为澄清话术
-            if result is not None and routing_v2 and result.get("response_source") in ("knowledge", "llm"):
+            # ⑦ 出站合规闸门: 生成类回复过敏感词/幻觉检查, 拦截替换为澄清话术
+            if result is not None and result.get("response_source") in ("knowledge", "llm"):
                 verdict = self._outbound_guard.check(
                     str(result.get("response", "")),
                     grounding_source=str(result.get("retrieval_context", "") or ""),
@@ -538,6 +481,35 @@ class LumioAgent:
                     logger.warning("出站闸门拦截(%s): session=%s", verdict.reason, session_id)
                     result["response"] = verdict.reply
                     result["response_source"] = "clarify"
+                    # 合规告警信号 → Badcase 闭环自动采集 (方案 §3.1 第五路)
+                    try:
+                        from lumio.services.common.badcase_store import capture_badcase
+
+                        sf = (
+                            self._session_manager._resolve_factory()
+                            if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
+                            else None
+                        )
+                        if sf:
+                            await capture_badcase(
+                                sf,
+                                trace_id=session_id,
+                                session_id=session_id,
+                                signal_source="compliance_alert",
+                                user_input=user_input,
+                                customer_id=customer_id,
+                                bot_output=str(verdict.reply),
+                                signal_detail={"reason": verdict.reason},
+                                snapshot={
+                                    "intent": intent_result.primary_intent.value,
+                                    "confidence": intent_result.primary_confidence,
+                                    "response_source": "clarify",
+                                    "guard_reason": verdict.reason,
+                                    "rag_hit": bool(str(result.get("retrieval_context", "") or "").strip()),
+                                },
+                            )
+                    except Exception:
+                        logger.debug("合规 Badcase 采集失败(不阻断)")
                     try:
                         log_decision(
                             session_id=session_id,
@@ -546,7 +518,7 @@ class LumioAgent:
                             reasoning=f"出站拦截({verdict.reason})",
                             evidence={"reason": verdict.reason},
                             latency_ms=0.0,
-                            turn_id=uuid_module.uuid4().hex[:16],
+                            turn_id="",  # 继承本轮 turn_id (contextvar)
                             customer_id=customer_id,
                         )
                     except Exception:
@@ -567,7 +539,7 @@ class LumioAgent:
                             "total_ms": round(total_ms, 1),
                         },
                         latency_ms=total_ms,
-                        turn_id=uuid_module.uuid4().hex[:16],
+                        turn_id="",  # 继承本轮 turn_id (contextvar)
                         customer_id=customer_id,
                     )
                 except Exception:
@@ -579,6 +551,17 @@ class LumioAgent:
             # 覆写清空防陈旧快照误豁免后续无关输入。
             if result is not None:
                 await self._update_awaiting_snapshot(session_id, intent_result.primary_intent, result)
+                # 诉求跟踪: upsert/流转 + 高紧急未办结回访 (开关可回滚)
+                try:
+                    track_state = (
+                        await self._session_manager.get_session(session_id)
+                        if self._session_manager is not None
+                        else None
+                    )
+                    if track_state is not None:
+                        await self._track_and_followup(session_id, track_state, intent_result, domain, result)
+                except Exception:
+                    logger.debug("诉求跟踪跳过(不阻断): session=%s", session_id)
 
             # P0 修复: 澄清轮的 L3 补判 (run() 统一出口). 噪声门/低置信分支在 handler 内
             # 提前 return clarify, 永远到不了各路径末尾的 _check_transfer -- 连续低置信的
@@ -704,7 +687,7 @@ class LumioAgent:
             turns = await self._session_manager.get_history(session_id, limit=6)
         except Exception:
             return None
-        return [
+        ctx = [
             {
                 "speaker": t.speaker,
                 "content": t.content,
@@ -715,10 +698,29 @@ class LumioAgent:
             for t in turns
             if t.speaker in ("customer", "bot") and t.content
         ][-6:]
+        # 防带偏 (诉求跟踪联动, 2026-09-04 E2E 实证: "什么是临时额度"办结后,
+        # "我的额度是什么"新查询仍被 BERT 历史拼接拖回知识链): 开启诉求跟踪
+        # 且最近轮已办结 (无未办结诉求) 时, 只保留最后一对轮次作上下文 —
+        # 新话题判定需要干净视野; 有未办结诉求时保留全部 (多轮补槽需要上文)。
+        if ctx and get_settings().session.topic_tracking_enabled and self._session_manager is not None:
+            try:
+                from lumio.shared.models import TopicRequestStatus
 
-    # ── 目标架构 v2 两级路由: 决策一/二 与四条执行链 ──
+                st = await self._session_manager.get_session(session_id)
+                live = [
+                    t
+                    for t in (getattr(st, "active_requests", None) or [])
+                    if t.status in (TopicRequestStatus.OPEN, TopicRequestStatus.WAITING_INFO)
+                ]
+                if st is not None and not live and len(ctx) >= 4:
+                    ctx = ctx[-2:]  # 只留最近一问一答
+            except Exception:
+                pass
+        return ctx
 
-    async def _dispatch_v2(
+    # ── 目标架构 ④ 两级路由: 决策一/二 与四条执行链 ──
+
+    async def _dispatch(
         self,
         session_id: str,
         user_input: str,
@@ -731,7 +733,7 @@ class LumioAgent:
     ) -> dict[str, Any]:
         """④ 两级路由决策
 
-        决策一: 交易性质三分流 (高风险转人工 / 金融交易链 A / 查询链 B);
+        决策一: 交易性质三分流 (高风险转人工 / 金融交易链路 / 查询直达链路);
         决策二: 只读咨询四分流 (并行竞速 / 复合意图 / RAG 链路)。
         任何链内部失败均回落既有知识/业务路径, 不产生无回复出口。
         """
@@ -740,27 +742,85 @@ class LumioAgent:
             classify_traffic,
             decision_two,
             detect_composite,
+            is_chitchat_redirect,
         )
 
         intent = intent_result.primary_intent
         confidence = intent_result.primary_confidence
-        traffic = classify_traffic(intent)
-        composite = detect_composite(intent, list(intent_result.alternatives or []), user_input)
+
+        # 裸槽位回归 (第二轮模拟 compliance_alert 根因): 上轮查询直达反问槽位后, 本轮
+        # 裸给值被分类成低置信 faq — 噪声门的 awaiting_hit 兜底位于各 handler 内部,
+        # 而分派先于 handler 把请求抢走, 落进知识链/竞速后被出站闸拦成"没太理解"。
+        # 此处等价补位: 有等待快照 + 本轮低置信 → 换回等待意图按其流量性质分派
+        # (等待意图多为查询类 → 查询直达 → _load_slot_prompt 消费快照与本轮槽值直查)。
+        if confidence < CLARIFY_CONFIDENCE_FLOOR:
+            try:
+                await_intent, awaiting = await self._session_awaiting_slots(session_id)
+            except Exception:
+                await_intent, awaiting = None, []
+            if awaiting and await_intent:
+                try:
+                    swapped_intent = normalize_intent(await_intent)
+                except ValueError:
+                    swapped_intent = None
+                if swapped_intent is not None:
+                    logger.info(
+                        "等待快照回归: 换回等待意图 %s 续办 (input=%r)",
+                        swapped_intent.value,
+                        user_input[:20],
+                    )
+                    intent_result = IntentResult(
+                        primary_intent=swapped_intent,
+                        primary_confidence=0.6,  # 上文已确认的意图, 不按本轮低置信记账
+                        alternatives=intent_result.alternatives,
+                        alternative_scores=intent_result.alternative_scores,
+                        energy=intent_result.energy,
+                        fast_conf=confidence,
+                        fast_intent=intent,
+                    )
+                    intent = swapped_intent
+                    confidence = 0.6
+        # classify_traffic 返回 (五域, 交易性质) 二元组 — P0 修复: 此前当单值比较,
+        # tuple == 枚举恒 False, 三分支全落空直奔决策二 (单测只测了函数本身没测
+        # 分派比较, 分派联调时暴露)
+        traffic_domain, traffic = classify_traffic(intent)
+        composite = detect_composite(
+            intent,
+            list(intent_result.alternatives or []),
+            user_input,
+            list(intent_result.alternative_scores or []),
+        )
+        logger.debug(
+            "dispatch: traffic=%s composite=%s intent=%s alts=%s",
+            traffic.value if traffic else "consulting",
+            composite,
+            intent.value,
+            [a.value for a in (intent_result.alternatives or [])],
+        )
         try:
             log_decision(
                 session_id=session_id,
                 agent_name="bot_agent",
-                action=DecisionAction.TOOL_CALL
-                if traffic != TrafficClass.CONSULTING
-                else DecisionAction.INTENT_CLASSIFY,
-                reasoning=f"v2 路由: 决策一={traffic.value} 决策二预备 composite={composite}",
+                # 路由决策专用动作: 此前借用 TOOL_CALL/INTENT_CLASSIFY, 审计链上
+                # 路由判定被标成"工具执行", 与真正的工具执行混淆 (用户实测反馈)
+                action=DecisionAction.ROUTE_DECISION,
+                reasoning=(
+                    "两级路由：第一级判定="
+                    + (
+                        _TRAFFIC_ZH_LOG.get(traffic.value, traffic.value)
+                        if traffic is not None
+                        else "咨询类（进入知识问答）"
+                    )
+                    + f"；复合意图={'是' if composite else '否'}"
+                ),
                 evidence={
-                    "traffic_class": traffic.value,
+                    "traffic_class": traffic.value if traffic else None,
+                    "domain": traffic_domain.value,
                     "confidence": confidence,
                     "composite": composite,
                     "alternatives": [a.value for a in (intent_result.alternatives or [])],
                 },
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
                 customer_id=customer_id,
             )
         except Exception:
@@ -774,34 +834,143 @@ class LumioAgent:
                 session_id, user_input, intent_result, history, entities, sentiment, customer_id
             )
         if traffic == TrafficClass.FINANCIAL_TRANSACTION:
-            # 链 A · 交易链路: 工具编排 + 敏感确认状态机; 无工具回落知识
+            # 高置信确定性直连 (qa_scan 挂账: 挂失链 LLM 编排本地时延 20-40s 超时
+            # 回落知识链): 意图置信 ≥0.9 且意图→工具映射唯一时, 跳过 LLM 编排循环
+            # 直接执行工具 (卡号注入/配额/脱敏/审计同源)。失败回落交易链路。
+            # 阈值 0.8: 挂失为保护性操作 (误挂可解挂), LLM 慢路径分类多落 0.76-0.85。
+            # 咨询句式豁免直连 (第八轮质检挂账: "信用卡找不到了, 怎么办呢"客户在问
+            # 流程, 直连把挂失办了 — 体验激进): 问"怎么办/怎么挂失"类走知识链答
+            # 流程介绍; 祈使句式 ("帮我挂失/赶紧停了") 保持直连执行。
+            consultative_markers = _lex("consultative_loss_markers")
+            if confidence >= 0.8 and any(m in user_input for m in consultative_markers):
+                logger.info("挂失咨询句式走知识链 (跳过直连): input=%r", user_input[:24])
+                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
+            if (
+                confidence >= 0.8
+                and self._tool_executor is not None
+                and self._tool_executor.has_tools()
+                and get_settings().mcp.progressive_disclosure_enabled
+            ):
+                from lumio.services.bot.tool_selection import select_tools_for_intent
+
+                direct_tools = select_tools_for_intent(intent, confidence, get_settings().mcp)
+                if direct_tools and len(direct_tools) == 1:
+                    try:
+                        direct = await self._tool_executor.execute_direct(
+                            direct_tools[0],
+                            {},
+                            session_id=session_id,
+                            actor_id=customer_id or session_id,
+                        )
+                        logger.info(
+                            "高置信意图工具直连: intent=%s conf=%.2f tool=%s",
+                            intent.value,
+                            confidence,
+                            direct_tools[0],
+                        )
+                        try:
+                            log_decision(
+                                session_id=session_id,
+                                agent_name="bot_agent",
+                                action=DecisionAction.TOOL_CALL,
+                                reasoning=f"高置信确定性直连: {intent.value}@{confidence:.2f} → {direct_tools[0]} (跳过 LLM 编排)",
+                                evidence={"tool": direct_tools[0], "direct": True, "confidence": confidence},
+                                turn_id="",  # 继承本轮 turn_id (contextvar)
+                                customer_id=customer_id,
+                            )
+                        except Exception:
+                            logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+                        return self._build_result(
+                            session_id,
+                            user_input,
+                            _format_tool_result(direct.content),
+                            "tool",
+                            intent.value,
+                            confidence,
+                        )
+                    except Exception as exc:
+                        logger.warning("工具直连失败, 回落交易链路 编排: tool=%s err=%s", direct_tools[0], exc)
+            # 交易链路 · 交易链路: 工具编排 + 敏感确认状态机; 无工具回落知识
             if self._tool_executor is not None and self._tool_executor.has_tools():
                 return await self._handle_tool(
                     session_id, user_input, intent_result, history, entities, sentiment, customer_id
                 )
             return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
         if traffic == TrafficClass.READ_ONLY_QUERY:
-            # 复合意图 (查询 + 解释/FAQ 诉求) 优先走链 C: 纯定义类问题会被
+            # 定义句式 (概念咨询) 直送知识链 (qa_scan 第五轮: "什么是临时额度"被
+            # 查询直达 直查答成"您当前没有临时额度" — 客户问概念, 机器人答账户状态)。
+            # domain_of_with_text 的定义句式强制咨询域只作用于 L2 向量判定块,
+            # 两级分派走 domain_of 无文本修正 — 此处补齐; "我的额度是什么"类
+            # 含个人数据诉求词的由 is_definition_query 自身排除, 仍走查询。
+            from lumio.shared.intent_taxonomy import is_definition_query
+
+            if is_definition_query(user_input):
+                logger.info("定义句式直送知识链 (查询直达前置拦截): input=%r", user_input[:24])
+                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
+            # 复合意图 (查询 + 解释/FAQ 诉求) 优先走复合级联: 纯定义类问题会被
             # 查询链路的缺参反问卡死 (会话 2b3b2613 实测: "信用额度是什么"三连问
-            # 卡号, 用户永远出不去)。链 C 缺参/无工具时自然回落知识路径。
+            # 卡号, 用户永远出不去)。复合级联 缺参/无工具时自然回落知识路径。
             if composite:
                 comp = await self._handle_composite(
                     session_id, user_input, intent_result, history, entities, sentiment, customer_id
                 )
                 if comp is not None:
                     return comp
-            # 链 B · 查询轻链路: 直连工具 + 缓存; 无工具/链失败回落
+            # 查询直达 · 查询轻链路: 直连工具 + 缓存; 无工具/链失败回落
             if self._tool_executor is not None and self._tool_executor.has_tools():
-                qc = await self._handle_query_chain(
-                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
-                )
+                try:
+                    qc = await self._handle_query_chain(
+                        session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                    )
+                except Exception as exc:
+                    import traceback
+
+                    logger.warning("查询直达异常: %s\n%s", exc, traceback.format_exc()[-600:])
+                    qc = None
                 if qc is not None:
                     return qc
-            return await self._handle_tool(
-                session_id, user_input, intent_result, history, entities, sentiment, customer_id
-            )
+            # 无可用工具 (查询直达 不可达) → 回落知识链, 与交易分支"无工具回落知识"对齐
+            if self._tool_executor is not None and self._tool_executor.has_tools():
+                return await self._handle_tool(
+                    session_id, user_input, intent_result, history, entities, sentiment, customer_id
+                )
+            return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
 
         # ── 决策二 (CONSULTING) ──
+        # 闲聊域短路 (会话 8700a2ea 复盘): 决策二只有 复合/竞速/RAG 三个出口, 闲聊流量
+        # 按置信分流全部落进 RAG 链 — "锄禾日当午"检索"命中"账单文档, 15 秒生成了整段
+        # 答非所问的账单说明。闲聊无业务诉求: 模板轻回复引导回业务, 零检索零生成零幻觉。
+        # alternatives 携带业务域意图的混合句不拦 (is_chitchat_redirect 内部判定)。
+        if is_chitchat_redirect(
+            intent, list(intent_result.alternatives or []), list(intent_result.alternative_scores or [])
+        ):
+            logger.info(
+                "闲聊域轻回复引导: session=%s input=%r conf=%.2f",
+                session_id,
+                user_input[:20],
+                confidence,
+            )
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.ROUTE_DECISION,
+                    reasoning="闲聊域轻回复引导(决策二短路), 不检索不生成",
+                    evidence={
+                        "traffic_class": None,
+                        "domain": traffic_domain.value,
+                        "confidence": confidence,
+                        "chitchat_redirect": True,
+                    },
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
+                    customer_id=customer_id,
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
+            return self._build_result(
+                session_id, user_input, CHITCHAT_REDIRECT_RESPONSE, "template", "chitchat", confidence
+            )
+
         route = decision_two(confidence, composite)
         if route.value == "parallel_race":
             return await self._handle_parallel_race(session_id, user_input, intent_result, history, entities, sentiment)
@@ -823,11 +992,20 @@ class LumioAgent:
         sentiment: SentimentLabel,
         customer_id: str | None,
     ) -> dict[str, Any] | None:
-        """链 B · 查询轻链路: 槽位参数 → 直连工具 → 单次摘要。
+        """查询直达 · 查询轻链路: 槽位参数 → 直连工具 → 单次摘要。
 
         Returns: None = 链路不适用 (无工具/失败), 调用方回落; 非 None = 已产出回复。
         """
         from lumio.services.bot.tool_selection import select_tools_for_intent
+
+        # 逐字精确 FAQ 出口 (防分类抖动, E2E p3faq 复盘): 客户原句与运营标准问
+        # 完全一致 (变体归一化查表, 非语义猜测) 时直接给标准答案 — 分类把标准
+        # 问句抖成查询意图时, 工具答的是账户数据而非问题本身 ("临时需要用卡
+        # 怎么办?"→查临时额度, 答非所问)。语义/BM25 不在此截胡; 紧急标记跳过。
+        if not _has_emergency_marker(user_input):
+            exact_hit = await self._try_faq_direct(session_id, user_input, customer_id, exact_only=True)
+            if exact_hit is not None:
+                return exact_hit
 
         # 填槽并持久化 (跨轮继承/历史反填复用既有机制), 再读回槽位值
         await self._load_slot_prompt(session_id, intent_result.primary_intent, entities or [], user_input)
@@ -851,19 +1029,62 @@ class LumioAgent:
             customer_id=customer_id,
             history=history,
         )
+        # E2 可解释 (用户反馈: 回放缺执行过程): 查询直达工具执行/缓存命中落决策日志
+        from lumio.shared.entity_sandbox import mask_pii_in_text
+
+        def _mask_args(a: dict) -> dict:
+            return {k: (mask_pii_in_text(str(v)) if isinstance(v, str) else v) for k, v in (a or {}).items()}
+
+        try:
+            log_decision(
+                session_id=session_id,
+                agent_name="query_chain",
+                action=DecisionAction.TOOL_CALL,
+                reasoning=(
+                    f"查询直达: {qc.tool_name}"
+                    f"{' (缓存命中)' if qc.cache_hit else ''}"
+                    f"{' 缺参: ' + ','.join(qc.missing_params) if qc.missing_params else ''}"
+                    if qc.tool_name
+                    else "查询直达未选到工具"
+                ),
+                evidence={
+                    "tool": qc.tool_name,
+                    "arguments": _mask_args(qc.tool_args),
+                    "cache_hit": qc.cache_hit,
+                    "result_preview": mask_pii_in_text(
+                        (qc.raw_result if (qc.raw_result and qc.raw_result != "(cache)") else (qc.content or "")) or ""
+                    )[:200],
+                    "missing_params": qc.missing_params,
+                    "route": "query",
+                    "mcp_ms": round(qc.mcp_ms, 1),
+                    "summarize_ms": round(qc.summarize_ms, 1),
+                },
+                latency_ms=round(qc.total_ms, 1),
+                turn_id="",
+                customer_id=customer_id,
+            )
+        except Exception:
+            logger.debug("查询直达决策日志失败(不阻断): session=%s", session_id)
         if qc.error:
             logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
             return None
         if qc.missing_params:
-            # 缺参先探知识 (会话 2b3b2613 复盘: "信用额度是什么"缺卡号被反问,
-            # 但定义类问题知识库可答 —— 反问个人参数前先看 RAG 有据与否)
-            try:
-                probe = await self._retrieve(user_input)
-            except Exception:
-                probe = ""
-            if probe:
-                logger.info("查询链路缺参但 RAG 有据, 转知识路径: session=%s", session_id)
-                return await self._handle_knowledge(session_id, user_input, intent_result, history, entities, sentiment)
+            # 缺参探知识仅限定义句式 (会话 2b3b2613 复盘: "信用额度是什么"该走知识)。
+            # 一小时模拟 badcase 修正: 真查询诉求 ("帮我查账单"要的是具体金额)曾被
+            # "如何看账单"类文档截胡转知识路径 —— 非定义句式直接反问补槽, 客户给
+            # 卡号即直查工具。定义句式现已在分类层被强制咨询域, 此分支仅兜漏网。
+            from lumio.shared.intent_taxonomy import is_definition_query
+
+            if is_definition_query(user_input):
+                try:
+                    probe = await self._retrieve(user_input)
+                except Exception:
+                    probe = ""
+                if probe:
+                    logger.info("查询链路缺参(定义句式)且 RAG 有据, 转知识路径: session=%s", session_id)
+                    return await self._handle_knowledge(
+                        session_id, user_input, intent_result, history, entities, sentiment
+                    )
             # 反问澄清 (TW6→S1 补槽回流): 槽位 prompt 过弱时用参数中文名直问
             param_zh = {
                 "period": "账期（如 2026-08）",
@@ -888,6 +1109,9 @@ class LumioAgent:
                 entities=entities,
                 sentiment=sentiment,
             )
+        # 工具结果随结果带回 (retrieval_context): 复合意图级联据此把取数注入
+        # 知识生成 (会话 smoke-qa-1788567861 复盘: 此前恒空, 复合取数后被废弃
+        # 回落重跑); 缓存命中时退回复读文本, 审计回放走默认脱敏。
         return self._build_result(
             session_id,
             user_input,
@@ -897,6 +1121,7 @@ class LumioAgent:
             intent_result.primary_confidence,
             entities=entities,
             sentiment=sentiment,
+            retrieval_context=(qc.raw_result if qc.raw_result and qc.raw_result != "(cache)" else (qc.content or "")),
         )
 
     async def _handle_parallel_race(
@@ -908,7 +1133,7 @@ class LumioAgent:
         entities: list[Entity] | None,
         sentiment: SentimentLabel,
     ) -> dict[str, Any]:
-        """链 D · 低置信并行竞速: FAQ 与 RAG 双路并发, 归并取高分。"""
+        """低置信并行竞速: FAQ 与 RAG 双路并发, 归并取高分。"""
         from lumio.services.bot.parallel_race import race
 
         embedding_provider = (
@@ -926,6 +1151,7 @@ class LumioAgent:
                 redis_client=session_manager._redis if session_manager else None,
                 embedding_provider=embedding_provider,
                 milvus_collection=self._milvus_collection,
+                es_client=self._es_client,
                 user_role="customer",
                 session_factory=(
                     session_manager._resolve_factory()
@@ -963,7 +1189,7 @@ class LumioAgent:
         sentiment: SentimentLabel,
         customer_id: str | None,
     ) -> dict[str, Any] | None:
-        """链 C · 复合意图: 查询取数 → 数据注入 RAG → 联合生成。
+        """复合意图级联: 查询取数 → 数据注入 RAG → 联合生成。
 
         Returns: None = 查询链不适用 (无工具/缺参数), 调用方回落纯知识路径。
         """
@@ -1044,7 +1270,7 @@ class LumioAgent:
                     action=DecisionAction.NOISE_BLOCKED,
                     reasoning=f"噪声门拦截({gate_reason})",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -1121,7 +1347,7 @@ class LumioAgent:
                     action=DecisionAction.CONTEXT_REPLY_PASS,
                     reasoning="多轮回话判定放行",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -1165,8 +1391,17 @@ class LumioAgent:
                 intent.primary_intent.value,
                 intent.primary_confidence,
             )
+        # ── 统一知识检索网关 · FAQ 通道 (架构整改) ──
+        # FAQ 与文档同属知识库, 检索统一在路由之后: 本路径只承接咨询域流量,
+        # 交易/查询意图上游已走工具直达。FAQ 通道优先于文档 RAG — 人工审核过的
+        # 标准答案高于模型生成答案; 未命中继续文档通道。紧急标记输入跳过 FAQ
+        # (敏感诉求不得被字面相似词条劫持), 敏感重路由轮跳过 (防二次绕开状态机)。
+        if not _sensitive_rerouted and not _has_emergency_marker(user_input):
+            faq_hit = await self._try_faq_direct(session_id, user_input)
+            if faq_hit is not None:
+                return faq_hit
         _rag_t0 = time.monotonic()
-        context = await self._retrieve(user_input)
+        context = await self._retrieve(user_input, intent=intent.primary_intent, confidence=intent.primary_confidence)
         if extra_context:
             context = f"{extra_context}\n\n{context}" if context else extra_context
         # E2 决策可解释: 记录 RAG 检索决策 (命中与否)
@@ -1176,8 +1411,13 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.RAG_RETRIEVE,
                 reasoning=f"RAG 检索{'命中' if context else '未命中'}",
-                evidence={"hit": bool(context), "context_len": len(context or "")},
-                turn_id=uuid_module.uuid4().hex[:16],
+                evidence={
+                    "hit": bool(context),
+                    "context_len": len(context or ""),
+                    "query": user_input[:60],
+                    "citations": (self._last_citation_docids or [])[:5],
+                },
+                turn_id="",  # 继承本轮 turn_id (contextvar)
                 latency_ms=(time.monotonic() - _rag_t0) * 1000,
             )
         except Exception:
@@ -1299,6 +1539,11 @@ class LumioAgent:
             messages=messages,
         )
         _llm_ms = (time.monotonic() - _t_llm) * 1000
+        # ⑥ 引用来源 (2026-09-04 产品决策: 客户回复不展示"来源：《…》"脚注):
+        # 引用文档标题改为记入生成决策日志 evidence, 审计可在回放中看到依据
+        citation_titles: list[str] = []
+        if context and result.source in ("llm", "retrieval"):
+            citation_titles = await self._citation_titles()
         # E2 决策可解释: 记录 LLM 生成决策 (含降级来源)
         try:
             log_decision(
@@ -1306,9 +1551,13 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"knowledge 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", ""), "rag_used": bool(context)},
+                evidence={
+                    "source": getattr(result, "source", ""),
+                    "rag_used": bool(context),
+                    "citations": citation_titles[:5],
+                },
                 latency_ms=_llm_ms,
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -1333,12 +1582,7 @@ class LumioAgent:
         if result.source in ("template", "fallback") and not should_transfer:
             should_transfer = True
             transfer_reason = f"degraded_{result.source}: LLM 不可用, 降级回复"
-        # ⑥ 引用来源标注: 知识生成回复尾部附《文档标题》(doc_id → 标题, 带缓存)
         reply = result.content
-        if context and result.source in ("llm", "retrieval"):
-            footer = await self._citation_footer()
-            if footer:
-                reply = f"{reply}{footer}"
 
         return self._build_result(
             session_id,
@@ -1354,7 +1598,7 @@ class LumioAgent:
             retrieval_context=context,
         )
 
-    async def _citation_footer(self) -> str:
+    async def _citation_titles(self) -> list[str]:
         """⑥ 引用来源: 本轮检索 chunk 的 source_doc → kb_document 标题 (带缓存)"""
         docids = [d for d in dict.fromkeys(getattr(self, "_last_citation_docids", None) or []) if d]
         if not docids:
@@ -1389,8 +1633,7 @@ class LumioAgent:
         except Exception as exc:
             logger.debug("引用标题查询失败(不阻断): %s", exc)
             return ""
-        unique = list(dict.fromkeys(titles))
-        return ("\n\n来源：" + "、".join(f"《{t}》" for t in unique)) if unique else ""
+        return list(dict.fromkeys(titles))
 
     async def _handle_business(
         self,
@@ -1449,6 +1692,50 @@ class LumioAgent:
                     await self._create_complaint_ticket(session_id, user_input, customer_id)
                 except Exception as exc:
                     logger.debug("投诉工单创建失败 (不阻断转人工): session=%s err=%s", session_id, exc)
+            # 转人工信号采集 (闭环 §3.1 第二路): 真·明确转人工即时路径同样留痕归因现场
+            # —— 此前只有 L3 低置信确认链采集, 客户主动请求路径漏采。
+            # 采集精度治理 (300会话规模轮: 52% 坏例为误采集): 客户开门见山的主动
+            # 转人工/投诉 (意图明确+高置信) 走对流程是正常诉求, 不是 bot 的坏例 —
+            # 不采集。该采的是低置信 streak/连续澄清被逼转人工 (L3 链另行采集)。
+            _explicit_transfer = (
+                primary
+                in (
+                    IntentLabel.TRANSFER_AGENT,
+                    IntentLabel.COMPLAINT,
+                    IntentLabel.DISPUTE_SUBMIT,
+                )
+                and conf >= 0.7
+            )
+            try:
+                from lumio.services.common.badcase_store import capture_badcase
+
+                sf = (
+                    self._session_manager._resolve_factory()
+                    if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
+                    else None
+                )
+                if sf and not _explicit_transfer:
+                    from lumio.services.bot.routing import classify_traffic
+
+                    _dom, _tc = classify_traffic(primary)
+                    await capture_badcase(
+                        sf,
+                        trace_id=session_id,
+                        session_id=session_id,
+                        signal_source="transfer",
+                        user_input=user_input,
+                        customer_id=customer_id,
+                        bot_output=BUSINESS_TRANSFER_TEMPLATE.format(reason=reason),
+                        signal_detail={"transfer_reason": reason, "stage": "immediate", "intent": primary.value},
+                        snapshot={
+                            "intent": primary.value,
+                            "confidence": conf,
+                            "traffic_class": _tc.value if _tc else None,
+                            "response_source": "template",
+                        },
+                    )
+            except Exception:
+                logger.debug("转人工 Badcase 采集失败(不阻断)")
             return self._build_result(
                 session_id,
                 user_input,
@@ -1560,7 +1847,7 @@ class LumioAgent:
                 reasoning=f"business 生成, 来源={getattr(result, 'source', '')}",
                 evidence={"source": getattr(result, "source", ""), "domain": "business", "rag_used": bool(context)},
                 latency_ms=_llm_ms,
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -1645,6 +1932,31 @@ class LumioAgent:
             except Exception:
                 rag_context = ""
             if rag_context:
+                # 300会话规模轮修复 (确认继承断裂根因): 挂失等敏感写类编排无工具调用
+                # 转 knowledge 给引导话术时, 同时挂 pending 挂失确认 — 否则下一句
+                # "确认挂失"无状态可继承被重新分类成 faq, 23 条 layer_3 坏例的来源。
+                if (
+                    intent.primary_intent
+                    in (
+                        IntentLabel.CARD_LOSS,
+                        IntentLabel.CARD_LOSS_REPORT,
+                    )
+                    and self._session_manager is not None
+                ):
+                    try:
+                        from lumio.shared.models import PendingAction
+
+                        await self._save_pending_action(
+                            session_id,
+                            PendingAction(
+                                tool_name="report_card_lost",
+                                confirm_prompt="如您确认需要挂失, 请回复『确认』, 我将为您办理挂失。",
+                                arguments={"source": "orchestration_fallback"},
+                            ),
+                        )
+                        logger.info("敏感意图编排无工具, 已挂 pending 确认: session=%s", session_id)
+                    except Exception:
+                        logger.debug("pending 挂失确认挂载失败(不阻断): session=%s", session_id)
                 logger.info("工具编排无工具调用且检索有据, 转知识路径 grounding: session=%s", session_id)
                 return await self._handle_knowledge(
                     session_id, user_input, intent, history, entities, sentiment, _sensitive_rerouted=True
@@ -1825,7 +2137,14 @@ class LumioAgent:
         # unclear: 无法判定为确认/取消 — 计数, 达到上限自动取消并放行新消息
         # (业务场景: 确认窗口内用户发新问题, 若一直吞掉会被卡死, 需给逃生路径)
         new_count = (pending.unclear_count or 0) + 1
-        if new_count >= get_settings().mcp.unclear_auto_cancel_threshold:
+        # 明确新话题快速放行 (qa_scan 第六轮: 挂失确认等待中客户问"新卡多久
+        # 寄到", 连续两轮被重复确认话术吞掉): 带疑问特征或明显长于确认/犹豫
+        # 短语的输入, 不再计数等待 — 立即取消确认并按新消息处理。短回退词
+        # ("嗯"/"再想想") 仍走计数路径, 防误放行真犹豫。
+        stripped = (user_input or "").strip()
+        new_topic_markers = ("多久", "怎么", "什么", "为什么", "多少", "如何", "哪里", "几", "吗", "？", "?", "咋")
+        looks_new_topic = len(stripped) >= 10 or any(m in stripped for m in new_topic_markers)
+        if looks_new_topic or new_count >= get_settings().mcp.unclear_auto_cancel_threshold:
             await self._clear_pending_action(session_id, state.version)
             TOOL_CONFIRMATIONS.labels(decision="cancel").inc()
             await self._tool_executor.audit_decision(  # type: ignore[union-attr]
@@ -1883,6 +2202,36 @@ class LumioAgent:
                 await self._clear_pending_action(session_id, state.version)
                 reason = (pending.arguments or {}).get("transfer_reason") or "连续多轮未理解后客户确认转人工"
                 logger.info("L3 转人工已确认, 派真人: session=%s reason=%s", session_id, reason)
+                # 转人工信号 (方案 §3.1 第二路, 最强信号) → Badcase 闭环自动采集,
+                # 留存转人工前对话现场供归因 (低置信 streak / 降级 / 主动请求)
+                try:
+                    from lumio.services.common.badcase_store import capture_badcase
+
+                    sf = (
+                        self._session_manager._resolve_factory()
+                        if self._session_manager is not None and hasattr(self._session_manager, "_resolve_factory")
+                        else None
+                    )
+                    if sf:
+                        await capture_badcase(
+                            sf,
+                            trace_id=session_id,
+                            session_id=session_id,
+                            signal_source="transfer",
+                            user_input=user_input,
+                            customer_id=None,
+                            bot_output=BUSINESS_TRANSFER_TEMPLATE.format(reason=reason),
+                            signal_detail={"transfer_reason": reason, "stage": "confirmed"},
+                            snapshot={
+                                "intent": "transfer_agent",
+                                "confidence": None,
+                                "traffic_class": "high_risk",
+                                "response_source": "template",
+                                "stage_detail": "L3 低置信确认链",
+                            },
+                        )
+                except Exception:
+                    logger.debug("转人工 Badcase 采集失败(不阻断)")
                 return self._build_result(
                     session_id,
                     user_input,
@@ -2072,7 +2421,7 @@ class LumioAgent:
                     action=DecisionAction.NOISE_BLOCKED,
                     reasoning=f"噪声门拦截({gate_reason})",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -2122,7 +2471,7 @@ class LumioAgent:
                     action=DecisionAction.CONTEXT_REPLY_PASS,
                     reasoning="多轮回话判定放行",
                     evidence=gate_evidence,
-                    turn_id=uuid_module.uuid4().hex[:16],
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
                 )
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -2192,7 +2541,7 @@ class LumioAgent:
                 reasoning=f"fallback 生成, 来源={getattr(result, 'source', '')}",
                 evidence={"source": getattr(result, "source", ""), "domain": "chitchat"},
                 latency_ms=_llm_ms,
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
@@ -2315,8 +2664,96 @@ class LumioAgent:
         )
         return re.sub(r"[\s,?,.!;:；：]+", "", t)
 
-    async def _retrieve(self, query: str) -> str:
-        """RAG 检索 (P0-3 上下文工程: 接线 reranker + 相关性阈值 + 首尾重排 + RAG 预算截断)"""
+    async def _try_faq_direct(
+        self,
+        session_id: str,
+        user_input: str,
+        customer_id: str | None = None,
+        *,
+        exact_only: bool = False,
+    ) -> dict[str, Any] | None:
+        """统一知识检索网关 · FAQ 通道 (路由后): 匹配命中 → 直出标准答案。
+
+        只在咨询域知识路径调用 — 交易/查询流量上游已走工具直达, FAQ 从结构上
+        不可能再截胡个人化查询 (a7f6e73 前置截胡的根因是检索跑在理解之前)。
+        返回 None = 未命中, 调用方继续文档 RAG 通道; 检索日志落
+        kb_faq_search_log (控制台 FAQ 命中率指标数据源)。
+
+        exact_only: 只接受逐字/变体归一化精确命中 (查表, 非语义猜测) — 供查询
+        直达链防分类抖动: 客户原句与运营标准问逐字一致时给标准答案, 而非被
+        抖动分类带去查工具答非所问 (会话 p3faq: "临时需要用卡怎么办?"被判
+        limit_query 查了临时额度)。语义/BM25 永不在此路径截胡查询流量。
+        """
+        _t0 = time.monotonic()
+        try:
+            from lumio.services.common.faq_service import get_faq, search_faq
+
+            session_manager = self._session_manager
+            faq_embedding = (
+                self._embedding_breaker.provider
+                if self._embedding_breaker and self._embedding_breaker.is_available
+                else None
+            )
+            faq_res = await search_faq(
+                query=user_input,
+                redis_client=session_manager._redis if session_manager else None,
+                embedding_provider=faq_embedding,
+                milvus_collection=self._milvus_collection,
+                es_client=self._es_client,
+                user_role="customer",
+                session_factory=(
+                    session_manager._resolve_factory()
+                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                    else None
+                ),
+                session_id=session_id,
+            )
+            accepted = ("exact",) if exact_only else ("exact", "semantic", "bm25")
+            if faq_res["match_type"] not in accepted or not faq_res["results"]:
+                return None
+            top = faq_res["results"][0]
+            answer = top.get("answer")
+            if not answer and top.get("faq_id"):
+                faq_sf = (
+                    session_manager._resolve_factory()
+                    if session_manager is not None and hasattr(session_manager, "_resolve_factory")
+                    else None
+                )
+                # chunk_id 带变体序号后缀 (faqid#0), 回查前剥离取真实 FAQ UUID
+                real_id = top["faq_id"].split("#", 1)[0]
+                detail = await get_faq(faq_sf, real_id) if faq_sf else None
+                answer = detail.get("answer") if detail else None
+            if not answer:
+                return None
+            logger.info("FAQ 通道命中 (%s): %s", faq_res["match_type"], top.get("question", "")[:50])
+            try:
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.FAQ_DIRECT,
+                    reasoning=f"FAQ 直出 ({faq_res['match_type']})",
+                    evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
+                    latency_ms=(time.monotonic() - _t0) * 1000,
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
+                    customer_id=customer_id,
+                )
+            except Exception:
+                logger.debug("decision_log 记录失败(不阻断)")
+            return self._build_result(session_id, user_input, answer, "faq", "faq")
+        except Exception as faq_err:
+            logger.warning("FAQ 通道匹配失败, 继续文档检索: %s", faq_err)
+            return None
+
+    async def _retrieve(self, query: str, *, intent: IntentLabel | None = None, confidence: float = 0.0) -> str:
+        """RAG 检索 (P0-3 上下文工程: 接线 reranker + 相关性阈值 + 首尾重排 + RAG 预算截算)
+
+        intent/confidence 提供时做意图感知检索词增强 (高置信交易/风险意图拼规范词)。
+        """
+        if intent is not None and confidence >= 0.7:
+            terms = _INTENT_RETRIEVAL_TERMS.get(intent)
+            if terms and terms not in query:
+                query = f"{query} {terms}"
+                logger.info("意图感知检索词增强: intent=%s conf=%.2f → %r", intent.value, confidence, query[:60])
         if self._degradation_mgr.level == DegradationLevel.FALLBACK:
             return ""
         # P1-13 修复: 检索前查 ES/Milvus 熔断器 — 熔断打开时主动跳过检索,
@@ -2333,6 +2770,7 @@ class LumioAgent:
         except Exception:
             pass
         try:
+            from lumio.services.common.retrieval import query_chunk_overlap_zero
             from lumio.services.common.retrieval import retrieve as do_retrieve
 
             settings = get_settings()
@@ -2354,6 +2792,17 @@ class LumioAgent:
             )
             self._last_citation_docids = [r.source_doc for r in (resp.results or [])]
             if resp.results:
+                # 相关性兜底门 (会话 8700a2ea): reranker 退化时 RRF 阈值 0 形同虚设,
+                # "锄禾日当午"靠单字"日"BM25 非零命中账单文档。查询与全部片段零词法
+                # 重叠 → 无证据不生成, 判 miss 走既有无知识降级话术。
+                if query_chunk_overlap_zero(query, [r.content for r in resp.results]):
+                    logger.info(
+                        "检索词法重叠门: 查询与全部片段零重叠, 视为 miss: query=%r docs=%d",
+                        query[:30],
+                        len(resp.results),
+                    )
+                    self._last_citation_docids = []
+                    return ""
                 # P0-3 首尾重排 (LongLLMLingua reorder_context="sort"):
                 # lost-in-middle — 模型对中段注意力最弱, 相关性最高的文档放最前,
                 # 次高放最后, 其余居中
@@ -2692,6 +3141,175 @@ class LumioAgent:
         except Exception:
             logger.debug("摘要更新异常: session=%s", session_id)
 
+    # ── 诉求跟踪器 (多轮会话管理, 2026-09-04): 断档/带偏同根源修复 ──
+    #
+    # 设计纪律 (不留坑):
+    # - 回访只提醒不建新等待状态: 客户回复由既有分类器自然处理
+    #   ("挂失"关键词重新命中规则), 不引入第二个确认状态机
+    # - urgency 由意图域判定 (risk/complain/transfer=high), 不新增词表
+    # - patch_state 版本冲突放弃本轮更新 (下一轮自愈), 不重试循环
+    # - 上限 5 条, 满则挤掉最老的已办结项
+
+    _TOPIC_INTENT_ZH: ClassVar[dict[str, str]] = {
+        "card_loss": "挂失",
+        "card_loss_report": "挂失",
+        "complaint": "投诉",
+        "transfer_agent": "转人工",
+        "dispute_chargeback": "争议处理",
+        "dispute_submit": "争议处理",
+        "bill_query": "账单查询",
+        "account_bill_query": "账单查询",
+        "limit_query": "额度查询",
+        "installment_inquiry": "分期咨询",
+        "reward_query": "积分服务",
+        "txn_query": "交易查询",
+        "transaction_query": "交易查询",
+    }
+    _TOPIC_HIGH_URGENCY_DOMAINS: ClassVar[frozenset[str]] = frozenset({"risk", "complain", "transfer"})
+    _TOPIC_MAX_ACTIVE: ClassVar[int] = 5
+
+    def _intent_as_topic(self, intent_result: IntentResult, domain: str, turn_count: int) -> TopicRequest | None:
+        """本轮分类结果 → 诉求对象; 非诉求意图 (闲聊/低置信兜底) 返回 None"""
+        from lumio.shared.models import TopicRequest
+
+        intent = intent_result.primary_intent
+        conf = intent_result.primary_confidence
+        # 低置信 faq/闲聊是兜底不是诉求; 高置信 faq (产品咨询) 也视为轻诉求不建
+        # (FAQ 已直答即 fulfilled, 无跟踪价值)
+        if (
+            intent in (IntentLabel.NB_CHITCHAT, IntentLabel.CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.FAQ)
+            and conf < 0.8
+        ):
+            return None
+        label = self._TOPIC_INTENT_ZH.get(intent.value, "")
+        if not label:
+            return None
+        urgency = "high" if domain in self._TOPIC_HIGH_URGENCY_DOMAINS else "normal"
+        return TopicRequest(
+            id=f"{intent.value}",
+            intent=intent.value,
+            label_zh=label,
+            urgency=urgency,
+            raised_turn=turn_count,
+        )
+
+    def _merge_topic_requests(
+        self, existing: list[TopicRequest], new_topic: TopicRequest | None, response_source: str
+    ) -> list[TopicRequest]:
+        """诉求合并与状态流转 (纯函数, 便于单测)
+
+        - new_topic 与本轮: response_source 决定状态 (tool/faq/knowledge=fulfilled,
+          slot_hint/clarify=waiting_info, 其他不动)
+        - 旧诉求: 同 intent 刷新; 不同 intent 保留原状态
+        - 挤出: 超上限时优先挤掉最老的 fulfilled
+        """
+        from lumio.shared.models import TopicRequestStatus
+
+        by_id = {t.id: t.model_copy(deep=True) for t in existing}
+        if new_topic is not None:
+            cur = by_id.get(new_topic.id)
+            if cur is not None:
+                cur.updated_at = new_topic.updated_at
+                cur.raised_turn = new_topic.raised_turn
+                cur.urgency = "high" if "high" in (cur.urgency, new_topic.urgency) else cur.urgency  # high 不降级
+            else:
+                by_id[new_topic.id] = new_topic
+            # 本轮诉求按回复来源流转
+            if response_source in ("tool", "faq", "knowledge", "retrieval"):
+                by_id[new_topic.id].status = TopicRequestStatus.FULFILLED
+            elif response_source in ("slot_hint", "clarify"):
+                by_id[new_topic.id].status = TopicRequestStatus.WAITING_INFO
+            # template/fallback 等不动 (转人工/问候不是诉求办结)
+        out = list(by_id.values())
+        if len(out) > self._TOPIC_MAX_ACTIVE:
+            fulfilled = sorted([t for t in out if t.status == TopicRequestStatus.FULFILLED], key=lambda t: t.updated_at)
+            for t in fulfilled[: len(out) - self._TOPIC_MAX_ACTIVE]:
+                out.remove(t)
+            out = out[: self._TOPIC_MAX_ACTIVE]
+        return out
+
+    def _pick_followup(
+        self, requests: list[TopicRequest], current_intent_value: str, revisit_max: int
+    ) -> TopicRequest | None:
+        """挑一条该回访的高紧急诉求: 未办结 + 非本轮意图 + 未超回访上限"""
+        from lumio.shared.models import TopicRequestStatus
+
+        for t in requests:
+            if (
+                t.urgency == "high"
+                and t.status in (TopicRequestStatus.OPEN, TopicRequestStatus.WAITING_INFO)
+                and t.intent != current_intent_value
+                and t.revisit_count < revisit_max
+            ):
+                return t
+        return None
+
+    async def _track_and_followup(
+        self,
+        session_id: str,
+        state: Any,
+        intent_result: IntentResult,
+        domain: str,
+        result: dict[str, Any],
+    ) -> None:
+        """run() 出口统一调用: 诉求 upsert/流转写回 + 高紧急回访追加 (总开关)"""
+
+        if not get_settings().session.topic_tracking_enabled or self._session_manager is None or state is None:
+            return
+        try:
+            turn_count = getattr(state, "turn_count", 0) or 0
+            new_topic = self._intent_as_topic(intent_result, domain, turn_count)
+            merged = self._merge_topic_requests(
+                list(getattr(state, "active_requests", None) or []),
+                new_topic,
+                str(result.get("response_source") or ""),
+            )
+            # 回访: 本轮是新话题 (≠诉求意图) 且诉求高紧急未办结
+            followup = self._pick_followup(
+                merged,
+                intent_result.primary_intent.value,
+                get_settings().session.topic_revisit_max,
+            )
+            revisit_note = ""
+            if followup is not None and new_topic is not None:  # 本轮有明确新诉求才算"切话题"
+                followup.revisit_count += 1
+                revisit_note = (
+                    f"\n\n另外，您刚才提到的{followup.label_zh}还未办理完成。"
+                    f"如仍需要，请再说一次，或回复『转人工』由专员为您协助。"
+                )
+                result["response"] = str(result.get("response") or "") + revisit_note
+            await self._session_manager.patch_state(
+                session_id=session_id,
+                expected_version=state.version,
+                patches={"active_requests": [t.model_dump(mode="json") for t in merged]},
+            )
+            with contextlib.suppress(Exception):
+                log_decision(
+                    session_id=session_id,
+                    agent_name="bot_agent",
+                    action=DecisionAction.TOPIC_TRACK,
+                    reasoning=(
+                        f"诉求跟踪: {new_topic.label_zh if new_topic else '本轮无新诉求'}"
+                        f"{'；回访提醒未办结的' + followup.label_zh if followup is not None and revisit_note else ''}"
+                    ),
+                    evidence={
+                        "requests": [
+                            {
+                                "intent": t.label_zh,
+                                "urgency": t.urgency,
+                                "status": t.status.value,
+                                "revisits": t.revisit_count,
+                            }
+                            for t in merged
+                        ][:5],
+                        "followup_sent": bool(revisit_note),
+                    },
+                    turn_id="",  # 继承本轮 turn_id (contextvar)
+                )
+        except Exception as exc:
+            # 版本冲突等: 放弃本轮写回, 下一轮自愈 — 诉求跟踪失败绝不影响主回复
+            logger.debug("诉求跟踪写回失败(不阻断): session=%s err=%s", session_id, exc)
+
     async def _build_session_memory(self, session_id: str) -> str:
         """构建结构化会话记忆（注入 system prompt，永不裁剪）
 
@@ -2738,8 +3356,23 @@ class LumioAgent:
                     entity_strs = [f"{e.entity_type}={e.value}" for e in filtered]
                     parts.append(f"[已知实体] {', '.join(entity_strs)}")
 
-            # 意图栈
-            if state.intent_stack:
+            # 意图栈 (防带偏: 诉求跟踪开启时只保留未办结诉求的意图 + 当前意图 —
+            # 旧话题已办结不应再影响新轮判定, "临时额度概念带偏额度查询"根治)
+            from lumio.shared.config import get_settings as _gs_topic
+
+            _topic_on = _gs_topic().session.topic_tracking_enabled
+            _active = list(getattr(state, "active_requests", None) or [])
+            if _topic_on and _active:
+                from lumio.shared.models import TopicRequestStatus
+
+                live_ids = [
+                    t.id for t in _active if t.status in (TopicRequestStatus.OPEN, TopicRequestStatus.WAITING_INFO)
+                ]
+                if state.last_intent is not None and state.last_intent.value not in live_ids:
+                    live_ids.append(state.last_intent.value)
+                if live_ids:
+                    parts.append(f"[进行中诉求] {'、'.join(live_ids)}")
+            elif state.intent_stack:
                 intent_strs = [i.value if hasattr(i, "value") else str(i) for i in state.intent_stack]
                 parts.append(f"[意图历史] {' → '.join(intent_strs)}")
 
@@ -3097,11 +3730,34 @@ class LumioAgent:
             "fast_intent": intent.fast_intent.value if intent.fast_intent else None,
             "fast_slow_disagreement": _fast_slow_disagreement(intent),
         }
+        # 零信息量输入不算有效回话 (闭环第十轮: "。。。。。"借上轮积分话题的
+        # 回话豁免漏放, 被当槽位答案查积分还答了兑换比例)。注意不能复用
+        # _is_noise_input (纯数字 "4444" 是合法槽位答案, 上轮问卡号本轮作答
+        # 是回话豁免的核心场景) — 仅拦"去标点后无任何内容"的纯标点形态。
+        import re as _re
+
+        _stripped_for_reply = _re.sub(r"[\s，。、；：！？!?,.;:·…─~～#@*&%$()（）\"'\-]+", "", user_input or "")
+        if is_replying and not _stripped_for_reply:
+            return "noise", evidence
         if is_replying:
             return None, evidence
-        # P1: energy 强"不认" -> 直接当噪声拦截 (非回话), 高于低置信的澄清强度
+        # P1: energy 强"不认" -> 直接当噪声拦截 (非回话), 高于低置信的澄清强度。
+        # 双信号收窄 (OOD 阈值校准 2026-09-02: ID/OOD 能量分布部分重叠, ID 侧
+        # 误杀 ~4.2% — 能量单信号不再一刀切): 快路径强置信业务判定 (≥0.7 且非
+        # 闲聊/兜底域) 信任分类器放行, 其余 (闲聊/低置信/慢路径) 保持拦截。
         if verdict == "unknown":
-            return "ood_unknown", evidence
+            strong_business = (
+                intent.primary_confidence >= 0.7
+                and get_domain(intent.primary_intent) not in ("fallback",)
+                and not _fast_slow_disagreement(intent)
+            )
+            # 紧急诉求豁免 (模拟复盘: 等待补卡号期间"先别查了, 我要挂失"被 OOD
+            # 拦成"没太明白"—— 快慢分歧标记反而成为拦截理由, 而分歧真相是向量
+            # 通道把挂失句吸到 faq@0.85、BERT 弱信号 card_loss@0.29 才是对的)。
+            # 挂失/被盗类输入即使能量判 unknown 也不按 OOD 拦, 交知识/敏感链路
+            # 给出挂失指引 — 与 FAQ 通道紧急豁免同纪律。
+            if not strong_business and not _has_emergency_marker(user_input):
+                return "ood_unknown", evidence
         if low_conf:
             # 分类器失败兜底 (conf=0.0) 不拦: 放行走 RAG, 由检索 grounding/
             # 词法证据门决定答还是澄清 —— GPU 争抢下分类高频超时, 一刀切
@@ -3121,6 +3777,11 @@ class LumioAgent:
         # "信用卡额度是什么"这类真问题。
         if _fast_slow_disagreement(intent) and _disagreement_is_dangerous(intent):
             return "fast_slow_disagreement", evidence
+        # Phase 3 · 子词碎片确定性拦截: ≤2 字裸词 ("信用"/"卡片") 被分类器标记
+        # source=subword (规则/BERT/能量都给不出可靠信号, LLM 只会幻觉 faq@0.6x)。
+        # 回话/等槽豁免已在上方返回, 到这里的裸词直接确定性澄清, 零 LLM。
+        if getattr(intent, "classification_source", None) == "subword":
+            return "subword_ambiguous", evidence
         # P1: 模糊带宽仲裁 — 语义吃不准(BERT 中段 energy / 低置信但非噪声)时交 LLM 裁决.
         # LLM 结果作为弱信号投票, 不单独放行: 仅当 LLM 明确判 business 时结合实体/槽位放行,
         # 判 noise 则拦截; chitchat/unknown 交由下方既有语义路径(不硬拦, 也不硬答).
@@ -3135,7 +3796,20 @@ class LumioAgent:
             and self._classifier is not None
             and getattr(self._classifier, "_llm", None) is not None
         ):
-            verdict_domain = await self._arbitrate_domain(user_input, getattr(self._classifier, "_llm", None))
+            # 单次结构化裁决 (架构整改): 慢路径分类已同一次调用输出 业务/闲聊/噪声
+            # 判定, 直接复用 — 不再为同一输入打第二次仲裁 LLM (会话 smoke-qa4 复盘:
+            # 分类 5.2s + 仲裁 4.3s 串行, 弱证据闲聊整轮 10s)。仅快路径短路/慢路径
+            # 失败兜底 (无 llm_input_class) 时才独立调用仲裁兜底。
+            prior_class = getattr(intent, "llm_input_class", None)
+            if prior_class in ("business", "chitchat", "noise"):
+                verdict_domain = {
+                    "domain": prior_class,
+                    "confidence": intent.primary_confidence,
+                    "structured": True,
+                    "reused_slow_classify": True,
+                }
+            else:
+                verdict_domain = await self._arbitrate_domain(user_input, getattr(self._classifier, "_llm", None))
             evidence["arbiter_domain"] = verdict_domain["domain"]
             if verdict_domain["domain"] == "noise":
                 return "arbiter_noise", evidence
@@ -3212,7 +3886,7 @@ class LumioAgent:
                 action=DecisionAction.MIS_KILL_CANDIDATE,
                 reasoning=f"疑似误杀: 上轮回话放行后本轮被噪声门拦({gate_reason})",
                 evidence={"prev_reply_input": prev["input"], "reblocked_reason": gate_reason},
-                turn_id=uuid_module.uuid4().hex[:16],
+                turn_id="",  # 继承本轮 turn_id (contextvar)
             )
         except Exception:
             logger.debug("疑似误杀标记失败(不阻断): session=%s", session_id)
@@ -3327,6 +4001,58 @@ def _has_grounding(session_memory: str, history: list | None) -> bool:
     if any(m in session_memory for m in markers):
         return True
     return bool(history)
+
+
+def _format_tool_result(content: str) -> str:
+    """工具直连结果 → 客户话术 (JSON 原文模板化, 解析失败原文返回)
+
+    工具返回 JSON (工单号/卡号/状态) 不宜直接展示给客户; 挂失等敏感操作
+    的回执字段是稳定的, 模板化零 LLM 成本。
+    """
+    text = (content or "").strip()
+    if not text.startswith("{"):
+        return text
+    try:
+        import json as _json
+
+        data = _json.loads(text)
+    except Exception:
+        return text
+    if "action" in data and ("referenceNo" in data or "status" in data):
+        parts = [f"{data.get('action', '操作')}已受理"]
+        if data.get("referenceNo"):
+            parts.append(f"受理编号 {data['referenceNo']}")
+        if data.get("cardNo"):
+            parts.append(f"卡号 {data['cardNo']}")
+        if data.get("status"):
+            parts.append(f"当前状态: {data['status']}")
+        if data.get("effectiveTime"):
+            parts.append(f"生效时间 {data['effectiveTime']}")
+        parts.append("后续进展将以短信通知, 如需帮助可回复『转人工』")
+        return "，".join(parts) + "。"
+    return text
+
+
+# 意图感知检索词增强 (qa_scan 挂账: 挂失/额度口语 query 被《年费减免条件》字面
+# 抢位 —— 年费文档里也有"挂失补卡"字样, BM25 词面区分度不足; reranker 在本环境
+# 结构性不可用 (Ollama 0.21 无 /api/rerank 端点, bge-reranker GGUF 仅 completion
+# 能力), RRF 无相关性过滤)。高置信交易/风险意图把规范检索词拼进 query, 让 BM25
+# 命中正确的领域文档; 定义/咨询类意图无条目 = 原文检索不变。
+_INTENT_RETRIEVAL_TERMS: dict[IntentLabel, str] = {
+    IntentLabel[k]: v for k, v in _lex_map("intent_retrieval_terms").items()
+}
+
+
+# 紧急意图标记 (FAQ 短路豁免, qa_scan 首轮复盘): 挂失/盗刷类输入必须进意图分类
+# 走敏感链路, 不允许被字面相似的 FAQ 条目 (如"数字人民币硬钱包") 0.2s 劫持。
+# 宁可豁免面稍宽 (含这些词的 FAQ 咨询改走分类, 结果仍是挂失介绍/办理引导)。
+
+_EMERGENCY_MARKERS = _lex("emergency_markers")
+
+
+def _has_emergency_marker(text: str) -> bool:
+    """输入含紧急意图标记 (挂失/盗刷) → 豁免 FAQ 前置短路, 强制走意图分类"""
+    return any(m in (text or "") for m in _EMERGENCY_MARKERS)
 
 
 def _is_noise_input(text: str) -> bool:

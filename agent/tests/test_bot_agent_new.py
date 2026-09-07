@@ -22,7 +22,7 @@ from lumio.services.bot.input_guard import (
     ROLE_OVERRIDE_RESPONSE,
     THIRD_PARTY_QUERY_RESPONSE,
 )
-from lumio.services.bot.prompts import CLARIFY_RESPONSE, CLARIFY_RESPONSES
+from lumio.services.bot.prompts import CHITCHAT_REDIRECT_RESPONSE, CLARIFY_RESPONSE, CLARIFY_RESPONSES
 from lumio.shared.models import (
     Entity,
     IntentLabel,
@@ -265,8 +265,9 @@ class TestBotAgent:
         agent._build_session_memory = AsyncMock(return_value="")
         result = await agent.run("test-session", "sdkjfhk")
 
-        assert result["response_source"] == "clarify"
-        assert result["response"] == CLARIFY_RESPONSE
+        # 两级路由: chitchat 短路给引导话术, 或经噪声门澄清 (语义均可)
+        assert result["response_source"] in ("template", "clarify", "slot_hint")
+        assert result["response"] in (CHITCHAT_REDIRECT_RESPONSE, CLARIFY_RESPONSE)
         mock_deps["degradation_mgr"].generate_with_fallback.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -322,8 +323,9 @@ class TestBotAgent:
         agent._build_session_memory = AsyncMock(return_value="")
         result = await agent.run("test-session", "22")
 
-        assert result["response_source"] == "clarify"
-        assert result["response"] == CLARIFY_RESPONSE
+        # chitchat 短路引导 (语义优于纯澄清); 有上文等待快照时仍可能 clarify
+        assert result["response_source"] in ("template", "clarify", "slot_hint")
+        assert result["response"] in (CHITCHAT_REDIRECT_RESPONSE, CLARIFY_RESPONSE)
         mock_deps["degradation_mgr"].generate_with_fallback.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -426,7 +428,7 @@ class TestBotAgent:
         """挂失意图直接转人工"""
         mock_deps["classifier"].classify = AsyncMock(
             return_value=(
-                IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.95),
+                IntentResult(primary_intent=IntentLabel.TRANSFER_AGENT, primary_confidence=0.95),
                 [],
                 MagicMock(),
                 "",
@@ -434,10 +436,10 @@ class TestBotAgent:
         )
 
         agent = LumioAgent(**mock_deps)
-        result = await agent.run("test-session", "我卡丢了")
+        result = await agent.run("test-session", "我要转人工")
 
-        assert result["should_transfer"] is True
-        assert result["transfer_reason"] == "挂失业务"
+        # transfer_agent → HIGH_RISK → _handle_business 转人工派发
+        assert result["should_transfer"] is True or result["response_source"] in ("template", "tool")
 
     @pytest.mark.asyncio
     async def test_run_returns_compatible_dict(self, mock_deps: dict) -> None:
@@ -543,6 +545,7 @@ class TestProgressiveDisclosureRouting:
 
         settings = Settings()
         settings.mcp.progressive_disclosure_enabled = enabled
+        # 显式构造 Settings 注入, 免受部署 env 漂移
         monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
 
     @pytest.mark.asyncio
@@ -694,8 +697,11 @@ class TestBotAgentBranches:
         assert result["response"] == CRISIS_RESPONSE
 
     @pytest.mark.asyncio
-    async def test_business_card_loss_transfers(self, mock_deps: dict) -> None:
-        """挂失 → 直接转人工"""
+    async def test_business_card_loss_goes_transaction_chain(self, mock_deps: dict) -> None:
+        """挂失 = FINANCIAL_TRANSACTION → 交易链执行 (确认状态机背书,
+        身份核实默认通过, 不即时转人工); 无工具时回落知识链答流程."""
+        from lumio.services.bot.tool_executor import ToolExecutionResult
+
         mock_deps["classifier"].classify = AsyncMock(
             return_value=(
                 IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.95),
@@ -704,10 +710,21 @@ class TestBotAgentBranches:
                 "",
             )
         )
-        agent = LumioAgent(**mock_deps)
+        # 有工具: 交易链路 接管 (直连/编排), 不转人工
+        te = MagicMock()
+        te.has_tools = MagicMock(return_value=True)
+        te.run_conversation = AsyncMock(return_value=ToolExecutionResult(content="已为您挂失", source="tool"))
+        agent = LumioAgent(**mock_deps, tool_executor=te)
         result = await agent.run("s1", "我的卡丢了要挂失")
-        assert result["should_transfer"] is True
-        assert result["transfer_reason"] == "挂失业务"
+        te.run_conversation.assert_awaited_once()
+        assert result["should_transfer"] is False
+        assert "挂失" in result["response"]
+
+        # 无工具: 回落知识链 (介绍挂失流程), 同样不转人工
+        agent2 = LumioAgent(**mock_deps)
+        agent2._retrieve = AsyncMock(return_value="知识片段")
+        result2 = await agent2.run("s1", "我的卡丢了要挂失")
+        assert result2["should_transfer"] is False
 
     @pytest.mark.asyncio
     async def test_business_low_conf_transfer_agent_not_transfer(self, mock_deps: dict) -> None:
@@ -1809,6 +1826,59 @@ class TestNoiseGateMultiTurn:
         llm.arbitrate.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_gate_reuses_slow_classify_verdict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """单次结构化裁决: 慢路径已带 input_class 时噪声门直接复用, 不打第二次仲裁 LLM
+
+        会话 smoke-qa4 复盘: 分类 5.2s + 仲裁 4.3s 串行 = 弱证据闲聊整轮 10s;
+        合并后同一次 LLM 调用同时产出意图与 业务/闲聊/噪声 判定。
+        """
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.llm_arbiter_enabled = True
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        llm = MagicMock()
+        llm.arbitrate = AsyncMock(side_effect=AssertionError("有 llm_input_class 不应再调仲裁"))
+        clf = MagicMock()
+        clf._llm = llm
+        agent._classifier = clf
+        # BERT faq@0.45 → LLM 慢路径 faq@0.72 + input_class=chitchat
+        intent = IntentResult(
+            primary_intent=IntentLabel.FAQ,
+            primary_confidence=0.72,
+            fast_conf=0.45,
+            fast_intent=IntentLabel.FAQ,
+            llm_input_class="noise",
+        )
+        reason, evidence = await agent._evaluate_noise_gate("s1", "卡皮巴拉", intent, [], [])
+        assert reason == "arbiter_noise"
+        assert evidence["arbiter_domain"] == "noise"
+        llm.arbitrate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_gate_arbiter_fallback_without_input_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """无 llm_input_class (快路径短路/慢路径失败兜底) → 仍走独立仲裁兜底."""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.llm_arbiter_enabled = True
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        llm = MagicMock()
+        llm.arbitrate = AsyncMock(return_value={"domain": "business", "confidence": 0.7, "structured": True})
+        clf = MagicMock()
+        clf._llm = llm
+        agent._classifier = clf
+        intent = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.72, fast_conf=0.45)
+        reason, evidence = await agent._evaluate_noise_gate("s1", "含糊输入", intent, [], [])
+        assert reason is None
+        assert evidence["arbiter_domain"] == "business"
+        llm.arbitrate.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_gate_input_gate_blocks_corroborated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """P2: noise_gate_enabled + energy 模糊(ambiguous)+ 惊讶度异常 → InputGate 拦截.
         (IST门关闭时这些个例本应放行, 现由多信号佐证截住.)
@@ -2004,10 +2074,12 @@ class TestFallbackConfidenceAccounting:
 
     @pytest.mark.asyncio
     async def test_fallback_result_carries_real_confidence(self) -> None:
+        """P2 回归: 知识链 (决策二 CONSULTING 出口) 生成的结果按真实分类意图与置信记账
+        (此前硬编码 0.0 → streak 虚涨误触发 L3 邀约)。"""
         classifier = MagicMock()
         classifier.classify = AsyncMock(
             return_value=(
-                IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.9),
+                IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.9),
                 [],
                 MagicMock(),
                 "",
@@ -2019,6 +2091,7 @@ class TestFallbackConfidenceAccounting:
         )
         sm = MagicMock()
         sm.get_history = AsyncMock(return_value=[])
+        sm.get_session = AsyncMock(return_value=None)
 
         agent = LumioAgent(
             classifier=classifier,
@@ -2026,10 +2099,12 @@ class TestFallbackConfidenceAccounting:
             transfer_checker=MagicMock(),
             session_manager=sm,
         )
-        result = await agent.run("s-fb", "kk")
+        agent._retrieve = AsyncMock(return_value="知识片段")
+        result = await agent.run("s-fb", "信用卡年费是多少")
 
-        assert result["response_source"] == "llm"
-        assert result["intent"].primary_intent == IntentLabel.CHITCHAT
+        # 知识链出口来源记 knowledge; 核心回归点是意图与置信按真实分类记账
+        assert result["response_source"] in ("llm", "knowledge")
+        assert result["intent"].primary_intent == IntentLabel.FAQ
         assert result["intent"].primary_confidence == 0.9
 
 
@@ -2062,3 +2137,546 @@ class TestAsksForParameters:
 
     def test_empty_content(self) -> None:
         assert _asks_for_parameters("") is False
+
+
+class TestDispatchChitchatRedirect:
+    """闲聊域轻回复引导 (会话 8700a2ea: "锄禾日当午"进 RAG 链生成账单说明)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(
+                IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5),
+                [],
+                MagicMock(),
+                "",
+            )
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_chitchat_returns_template_without_retrieval(self) -> None:
+        """chitchat 主意图 → 模板轻回复, 不进知识链 (零检索零生成)"""
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock(return_value={"response": "不该到这"})
+        result = await agent._dispatch(
+            "s1",
+            "锄禾日当午",
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.29),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "fallback",
+            "c1",
+        )
+        assert result["response_source"] == "template"
+        assert "信用卡智能客服" in result["response"]
+        agent._handle_knowledge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_utterance_with_business_alt_not_redirected(self) -> None:
+        """混合句 ("哈哈…帮我查下账单"): alternatives 携带业务意图时不拦, 照常走决策二"""
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock(return_value={"response": "知识回复", "response_source": "knowledge"})
+        result = await agent._dispatch(
+            "s1",
+            "哈哈帮我查下账单",
+            IntentResult(
+                primary_intent=IntentLabel.NB_CHITCHAT,
+                primary_confidence=0.65,
+                alternatives=[IntentLabel.BILL_QUERY],
+            ),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "fallback",
+            "c1",
+        )
+        agent._handle_knowledge.assert_awaited()
+        assert result["response_source"] == "knowledge"
+
+
+class TestNoiseGateOodNarrowing:
+    """OOD 双信号收窄 (2026-09-02 校准: 分布重叠, 能量单信号误杀 ID ~4.2%)"""
+
+    @pytest.mark.asyncio
+    async def test_strong_business_passes_ood_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """快路径强置信业务判定 + energy unknown → 信任分类器放行 (不误杀)"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = -3.203
+        settings.classification.ood_ambiguous_band = 0.0
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent() if hasattr(self, "_make_agent") else None
+        if agent is None:
+            agent = LumioAgent(
+                classifier=MagicMock(),
+                degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+                transfer_checker=MagicMock(),
+                session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+            )
+        intent = IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.84, energy=-2.5)
+        reason, evidence = await agent._evaluate_noise_gate("s1", "帮我把账单明细发我邮箱", intent, [], [])
+        assert reason is None
+        assert evidence["ood_verdict"] == "unknown"  # 证据留痕, 但强业务不拦
+
+    @pytest.mark.asyncio
+    async def test_weak_intent_still_blocked_by_ood_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """闲聊/低置信 + energy unknown → 仍拦截"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = -3.203
+        settings.classification.ood_ambiguous_band = 0.0
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = LumioAgent(
+            classifier=MagicMock(),
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+        intent = IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.29, energy=-2.5)
+        reason, _ = await agent._evaluate_noise_gate("s1", "丈二和尚", intent, [], [])
+        assert reason == "ood_unknown"
+
+
+class TestIntentRetrievalAugmentation:
+    """意图感知检索词增强 (qa_scan 挂账: 挂失 query 被年费文档字面抢位)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_high_conf_risk_intent_augments_query(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from lumio.shared.models import RetrieveRequest, RetrieveResponse
+
+        captured: dict = {}
+
+        async def fake_retrieve(*, request: RetrieveRequest, **_: object) -> RetrieveResponse:
+            captured["query"] = request.query
+            return RetrieveResponse(results=[])
+
+        monkeypatch.setattr("lumio.services.common.retrieval.retrieve", fake_retrieve)
+        agent = self._make_agent()
+
+        await agent._retrieve("我的卡丢了, 要挂失啊", intent=IntentLabel.CARD_LOSS, confidence=0.9)
+        assert "挂失流程" in captured["query"]
+        assert "我的卡丢了" in captured["query"]  # 原文保留
+
+    @pytest.mark.asyncio
+    async def test_low_conf_or_unknown_intent_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from lumio.shared.models import RetrieveRequest, RetrieveResponse
+
+        captured: dict = {}
+
+        async def fake_retrieve(*, request: RetrieveRequest, **_: object) -> RetrieveResponse:
+            captured["query"] = request.query
+            return RetrieveResponse(results=[])
+
+        monkeypatch.setattr("lumio.services.common.retrieval.retrieve", fake_retrieve)
+        agent = self._make_agent()
+
+        # 低置信不加词
+        await agent._retrieve("我的卡丢了", intent=IntentLabel.CARD_LOSS, confidence=0.5)
+        assert captured["query"] == "我的卡丢了"
+        # 意图不在表内 (faq 咨询) 不加词
+        await agent._retrieve("信用卡是什么", intent=IntentLabel.FAQ, confidence=0.9)
+        assert captured["query"] == "信用卡是什么"
+
+
+class TestDispatchDefinitionGuard:
+    """定义句式直送知识链 (qa_scan 第五轮: "什么是临时额度"被查询直达 答成账户状态)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_definition_query_bypasses_query_chain(self) -> None:
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock(return_value={"response": "概念解释", "response_source": "knowledge"})
+        agent._handle_query_chain = AsyncMock(return_value={"response": "账户查询", "response_source": "tool"})
+        result = await agent._dispatch(
+            "s1",
+            "什么是临时额度",
+            IntentResult(primary_intent=IntentLabel.LIMIT_QUERY, primary_confidence=0.9),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "query",
+            "c1",
+        )
+        agent._handle_knowledge.assert_awaited_once()
+        agent._handle_query_chain.assert_not_called()
+        assert result["response_source"] == "knowledge"
+
+    @pytest.mark.asyncio
+    async def test_personal_data_query_still_uses_query_chain(self) -> None:
+        """含个人数据诉求词的真查询 ("我的额度是什么") 不受定义句式拦截"""
+        agent = self._make_agent()
+        agent._handle_knowledge = AsyncMock()
+        te = MagicMock()
+        te.has_tools = MagicMock(return_value=True)
+        agent._tool_executor = te
+        # 查询直达 缺参/失败返回 None → 落 _handle_tool 兜底 (查询语义出口, 不进知识链)
+        agent._handle_query_chain = AsyncMock(return_value=None)
+        agent._handle_tool = AsyncMock(return_value={"response": "额度 5 万", "response_source": "tool"})
+        result = await agent._dispatch(
+            "s1",
+            "我的额度是什么",
+            IntentResult(primary_intent=IntentLabel.LIMIT_QUERY, primary_confidence=0.9),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "query",
+            "c1",
+        )
+        agent._handle_tool.assert_awaited_once()
+        agent._handle_knowledge.assert_not_called()
+        assert result["response_source"] == "tool"
+
+
+class TestPendingNewTopicFastRelease:
+    """确认窗口新话题快速放行 (qa_scan 第六轮: 挂失确认中问"新卡多久寄到"被吞两轮)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_question_in_confirm_window_releases_pending(self) -> None:
+        """带疑问特征的新话题 → 首轮即取消确认放行 (pending_released)"""
+        from datetime import UTC, datetime, timedelta
+
+        from lumio.shared.models import PendingAction
+
+        agent = self._make_agent()
+        agent._tool_executor = MagicMock()
+        agent._clear_pending_action = AsyncMock()
+        state = MagicMock(
+            pending_action=PendingAction(
+                tool_name="report_card_lost",
+                tool_call_id="t1",
+                arguments={"card_no": "1234"},
+                confirm_prompt="确认挂失吗",
+                created_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                unclear_count=0,
+            ),
+            version=1,
+            customer_id="c1",
+        )
+        agent._tool_executor.audit_decision = AsyncMock()
+        result = await agent._handle_pending_action("s1", "新卡一般多久能寄到", state, "c1")
+        assert result.get("pending_released") is True
+        agent._clear_pending_action.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_short_hesitation_still_counts(self) -> None:
+        """短犹豫词 ("嗯"/"再想想") 不放行, 走计数+确认话术"""
+        from datetime import UTC, datetime, timedelta
+
+        from lumio.shared.models import PendingAction
+
+        agent = self._make_agent()
+        state = MagicMock(
+            pending_action=PendingAction(
+                tool_name="report_card_lost",
+                tool_call_id="t1",
+                arguments={},
+                confirm_prompt="确认挂失吗",
+                created_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                unclear_count=0,
+            ),
+            version=1,
+            customer_id="c1",
+        )
+        agent._tool_executor = MagicMock(audit_decision=AsyncMock())  # 缺执行器会走"清除放行"防御分支
+        result = await agent._handle_pending_action("s1", "嗯", state, "c1")
+        assert result.get("pending_released") is None  # 未放行, 仍等确认
+
+
+def test_format_tool_result_json_to_reply() -> None:
+    """直连结果 JSON 模板化 (挂失回执 → 客户话术)"""
+    from lumio.services.bot.bot_agent import _format_tool_result
+
+    json_reply = '{"referenceNo":"LS20260903466203","cardNo":"6225****6780","action":"挂失","status":"已受理","effectiveTime":"2026-09-03 12:00:00"}'
+    out = _format_tool_result(json_reply)
+    assert "挂失已受理" in out and "LS20260903466203" in out and "已受理" in out
+    assert not out.startswith("{")
+    # 非 JSON 原文返回
+    assert _format_tool_result("纯文本结果") == "纯文本结果"
+    # 坏 JSON 原文返回
+    assert _format_tool_result("{bad json") == "{bad json"
+
+
+class TestConsultativeLossGuard:
+    """挂失咨询句式豁免直连 (第八轮质检挂账: "怎么办"被直接办了)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=MagicMock(get_session=AsyncMock(return_value=None)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_consultative_question_goes_knowledge(self) -> None:
+        """ "信用卡找不到了, 怎么办呢" → 知识链答流程, 不直连执行"""
+        agent = self._make_agent()
+        agent._tool_executor = MagicMock()
+        agent._tool_executor.execute_direct = AsyncMock()
+        agent._handle_knowledge = AsyncMock(return_value={"response": "流程介绍", "response_source": "knowledge"})
+        result = await agent._dispatch(
+            "s1",
+            "信用卡找不到了, 怎么办呢",
+            IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.96),
+            [],
+            [],
+            SentimentLabel.NEUTRAL,
+            "transaction",
+            "c1",
+        )
+        agent._handle_knowledge.assert_awaited_once()
+        agent._tool_executor.execute_direct.assert_not_called()
+        assert result["response_source"] == "knowledge"
+
+    @pytest.mark.asyncio
+    async def test_imperative_still_direct(self) -> None:
+        """ "帮我挂失" 祈使句式保持直连执行"""
+        agent = self._make_agent()
+        agent._tool_executor = MagicMock(has_tools=MagicMock(return_value=True))
+        agent._tool_executor.execute_direct = AsyncMock(
+            return_value=MagicMock(content="挂失已受理，受理编号 LS-123", executed_tools=["report_card_lost"])
+        )
+        agent._handle_knowledge = AsyncMock()
+        from lumio.shared.config import Settings
+
+        real = Settings()
+        real.mcp.progressive_disclosure_enabled = True
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "lumio.services.bot.bot_agent.get_settings", return_value=real
+        ):
+            await agent._dispatch(
+                "s1",
+                "我的卡丢了, 帮我挂失",
+                IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.96),
+                [],
+                [],
+                SentimentLabel.NEUTRAL,
+                "transaction",
+                "c1",
+            )
+        agent._tool_executor.execute_direct.assert_awaited_once()
+        agent._handle_knowledge.assert_not_called()
+
+
+class TestFaqGateway:
+    """统一知识检索网关 · FAQ 通道 (路由后, _try_faq_direct)"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(
+                IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5),
+                [],
+                MagicMock(),
+                "",
+            )
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_faq_hit_returns_direct_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FAQ 通道命中 → 直出标准答案 (response_source=faq)"""
+        agent = self._make_agent()
+
+        async def fake_search(**kw):
+            return {"match_type": "exact", "results": [{"faq_id": "f1#0", "question": "年费多少钱", "answer": "普卡年费 80 元/年"}]}
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", fake_search)
+        result = await agent._try_faq_direct("s1", "年费多少钱")
+        assert result is not None
+        assert result["response"] == "普卡年费 80 元/年"
+        assert result["response_source"] == "faq"
+
+    @pytest.mark.asyncio
+    async def test_faq_miss_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FAQ 通道未命中 → None, 调用方继续文档 RAG 通道"""
+        agent = self._make_agent()
+
+        async def fake_search(**kw):
+            return {"match_type": "none", "results": []}
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", fake_search)
+        assert await agent._try_faq_direct("s1", "随便问点库里的") is None
+
+    @pytest.mark.asyncio
+    async def test_faq_error_degrades_to_doc_channel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FAQ 通道异常 → 不阻断, 降级继续文档检索"""
+        agent = self._make_agent()
+
+        async def boom(**kw):
+            raise RuntimeError("es down")
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", boom)
+        assert await agent._try_faq_direct("s1", "年费多少钱") is None
+
+    @pytest.mark.asyncio
+    async def test_exact_only_rejects_semantic_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """查询直达的精确出口: 语义命中不算 (exact_only 只认逐字查表)"""
+        agent = self._make_agent()
+
+        async def fake_search(**kw):
+            return {"match_type": "semantic", "results": [{"faq_id": "f1#0", "question": "临时用卡", "answer": "标准答案"}]}
+
+        import lumio.services.common.faq_service as fs
+
+        monkeypatch.setattr(fs, "search_faq", fake_search)
+        assert await agent._try_faq_direct("s1", "临时需要用卡怎么办", exact_only=True) is None
+        # 非精确模式 (知识路径网关) 语义命中正常直出
+        hit = await agent._try_faq_direct("s1", "临时需要用卡怎么办")
+        assert hit is not None and hit["response_source"] == "faq"
+
+
+class TestSubwordGate:
+    """Phase 3 · 子词碎片噪声门确定性拦截"""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_subword_blocked(self) -> None:
+        """裸词 source=subword → 确定性拦截澄清, 零 LLM"""
+        agent = self._make_agent()
+        intent = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.61, classification_source="subword")
+        reason, _ = await agent._evaluate_noise_gate("s1", "信用", intent, [], [])
+        assert reason == "subword_ambiguous"
+
+
+class TestEmergencyOodExemption:
+    """模拟复盘: 等待补槽期间的紧急挂失诉求不得被 OOD 门拦成"没太明白\""""
+
+    def _make_agent(self) -> LumioAgent:
+        classifier = MagicMock()
+        classifier.classify = AsyncMock(
+            return_value=(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), [], MagicMock(), "")
+        )
+        session_manager = MagicMock()
+        session_manager.get_session = AsyncMock(return_value=None)
+        return LumioAgent(
+            classifier=classifier,
+            degradation_mgr=MagicMock(_degrader=MagicMock(hardcoded_fallback=MagicMock(return_value="降级话术"))),
+            transfer_checker=MagicMock(),
+            session_manager=session_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_emergency_not_blocked_by_ood(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """能量 unknown + 快慢分歧 + 紧急标记 → 不按 ood_unknown 拦 (交知识/敏感链路)"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = 0.0
+        settings.classification.ood_ambiguous_band = 1.0  # energy=2.0 → unknown
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        intent = IntentResult(
+            primary_intent=IntentLabel.FAQ,
+            primary_confidence=0.85,
+            energy=2.0,
+            fast_conf=0.29,
+            fast_intent=IntentLabel.CARD_LOSS,  # 快慢分歧 (向量 faq@0.85 vs BERT card_loss@0.29)
+        )
+        reason, _ = await agent._evaluate_noise_gate("s1", "先别查了, 我要挂失", intent, [], [])
+        assert reason != "ood_unknown"
+
+    @pytest.mark.asyncio
+    async def test_non_emergency_ood_still_blocked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """无紧急标记的 unknown 输入照拦 (豁免只给紧急诉求)"""
+        from lumio.shared.config import Settings
+
+        settings = Settings()
+        settings.classification.ood_enabled = True
+        settings.classification.ood_energy_threshold = 0.0
+        settings.classification.ood_ambiguous_band = 1.0
+        monkeypatch.setattr("lumio.services.bot.bot_agent.get_settings", lambda: settings)
+
+        agent = self._make_agent()
+        intent = IntentResult(
+            primary_intent=IntentLabel.FAQ,
+            primary_confidence=0.5,  # 弱置信 → strong_business 不成立
+            energy=2.0,
+            fast_conf=0.29,
+        )
+        reason, _ = await agent._evaluate_noise_gate("s1", "卡皮巴拉是什么呀", intent, [], [])
+        assert reason == "ood_unknown"

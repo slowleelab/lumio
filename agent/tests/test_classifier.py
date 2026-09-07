@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -115,6 +116,60 @@ async def test_llm_classify_fallback_on_error() -> None:
     classifier = LLMClassifier(mock_llm)
     with pytest.raises(Exception, match="LLM 不可用"):
         await classifier.classify("随便什么")
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_parses_input_class() -> None:
+    """单次结构化裁决: 同次分类输出的 业务/闲聊/噪声 判定透传到 IntentResult
+
+    噪声门据此复用裁决结论, 免去第二次独立仲裁 LLM 调用 (弱证据输入 10s 减半)。
+    非法/缺失 input_class 归 None (调用方走仲裁兜底)。
+    """
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value={
+            "intent": "faq",
+            "confidence": 0.3,
+            "entities": [],
+            "sentiment": "neutral",
+            "input_class": "chitchat",
+        }
+    )
+    classifier = LLMClassifier(mock_llm)
+    intent, _, _ = await classifier.classify("卡皮巴拉")
+    assert intent.llm_input_class == "chitchat"
+
+    # 非法值 → None
+    mock_llm.classify = AsyncMock(
+        return_value={"intent": "faq", "confidence": 0.4, "entities": [], "sentiment": "neutral", "input_class": "银行"}
+    )
+    intent, _, _ = await classifier.classify("乱出的")
+    assert intent.llm_input_class is None
+
+    # 缺失 → None
+    mock_llm.classify = AsyncMock(return_value={"intent": "bill_query", "confidence": 0.9, "entities": [], "sentiment": "neutral"})
+    intent, _, _ = await classifier.classify("查账单")
+    assert intent.llm_input_class is None
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_input_class_cached() -> None:
+    """分类缓存命中时 input_class 一并复用 (model_copy 深拷贝不丢字段)"""
+    from lumio.shared.config import get_settings
+
+    get_settings().llm.classify_cache_enabled = True
+    try:
+        mock_llm = MagicMock()
+        mock_llm.classify = AsyncMock(
+            return_value={"intent": "faq", "confidence": 0.4, "entities": [], "sentiment": "neutral", "input_class": "noise"}
+        )
+        classifier = LLMClassifier(mock_llm)
+        _, _, _ = await classifier.classify("hjfw 什么")
+        mock_llm.classify = AsyncMock(side_effect=AssertionError("缓存命中不应再调 LLM"))
+        intent, _, _ = await classifier.classify("hjfw 什么")
+        assert intent.llm_input_class == "noise"
+    finally:
+        get_settings().llm.classify_cache_enabled = True
 
 
 # ── IntentClassifier (双通道) ──
@@ -815,3 +870,451 @@ async def test_non_apply_bert_result_not_overridden() -> None:
 
     assert intent.primary_intent == IntentLabel.LIMIT_QUERY
     assert source == "bert"
+
+
+# ── 查询类意图规则覆盖 (一小时模拟 badcase 根治: 账单查询被 BERT 判 faq) ──
+
+
+@pytest.mark.asyncio
+async def test_bert_faq_overridden_by_query_rule() -> None:
+    """BERT 把账单查询判成 faq 高置信 → 查询规则覆盖, 走工具链而非知识链"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.9)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("帮我查一下信用卡账单")
+
+    assert intent.primary_intent == IntentLabel.BILL_QUERY
+    assert intent.primary_confidence == 0.84
+    assert source == "rule:query"
+    assert intent.fast_intent == IntentLabel.FAQ  # 审计留痕
+
+
+@pytest.mark.asyncio
+async def test_consultive_bill_text_not_overridden() -> None:
+    """咨询句 (含手续费/怎么) 不被查询规则覆盖 —— "账单分期手续费怎么算"是咨询不是查询"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.9)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("账单分期手续费怎么算")
+
+    assert intent.primary_intent == IntentLabel.FAQ
+    assert source == "bert"
+
+
+@pytest.mark.asyncio
+async def test_balance_query_overridden() -> None:
+    fake = _fake_bert(IntentLabel.FAQ, 0.75)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _entities, _sentiment, source = await classifier.classify("我的信用卡可用额度还有多少")
+
+    assert intent.primary_intent == IntentLabel.LIMIT_QUERY
+    assert source == "rule:query"
+
+
+# ── 预处理乱序纠错 (layer_1 坏例根治: "数人字民币") ──
+
+
+def test_fix_adjacent_typos_swapped_word() -> None:
+    from lumio.services.common.classifier import fix_adjacent_typos
+
+    assert fix_adjacent_typos("怎么给数人字民币硬钱包充值呢") == "怎么给数字人民币硬钱包充值呢"
+    assert fix_adjacent_typos("我要查我的账单账")  # 不在词表形态的不误改
+    assert fix_adjacent_typos("信用卡挂失") == "信用卡挂失"  # 正常输入零改动
+    assert fix_adjacent_typos("") == ""
+
+
+def test_fix_adjacent_typos_normal_input_untouched() -> None:
+    from lumio.services.common.classifier import fix_adjacent_typos
+
+    for normal in ("帮我查一下信用卡账单", "数字人民币硬钱包怎么充值", "我的卡丢了要挂失"):
+        assert fix_adjacent_typos(normal) == normal
+
+
+def test_wallet_stolen_overridden_to_card_loss() -> None:
+    """挂失补词覆盖: '钱包被偷'必须判挂失而非 faq (错过挂失黄金时间是 P0)"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.73)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _e, _s, source = asyncio.run(classifier.classify("钱包被偷了, 卡也在里面"))
+    assert intent.primary_intent == IntentLabel.CARD_LOSS
+    assert source == "rule"
+
+
+def test_colloquial_limit_query_variants() -> None:
+    """口语变体额度查询 (长对话场景暴露): '还能刷多少'应判额度而非被拒"""
+    fake = _fake_bert(IntentLabel.FAQ, 0.74)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake)
+    intent, _e, _s, _source = asyncio.run(classifier.classify("请问一下 现在卡里还能刷多少"))
+    assert intent.primary_intent == IntentLabel.LIMIT_QUERY
+    assert intent.primary_confidence == 0.95
+
+
+# ── 闲聊/噪声置信封顶 (会话 8700a2ea: "锄禾日当午"→chitchat@0.70 直通知识链) ──
+
+
+@pytest.mark.asyncio
+async def test_dual_path_chitchat_conf_capped() -> None:
+    """LLM 慢路径自评 chitchat@0.70 → 出口封顶 0.29 (低于低置信地板)"""
+    rule = RuleClassifier()
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.70),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(rule_classifier=rule, llm_classifier=mock_llm_classifier, fast_threshold=0.7)
+    intent, _entities, _sentiment, source = await classifier.classify("锄禾日当午")
+
+    assert intent.primary_intent == IntentLabel.NB_CHITCHAT
+    assert intent.primary_confidence <= 0.29
+    # 快慢分歧证据保留原始值
+    assert intent.fast_conf is None or intent.fast_conf >= 0.0
+    assert source == "llm"
+
+
+@pytest.mark.asyncio
+async def test_fast_path_chitchat_conf_capped() -> None:
+    """BERT 快路径 chitchat@0.75 直接放行时同样封顶"""
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.75)
+    )
+
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(),
+        llm_classifier=None,
+        fast_threshold=0.7,
+        bert_classifier=fake_bert,
+    )
+    intent, _entities, _sentiment, source = await classifier.classify("哈哈哈")
+
+    assert intent.primary_confidence <= 0.29
+
+
+@pytest.mark.asyncio
+async def test_business_intent_conf_not_capped() -> None:
+    """业务意图置信不受封顶影响"""
+    rule = RuleClassifier()
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.88),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(rule_classifier=rule, llm_classifier=mock_llm_classifier, fast_threshold=0.7)
+    # 用不命中规则的输入, 让慢路径 LLM 结果 (bill_query@0.88) 成为最终结果
+    intent, _entities, _sentiment, _source = await classifier.classify("这个怎么弄")
+
+    assert intent.primary_intent == IntentLabel.BILL_QUERY
+    assert intent.primary_confidence == 0.88
+
+
+@pytest.mark.asyncio
+async def test_chitchat_legacy_alias_conf_capped() -> None:
+    """旧 flat 别名 IntentLabel.CHITCHAT ("chitchat") 同样封顶
+
+    E2E 实测 (会话 8700a2ea 复盘轮): BERT/LLM 直接构造别名对象, 不经归一化,
+    首版封顶集合只含 NB_CHITCHAT/NB_NOISE 时漏封 — poll 仍显示 chitchat@0.7。
+    """
+    rule = RuleClassifier()
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.70),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(rule_classifier=rule, llm_classifier=mock_llm_classifier, fast_threshold=0.7)
+    intent, _entities, _sentiment, _source = await classifier.classify("锄禾日当午")
+
+    assert intent.primary_confidence <= 0.29
+
+
+# ── 次选意图分数 (会话 22ad: 弱次选挡闲聊短路) + OOD 短路 (免 6s LLM 复核) ──
+
+
+def test_rule_alternatives_carry_scores() -> None:
+    """规则次选带对齐分数 (conf ≥0.5 的次选才进列表, 分数同步)"""
+    result = RuleClassifier().classify("查一下账单和积分")
+    assert len(result.alternatives) == len(result.alternative_scores)
+    for s in result.alternative_scores:
+        assert s >= 0.5
+
+
+@pytest.mark.asyncio
+async def test_llm_result_inherits_fast_alternative_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LLM 慢路径采纳时, 继承快路径 (BERT top-K) 的带分数次选"""
+    from lumio.shared.config import Settings
+
+    settings = Settings()
+    monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
+
+    rule = RuleClassifier()
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(
+            primary_intent=IntentLabel.CHITCHAT,
+            primary_confidence=0.45,
+            alternatives=[IntentLabel.BILL_QUERY],
+            alternative_scores=[0.22],
+        )
+    )
+    # energy 判 known (-5.0 < 阈值 -3.203) → 闲聊 OOD 短路不触发, 走 LLM 慢路径
+    fake_bert.ood_score = AsyncMock(return_value=-5.0)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.70),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(
+        rule_classifier=rule,
+        llm_classifier=mock_llm,
+        bert_classifier=fake_bert,
+        fast_threshold=0.7,
+    )
+    intent, _e, _s, source = await classifier.classify("锄禾日当午")
+
+    assert source == "llm"
+    # LLM 只出主意图, 次选继承快路径的带分数次选
+    assert intent.alternatives == [IntentLabel.BILL_QUERY]
+    assert intent.alternative_scores == [0.22]
+    assert intent.primary_confidence <= 0.29  # 出口封顶
+
+
+@pytest.mark.asyncio
+async def test_ood_unknown_short_circuits_llm_for_chitchat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BERT 判闲聊 + energy 判 unknown → 双信号同向, 免 LLM 复核 (会话 22ad 根治)"""
+    from lumio.shared.config import Settings
+
+    settings = Settings()
+    settings.classification.ood_enabled = True
+    settings.classification.ood_energy_threshold = -5.0  # energy=-8.0 < -5.0-band → known? 注意方向
+    monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
+
+    # ood_verdict: energy 高 → unknown。取 energy=+2.0, threshold=-5.0 → unknown
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.45)
+    )
+    fake_bert.ood_score = AsyncMock(return_value=2.0)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock()
+
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(),
+        llm_classifier=mock_llm,
+        bert_classifier=fake_bert,
+        fast_threshold=0.7,
+    )
+    intent, _e, _s, source = await classifier.classify("丈二和尚")
+
+    assert source == "bert:ood"
+    mock_llm.classify.assert_not_called()  # 6s 慢路径被省掉
+    assert intent.primary_confidence <= 0.29  # 出口封顶仍生效
+
+
+@pytest.mark.asyncio
+async def test_ood_unknown_business_intent_still_uses_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """业务意图即使 unknown 仍走 LLM (可能是新意图/长尾, 不能误杀)"""
+    from lumio.shared.config import Settings
+
+    settings = Settings()
+    settings.classification.ood_enabled = True
+    settings.classification.ood_energy_threshold = -5.0
+    monkeypatch.setattr("lumio.services.common.classifier.get_settings", lambda: settings)
+
+    fake_bert = MagicMock()
+    fake_bert.classify = AsyncMock(
+        return_value=IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.45)
+    )
+    fake_bert.ood_score = AsyncMock(return_value=2.0)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.BILL_QUERY, primary_confidence=0.8),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(),
+        llm_classifier=mock_llm,
+        bert_classifier=fake_bert,
+        fast_threshold=0.7,
+    )
+    _intent, _e, _s, source = await classifier.classify("帮我看下这个月的账单")
+
+    assert source == "llm"
+    mock_llm.classify.assert_awaited_once()
+
+
+# ── 按类快路径阈值 (架构整改 Phase 3) ──
+
+
+def test_fast_thresholds_loader_and_fallback(tmp_path) -> None:
+    """按类阈值加载: 注入 path 读取; 缺类/缺文件沿用全局 0.7"""
+    from lumio.services.common.classifier import _load_fast_thresholds
+
+    f = tmp_path / "t.json"
+    f.write_text('{"thresholds": {"chitchat": 0.9, "faq": 0.75}}')
+    ts = _load_fast_thresholds(path=str(f))
+    assert ts == {"chitchat": 0.9, "faq": 0.75}
+
+    # 缺文件 → 空 dict (沿用全局)
+    assert _load_fast_thresholds(path=str(tmp_path / "missing.json")) == {}
+
+
+def test_fast_accept_threshold_uses_per_class_value(monkeypatch, tmp_path) -> None:
+    """快路径采纳按预测类查表: chitchat 收紧到 0.9, 其余类保持全局"""
+    from lumio.services.common import classifier as clf
+
+    f = tmp_path / "t.json"
+    f.write_text('{"thresholds": {"chitchat": 0.9}}')
+    monkeypatch.setattr(clf, "_FAST_THRESHOLD_PATH", str(f))
+    monkeypatch.setattr(clf, "_fast_thresholds_cache", None)  # 重置进程缓存
+
+    assert clf._fast_accept_threshold(IntentLabel.CHITCHAT) == 0.9
+    assert clf._fast_accept_threshold(IntentLabel.BILL_QUERY, default=0.6) == 0.6  # 缺类用实例默认
+
+
+@pytest.mark.asyncio
+async def test_fast_path_blocked_by_tightened_class_threshold(monkeypatch, tmp_path) -> None:
+    """chitchat 阈值收紧到 0.9 后, BERT chitchat@0.75 不再快路径短路 → 落慢路径"""
+    from lumio.services.common import classifier as clf
+
+    f = tmp_path / "t.json"
+    f.write_text('{"thresholds": {"chitchat": 0.9}}')
+    monkeypatch.setattr(clf, "_FAST_THRESHOLD_PATH", str(f))
+    monkeypatch.setattr(clf, "_fast_thresholds_cache", None)
+
+    fake_bert = _fake_bert(IntentLabel.CHITCHAT, 0.75)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.CHITCHAT, primary_confidence=0.8, llm_input_class="chitchat"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = clf.IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("哈哈你好呀")
+    # 收紧后 0.75 < 0.9 → 慢路径接管
+    assert source == "llm"
+    mock_llm_classifier.classify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_classification_source_transparent() -> None:
+    """分类状态透传: 快路径命中 source=bert; 兜底 source=fallback — 供审计区分真假识别"""
+    fake_bert = _fake_bert(IntentLabel.BILL_QUERY, 0.95)
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None, bert_classifier=fake_bert)
+    intent, _, _, source = await classifier.classify("查账单")
+    assert source == "bert"
+    assert intent.classification_source == "bert"
+
+    classifier2 = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=None)
+    intent2, _, _, source2 = await classifier2.classify("这个怎么弄")
+    assert source2 == "fallback"
+    assert intent2.classification_source == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_fallback_merge_keeps_llm_verdict() -> None:
+    """慢路径被回退时裁决结论随行 (会话 79572c98 复盘)
+
+    慢路径 LLM 已跑完并输出 input_class, 回退快路径意图若丢掉该结论,
+    噪声门会对同一输入再打一次仲裁 LLM (6.5s+6.3s 双花, 全程 23.4s 的元凶)。
+    """
+    from lumio.services.common.bert_classifier import BertIntentClassifier  # noqa: F401  (仅示类型来源)
+
+    fake_bert = _fake_bert(IntentLabel.INSTALLMENT_INQUIRY, 0.6)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5, llm_input_class="business"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("分期的事情")
+    # 快路径业务意图 0.6 > 慢路径 faq@0.5 → 回退快路径
+    assert source == "fallback"
+    assert intent.primary_intent == IntentLabel.INSTALLMENT_INQUIRY
+    # 但 LLM 裁决结论必须保留 — 噪声门据此免二次仲裁
+    assert intent.llm_input_class == "business"
+
+
+# ── Phase 3 · 子词碎片显式出路 ──
+
+
+@pytest.mark.asyncio
+async def test_subword_short_circuits_slow_path() -> None:
+    """≤2 字裸词 ("信用") 不进 LLM 慢路径 — source=subword 交噪声门确定性澄清
+
+    会话 79572c98: LLM 对裸词只会幻觉 faq@0.6x (6s 超时 + 长篇大论 23.4s)。
+    """
+    fake_bert = _fake_bert(IntentLabel.FAQ, 0.61)  # BERT 弱识别, 不够快路径采纳
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(side_effect=AssertionError("子词不应进 LLM 慢路径"))
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("信用")
+    assert source == "subword"
+    assert intent.classification_source == "subword"
+    mock_llm.classify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_subword_spared_for_rule_signaled_action_word() -> None:
+    """规则层有意图信号的动作词 ("挂失"@0.56) 不受子词短路 — 照走慢路径识别"""
+    fake_bert = _fake_bert(IntentLabel.FAQ, 0.5)
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.CARD_LOSS, primary_confidence=0.85, llm_input_class="business"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
+    )
+    intent, _, _, source = await classifier.classify("挂失")
+    assert source == "llm"
+    assert intent.primary_intent == IntentLabel.CARD_LOSS
+    assert intent.llm_input_class == "business"
+
+
+@pytest.mark.asyncio
+async def test_full_sentence_not_subword() -> None:
+    """正常完整句不触发子词短路 (长度>2), 弱置信照走慢路径"""
+    fake_bert = _fake_bert(IntentLabel.FAQ, 0.61)
+    mock_llm_classifier = MagicMock()
+    mock_llm_classifier.classify = AsyncMock(
+        return_value=(
+            IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.8, llm_input_class="business"),
+            [],
+            SentimentLabel.NEUTRAL,
+        )
+    )
+    classifier = IntentClassifier(
+        rule_classifier=RuleClassifier(), llm_classifier=mock_llm_classifier, bert_classifier=fake_bert
+    )
+    _, _, _, source = await classifier.classify("信用卡的年费政策是什么样的")
+    assert source in ("llm", "fallback")

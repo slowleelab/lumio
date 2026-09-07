@@ -1,4 +1,4 @@
-"""链 D · 低置信并行竞速（目标架构 ⑤D）
+"""低置信并行竞速（目标架构 ⑤D）
 
 置信度落在低置信带宽 (0.4~0.6) 时, FAQ 检索与 RAG 检索并行竞速,
 归并取高分链路 —— 对冲意图分类的路由偏差, 替代"低置信直接拦回澄清"的
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,8 @@ class RaceOutcome:
 
 
 async def race(
-    faq_fn,
-    rag_fn,
+    faq_fn: Any,
+    rag_fn: Any,
     *,
     faq_timeout: float = 5.0,
     rag_timeout: float = 10.0,

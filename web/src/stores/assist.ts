@@ -7,7 +7,7 @@ import { getToken } from "@/api/client"
 export const useAssistStore = defineStore("assist", () => {
   const sessions = ref<SessionInfo[]>([])
 
-  const currentAgentId = ref<string | null>(null)  // v2.0: per-agent WS
+  const currentAgentId = ref<string | null>(null)  // 按坐席建连的 WS
   const activeSessionId = ref<string | null>(null)
   const wsStatus = ref<"connecting" | "connected" | "disconnected" | "error">("disconnected")
 

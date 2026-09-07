@@ -2,7 +2,7 @@
 
 能力:
 1. 粘性分桶 (sticky bucket): 同一 customer_id 总是进同一变体
-2. 流量比例: 实验定义 v1: 50%, v2: 50%
+2. 流量比例: 实验定义 control: 50%, treatment: 50%
 3. 曝光 + 转化埋点
 4. 统计显著性检验 (p-value < 0.05)
 """
@@ -31,7 +31,7 @@ class ExperimentStatus(str, Enum):
 class Variant:
     """实验变体."""
 
-    name: str  # "control" / "v1" / "v2"
+    name: str  # "control" / "treatment"
     weight: float  # 0-100, 总和应为 100
     config: dict[str, Any] = field(default_factory=dict)  # 变体配置
 
@@ -181,14 +181,14 @@ def _normal_cdf(x: float) -> float:
 
 def register_default_experiments(registry: ExperimentRegistry) -> None:
     """注册默认实验 (在 app 启动时调用)."""
-    # 实验 1: Prompt V2 vs V1
+    # 实验 1: 新旧 Prompt 对比
     registry.register(
         Experiment(
-            name="prompt_v2_test",
+            name="prompt_ab_test",
             description="测试新版 prompt 是否提升 CSAT",
             variants=[
-                Variant(name="control", weight=50.0, config={"prompt_version": "v1"}),
-                Variant(name="treatment", weight=50.0, config={"prompt_version": "v2"}),
+                Variant(name="control", weight=50.0, config={"prompt_version": "baseline"}),
+                Variant(name="treatment", weight=50.0, config={"prompt_version": "candidate"}),
             ],
             status=ExperimentStatus.RUNNING,
         )

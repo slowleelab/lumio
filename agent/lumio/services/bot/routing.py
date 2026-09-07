@@ -5,8 +5,6 @@
 
 分类表以既有 INTENT_DOMAINS + SENSITIVE_INTENTS 为单一事实源归并生成，
 另加显式覆盖表，避免第三处意图清单漂移。
-
-特性开关 bot.routing_v2_enabled 控制分派层走新决策还是旧链路（回滚保底）。
 """
 
 from __future__ import annotations
@@ -25,8 +23,8 @@ class TrafficClass(StrEnum):
     本枚举只表达"交易性质"这一个维度: 金融交易 / 只读查询 / 高风险。
     """
 
-    FINANCIAL_TRANSACTION = "financial_transaction"  # 资金变动/账户变更 → 链 A (工具编排+确认状态机)
-    READ_ONLY_QUERY = "read_only_query"  # 查余额/明细/进度 → 链 B (轻路径)
+    FINANCIAL_TRANSACTION = "financial_transaction"  # 资金变动/账户变更 → 交易链路 (工具编排+确认状态机)
+    READ_ONLY_QUERY = "read_only_query"  # 查余额/明细/进度 → 查询直达 (轻路径)
     HIGH_RISK = "high_risk"  # 投诉/争议/转人工诉求 → 人工坐席
 
 
@@ -46,13 +44,13 @@ class RouteDecision(StrEnum):
 _HIGH_RISK_DOMAINS = {"complain", "transfer"}
 
 # 金融交易: 资金变动/账户变更类。
-# v1 口径 = risk 域 (挂失/冻结/欺诈上报, 有确认状态机背书的敏感工具) ∪ SENSITIVE_INTENTS
+# 口径 = risk 域 (挂失/冻结/欺诈上报, 有确认状态机背书的敏感工具) ∪ SENSITIVE_INTENTS
 # 中非投诉争议类。其余"knowledge 域的写类意图" (如电子账单设置) 仍走知识介绍——
 # 无对应执行工具, 贸然进交易链会零工具可用 (与现状一致, 工具补齐后在此表追加)。
 _FINANCIAL_DOMAINS = {"risk"}
 
 # 有真实执行工具的写类意图显式覆盖 (knowledge 域默认只给介绍, 但这些在 MCP
-# 工具面有对应交易工具 + 确认状态机背书, 应进链 A):
+# 工具面有对应交易工具 + 确认状态机背书, 应进交易链路):
 # apply_bill_installment / adjust_temp_credit_limit / repay_credit_card 等
 _FINANCIAL_TOOL_OVERRIDES: set[IntentLabel] = {
     IntentLabel.INST_APPLY,  # apply_bill_installment
@@ -113,18 +111,74 @@ def decision_two(confidence: float, has_composite: bool) -> RouteDecision:
     return RouteDecision.RAG_CHAIN
 
 
-# ── 复合意图检测 (链 C, v1 规则) ──
+# ── 复合意图检测 (查询取数 + 解释诉求) ──
 
 _EXPLAIN_PATTERNS = ("为什么", "怎么算", "如何计算", "怎么收费", "什么意思", "解释")
 
+# 业务次选"强到足以代表真实解释诉求"的分数线 (softmax 概率), 与闲聊短路
+# _ALT_BUSINESS_PASS_SCORE 同纪律: 分类器输出的对冲性弱次选 (如 bill_query
+# 轮挂 installment_inquiry@0.08) 不代表客户真在问"为什么", 不触发复合级联
+# (会话 smoke-qa-1788567861 复盘: 纯"账单日是几号"被弱次选误判复合)。
+_ALT_COMPOSITE_MIN_SCORE = 0.30
 
-def detect_composite(intent: IntentLabel, alternatives: list[IntentLabel], text: str) -> bool:
+
+def detect_composite(
+    intent: IntentLabel,
+    alternatives: list[IntentLabel],
+    text: str,
+    alternative_scores: list[float] | None = None,
+) -> bool:
     """查询诉求 + 解释诉求的复合检测
 
-    v1 规则: 主意图为查询类 且 (alternatives 携带知识类意图 或 文本含解释诉求词)。
+    规则: 主意图为查询类 且 (alternatives 携带**强**知识类意图 或 文本含解释诉求词)。
+    强弱由 alternative_scores (与 alternatives 按下标对齐) 判定: 低于分数线的
+    对冲性弱次选不算; 分数缺失的次选按"强"处理 (保守, 不弱化复合保护)。
     """
     if not normalize_for_query(intent):
         return False
-    if any(a not in (IntentLabel.FAQ,) and domain_of(a) == IntentDomain.CONSULTING for a in alternatives or []):
-        return True
+    for i, alt in enumerate(alternatives or []):
+        if alt in (IntentLabel.FAQ,) or domain_of(alt) != IntentDomain.CONSULTING:
+            continue
+        score = alternative_scores[i] if alternative_scores and i < len(alternative_scores) else None
+        if score is None or score >= _ALT_COMPOSITE_MIN_SCORE:
+            return True
     return any(p in text for p in _EXPLAIN_PATTERNS)
+
+
+# 闲聊域轻回复引导 (会话 8700a2ea 复盘): "锄禾日当午"被分类成 chitchat@0.70 进
+# 决策二, 高置信直落 RAG 链, 检索靠单字"日"BM25 非零命中"账单日"文档, 15 秒生成
+# 了整段账单说明 — 答非所问。闲聊/无义输入没有业务诉求, 检索与生成只有成本和
+# 幻觉风险, 应模板轻回复引导回业务。
+# alternatives 携带业务域意图的混合句 ("哈哈帮我查下账单") 不拦 — 照常走决策二,
+# 让检索/竞速链路服务其中的业务诉求。
+_NONBUSINESS_PASSTHROUGH = frozenset(
+    {IntentLabel.FAQ, IntentLabel.NB_CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.CHITCHAT}
+)
+_BUSINESS_DOMAINS = frozenset({IntentDomain.QUERY, IntentDomain.TRANSACTION, IntentDomain.SERVICE})
+# 业务次选"强到足以代表业务诉求"的分数线 (softmax 概率)。会话 22ad: "丈二和尚"
+# 的 BERT 次选 transfer_agent/transaction_query 是对冲性弱次选 (<0.3), 却挡掉了
+# 闲聊短路。带分数时低于此线的弱次选不拦; 无分数 (旧调用方) 保持保守放行。
+_ALT_BUSINESS_PASS_SCORE = 0.30
+
+
+def is_chitchat_redirect(
+    intent: IntentLabel,
+    alternatives: list[IntentLabel] | None,
+    alternative_scores: list[float] | None = None,
+) -> bool:
+    """闲聊域轻回复判定: 主意图属闲聊域 且 alternatives 不携带**强**业务域意图。
+
+    强弱由 alternative_scores (与 alternatives 按下标对齐) 判定:
+    分数缺失的次选按"强"处理 (保守放行, 不弱化混合句保护)。
+    """
+    if domain_of(intent) != IntentDomain.CHITCHAT:
+        return False
+    scores = alternative_scores or []
+    for i, alt in enumerate(alternatives or []):
+        if alt in _NONBUSINESS_PASSTHROUGH:
+            continue
+        if domain_of(alt) in _BUSINESS_DOMAINS:
+            score = scores[i] if i < len(scores) else None
+            if score is None or score >= _ALT_BUSINESS_PASS_SCORE:
+                return False
+    return True

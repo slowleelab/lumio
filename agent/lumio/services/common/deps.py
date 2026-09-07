@@ -68,7 +68,7 @@ RedisClient = Annotated[Redis, Depends(get_redis_client)]
 async def init_embedding(app: FastAPI) -> None:
     """初始化嵌入服务，存储到 app.state"""
     settings = get_settings()
-    ollama_base = settings.llm.base_url.replace("/v1", "").rstrip("/")
+    ollama_base = settings.rag.ollama_base_url.rstrip("/")  # 独立于 LLM (LLM 可切远程 API)
     provider = create_embedding_provider(
         provider_type=settings.rag.embedding_provider,
         ollama_base_url=ollama_base,
@@ -78,6 +78,7 @@ async def init_embedding(app: FastAPI) -> None:
         dim=settings.rag.embedding_dim,
         batch_size=settings.rag.embedding_batch_size,
         timeout=settings.rag.embedding_timeout,
+        num_gpu=settings.rag.embedding_num_gpu,
         max_retries=settings.rag.embedding_max_retries,
     )
     breaker = EmbeddingCircuitBreaker(provider)
@@ -112,13 +113,14 @@ async def close_embedding(app: FastAPI) -> None:
 async def init_reranker(app: FastAPI) -> None:
     """初始化重排服务，存储到 app.state"""
     settings = get_settings()
-    ollama_base = settings.llm.base_url.replace("/v1", "").rstrip("/")
+    ollama_base = settings.rag.ollama_base_url.rstrip("/")  # 独立于 LLM (LLM 可切远程 API)
     provider = create_reranker_provider(
         provider_type=settings.rag.reranker_provider,
         ollama_base_url=ollama_base,
         ollama_model=settings.rag.reranker_model,
         tei_base_url=settings.rag.tei_base_url,
         tei_model=settings.rag.reranker_model,
+        num_gpu=settings.rag.rerank_num_gpu,
     )
     app.state.reranker_provider = provider
 

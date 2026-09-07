@@ -10,10 +10,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
 from lumio.shared.config import get_settings
+from lumio.shared.lexicon import lexicon_values as _lex
 from lumio.shared.metrics import RAG_CACHE_OPS, RERANK_DEGRADATION, RETRIEVE_DURATION
 from lumio.shared.models import RetrievedChunk, RetrieveRequest, RetrieveResponse
 from lumio.shared.tracing import traced
@@ -129,7 +131,7 @@ def build_milvus_expr(filters: dict) -> str:
                 if epoch_sec:
                     conditions.append(f"{key} >= {epoch_sec}")
         elif key == "keywords":
-            # v2.1: ARRAY_CONTAINS 精确过滤，替代 like 模糊匹配
+            # ARRAY_CONTAINS 精确过滤，替代 like 模糊匹配
             if isinstance(value, list):
                 kw_conds = [f'ARRAY_CONTAINS(keywords, "{kw}")' for kw in value]
                 conditions.append("(" + " or ".join(kw_conds) + ")")
@@ -155,6 +157,61 @@ def _build_cache_key(
     if rerank:
         key += ":rerank"
     return key
+
+
+# ── 查询词法重叠门 (会话 8700a2ea 复盘) ──
+# "锄禾日当午"靠单字"日"BM25 非零命中"账单日"文档: reranker 可用时 confidence_threshold
+# (rerank 分数对 query+doc 联合打分) 能拦, 但 reranker 退化 (Ollama /api/rerank 404) 时
+# 回退 RRF 阈值 0.0 = 零过滤, 词法证据门又只拦"BM25 零命中" — 单字命中即绕过。
+# 本门在调用侧兜底: 查询的全部信息性词块 (CJK 2-gram / ≥2 字符拉丁数字词) 与所有
+# 检索片段零重叠 → 无任何词法证据, 视为 miss。与 FAQ 双门槛同一哲学: 没有证据不生成。
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z0-9]+")
+_ALNUM_RUN = re.compile(r"[A-Za-z0-9]+")
+
+
+def _query_grams(query: str) -> set[str]:
+    """提取查询的信息性词块: 连续 CJK 段的 2-gram + ≥2 字符拉丁/数字词"""
+    grams: set[str] = set()
+    for run in _CJK_RUN.findall(query or ""):
+        if _ALNUM_RUN.fullmatch(run):
+            if len(run) >= 2:
+                grams.add(run.lower())
+        else:
+            grams.update(run[i : i + 2] for i in range(len(run) - 1))
+    return grams
+
+
+# 通用动词/疑问/助词类 bigram: 几乎存在于所有银行业务文档 ("查看账单/登录APP/
+# 办理业务"), 命中不构成相关性证据 (会话 9ed55603: 无义输入"查看开发"靠"查看"
+# 一词击穿重叠门, 14.2s 生成了整段账单知识)。与 FAQ 侧 _FAQ_GENERIC_GRAMS 同型。
+_GENERIC_GRAMS = frozenset(_lex("retrieval_generic_grams"))
+
+# 业务名词词块 (强证据): 银行信用卡域稳定名词, 一个命中即构成相关性证据
+_BUSINESS_NOUN_GRAMS = frozenset(_lex("business_noun_grams"))
+
+
+def query_chunk_overlap_zero(query: str, chunks: list[str]) -> bool:
+    """查询与检索片段零词法重叠判定 (调用侧相关性兜底门)
+
+    True = 查询没有任何信息性词块出现在任何片段里 → 判 miss;
+    查询本身无可提取词块 (如单字"卡") 时无法判定 → False (放行, 不误杀)。
+    通用动词/疑问词块不计入证据 (去停用后无词块 = 无法判定, 放行)。
+    """
+    grams = _query_grams(query) - _GENERIC_GRAMS
+    if not grams:
+        return False
+    blob = "\n".join(chunks)
+    # 业务名词强证据: 银行域稳定名词词块命中即放行 ("查看账单"的证据是"账单",
+    # 跨词 bigram "看账"会被拆碎 — 强名词一个就够)。
+    if any(g in blob for g in grams & _BUSINESS_NOUN_GRAMS):
+        return False
+    hits = sum(1 for g in grams if g in blob)
+    # 弱证据强度判据 (会话 9ed55603: "查看开发"靠碎片"开发"撞上无关文档放行):
+    # 表外词块需 ≥2 命中 — 单碎片撞词 (无义输入的 bigram 碎片碰上某文档) 判 miss;
+    # 单词块查询 (弱词但整块命中) 保留放行, 不误杀长尾真实问法。
+    if len(grams) == 1:
+        return hits == 0
+    return hits < 2
 
 
 def _date_to_epoch(date_str: str) -> int | None:

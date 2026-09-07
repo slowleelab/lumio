@@ -4,9 +4,9 @@
 
     五域 (IntentDomain) → 子域组 (GroupKey) → 叶子意图 (既有 IntentLabel)
 
-五域与 v2 路由 TrafficClass 直接对齐:
-    query 查询域(非金融) → READ_ONLY_QUERY → 链 B
-    transaction 交易域(金融类) → FINANCIAL_TRANSACTION → 链 A
+五域与两级路由 TrafficClass 直接对齐:
+    query 查询域(非金融) → READ_ONLY_QUERY → 查询直达
+    transaction 交易域(金融类) → FINANCIAL_TRANSACTION → 交易链路
     consulting 咨询域 → CONSULTING → 决策二
     service 服务域(人工转接/投诉) → HIGH_RISK → 人工
     chitchat 闲聊域 → CONSULTING/兜底
@@ -56,6 +56,7 @@ GROUP_C2_BUSINESS = "C2_business"  # 业务咨询: 怎么开通/怎么取消
 GROUP_C3_DISPUTE = "C3_dispute"  # 争议咨询: 费用异议/扣款质疑
 GROUP_D1_TRANSFER = "D1_transfer"  # 人工转接
 GROUP_D2_COMPLAINT = "D2_complaint"  # 投诉建议
+GROUP_E_CHITCHAT = "E_chitchat"  # 闲聊/兜底 (nb_chitchat/handoff_end/nb_noise)
 
 # 叶子意图 → 子域组 (按旧域名 + 意图名段归组; 未列出的意图沿用域默认组)
 _DOMAIN_DEFAULT_GROUP: dict[IntentDomain, str] = {
@@ -63,7 +64,7 @@ _DOMAIN_DEFAULT_GROUP: dict[IntentDomain, str] = {
     IntentDomain.TRANSACTION: GROUP_B2_ACCOUNT_CHANGE,
     IntentDomain.CONSULTING: GROUP_C2_BUSINESS,
     IntentDomain.SERVICE: GROUP_D1_TRANSFER,
-    IntentDomain.CHITCHAT: "",
+    IntentDomain.CHITCHAT: GROUP_E_CHITCHAT,
 }
 
 # 显式组覆盖 (按骨架树的代表叶子; 其余意图落域默认组, 不逐一枚举 149 个)
@@ -106,7 +107,7 @@ _GROUP_OVERRIDES: dict[IntentLabel, str] = {
 # 域级显式覆盖 (组覆盖但旧域名不一致的意图, 两级保持一致)
 # 定义句式 (概念咨询, 会话 2b3b2613/9d64b59 根治): "X是什么/什么是X/什么叫X"
 # 是概念咨询而非个人账户数据查询 —— L3 LLM 高频把这类误判成 limit_query 进
-# 查询域 → 链 B 反问卡号死循环。句式命中强制咨询域。
+# 查询域 → 查询直达 反问卡号死循环。句式命中强制咨询域。
 _DEFINITION_SUFFIX = "是什么"
 _DEFINITION_PREFIX = "什么是"
 _DEFINITION_PREFIX_ALT = "什么叫"
@@ -133,8 +134,20 @@ _DOMAIN_OVERRIDES: dict[IntentLabel, IntentDomain] = {
 
 
 def domain_of(intent: IntentLabel | str) -> IntentDomain:
-    """叶子意图 → 五域 (骨架第一级)"""
+    """叶子意图 → 五域 (骨架第一级)
+
+    运营注册表意图 (未进代码枚举的 slug) 先查注册表 —— 否则会被
+    normalize_intent 未知值兜底成 FAQ, 注册表意图的域判定失效。
+    """
     if isinstance(intent, str) and not isinstance(intent, IntentLabel):
+        from lumio.shared.intent_registry import registry_domain
+
+        reg = registry_domain(intent)
+        if reg is not None:
+            try:
+                return IntentDomain(reg)
+            except ValueError:
+                pass
         intent = normalize_intent(intent)
     override = _DOMAIN_OVERRIDES.get(intent)
     if override:
@@ -156,11 +169,38 @@ def domain_of_with_text(intent: IntentLabel | str, text: str) -> IntentDomain:
 def group_of(intent: IntentLabel | str) -> str:
     """叶子意图 → 子域组 (骨架第二级)"""
     if isinstance(intent, str) and not isinstance(intent, IntentLabel):
+        from lumio.shared.intent_registry import registry_domain, registry_group
+
+        reg = registry_group(intent)
+        if reg is not None:
+            return reg
+        reg_dom = registry_domain(intent)
+        if reg_dom is not None:
+            # 注册表意图未指定组 → 按其注册域的默认组 (不能走 normalize→FAQ 的组覆盖)
+            try:
+                return _DOMAIN_DEFAULT_GROUP[IntentDomain(reg_dom)]
+            except (ValueError, KeyError):
+                return ""
         intent = normalize_intent(intent)
     override = _GROUP_OVERRIDES.get(intent)
     if override:
         return override
     return _DOMAIN_DEFAULT_GROUP.get(domain_of(intent), "")
+
+
+# 域代表叶子: L2 域命中/注册表意图映射到枚举叶子时使用 (保持单一来源)
+_DOMAIN_REPRESENTATIVE: dict[IntentDomain, IntentLabel] = {
+    IntentDomain.QUERY: IntentLabel.ACCOUNT_BILL_QUERY,
+    IntentDomain.TRANSACTION: IntentLabel.CARD_LOSS_REPORT,
+    IntentDomain.CONSULTING: IntentLabel.FAQ,
+    IntentDomain.SERVICE: IntentLabel.TRANSFER_AGENT,
+    IntentDomain.CHITCHAT: IntentLabel.CHITCHAT,
+}
+
+
+def domain_representative(domain: IntentDomain) -> IntentLabel:
+    """域 → 代表叶子意图 (注册表意图按域落叶子时用, 与 L2 域命中同一张表)"""
+    return _DOMAIN_REPRESENTATIVE[domain]
 
 
 def leaves_in_domain(domain: IntentDomain) -> list[IntentLabel]:

@@ -203,6 +203,58 @@ async def test_get_db_factory_failure_cached(monkeypatch):
     assert logger._db_session_factory is False
 
 
+async def test_write_pg_uses_call_time_not_flush_time(monkeypatch):
+    """PG 行 created_at = log_decision 调用时刻, 而非后台 task 执行时刻
+
+    每条决策一个独立后台 task, 执行顺序微秒级会颠倒 — 同批留痕的语义顺序
+    (意图分类→路由决策) 曾被打乱 (会话 smoke-qa4 复盘)。
+    """
+    from datetime import UTC, datetime
+
+    logger = DecisionLogger()
+    rows: list = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def add(self, row):
+            rows.append(row)
+
+        async def commit(self):
+            return None
+
+    class FakeFactory:
+        def __call__(self):
+            return FakeSession()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    async def fake_factory():
+        return FakeFactory()
+
+    monkeypatch.setattr(logger, "_db_session_factory", FakeFactory())
+    rec = DecisionRecord(
+        decision_id="d1",
+        session_id="s1",
+        turn_id="t1",
+        agent_name="bot",
+        action=DecisionAction.INTENT_CLASSIFY,
+        reasoning="分类",
+        created_at=1000000000.5,
+    )
+    await logger._write_pg(rec)
+    assert rows, "应写入 PG 行"
+    assert rows[0].created_at == datetime.fromtimestamp(1000000000.5, tz=UTC)
+
+
 def test_singleton_and_helper():
     """单例 + 便捷函数"""
     g1 = get_decision_logger()
@@ -216,3 +268,40 @@ def test_singleton_and_helper():
         turn_id="t1",
     )
     assert decision_id
+
+
+def test_turn_context_inheritance(monkeypatch):
+    """turn_id 按轮贯穿: 绑定后留空的 log_decision 自动继承本轮 ID
+
+    会话回放决策链按轮分组依赖此行为 (此前每条决策独立 uuid4, 无法归组)。
+    """
+    from lumio.services.common.decision_log import bind_turn_context, current_turn_id
+
+    bind_turn_context("turn-abc")
+    assert current_turn_id() == "turn-abc"
+    captured: list[DecisionRecord] = []
+    def _fake_record(self, **kw):
+        captured.append(DecisionRecord(decision_id=f"d{len(captured)}", **kw))
+        return "id"
+
+    monkeypatch.setattr(DecisionLogger, "record", _fake_record)
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.TURN_START, reasoning="出队")
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.INTENT_CLASSIFY, reasoning="分类", turn_id="")
+    # 显式指定的 turn_id 优先于上下文
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.TOOL_CALL, reasoning="工具", turn_id="manual")
+    assert [r.turn_id for r in captured] == ["turn-abc", "turn-abc", "manual"]
+
+    # 新一轮重新绑定后旧值不泄漏 (串行 worker 语义)
+    bind_turn_context("turn-xyz")
+    log_decision(session_id="s", agent_name="bot", action=DecisionAction.CHAIN_COMPLETE, reasoning="完成")
+    assert captured[-1].turn_id == "turn-xyz"
+
+
+def test_turn_start_action_value():
+    """出队留痕动作存在 (排队耗时归因)"""
+    assert DecisionAction.TURN_START.value == "turn_start"
+
+
+def test_route_decision_action_value():
+    """路由决策专用动作存在 — 此前借用 TOOL_CALL, 审计链把路由判定标成"工具执行\""""
+    assert DecisionAction.ROUTE_DECISION.value == "route_decision"

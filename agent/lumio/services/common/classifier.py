@@ -16,7 +16,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 from lumio.services.bot.entity_extractor import extract_entities, normalize_entity_type
-from lumio.services.common.bert_classifier import BertIntentClassifier
+from lumio.services.common.bert_classifier import BertIntentClassifier, ood_verdict
 from lumio.services.common.trap_collector import TrapCollector, TrapRecord
 from lumio.shared.config import get_settings
 from lumio.shared.models import Entity, IntentLabel, IntentResult, SentimentLabel, normalize_intent
@@ -32,13 +32,131 @@ logger = logging.getLogger(__name__)
 # 规则分类器阈值：Fast Path 置信度 >= 此值直接使用
 _FAST_PATH_THRESHOLD = 0.7
 
+# ── 快路径按类采纳阈值 (架构整改 Phase 3: 数据驱动替代全局常数) ──────────
+# 各意图类的 softmax 可分性不同, 一刀切全局阈值两头误伤。校准产物
+# fast_path_thresholds.json 由 scripts/intent_threshold_calibrate.py 用种子
+# 金标集生成 (--floor 即下限, 当前口径 0.7 = 只允许比全局更严, 放宽需生产
+# 标注数据背书), 闭环坏例回流积累后重跑即可逐类收紧。缺类/缺文件沿用全局。
+_FAST_THRESHOLD_PATH = "data/intent_classification/fast_path_thresholds.json"
+_fast_thresholds_cache: dict[str, float] | None = None
+
+
+def _load_fast_thresholds(path: str | None = None) -> dict[str, float]:
+    """加载按类阈值; path 注入仅供测试 (不污染进程缓存)。失败返回空 dict 沿用全局。"""
+    global _fast_thresholds_cache
+    if path is not None:
+        try:
+            import json
+            from pathlib import Path
+
+            file = Path(__file__).resolve().parents[3] / path
+            return {k: float(v) for k, v in (json.loads(file.read_text()).get("thresholds") or {}).items()}
+        except Exception:
+            return {}
+    if _fast_thresholds_cache is None:
+        try:
+            import json
+            from pathlib import Path
+
+            file = Path(__file__).resolve().parents[3] / _FAST_THRESHOLD_PATH
+            _fast_thresholds_cache = {
+                k: float(v) for k, v in (json.loads(file.read_text()).get("thresholds") or {}).items()
+            }
+        except Exception:
+            _fast_thresholds_cache = {}
+    return _fast_thresholds_cache
+
+
+def _fast_accept_threshold(label: IntentLabel, default: float = _FAST_PATH_THRESHOLD) -> float:
+    """快路径采纳阈值: 按预测类查表, 缺类沿用调用方默认 (实例 fast_threshold)。"""
+    return _load_fast_thresholds().get(label.value, default)
+
 # 办理词规则覆盖 (会话 48882b05 同型消歧): BERT 标签空间是旧扁平 10 类, 发不出
 # 写类主名意图; 规则层对这些意图高置信命中时覆盖 BERT 快路径结果。仅收办理动作词
 # (提额/降额), 覆盖阈值取两规则置信 0.96 之下、其余规则最高置信 0.95 之上。
 _APPLY_INTENT_RULE_OVERRIDE: frozenset[IntentLabel] = frozenset(
-    {IntentLabel.LIMIT_APPLY_INCREASE, IntentLabel.LIMIT_APPLY_DECREASE}
+    {
+        IntentLabel.LIMIT_APPLY_INCREASE,
+        IntentLabel.LIMIT_APPLY_DECREASE,
+        # 挂失类 (第二轮模拟: "钱包被偷了卡也在里面"被 BERT 判 faq@0.73 → 走知识链
+        # 给安抚话术而非挂失链, 错过挂失黄金时间) — 规则命中即覆盖
+        IntentLabel.CARD_LOSS,
+        IntentLabel.CARD_LOSS_REPORT,
+    }
 )
 _APPLY_OVERRIDE_CONF = 0.95
+
+# 查询类意图的规则覆盖集 (与 tool_selection.TOOL_INTENTS 查询子集对齐, 不新增
+# 第三处清单 —— 在此显式列出并注明对齐关系, 因 services.common 不得顶层依赖
+# services.bot)。旧 flat 别名与主名成对收录。
+_QUERY_INTENT_OVERRIDES: frozenset[IntentLabel] = frozenset(
+    {
+        IntentLabel.BILL_QUERY,
+        IntentLabel.TRANSACTION_QUERY,
+        IntentLabel.LIMIT_QUERY,
+        IntentLabel.REWARD_QUERY,
+        IntentLabel.ACCOUNT_BILL_QUERY,
+        IntentLabel.TXN_QUERY,
+        IntentLabel.POINTS_BALANCE_QUERY,
+    }
+)
+# 咨询标记词: 含这些词的句子是"关于账单/额度的问题"而非"查账单/额度"本身,
+# 规则关键词命中不作数 (如"账单分期手续费怎么算" ≠ 账单查询)。
+# 强查询动作词 (闭环第十轮: "上个月账单给我看看, 最低还款是怎么算的"被咨询
+# 标记"怎么"拦住查询覆盖, BERT 误判 faq@0.82 走知识链未查账单): 客户动作
+# 词 + 业务名词并存时主诉求是查数, "怎么算"是追问解释 — 查询意图优先
+# (查询直达/复合级联 取数后仍可解释), 咨询标记不再一票否决。
+_STRONG_QUERY_ACTIONS = ("给我看", "看看", "查一下", "查下", "帮我查", "帮我看", "帮我看下", "明细", "拉一下")
+
+_CONSULTIVE_MARKERS = (
+    "怎么",
+    "如何",
+    "为什么",
+    "什么意思",
+    "是什么",
+    "什么是",
+    "什么叫",
+    "介绍",
+    "规则",
+    "政策",
+    "手续费",
+    "利率",
+    "条件",
+    "区别",
+    "划算",
+)
+
+# 预处理轻量纠错 (坏例 layer_1 根治: "数人字民币"相邻字交换 → 意图为空全链拒答):
+# 对高频金融词穷举"相邻双字交换"变体, 命中即替换。只修词表内乱序, 不做通配纠错
+# (避免误纠正常输入), 修正后文本进入 L1/L2/L3 分类, 原文不受影响。
+_TYPO_FIX_VOCAB = (
+    "数字人民币",
+    "为什么",
+    "怎么办",
+    "怎么回事",
+    "信用卡",
+    "账单",
+    "还款",
+    "额度",
+    "积分",
+    "挂失",
+    "分期",
+    "转账",
+    "密码",
+    "交易",
+    "限额",
+)
+
+
+def fix_adjacent_typos(text: str) -> str:
+    """词表驱动的相邻字交换纠错 (打字乱序的最常见形态)"""
+    for word in _TYPO_FIX_VOCAB:
+        for i in range(len(word) - 1):
+            swapped = word[:i] + word[i + 1] + word[i] + word[i + 2 :]
+            if swapped != word and swapped in text:
+                text = text.replace(swapped, word)
+    return text
+
 
 # 低置信噪声闸下限: BERT 快路径置信度低于此值时视为"没认出来", 直接不花一次 LLM 慢路径分类.
 # 实测 LLM 慢路径会把噪声置信抬到恰 ≥ 此下限 (如 0.219→0.30), 既浪费一次 6s+ 调用,
@@ -46,11 +164,20 @@ _APPLY_OVERRIDE_CONF = 0.95
 # bot_agent 的 CLARIFY_CONFIDENCE_FLOOR (0.3) 对齐, 低于它本来就该回确定性澄清.
 _LOW_CONF_FLOOR = 0.3
 
+# 闲聊/噪声意图置信封顶 (会话 8700a2ea 复盘): LLM 慢路径对闲聊的自评置信会到
+# 0.7+ ("锄禾日当午"→chitchat@0.70), 中高置信让它跳过低置信护栏直通知识链生成。
+# 闲聊本质是"没认出业务意图", 记账置信必须压到低置信地板以下, 让下游噪声闸/
+# 澄清/竞速按"不确定"对待。fast_conf 保留原始值作分歧证据, 只封 primary。
+_NONBUSINESS_CONF_CAP = 0.29
+# 注意含旧 flat 别名 IntentLabel.CHITCHAT — BERT/LLM 分类器直接构造别名对象,
+# 不会自动归一化到 NB_CHITCHAT (E2E 实测 poll 显示 chitchat@0.7 漏封)
+_NONBUSINESS_CAP_INTENTS = frozenset({IntentLabel.NB_CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.CHITCHAT})
+
 
 def _collect_alternatives(
     hits: list[tuple[IntentLabel, float]], primary: IntentLabel, limit: int = 3
-) -> list[IntentLabel]:
-    """从规则命中列表收集次意图 (多意图).
+) -> tuple[list[IntentLabel], list[float]]:
+    """从规则命中列表收集次意图 (多意图), 返回 (次意图, 对齐分数).
 
     - 去重、剔除主意图
     - 按置信度降序
@@ -58,6 +185,7 @@ def _collect_alternatives(
     """
     seen: set[IntentLabel] = set()
     out: list[IntentLabel] = []
+    out_scores: list[float] = []
     for intent, conf in sorted(hits, key=lambda x: x[1], reverse=True):
         if intent == primary or intent in seen:
             continue
@@ -65,9 +193,10 @@ def _collect_alternatives(
             continue
         seen.add(intent)
         out.append(intent)
+        out_scores.append(conf)
         if len(out) >= limit - 1:  # include primary, so return at most limit-1
             break
-    return out
+    return out, out_scores
 
 
 # 写类（办理/申请/设置/变更/取消/绑定/兑换/激活）意图集合。
@@ -315,6 +444,18 @@ _SENSITIVE_RULE_PRIORITY: frozenset[IntentLabel] = frozenset(
     {IntentLabel.CARD_LOSS, IntentLabel.COMPLAINT, IntentLabel.TRANSFER_AGENT}
 )
 _RULES: list[dict[str, Any]] = [
+    # 挂失类 (第二轮模拟补词: "钱包被偷了卡也在里面"变体没接住)
+    {
+        "intent": IntentLabel.CARD_LOSS,
+        # qa_scan 第四轮: "信用卡找不到了"两次被判没理解 — 该词须进 0.96 高置信
+        # 规则 (_APPLY_INTENT_RULE_OVERRIDE 要求 ≥0.95 才能覆盖 BERT 误判的 faq@0.7+);
+        # pattern 限定带"卡"字, 防"钥匙找不到了"误伤
+        # "被盗"补词 (闭环挂账: "卡好像被盗了"不含"被盗刷/卡片被盗"完整词面, 置信
+        # 不足 0.8 没进直连, LLM 编排 18.6s 回落); "被盗"二字在客服语料足够特异
+        "patterns": [r"钱包被偷", r"钱包被[盗抢]", r"卡片被盗", r"被盗刷", r"被盗", r"卡[不没]找了", r"卡找不到了"],
+        "keywords": ["钱包被偷", "钱包被盗", "被盗刷", "卡找不到了"],
+        "confidence": 0.96,
+    },
     # 账单类
     {
         "intent": IntentLabel.BILL_QUERY,
@@ -351,8 +492,10 @@ _RULES: list[dict[str, Any]] = [
         # 注意: 关键词不含 "信用" — 它是 "信用卡" 的子串, 会把任何含"信用卡"的句子
         # (如"信用卡丢了要挂失") 误拉进额度类; 标定(2026-08-25)时实测暴露了该歧义。
         # 注意: 不含 "提额/降额" — 办理词已上移至上方调整类 (limit_apply_increase/decrease)。
-        "patterns": [r"额度", r"可用额度", r"信用额度"],
-        "keywords": ["额度", "可用", "临时额度", "授信"],
+        # 长对话场景补词 (第四轮模拟: "现在卡里还能刷多少"无"额度"词被拒):
+        # 口语变体 "还能刷/还能用/剩多少" 归额度查询
+        "patterns": [r"额度", r"可用额度", r"信用额度", r"还能刷多少", r"还能用多少", r"剩多少额度"],
+        "keywords": ["额度", "可用", "临时额度", "授信", "还能刷", "还能用多少"],
         "confidence": 0.95,
     },
     # 分期类
@@ -379,8 +522,10 @@ _RULES: list[dict[str, Any]] = [
     # 挂失
     {
         "intent": IntentLabel.CARD_LOSS,
-        "patterns": [r"挂失", r"补卡", r"换卡", r"卡片丢失"],
-        "keywords": ["挂失", "丢失", "补卡", "换卡"],
+        # qa_scan 第四轮: "信用卡找不到了,怎么办"两次被判没理解 — 口语"找不到"
+        # 与"丢失"同义, 补词 (会话 22ad 同型: 识别层漏词 → 澄清敷衍紧急挂失)
+        "patterns": [r"挂失", r"补卡", r"换卡", r"卡片丢失", r"卡?[不没]找了", r"找不到了"],
+        "keywords": ["挂失", "丢失", "补卡", "换卡", "找不到了"],
         "confidence": 0.56,
     },
     # 投诉
@@ -415,7 +560,8 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
   "intent": "意图标签",
   "confidence": 0.0-1.0的置信度,
   "entities": [{"entity_type": "类型", "value": "值"}],
-  "sentiment": "positive/neutral/negative/angry"
+  "sentiment": "positive/neutral/negative/angry",
+  "input_class": "business|chitchat|noise"
 }
 ```
 
@@ -431,24 +577,91 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 - transfer_agent: 转人工
 - chitchat: 闲聊
 
+## input_class 判定（与意图分类同一次输出，独立打分）
+- business: 与银行业务相关的真实诉求（查账/分期/挂失/投诉/额度/积分/转人工等）
+- chitchat: 闲聊/寒暄/玩笑/与银行业务无关的话题（如动物名、天气、表情）
+- noise: 乱码/按键误触/无意义输入
+- 拿不准、或像是在接上文的数字/金额/卡号回话但语义不明 → business（保守，宁放过不误拦）
+
 ## 示例
 用户: 我上个月花了多少钱
-输出: {"intent": "bill_query", "confidence": 0.9, "entities": [{"entity_type": "time_range", "value": "上个月"}], "sentiment": "neutral"}
+输出: {"intent": "bill_query", "confidence": 0.9, "entities": [{"entity_type": "time_range", "value": "上个月"}], "sentiment": "neutral", "input_class": "business"}
 
 用户: 额度太低了能不能提一下
-输出: {"intent": "limit_query", "confidence": 0.85, "entities": [{"entity_type": "action", "value": "提额"}], "sentiment": "neutral"}
+输出: {"intent": "limit_query", "confidence": 0.85, "entities": [{"entity_type": "action", "value": "提额"}], "sentiment": "neutral", "input_class": "business"}
 
 用户: 你们的年费怎么这么贵，我要投诉
-输出: {"intent": "complaint", "confidence": 0.95, "entities": [{"entity_type": "topic", "value": "年费"}], "sentiment": "angry"}
+输出: {"intent": "complaint", "confidence": 0.95, "entities": [{"entity_type": "topic", "value": "年费"}], "sentiment": "angry", "input_class": "business"}
 
 用户: 你好呀
-输出: {"intent": "chitchat", "confidence": 0.9, "entities": [], "sentiment": "positive"}
+输出: {"intent": "chitchat", "confidence": 0.9, "entities": [], "sentiment": "positive", "input_class": "chitchat"}
+
+用户: 卡皮巴拉
+输出: {"intent": "faq", "confidence": 0.3, "entities": [], "sentiment": "neutral", "input_class": "chitchat"}
 
 ## 要求
 - 只输出 JSON，不要其他文字
 - 置信度 0-1 之间，不确定时给低分
 - 模糊输入给 intent="faq"，confidence < 0.5
 """
+
+
+def build_classify_system_prompt() -> str:
+    """L3 分类 prompt = 静态基线 + 运营注册表增量 (影子/生效意图)。
+
+    注册表为空时与静态串逐字节一致 (零回归); 有增量时追加候选段。
+    影子意图标注 [影子观察中]: 模型可选它, 线上只记日志不改变路由。
+    """
+    from lumio.shared.intent_registry import get_registry
+
+    extra = get_registry().prompt_intents()
+    if not extra:
+        return _CLASSIFY_SYSTEM_PROMPT
+    lines = ["", "## 运营新增意图 (与上面的意图标签同等可选)"]
+    for it in extra:
+        mark = " [影子观察中]" if it["state"] == "shadow" else ""
+        definition = f" — {it['definition']}" if it["definition"] else ""
+        lines.append(f"- {it['slug']}: {it['name_zh']}{definition}{mark}")
+    return _CLASSIFY_SYSTEM_PROMPT + "\n".join(lines) + "\n"
+
+
+def _apply_registry_intent(raw_intent: str) -> IntentLabel | None:
+    """LLM 输出命中运营注册表意图 → 按域落代表叶子。
+
+    两级路由按 (五域, 交易性质) 分流, 注册表意图尚无专属工具/槽位, 域代表
+    叶子即其真实路由语义; 影子状态只记命中日志与指标, 不进路由索引。
+    """
+    from lumio.shared.intent_registry import RegistryState, get_registry
+    from lumio.shared.intent_taxonomy import IntentDomain, domain_representative
+
+    entry = get_registry().get(raw_intent)
+    if entry is None or entry.state not in (RegistryState.SHADOW, RegistryState.ACTIVE):
+        return None
+    try:
+        rep = domain_representative(IntentDomain(entry.domain))
+    except (ValueError, KeyError):
+        return None
+    is_shadow = entry.state == RegistryState.SHADOW
+    get_registry().record_hit(entry.slug, shadow=is_shadow)
+    from lumio.shared.metrics import INTENT_REGISTRY_HITS
+
+    INTENT_REGISTRY_HITS.labels(slug=entry.slug, state=entry.state).inc()
+    if is_shadow:
+        logger.info(
+            "[影子命中] %s (%s) domain=%s conf 待上层记录 — 仅观察不影响路由",
+            entry.slug,
+            entry.name_zh,
+            entry.domain,
+        )
+    else:
+        logger.info(
+            "[注册表意图] %s (%s) domain=%s → 叶子 %s",
+            entry.slug,
+            entry.name_zh,
+            entry.domain,
+            rep.value,
+        )
+    return rep
 
 
 class RuleClassifier:
@@ -521,10 +734,12 @@ class RuleClassifier:
                     best_intent = rule["intent"]
                     best_confidence = rule_confidence
 
+        alt_labels, alt_scores = _collect_alternatives(hits, best_intent)
         return IntentResult(
             primary_intent=best_intent,
             primary_confidence=best_confidence,
-            alternatives=_collect_alternatives(hits, best_intent),
+            alternatives=alt_labels,
+            alternative_scores=alt_scores,
         )
 
 
@@ -579,7 +794,7 @@ class LLMClassifier:
             timeout = llm_settings.classify_timeout
             result = await asyncio.wait_for(
                 self._llm.classify(
-                    system_prompt=_CLASSIFY_SYSTEM_PROMPT,
+                    system_prompt=build_classify_system_prompt(),
                     user_input=text,
                     timeout=timeout,
                 ),
@@ -593,13 +808,24 @@ class LLMClassifier:
             logger.warning("LLM 分类调用失败/超时(≤%.1fs)，上抛交 Fast Path 兜底", llm_settings.classify_timeout)
             raise
 
-        intent_label = _parse_intent(result.get("intent", ""))
+        # 运营注册表意图优先: 命中影子/生效条目时按域落代表叶子 (未命中走枚举解析)
+        intent_label = _apply_registry_intent(str(result.get("intent", "")))
+        if intent_label is None:
+            intent_label = _parse_intent(result.get("intent", ""))
         confidence = result.get("confidence", 0.0)
         entities = _parse_entities(result.get("entities", []))
         sentiment = _parse_sentiment(result.get("sentiment", ""))
+        # 单次结构化裁决: 同一次调用顺带输出 业务/闲聊/噪声 判定, 噪声门直接复用
+        # (此前需第二次独立仲裁 LLM 调用, 弱证据输入整轮 10s 中一半花在这)
+        raw_input_class = str(result.get("input_class") or "").strip().lower()
+        input_class = raw_input_class if raw_input_class in ("business", "chitchat", "noise") else None
 
         parsed = (
-            IntentResult(primary_intent=intent_label, primary_confidence=confidence),
+            IntentResult(
+                primary_intent=intent_label,
+                primary_confidence=confidence,
+                llm_input_class=input_class,
+            ),
             entities,
             sentiment,
         )
@@ -716,7 +942,7 @@ class IntentClassifier:
         text: str,
         history: list[dict[str, str]] | None = None,
     ) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
-        """执行双通道分类
+        """执行双通道分类 (公共入口: 出口处统一做闲聊/噪声置信封顶)
 
         Args:
             text: 用户输入文本
@@ -725,6 +951,45 @@ class IntentClassifier:
         Returns:
             (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback"|"bert:lowconf")
         """
+        _t_start = time.monotonic()
+        intent_result, entities, sentiment, source = await self._classify_impl(text, history)
+        # 闲聊/噪声置信封顶 (会话 8700a2ea): 无论快慢路径, NB_CHITCHAT/NB_NOISE 的
+        # primary_confidence 一律压到 _NONBUSINESS_CONF_CAP — LLM 自评通胀的 0.7+
+        # 会跳过低置信护栏。fast_conf 不动 (保留原始分歧证据)。
+        if (
+            intent_result.primary_intent in _NONBUSINESS_CAP_INTENTS
+            and intent_result.primary_confidence > _NONBUSINESS_CONF_CAP
+        ):
+            logger.debug(
+                "闲聊/噪声置信封顶: %s@%.2f → %.2f (text=%r)",
+                intent_result.primary_intent.value,
+                intent_result.primary_confidence,
+                _NONBUSINESS_CONF_CAP,
+                text[:20],
+            )
+            intent_result.primary_confidence = _NONBUSINESS_CONF_CAP
+        # 分类状态随结果透传 (意图体系拆分·路由层): 区分 真识别(bert/vector/llm/rule)
+        # 与 弱识别/兜底(fallback/bert:lowconf/bert:ood) — 此前兜底轮在审计里被
+        # 记成"识别意图: faq（知识咨询）", faq 四职合一的观感即来源于此。
+        intent_result.classification_source = source
+        # 级联分层埋点 (架构整改 Phase 4): 各层终态计数 + 分层延迟
+        try:
+            from lumio.shared.metrics import INTENT_TIER_LATENCY, INTENT_TIER_REQUESTS
+
+            INTENT_TIER_REQUESTS.labels(source=source).inc()
+            INTENT_TIER_LATENCY.labels(source=source).observe(time.monotonic() - _t_start)
+        except Exception:
+            pass
+        return intent_result, entities, sentiment, source
+
+    async def _classify_impl(
+        self,
+        text: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
+        """双通道分类主体 (classify 的实现, 出口置信封顶在 classify 包装层)"""
+        # ①预处理·乱序纠错 (layer_1 坏例根治): 修正文本进入全部三级分类
+        text = fix_adjacent_typos(text)
         # Fast Path: 优先小 BERT, 否则规则; BERT 异常时回退规则 (打不挂线上)
         fast_source = "rule"
         if self._bert is not None:
@@ -748,6 +1013,31 @@ class IntentClassifier:
             fast_result = self._rule.classify(text)
             self._last_energy = None
 
+        # 规则判定统一上提 (子词豁免 + 后续覆盖判定共用; 纯正则 <1ms, 上提零成本)
+        rule_fast = self._rule.classify(text)
+
+        # Phase 3 · 子词碎片显式出路 (会话 79572c98 复盘): 规则/BERT 都没能高置信
+        # 采纳、且规则层也无意图信号的 ≤2 字裸词 ("信用"@faq0.0/"卡片"/"年费") —
+        # 能量检测原理上分不开 (域内词汇构成, "信用"@-3.71 比真业务句中位能量更
+        # 深), L2 向量会把碎片语义猜测成 faq 种子抬过采纳线 (p4sub E2E 实测),
+        # LLM 慢路径也只会幻觉 faq@0.6x。在向量通道之前短路, 标记 source=subword
+        # 交噪声门确定性拦回澄清, 零 LLM 零检索。
+        # 豁免: 规则置信 ≥0.5 的动作词 ("挂失"@0.56/"投诉"@0.62) 有明确意图信号,
+        # 照走级联; 高置信查询词 ("额度"@0.95) 由上方快路径结果直接采纳。
+        import re as _re_subword
+
+        _stripped_subword = _re_subword.sub(r"[\s，。、；：！？!?,.;:·…～~#@*&%$()（）\"'\-]+", "", text)
+        if len(_stripped_subword) <= 2 and rule_fast.primary_confidence < 0.5:
+            logger.info(
+                "子词碎片短路 (len=%d): intent=%s@%.2f → 噪声门确定性澄清 (text=%r)",
+                len(_stripped_subword),
+                fast_result.primary_intent.value,
+                fast_result.primary_confidence,
+                text[:12],
+            )
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "subword")
+            return fast_result, extract_entities(text), self._rule_sentiment(text), "subword"
+
         # ── L2 向量检索意图 (目标架构 ③: L1 规则 → L2 向量 → L3 LLM) ──
         # L1 未强命中时, 与种子语料余弦检索取意图; 置信不足才落 L3 LLM。
         # BERT 保留为证据信号 (fast_conf/fast_intent 透传审计), 不再单独定路由。
@@ -759,35 +1049,32 @@ class IntentClassifier:
             try:
                 vm = await self._intent_vector.search(text)
                 if vm.matched and vm.score >= get_settings().classification.vector_intent_threshold:
-                    from lumio.shared.intent_taxonomy import IntentDomain, domain_of
+                    from lumio.shared.intent_taxonomy import (
+                        IntentDomain,
+                        domain_of,
+                        domain_of_with_text,
+                        domain_representative,
+                    )
 
                     # L2 判定五域 (骨架第一级); 叶子优先取快路径同域意图 (更精确),
-                    # 否则用域代表叶子, 保证 v2 路由 TrafficClass 与域一致
-                    domain_rep = {
-                        IntentDomain.QUERY: IntentLabel.ACCOUNT_BILL_QUERY,
-                        IntentDomain.TRANSACTION: IntentLabel.CARD_LOSS_REPORT,
-                        IntentDomain.CONSULTING: IntentLabel.FAQ,
-                        IntentDomain.SERVICE: IntentLabel.TRANSFER_AGENT,
-                        IntentDomain.CHITCHAT: IntentLabel.CHITCHAT,
-                    }
+                    # 否则用域代表叶子, 保证两级路由 TrafficClass 与域一致
                     try:
                         v_domain = IntentDomain(vm.intent)
                     except ValueError:
                         v_domain = None
                     if v_domain is None:
                         raise ValueError(f"L2 返回未知域: {vm.intent}")
-                    from lumio.shared.intent_taxonomy import domain_of_with_text
-
                     v_domain = domain_of_with_text(v_domain, text)  # 定义句式强制咨询域
                     if domain_of(fast_result.primary_intent) == v_domain:
                         v_leaf = fast_result.primary_intent
                     else:
-                        v_leaf = domain_rep[v_domain]
+                        v_leaf = domain_representative(v_domain)
                     logger.info("L2 向量域命中: %s@%.3f → 叶子 %s", v_domain.value, vm.score, v_leaf.value)
                     fast_result = IntentResult(
                         primary_intent=v_leaf,
                         primary_confidence=round(min(vm.score, 0.99), 4),
                         alternatives=fast_result.alternatives,
+                        alternative_scores=fast_result.alternative_scores,
                         energy=fast_result.energy,
                         fast_conf=fast_result.primary_confidence,
                         fast_intent=fast_result.primary_intent,
@@ -801,12 +1088,20 @@ class IntentClassifier:
         # 后会经工具编排真执行提额确认链, 违背"办理交官方渠道, 机器人返回办理介绍"。
         # 规则层高置信 (≥0.95) 命中办理词时以规则意图覆盖快路径; 仅覆盖这两个意图,
         # 其余分类零回归。BERT 关闭时 rule==rule 为空操作。
-        rule_fast = self._rule.classify(text)
-        if (
-            fast_result.primary_intent != rule_fast.primary_intent
-            and rule_fast.primary_intent in _APPLY_INTENT_RULE_OVERRIDE
+        # (rule_fast 已在级联头部统一计算)
+        # 同意图置信提升 (闭环挂账: "卡好像被盗了" BERT 判 card_loss@0.5x、规则
+        # 判 0.96 — 意图相同不触发旧覆盖条件, 低置信落 LLM 慢路径 0.76 错过
+        # 直连阈值): 敏感意图规则高置信而快路径置信不足时, 用规则置信 —
+        # 挂失是保护性操作, 规则词面 ("被盗/挂失/找不到了") 足够特异。
+        _rule_override = (
+            rule_fast.primary_intent in _APPLY_INTENT_RULE_OVERRIDE
             and rule_fast.primary_confidence >= _APPLY_OVERRIDE_CONF
-        ):
+            and (
+                fast_result.primary_intent != rule_fast.primary_intent
+                or fast_result.primary_confidence < 0.8
+            )
+        )
+        if _rule_override:
             logger.info(
                 "办理词规则覆盖快路径: %s@%.2f -> %s@%.2f (text=%r)",
                 fast_result.primary_intent.value,
@@ -819,6 +1114,7 @@ class IntentClassifier:
                 primary_intent=rule_fast.primary_intent,
                 primary_confidence=rule_fast.primary_confidence,
                 alternatives=fast_result.alternatives,
+                alternative_scores=fast_result.alternative_scores,
                 energy=fast_result.energy,
                 # 审计留痕: 保留 BERT 原始判定, 事后可查"哪一路在幻觉"
                 fast_conf=fast_result.primary_confidence,
@@ -826,7 +1122,40 @@ class IntentClassifier:
             )
             fast_source = "rule"
 
-        if fast_result.primary_confidence >= self._threshold:
+        # 查询类意图规则覆盖 (一小时模拟 badcase 根治: "帮我查一下信用卡账单"被 BERT
+        # 判 faq → 知识链被能力边界红线拦截, 实际应走查询直达 工具直查; L3 LLM 分类在
+        # 负载下 6s 超时后兜底 BERT, 误判被放大)。规则是人工维护的确定性关键词,
+        # 查询意图高置信命中且句式无咨询标记 (怎么/为什么/规则/手续费…) 时比 BERT
+        # 可靠 —— 与 _APPLY_INTENT_RULE_OVERRIDE 同型, 仅覆盖查询意图, 咨询句零回归。
+        if (
+            fast_result.primary_intent != rule_fast.primary_intent
+            and rule_fast.primary_confidence >= 0.8
+            and normalize_intent(rule_fast.primary_intent.value) in _QUERY_INTENT_OVERRIDES
+            and (
+                not any(m in text for m in _CONSULTIVE_MARKERS)
+                or any(a in text for a in _STRONG_QUERY_ACTIONS)
+            )
+        ):
+            logger.info(
+                "查询词规则覆盖快路径: %s@%.2f -> %s@%.2f (text=%r)",
+                fast_result.primary_intent.value,
+                fast_result.primary_confidence,
+                rule_fast.primary_intent.value,
+                rule_fast.primary_confidence,
+                text[:30],
+            )
+            fast_result = IntentResult(
+                primary_intent=rule_fast.primary_intent,
+                primary_confidence=rule_fast.primary_confidence,
+                alternatives=fast_result.alternatives,
+                alternative_scores=fast_result.alternative_scores,
+                energy=fast_result.energy,
+                fast_conf=fast_result.primary_confidence,
+                fast_intent=fast_result.primary_intent,
+            )
+            fast_source = "rule:query"
+
+        if fast_result.primary_confidence >= _fast_accept_threshold(fast_result.primary_intent, self._threshold):
             logger.debug(
                 "Fast Path 命中: intent=%s, confidence=%.2f, source=%s",
                 fast_result.primary_intent.value,
@@ -853,6 +1182,31 @@ class IntentClassifier:
             )
             await self._emit_sample(text, fast_source, fast_result, fast_result, "bert:lowconf")
             return fast_result, extract_entities(text), self._rule_sentiment(text), "bert:lowconf"
+
+        # P0 闲聊/噪声 OOD 短路 (会话 22ad 复盘: BERT 已判 chitchat@0.4x, LLM 慢路径
+        # 6.4s 复核出同一个结论, 且因"慢不优于快"最终采纳的还是快路径答案 — 6.4s 纯
+        # 浪费). 双信号同向才短路: BERT 主意图是闲聊/噪声 且 energy-OOD 判 "unknown"
+        # (分布外)。业务意图即使 unknown 仍走 LLM (可能是新意图/长尾问法, 不能误杀)。
+        if (
+            fast_source == "bert"
+            and fast_result.primary_intent in _NONBUSINESS_CAP_INTENTS
+            and fast_result.energy is not None
+            and ood_verdict(
+                fast_result.energy,
+                get_settings().classification.ood_energy_threshold,
+                get_settings().classification.ood_ambiguous_band,
+            )
+            == "unknown"
+        ):
+            logger.info(
+                "闲聊/噪声 OOD 短路慢路径: intent=%s@%.2f energy=%.2f → 免 LLM 复核 (text=%r)",
+                fast_result.primary_intent.value,
+                fast_result.primary_confidence,
+                fast_result.energy,
+                text[:20],
+            )
+            await self._emit_sample(text, fast_source, fast_result, fast_result, "bert:ood")
+            return fast_result, extract_entities(text), self._rule_sentiment(text), "bert:ood"
 
         # Slow Path
         if self._llm is None:
@@ -897,12 +1251,21 @@ class IntentClassifier:
             )
             await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")
             fast_result.energy = self._last_energy
+            # 单次裁决完整性 (会话 79572c98 复盘): 慢路径 LLM 已付代价跑完并给出
+            # 业务/闲聊/噪声判定, 回退快路径意图时裁决结论必须随行 — 否则噪声门
+            # 见不到 llm_input_class, 对同一输入再打一次仲裁 LLM (6.5s+6.3s 双花)。
+            fast_result.llm_input_class = llm_result.llm_input_class
             return fast_result, extract_entities(text), SentimentLabel.NEUTRAL, "fallback"
 
         # LLM 结果置信度也很低时，标记来源为 fallback
         source = "llm" if llm_result.primary_confidence >= 0.3 else "fallback"
         await self._emit_sample(text, fast_source, fast_result, llm_result, source)
         llm_result.energy = self._last_energy  # 快路径 energy 随慢路径结果一起透传
+        # 次选意图继承: LLM 慢路径只出主意图, 快路径 (BERT top-K) 的带分数次选
+        # 随结果透传 — 路由层的混合句判定 (闲聊短路放行) 依赖次选分数加权。
+        if not llm_result.alternatives and fast_result.alternatives:
+            llm_result.alternatives = fast_result.alternatives
+            llm_result.alternative_scores = fast_result.alternative_scores
         # P0 快慢分歧信号: 慢路径覆盖快路径时保留快路径意图/置信, 供下游噪声闸与
         # 转人工派发门判"两路分歧" -- 慢路径对乱码的自评置信会稳定通胀(会话 e33d1fa8:
         # BERT limit_query@0.39 -> LLM bill_query@0.7), 最终置信单项不可信.

@@ -83,63 +83,63 @@ class TestModelRegistry:
     def test_register_canary_promote_rollback(self, tmp_path: Path) -> None:
         reg = ModelRegistry(state_path=str(tmp_path / "registry.json"))
 
-        # v1 先作为基线 promote 到 active, 回滚才有目标
+        # 基线版本先 promote 到 active, 回滚才有目标
         def gates_ok():
             return [{"name": "golden", "passed": True}]
 
-        reg.register("v1", "data/intent_classification/base", notes="基线")
-        reg.set_canary("v1", traffic=1.0)
+        reg.register("1.0", "data/intent_classification/base", notes="基线")
+        reg.set_canary("1.0", traffic=1.0)
         assert reg.promote(gate_runner=gates_ok)[0] is True
-        assert reg._active == "v1"
-        assert reg.compose_classifier_path("fallback") != "fallback"  # v1 生效
+        assert reg._active == "1.0"
+        assert reg.compose_classifier_path("fallback") != "fallback"  # 版本生效
 
-        reg.register("v2", "data/intent_classification/v2", notes="回流后")
-        reg.set_canary("v2", traffic=0.5)
-        assert reg._canary == "v2" and reg._canary_traffic == 0.5
+        reg.register("2.0", "data/intent_classification/2.0", notes="回流后")
+        reg.set_canary("2.0", traffic=0.5)
+        assert reg._canary == "2.0" and reg._canary_traffic == 0.5
 
         # 门全 PASS → promote
         ok, report = reg.promote(gate_runner=gates_ok)
         assert ok is True
-        assert reg._active == "v2"
+        assert reg._active == "2.0"
         assert reg._canary is None
         assert reg._canary_traffic == 0.0
-        # v2 路径生效
-        assert reg.compose_classifier_path("fallback").endswith("v2")
+        # 新版本路径生效
+        assert reg.compose_classifier_path("fallback").endswith("2.0")
 
         # 回滚
-        assert reg.rollback() == "v1"
-        assert reg._active == "v1"
+        assert reg.rollback() == "1.0"
+        assert reg._active == "1.0"
 
     def test_promote_rejected_when_gate_fails(self, tmp_path: Path) -> None:
         reg = ModelRegistry(state_path=str(tmp_path / "r.json"))
-        reg.register("v1", "base")
-        reg.set_canary("v1")
+        reg.register("1.0", "base")
+        reg.set_canary("1.0")
         ok, report = reg.promote(gate_runner=lambda: [{"name": "golden", "passed": False}])
         assert ok is False
         assert reg._active is None  # 未设 active
 
     def test_promote_requires_gates_by_default(self, tmp_path: Path) -> None:
         reg = ModelRegistry(state_path=str(tmp_path / "r.json"), allow_ungated=False)
-        reg.register("v1", "base")
-        reg.set_canary("v1")
+        reg.register("1.0", "base")
+        reg.set_canary("1.0")
         ok, _ = reg.promote(gate_runner=None)
         assert ok is False
 
     def test_persistence_roundtrip(self, tmp_path: Path) -> None:
         state = str(tmp_path / "r.json")
         reg = ModelRegistry(state_path=state)
-        reg.register("v1", "base")
-        reg.set_canary("v1", traffic=0.3)
+        reg.register("1.0", "base")
+        reg.set_canary("1.0", traffic=0.3)
         reg.save()
         reg2 = ModelRegistry(state_path=state)
-        assert reg2._canary == "v1"
+        assert reg2._canary == "1.0"
         assert reg2._canary_traffic == 0.3
 
     def test_duplicate_register_raises(self, tmp_path: Path) -> None:
         reg = ModelRegistry(state_path=str(tmp_path / "r.json"))
-        reg.register("v1", "base")
+        reg.register("1.0", "base")
         with pytest.raises(ValueError):
-            reg.register("v1", "other")
+            reg.register("1.0", "other")
 
 
 # ── 样本回流 ────────────────────────────────────────────────────────────────
@@ -196,9 +196,9 @@ class TestSampleBackflow:
         assert cands == []
 
     def test_dedup_by_text_intent(self) -> None:
-        s1, v1 = self._classification_failure("重复问法", "a")
-        s2, v2 = self._classification_failure("重复问法", "b")
-        cands = select_candidates([(s1, v1), (s2, v2)], max_n=10)
+        s1, c1 = self._classification_failure("重复问法", "a")
+        s2, c2 = self._classification_failure("重复问法", "b")
+        cands = select_candidates([(s1, c1), (s2, c2)], max_n=10)
         assert len(cands) == 1
         assert cands[0].sample_id == "a"
 

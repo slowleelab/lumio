@@ -20,7 +20,8 @@ class TestConfigDefaults:
         assert m.progressive_disclosure_enabled is False
         assert m.pd_confidence_threshold == 0.7
 
-    def test_default_intent_tool_map_covers_five_query_intents(self) -> None:
+    def test_default_intent_tool_map_covers_query_intents_and_card_loss(self) -> None:
+        """五类查询意图 + card_loss (高置信直连, 挂失链跳过 LLM 编排)"""
         m = MCPSettings()
         assert set(m.intent_tool_map) == {
             "bill_query",
@@ -28,6 +29,7 @@ class TestConfigDefaults:
             "limit_query",
             "installment_inquiry",
             "reward_query",
+            "card_loss",
         }
         # 每个意图都有非空工具子集
         assert all(tools for tools in m.intent_tool_map.values())

@@ -405,6 +405,10 @@ class IntentResult(BaseModel):
     primary_intent: IntentLabel
     primary_confidence: float
     alternatives: list[IntentLabel] = Field(default_factory=list)
+    # 次选意图分数 (与 alternatives 按下标对齐)。会话 22ad 复盘: 次选只带标签不带
+    # 分数, 路由策略只能"有业务次选就放行" — LLM/BERT 的对冲性弱次选 (softmax 第
+    # 二三名, 常 <0.3) 也能挡掉闲聊短路。空列表 = 无分数, 调用方按保守语义处理。
+    alternative_scores: list[float] = Field(default_factory=list)
     # P1: 本次分类的 energy-OOD 分 (-logsumexp). 随本对象按次透传给上层噪声闸,
     # 避免各 session 并发时共享 classifier._last_energy 造成跨会话串线.
     energy: float | None = Field(default=None, exclude=True)
@@ -413,6 +417,14 @@ class IntentResult(BaseModel):
     # 而快路径只给 limit_query@0.39, 见会话 e33d1fa8). None = 无慢路径覆盖.
     fast_conf: float | None = Field(default=None, exclude=True)
     fast_intent: IntentLabel | None = Field(default=None, exclude=True)
+    # 单次结构化裁决 (架构整改): LLM 慢路径分类与"业务/闲聊/噪声"仲裁合并为同一次
+    # 调用, 此字段即仲裁结论 ("business"|"chitchat"|"noise"). None = 本次结果未经
+    # LLM 慢路径 (快路径短路/慢路径失败兜底), 噪声门需要仲裁时再独立调用兜底。
+    llm_input_class: str | None = Field(default=None, exclude=True)
+    # 分类状态 (意图体系拆分·路由层): "bert"|"vector"|"rule"|"rule:query"|"llm" =
+    # 真识别; "fallback"|"bert:lowconf"|"bert:ood" = 弱识别/兜底; None = 分类器
+    # 异常未识别。兜底轮的 faq 标签是存储兼容残差, 不代表"识别为知识咨询"。
+    classification_source: str | None = Field(default=None, exclude=True)
 
 
 class SentimentResult(BaseModel):
@@ -522,6 +534,33 @@ class SlotValue(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class TopicRequestStatus(StrEnum):
+    """会话内诉求生命周期 (多轮会话管理, 2026-09-04)
+
+    断档/带偏同根源根治: 系统此前没有"客户有哪些进行中诉求"的表示 —
+    挂失说了没办完, 切话题后诉求蒸发 (断档); 旧话题又过度影响新轮
+    判定 (带偏)。诉求跟踪器让两边都有显式状态可依。
+    """
+
+    OPEN = "open"  # 已提出, 未开始处理
+    WAITING_INFO = "waiting_info"  # 处理中, 等客户补参数/确认
+    FULFILLED = "fulfilled"  # 已办结 (工具执行/知识回答完成)
+    DROPPED = "dropped"  # 客户明确放弃 / 会话结束
+
+
+class TopicRequest(BaseModel):
+    """进行中的客户诉求 (会话级, 跨轮持久)"""
+
+    id: str
+    intent: str  # IntentLabel value
+    label_zh: str  # 回访话术用中文名 ("挂失")
+    urgency: str = "normal"  # high: 挂失/投诉/转人工域 → 切话题后回访
+    status: TopicRequestStatus = TopicRequestStatus.OPEN
+    raised_turn: int = 0
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    revisit_count: int = 0  # 回访次数 (防骚扰上限)
+
+
 class SessionState(BaseModel):
     """会话状态对象
 
@@ -565,6 +604,10 @@ class SessionState(BaseModel):
     # 结构: {"intent": "installment_inquiry", "slots": [("amount","分期金额"), ...]}
     # 只存槽名/标签等元信息, 不含敏感值; 下轮放行/正常流转后整体覆写清空。
     awaiting_slots: dict[str, Any] = Field(default_factory=dict)
+
+    # 进行中诉求 (多轮会话管理): 客户已表达且未办结/未放弃的诉求清单,
+    # 每轮按意图 upsert、按回复来源流转状态; 高紧急未办结诉求切话题后回访
+    active_requests: list[TopicRequest] = Field(default_factory=list)
 
     # 对话摘要压缩（长对话场景）
     conversation_summary: str = ""  # 被裁剪轮次的摘要

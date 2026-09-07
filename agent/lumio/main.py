@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from contextlib import asynccontextmanager
@@ -194,6 +195,27 @@ _COMMON_CLOSE_STEPS = [
 # 机器人服务启动/关闭步骤 = 公共步骤 + Bot 专有步骤
 # R1 第三轮修复: 之前用 _COMMON_INIT_STEPS[:10] 切片, 漏掉 init_classifier(第11位)
 # 和 _safe_init_global_factory(第12位), 且单独追加 init_session_manager 导致重复初始化 2 次.
+_qa_backfill_tasks: set[asyncio.Task] = set()
+
+
+async def init_qa_verdict_backfill(app: FastAPI) -> None:
+    """qa_scan 存量 Redis 判定 → quality_record 一次性回填 (后台, 幂等)
+
+    判定此前只存 Redis (30 天 TTL); 质检记录列表要求"每一个会话都纳入",
+    启动时把升级窗口内已有的判定在 TTL 过期前补进 DB。
+    """
+    from lumio.services.common import quality_scan
+
+    sf = getattr(app.state, "db_session_factory", None)
+    redis_client = getattr(app.state, "redis_client", None)
+    if sf is None or redis_client is None:
+        return
+
+    task = asyncio.create_task(quality_scan.backfill_redis_verdicts(sf, redis_client))
+    _qa_backfill_tasks.add(task)
+    task.add_done_callback(_qa_backfill_tasks.discard)
+
+
 _BOT_INIT_STEPS = [
     *_COMMON_INIT_STEPS,  # 全量 14 步 (init_db ... 全局 redis)
     init_health_monitor,
@@ -207,6 +229,8 @@ _BOT_INIT_STEPS = [
     start_gdpr_worker_step,
     # P0-6 第三轮修复: 告警规则接线 (LLM 错误率/预算超限 → P0/P1 告警)
     build_alert_rules_step,
+    # 质检记录全量纳入: 存量 Redis 判定回填 (幂等, 后台)
+    init_qa_verdict_backfill,
 ]
 
 _BOT_CLOSE_STEPS = [

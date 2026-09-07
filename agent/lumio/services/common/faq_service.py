@@ -22,6 +22,7 @@ import redis.asyncio as aioredis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from lumio.shared.lexicon import lexicon_values as _lex
 from lumio.shared.orm_models import KbFaq, KbFaqSearchLog
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,16 @@ def _normalize_query(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).lower()
     # Python re 不支持 \p{P}: 显式枚举空白 + ASCII 标点 + CJK 标点区
     text = re.sub(r"[\s\u3000-\u303f\uff00-\uffef!-/:-@\[-`{-~]+", "", text)
-    return text
+    # 尾部语气词剥离 (qa_scan 第四轮: "积分怎么兑换礼品啊"≠变体"积分怎么兑换礼品",
+    # exact 击穿落到慢路径): 只剥句尾单字语气词且最多两层, "丢了"类的"了"不在表中
+    for _ in range(2):
+        text = re.sub(r"(啊|呢|吧|呀|嘛|哦|哈|啦)$", "", text)
+    # 首部礼貌/填充前缀剥离 (第十二轮模拟: 变体全部带随机前缀 "请问一下/那个/
+    # 麻烦/我想问下", FAQ exact 全线击穿落到 reward_query 工具链答有效期)。
+    # 只剥开头连续前缀词 (≤3 层), 业务句本身不受影响。
+    for _ in range(3):
+        text = re.sub(r"^(请问一下|请问|麻烦|那个|我想问下|我想问|帮我看看|请问您)", "", text)
+    return text.strip()
 
 
 def _cache_key(query: str) -> str:
@@ -47,6 +57,149 @@ def _cache_key(query: str) -> str:
     normalized = _normalize_query(query)
     h = hashlib.md5(normalized.encode()).hexdigest()
     return f"{_FAQ_CACHE_PREFIX}:{h}"
+
+
+# ── FAQ BM25 通道 (范式升级, 2026-09-04 用户批评成立: 逐词表范式脆弱) ──
+# exact 归一化匹配对自然语言变体结构性脆弱 (前缀/语气/同义词/词序每种都要
+# 人工补); BM25+IDF 是 60 年信息检索验证的机制: 高频礼貌前缀 IDF 极低天然
+# 消解, 业务词共现决定排序。exact 降级为快路径缓存, BM25 成为主力。
+_FAQ_ES_INDEX = "lumio_faq_index"
+
+
+async def _ensure_faq_es_index(es_client: Any) -> None:
+    """FAQ BM25 索引 (懒建): content=问题文本(主问题+变体逐条), doc_id=faq uuid"""
+    try:
+        if not await es_client.indices.exists(index=_FAQ_ES_INDEX):
+            await es_client.indices.create(
+                index=_FAQ_ES_INDEX,
+                mappings={
+                    "properties": {
+                        "content": {"type": "text", "analyzer": "ik_max_word"},
+                        "doc_id": {"type": "keyword"},
+                        "category": {"type": "keyword"},
+                    }
+                },
+            )
+    except Exception as exc:
+        logger.debug("FAQ ES 索引创建失败(复用已有): %s", exc)
+
+
+async def _index_faq_to_es(es_client: Any, faq: KbFaq) -> int:
+    """主问题+变体逐条写入 ES (BM25 检索面); 返回写入条数"""
+    if es_client is None:
+        return 0
+    await _ensure_faq_es_index(es_client)
+    # 逐条 index (bulk action 元数据在本 client 版本下解析异常, 逐条足够: FAQ ≤ 百级)
+    written = 0
+    for i, q in enumerate([faq.question, *(faq.variant_questions or [])]):
+        if not q:
+            continue
+        try:
+            await es_client.index(
+                index=_FAQ_ES_INDEX, id=f"{faq.id}#{i}", document={"content": q, "doc_id": str(faq.id), "category": faq.category or ""}, refresh="wait_for"
+            )
+            written += 1
+        except Exception as exc:
+            logger.warning("FAQ 写入 ES 失败(BM25 通道降级): %s", exc)
+            return written
+    return written
+
+
+# BM25 覆盖门停用词: 礼貌前缀/疑问衬字/单字 — 不计入"主体词" (分词后过滤)
+_BM25_STOP_TOKENS = frozenset(
+    "的 了 是 有 我 你 他 她 它 们 在 和 与 就 都 也 很 请 请问 请教 一下 那个 这个 "
+    "怎么 怎样 如何 什么 为什么 哪 哪个 哪些 吗 呢 吧 啊 呀 哈 嘛 哦 嗯 呗 罢 了 "
+    "能 可以 会 要 想 没 不 还 又 再 说 问 查 帮 麻烦 您 你们 我们 他们".split()
+)
+
+
+async def _query_key_terms(es_client: Any, query: str) -> list[str] | None:
+    """IK 分词取查询主体词 (停用词滤除)。_analyze 不可用返回 None → 覆盖门跳过。"""
+    try:
+        resp = await es_client.indices.analyze(index=_FAQ_ES_INDEX, body={"analyzer": "ik_smart", "text": query})
+        tokens = [
+            t["token"].strip()
+            for t in resp.get("tokens", [])
+            if len(t.get("token", "").strip()) >= 2 and t["token"].strip() not in _BM25_STOP_TOKENS
+        ]
+        return list(dict.fromkeys(tokens)) or None
+    except Exception:
+        return None
+
+
+def _bm25_coverage_ok(key_terms: list[str] | None, hit_text: str, min_terms: int = 2, min_ratio: float = 0.5) -> bool:
+    """主体词覆盖门: 命中文档须实际包含查询的主体词 (单词共现不算命中)。
+
+    会话 sf2 复盘: "信用卡逾期了会有什么后果"仅凭"信用卡"一词命中"信用卡年费
+    是多少？"@7.74 (短文档 BM25 长度归一化放大单词命中, 高分段又豁免区分度
+    检查) — 直出了年费标准表。门规: 主体词 ≥2 个时须命中 ≥min_terms 个且
+    覆盖率 ≥min_ratio; 主体词 <2 (本身即单词问句) 不拦, 交既有分数门。
+    """
+    if not key_terms or len(key_terms) < 2:
+        return True
+    hit = sum(1 for t in key_terms if t in hit_text)
+    return hit >= min_terms and hit / len(key_terms) >= min_ratio
+
+
+async def _bm25_faq_match(
+    es_client: Any, query: str, min_score: float = 3.5, margin: float = 1.3
+) -> tuple[str | None, float]:
+    """BM25 词法检索 FAQ (变体免疫主力通道)
+
+    Returns: (faq_id, score) — 未命中返回 (None, 0)。
+    门槛三保险 (暴力集实测校准, 零自研词表):
+    - min_score 绝对分门槛: BM25 的 IDF 已把高频礼貌前缀权重压到极低,
+      业务词共现决定分数 — 真命中 3.7~9.5, 无关句 <1。不用 msm (词覆盖率
+      要求把前缀算进分母, 叠加变体「请问一下哈那个积分咋兑换礼品呢」被误杀)
+    - margin 跨 FAQ 区分度: 与不同 FAQ 次名分数比 ≥1.3 (同 FAQ 变体竞争不拦)
+    - coverage 主体词覆盖门: 高分段单词共现 (仅"信用卡"即 7.74) 不再直出
+    """
+    if es_client is None or not query.strip():
+        return None, 0.0
+    try:
+        resp = await es_client.search(
+            index=_FAQ_ES_INDEX,
+            body={
+                "query": {"match": {"content": {"query": query}}},
+                "size": 3,
+                "_source": ["doc_id", "content"],
+            },
+        )
+        hits = resp["hits"]["hits"]
+        if not hits:
+            return None, 0.0
+        top = hits[0]
+        if float(top["_score"]) < min_score:
+            return None, 0.0
+        # 主体词覆盖门: 单词共现的高分假命中拦下 (sf2: 逾期问题→年费答案)
+        key_terms = await _query_key_terms(es_client, query)
+        if not _bm25_coverage_ok(key_terms, str(top["_source"].get("content") or "")):
+            logger.info(
+                "FAQ BM25 覆盖门拦截 (主体词共现不足): query=%r hit=%r terms=%s",
+                query[:24],
+                str(top["_source"].get("content") or "")[:24],
+                key_terms,
+            )
+            return None, 0.0
+        # 区分度判别: 比较对象是"不同 FAQ"的次名 — 同一 FAQ 的多条变体
+        # (doc_id 相同) 分数接近恰恰说明命中一致, 不参与 margin (暴力测试实证:
+        # "那个 积分怎么兑换" top1/top2 为同 FAQ 变体 4.95/4.52 曾被误拦)
+        # margin 只对边缘区间 (<6.0) 启用: 高分命中已有足量业务词共现, 次名同量级
+        # 多因通用词共现 ("信用卡怎么"让年费 FAQ 得 7.7 分) — 实测 "信用卡怎么挂失"
+        # 8.09/7.74 被误拦; 低分边缘才是真歧义区
+        strong_threshold = 6.0
+        rival = next((h for h in hits[1:] if h["_source"]["doc_id"] != top["_source"]["doc_id"]), None)
+        if (
+            float(top["_score"]) < strong_threshold
+            and rival is not None
+            and rival["_score"] > 0
+            and top["_score"] / rival["_score"] < margin
+        ):
+            return None, 0.0
+        return top["_source"]["doc_id"], float(top["_score"])
+    except Exception as exc:
+        logger.debug("FAQ BM25 检索失败(通道降级): %s", exc)
+        return None, 0.0
 
 
 # ── CRUD ──
@@ -376,16 +529,48 @@ async def check_faq_duplicate(
 # ── 检索 ──
 
 
+# 个人查询诉求标记 (qa_scan 第五轮: "我的额度是什么"被"分期占用额度吗?"语义截胡 —
+# mxbai 对共享话题词的短句区分度不足, "额度"二字让两个不同意图的问句余弦>0.85)。
+# 语义命中是"猜测" (exact 是查表): 带个人数据诉求的 query 永远不该被概念型 FAQ
+# 答案截胡, 放行走分类→查询链。exact 路不受影响 (精确变体 = 已知问法)。
+_PERSONAL_QUERY_MARKERS = _lex("personal_query_markers")
+
+# 通用 bigram: 几乎所有信用卡 query 都共享, 不构成"词面支撑"证据
+_FAQ_GENERIC_GRAMS = frozenset(_lex("faq_generic_grams"))  # 信用/用卡: "信用卡"的跨词 bigram, 不构成证据
+
+
+def _shares_informative_gram(query: str, question: str) -> bool:
+    """query 与命中 FAQ 问题是否共享至少一个信息性词块
+
+    mxbai 语义分数不稳定 (2026-09-03 实测: 同对"逾期影响 vs 丢失怎么办"昨天
+    miss <0.85 / 今天 0.92, 多次后端重启后漂移) — 语义命中必须有词面支撑:
+    共享任一非通用 CJK 2-gram / ≥2 字符数字词才放行, 否则视为嵌入噪声放行走
+    常规流程。query 无可判词块时不拦 (与 RAG 词法重叠门同约定)。
+    """
+    from lumio.services.common.retrieval import _query_grams
+
+    grams = _query_grams(query) - _FAQ_GENERIC_GRAMS
+    if not grams:
+        return True
+    return any(g in question for g in grams)
+
+
 async def search_faq(
     query: str,
     redis_client: aioredis.Redis | None,
     embedding_provider: Any = None,
     milvus_collection: Any = None,
+    es_client: Any = None,
     *,
     user_role: str | None = None,
     card_type: str | None = None,
     top_k: int = 5,
-    min_score: float = 0.75,
+    # 语义命中双门槛 (第三轮模拟 P0: mxbai 本地对中文短句区分度不足 — 同义对
+    # 0.556 / 无关对 0.648 信号倒挂, 单一 0.75 阈值让任何查询都命中 top1 FAQ,
+    # 全部流量被 FAQ 直出劫持)。高分 + 与次名显著拉开间隔才判语义命中;
+    # 同义问法主要由 question/variants 的归一化精确匹配承接。
+    min_score: float = 0.85,
+    min_margin: float = 0.04,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     session_id: str | None = None,
 ) -> dict:
@@ -417,6 +602,39 @@ async def search_faq(
                     await _log_search(session_factory, query, "exact", faq_data.get("id"), 1.0, user_role, session_id)
                     return {"match_type": "exact", "results": [faq_data]}
 
+    # 1b. BM25 词法检索 (主力通道, 2026-09-04 范式升级): exact 是快路径缓存,
+    # 变体 (前缀/语气/同义词/词序) 全部由 BM25+IDF 承接 — 高频礼貌词权重
+    # 天然消解, 业务词共现决定排序。命中回查 PG 拿标准答案。
+    if es_client is not None and not any(m in query for m in _PERSONAL_QUERY_MARKERS):
+        # 个人查询防截胡 (与语义路同纪律, 重放实测: "我的信用卡额度是多少"被 BM25
+        # 命中年费 FAQ@13.1 — 个人账户数据诉求不应被概念型 FAQ 截胡)
+        faq_id_bm25, bm25_score = await _bm25_faq_match(es_client, query)
+        if faq_id_bm25:
+            from sqlalchemy import select as _select
+
+            if session_factory is not None:
+                try:
+                    async with session_factory() as _db:
+                        row = (
+                            await _db.execute(_select(KbFaq).where(KbFaq.id == _coerce_faq_id(faq_id_bm25)))
+                        ).scalar_one_or_none()
+                    if row is not None:
+                        faq_data = {
+                            "id": str(row.id),
+                            "question": row.question,
+                            "answer": row.answer,
+                            "category": row.category,
+                            "card_types": row.card_types,
+                            "allowed_roles": row.allowed_roles,
+                        }
+                        if not (user_role and faq_data.get("allowed_roles") and user_role not in faq_data["allowed_roles"]):
+                            await _log_search(
+                                session_factory, query, "bm25", faq_data["id"], bm25_score, user_role, session_id
+                            )
+                            return {"match_type": "bm25", "results": [faq_data]}
+                except Exception as exc:
+                    logger.debug("BM25 命中回查失败(降级语义路): %s", exc)
+
     # 2. 语义匹配
     if embedding_provider and milvus_collection:
         try:
@@ -440,6 +658,17 @@ async def search_faq(
 
                 if hit.score < min_score:
                     continue  # 低分 nearest 不是"命中", 闲聊/离题必须放行走常规流程
+                # 间隔判别: top1 与 top2 分数接近 = 嵌入无法区分语义, 放行走常规流程
+                if len(results[0]) > 1:
+                    second = results[0][1].score
+                    if hit.score - second < min_margin:
+                        logger.info(
+                            "FAQ 语义间隔不足放行: q=%r top1=%.3f top2=%.3f",
+                            query[:24],
+                            hit.score,
+                            second,
+                        )
+                        return {"match_type": "miss", "results": []}
                 faq_results.append(
                     {
                         "faq_id": entity.get("chunk_id", ""),
@@ -452,6 +681,21 @@ async def search_faq(
                 if len(faq_results) >= top_k:
                     break
 
+            if faq_results and not _shares_informative_gram(query, str(faq_results[0].get("question") or "")):
+                logger.info(
+                    "FAQ 语义命中无词面支撑, 判嵌入噪声放行: q=%r top=%r score=%.3f",
+                    query[:24],
+                    str(faq_results[0].get("question") or "")[:24],
+                    faq_results[0].get("score", 0.0),
+                )
+                return {"match_type": "miss", "results": []}
+            if faq_results and any(m in query for m in _PERSONAL_QUERY_MARKERS):
+                logger.info(
+                    "FAQ 语义命中但 query 含个人查询诉求, 防截胡放行: q=%r top=%.3f",
+                    query[:24],
+                    faq_results[0].get("score", 0.0),
+                )
+                return {"match_type": "miss", "results": []}
             if faq_results:
                 # chunk_id 可能带变体序号后缀 (faqid#0), 落库前剥离取真实 FAQ UUID
                 faq_uuid = faq_results[0]["faq_id"].split("#", 1)[0]

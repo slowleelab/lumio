@@ -755,6 +755,9 @@ class SessionManager:
             "last_entities": [e.model_dump() for e in state.last_entities],
             "slot_values": {k: v.model_dump() for k, v in state.slot_values.items()},
             "awaiting_slots": state.awaiting_slots,
+            # 诉求跟踪 (2026-09-04): 必须序列化 — 同 pending_action 的 P0 前车之鉴,
+            # 缺失时每次 _save_meta 全量 SET 都会擦掉 patch_state 写入的诉求清单
+            "active_requests": [t.model_dump(mode="json") if hasattr(t, "model_dump") else t for t in state.active_requests],
             "confidence_history": state.confidence_history,
             "low_confidence_streak": state.low_confidence_streak,
             "human_request_score": state.human_request_score,

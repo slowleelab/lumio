@@ -908,7 +908,12 @@ async def test_run_agent_transfer_with_chat_client():
     redis = _make_redis()
     redis.get = AsyncMock(return_value=json.dumps({"status": "done", "reply": "x"}))
 
-    with patch.object(bot_router, "update_chat_message", new=AsyncMock()) as update_msg:
+    # merged 审计依赖模块级 _db_session_factory —— 单跑时无前序测试污染该全局,
+    # 显式 patch 一个假工厂 (此前全量跑"碰巧"靠其他测试设置的全局才通过)
+    with (
+        patch.object(bot_router, "_db_session_factory", MagicMock()),
+        patch.object(bot_router, "update_chat_message", new=AsyncMock()) as update_msg,
+    ):
         await bot_router._run_agent(redis, agent, "s1", "转人工", "m1", "orig-1", merged_message_ids=["mid-2"])
     chat_client.create_session.assert_awaited_once()
     # response key 扩展: is_transfer + transfer_url

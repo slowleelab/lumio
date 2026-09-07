@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from lumio.services.common.audit import update_chat_message, write_chat_message
+from lumio.services.common.decision_log import DecisionAction, bind_turn_context, log_decision
 from lumio.services.common.deps import (
     DbSession,
     EmbeddingBreakerDep,
@@ -613,6 +614,7 @@ async def _session_worker(
                             customer_id=customer_id,
                             customer_name=customer_name,
                             merged_message_ids=merged_message_ids,
+                            enqueue_time=enqueue_time,
                         )
                         # 处理耗时（含 RAG/LLM/工具/超时降级）分布
                         BOT_ANSWER_LATENCY.observe(asyncio.get_event_loop().time() - processing_start)
@@ -730,6 +732,7 @@ async def _run_agent(
     customer_id: str = "",  # P1-6 第三轮修复: 透传 customer_id (画像学习依赖)
     customer_name: str = "",  # 透传客户名称, 供转人工后坐席端展示
     merged_message_ids: list[str] | None = None,
+    enqueue_time: float = 0.0,  # 入队单调时钟 (TURN_START 排队耗时归因用)
 ) -> None:
     """标准 Agent 处理路径 (Semaphore 内)
 
@@ -786,6 +789,24 @@ async def _run_agent(
         return
 
     # Agent 编排 (P1-3 第三轮修复: 端到端 deadline, 防止 5 轮工具循环 × 60s 撑爆 semaphore)
+    # P1-3/P1-4 决策链整改: 绑定本轮 turn_id (本轮全部决策共用, 回放按轮分组) +
+    # 出队留痕 (排队耗时 — 此前入队到分类之间的等待在决策链上完全不可见)
+    _turn_id = uuid_module.uuid4().hex[:16]
+    bind_turn_context(_turn_id)
+    queue_wait_ms = round((asyncio.get_event_loop().time() - enqueue_time) * 1000, 1) if enqueue_time else None
+    try:
+        log_decision(
+            session_id=session_id,
+            agent_name="bot_agent",
+            action=DecisionAction.TURN_START,
+            reasoning=f"消息出队开始处理{'，排队 ' + str(int(queue_wait_ms)) + 'ms' if queue_wait_ms is not None else ''}",
+            evidence={"queue_wait_ms": queue_wait_ms, "input_preview": message[:60]},
+            latency_ms=queue_wait_ms or 0.0,
+            turn_id=_turn_id,
+            customer_id=customer_id or None,
+        )
+    except Exception:
+        logger.debug("TURN_START 决策留痕失败(不阻断): session=%s", session_id)
     try:
         result = await asyncio.wait_for(
             agent.run(session_id, message, customer_id=customer_id or None),
@@ -1757,6 +1778,31 @@ class ChatEndRequest(BaseModel):
     session_id: str
 
 
+# ── 会话结束自动质检 (全量纳入口径) ─────────────────────────────
+
+# 后台巡检 task 引用 (项目规范: 防 asyncio GC 在 await 期间回收)
+_qa_end_tasks: set[asyncio.Task] = set()
+
+
+async def _qa_scan_after_end(session_factory, judge_llm, redis_client, session_id: str) -> None:
+    """客户结束会话后立即单会话巡检 (后台, 失败只记日志不阻塞)"""
+    try:
+        from lumio.services.common import quality_scan
+
+        settings = get_settings()
+        await quality_scan.scan_session_by_id(
+            session_factory,
+            judge_llm,
+            redis_client,
+            session_id,
+            quality_scan.judge_model_name(settings),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("会话结束自动质检失败 (不阻断): session=%s err=%s", session_id, exc)
+
+
 @router.post("/chat/end")
 async def chat_end(body: ChatEndRequest, req: Request, user: CurrentUser):
     """客户主动结束会话"""
@@ -1770,6 +1816,24 @@ async def chat_end(body: ChatEndRequest, req: Request, user: CurrentUser):
                 SessionPhase.ENDED,
                 reason="customer_ended",
             )
+
+    # 会话结束即自动质检: 每一个会话都纳入质检记录 (不等人工点全量巡检)。
+    # 单会话一次裁判调用; 已检会话走 30 天 Redis 去重; LLM/DB 未就绪静默跳过。
+    settings = get_settings()
+    if settings.llm.qa_scan_on_session_end:
+        sf = getattr(req.app.state, "db_session_factory", None)
+        judge_llm = None
+        with contextlib.suppress(Exception):
+            from lumio.services.common import quality_scan as _qs
+
+            judge_llm = _qs.build_judge_llm(getattr(req.app.state, "llm_client", None), settings)
+        if sf is not None and judge_llm is not None:
+            task = asyncio.create_task(
+                _qa_scan_after_end(sf, judge_llm, getattr(req.app.state, "redis_client", None), body.session_id)
+            )
+            _qa_end_tasks.add(task)
+            task.add_done_callback(_qa_end_tasks.discard)
+
     return {"status": "ok", "session_id": body.session_id}
 
 
@@ -1860,6 +1924,67 @@ async def chat_feedback(body: ChatFeedbackRequest, req: Request, user: CurrentUs
                 ensure_ascii=False,
             ),
         )
+    # 闭环 §3.1 第一路: 差评 (rating=down) 自动采集 Badcase —— 此前只写 Redis,
+    # 负面反馈从未进归因闭环。取会话最后一轮 (客户输入 + bot 回复 + 管道中间产物) 作归因现场。
+    if body.rating == "down":
+        try:
+            sf = getattr(req.app.state, "db_session_factory", None) or _db_session_factory
+            if sf:
+                last_user_input, last_bot_output = "", ""
+                snapshot: dict = {}
+                async with sf() as db:
+                    from sqlalchemy import select
+
+                    from lumio.shared.orm_models import DialogueLog
+
+                    res = await db.execute(
+                        select(
+                            DialogueLog.speaker,
+                            DialogueLog.content,
+                            DialogueLog.intent,
+                            DialogueLog.confidence,
+                            DialogueLog.response_source,
+                        )
+                        .where(DialogueLog.session_id == body.session_id)
+                        .order_by(DialogueLog.timestamp.desc())
+                        .limit(4)
+                    )
+                    rows = list(res.all())
+                for row in reversed(rows):
+                    speaker, content = row[0], row[1]
+                    if speaker == "customer" and not last_user_input:
+                        last_user_input = content or ""
+                    elif speaker in ("bot", "assistant") and not last_bot_output:
+                        last_bot_output = content or ""
+                        resp_source = row[4] or ""
+                        snapshot = {
+                            "intent": row[2] or "",
+                            "confidence": float(row[3]) if row[3] is not None else None,
+                            "response_source": resp_source,
+                            # dialogue_log 无独立 rag 命中列, 按回复来源推断 (rag/faq=命中, 其他=未走检索)
+                            "rag_hit": resp_source in ("rag", "faq", "hybrid", "parallel_race"),
+                        }
+                if last_user_input:
+                    from lumio.services.common.badcase_store import capture_badcase
+
+                    await capture_badcase(
+                        sf,
+                        trace_id=body.session_id,
+                        session_id=body.session_id,
+                        signal_source="negative_feedback",
+                        user_input=last_user_input,
+                        customer_id=None,
+                        bot_output=last_bot_output or None,
+                        signal_detail={
+                            "message_id": body.message_id,
+                            "comment": body.comment[:200],
+                            "stage": "auto",
+                            "feedback": body.comment[:100] or "客户差评",
+                        },
+                        snapshot=snapshot,
+                    )
+        except Exception:
+            logger.debug("差评 Badcase 采集失败(不阻断反馈)")
     return {"status": "ok"}
 
 

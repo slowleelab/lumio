@@ -17,7 +17,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from lumio.services.bot.tool_guard import GuardDecision
@@ -331,8 +331,11 @@ class ToolCallingExecutor:
                             transfer_reason=f"tool_guard_refused: {tool_call.name} ({guard_decision.reason})",
                         )
 
-                    # 敏感工具 → 短路，先发身份核验信号，不执行
-                    if self._mcp.is_sensitive(tool_call.name):
+                    # 敏感工具 → 短路，先发身份核验信号，不执行。
+                    # 产品决策 (2026-09-03): 默认审核核实视为已通过 — 开关关闭时
+                    # 敏感写工具跳过核验弹框/文本确认直接执行 (审计照常); 合规
+                    # 环境置 true 恢复两段式。
+                    if self._settings.sensitive_confirm_enabled and self._mcp.is_sensitive(tool_call.name):
                         pending, verification = self._build_pending_action(tool_call, trace_id=trace_id)
                         TOOL_CONFIRMATIONS.labels(decision="pending").inc()
                         return ToolExecutionResult(
@@ -370,6 +373,32 @@ class ToolCallingExecutor:
                 f"工具编排循环超时 (> {int(self._settings.tool_loop_timeout_ms)}ms): session={session_id}"
             ) from None
 
+    async def execute_direct(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        session_id: str,
+        actor_id: str,
+        actor_role: str = "customer",
+    ) -> ToolExecutionResult:
+        """确定性直连执行 (不经 LLM 编排循环)
+
+        高置信意图 + 工具映射唯一时由分派层调用 (qa_scan 挂账: 挂失链 LLM
+        编排在本地时延下 20-40s 超时回落知识链 — card_loss@0.96 的目标工具
+        是确定的, 无需 LLM 决策)。卡号注入/配额/重试/脱敏/审计与编排路径
+        完全同源 (_execute_and_audit)。异常上抛由调用方回落交易链路。
+        """
+        tool_call = ToolCall(id=f"direct-{uuid4().hex[:12]}", name=tool_name, arguments=dict(arguments or {}))
+        tool_message = await self._execute_and_audit(
+            tool_call, session_id=session_id, actor_id=actor_id, actor_role=actor_role
+        )
+        return ToolExecutionResult(
+            content=str(tool_message.get("content") or ""),
+            source="tool",
+            executed_tools=[tool_name],
+        )
+
     async def _execute_and_audit(
         self,
         tool_call: ToolCall,
@@ -384,12 +413,13 @@ class ToolCallingExecutor:
         # 从对话收集。仅对 schema 声明了 card_no 参数的工具注入; LLM 已给出完整卡号时
         # 不覆盖 (如核验弹框路径已注入的 card_no)。
         spec = self._mcp.get_tool(tool_call.name)
+        card_key = schema_declares_card_no(spec.input_schema) if spec is not None else None
         if (
-            spec is not None
-            and schema_declares_card_no(spec.input_schema)
+            card_key
+            and not is_full_card_no(tool_call.arguments.get(card_key))
             and not is_full_card_no(tool_call.arguments.get("card_no"))
         ):
-            tool_call.arguments["card_no"] = resolve_card_no(actor_id)
+            tool_call.arguments[card_key] = resolve_card_no(actor_id)
         masked_args = mask_pii(json.dumps(tool_call.arguments, ensure_ascii=False))
         # P2-7 第五轮修复: 配额检查接线 — tool_robustness.ToolQuotaGuard 此前生产零调用,
         # TOOL_QUOTA_EXCEEDED 指标永不产生; 超配额直接拒绝, 不进 MCP
@@ -444,6 +474,28 @@ class ToolCallingExecutor:
             detail={"arguments": masked_args, "result": masked_content[:500], "is_error": is_error},
             status_code=500 if is_error else 200,
         )
+        # E2 可解释 (用户反馈: 回放决策链缺执行过程): 工具执行同时写决策日志,
+        # 回放时间线上可见"调了什么工具/什么参数/返回摘要/耗时"
+        try:
+            from lumio.services.common.decision_log import DecisionAction, log_decision
+
+            log_decision(
+                session_id=session_id,
+                agent_name="tool_executor",
+                action=DecisionAction.TOOL_CALL,
+                reasoning=f"工具执行: {tool_call.name} ({'失败' if is_error else '成功'})",
+                evidence={
+                    "tool": tool_call.name,
+                    "arguments": json.loads(masked_args or "{}") if masked_args else {},
+                    "result_preview": masked_content[:200],
+                    "is_error": is_error,
+                },
+                latency_ms=0.0,
+                turn_id="",
+                customer_id=actor_id,
+            )
+        except Exception:
+            pass  # 决策日志失败不阻断执行
 
         return {
             "role": "tool",

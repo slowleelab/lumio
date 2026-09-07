@@ -567,3 +567,226 @@ class TestFaqCrud:
 
         with pytest.raises(LumioError):
             await transition_faq_approval(sf, "id-1", "PUBLISHED", actor_id="admin", actor_role="admin")
+
+
+@pytest.mark.asyncio
+async def test_semantic_match_blocked_for_personal_query() -> None:
+    """个人查询诉求防截胡 (qa_scan 第五轮: "我的额度是什么"被"分期占用额度吗"截胡)"""
+
+    from lumio.services.common import faq_service as fs
+
+    class _Emb:
+        async def embed_query(self, text: str) -> list[float]:
+            return [1.0, 0.0]
+
+    class _Hit:
+        def __init__(self, score: float, question: str) -> None:
+            self.score = score
+            self.entity = {"chunk_id": "f1#0", "content": question, "category": "分期", "card_type": "", "keywords": []}
+
+    class _Coll:
+        def __init__(self, q: str) -> None:
+            self._q = q
+
+        def search(self, **kw):
+            # content 即语义命中的 question (词面支撑校验读 question 字段)
+            return [[_Hit(0.91, self._q), _Hit(0.80, self._q)]]  # 双门槛全过
+
+    class _Redis:
+        async def get(self, _k):
+            return None
+
+        async def setex(self, *a):
+            return None
+
+    res = await fs.search_faq("我的额度是什么", _Redis(), _Emb(), _Coll("分期占用额度吗"))
+    assert res["match_type"] == "miss"  # 防截胡放行 (有词面支撑"额度", 但含个人诉求)
+
+    res2 = await fs.search_faq("积分怎么兑换步骤", _Redis(), _Emb(), _Coll("积分兑换步骤详解"))
+    assert res2["match_type"] == "semantic"  # 有支撑且无个人诉求 → 命中
+
+
+def test_shares_informative_gram() -> None:
+    """语义命中词面支撑校验 (mxbai 分数漂移 0.85→0.92 的嵌入噪声防线)"""
+    from lumio.services.common.faq_service import _shares_informative_gram
+
+    # 「逾期」不在「丢失怎么办」中 → 无支撑 → 拦
+    assert _shares_informative_gram("信用卡逾期了会有什么影响", "信用卡丢失怎么办？") is False
+    # 「积分」「换话费」共享 → 有支撑 → 放行
+    assert _shares_informative_gram("怎么用积分换话费", "积分如何换话费") is True
+    # 硬钱包共享 → 放行
+    assert _shares_informative_gram("硬钱包如何充值", "数字人民币硬钱包怎么充值") is True
+    # 无可判词块 (纯停用词) → 不拦
+    assert _shares_informative_gram("信用卡", "信用卡丢失怎么办？") is True
+
+
+def test_normalize_strips_polite_prefix() -> None:
+    """礼貌前缀剥离 (第十二轮: 模拟器随机前缀致 FAQ exact 全线击穿)"""
+    from lumio.services.common.faq_service import _normalize_query
+
+    assert _normalize_query("请问一下 积分怎么兑换礼品") == _normalize_query("积分怎么兑换礼品")
+    assert _normalize_query("那个 帮我查下账单") == _normalize_query("帮我查下账单")
+    assert _normalize_query("我想问下 信用卡怎么挂失呢") == _normalize_query("信用卡怎么挂失")
+    # 业务句本身不含前缀词时不误伤
+    assert _normalize_query("帮我查一下账单") == "帮我查一下账单"
+
+
+class TestFaqBm25Channel:
+    """FAQ BM25 通道 (范式升级: exact 快路径, BM25 主力 — 变体结构性免疫)"""
+
+    @pytest.fixture
+    def fake_es(self):
+        class _Hits:
+            def __init__(self, hits):
+                self.hits = hits
+
+        class _ES:
+            def __init__(self, results=None, exc=None):
+                self.results = results or []
+                self.exc = exc
+                self.queries = []
+
+            async def search(self, index, body):
+                self.queries.append(body["query"]["match"]["content"]["query"])
+                if self.exc:
+                    raise self.exc
+                return {"hits": {"hits": self.results}}
+
+        return _ES
+
+    @pytest.mark.asyncio
+    async def test_bm25_hit_returns_faq(self, fake_es) -> None:
+        """BM25 命中 → 回查 PG 返回标准答案 (match_type=bm25)"""
+        import lumio.services.common.faq_service as fs
+
+        es = fake_es(results=[{"_score": 8.2, "_source": {"doc_id": FAQ_ID}}])
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=_faq_row())))
+
+        # 简化: 直接测 _bm25_faq_match (检索层) + 集成验证走 E2E
+        faq_id, score = await fs._bm25_faq_match(es, "请问一下哈 积分怎么兑换礼品呢")
+        assert faq_id == FAQ_ID and score == 8.2
+
+    @pytest.mark.asyncio
+    async def test_bm25_margin_blocks_ambiguous(self, fake_es) -> None:
+        """top1/top2 区分度不足 → 不赌 (返回 None)"""
+        import lumio.services.common.faq_service as fs
+
+        # 边缘低分区间才判 margin (高分 ≥6 有旁路): 4.0/3.6 <1.3 → 拦
+        es = fake_es(
+            results=[
+                {"_score": 4.0, "_source": {"doc_id": FAQ_ID}},
+                {"_score": 3.6, "_source": {"doc_id": "other"}},
+            ]
+        )
+        faq_id, _ = await fs._bm25_faq_match(es, "积分")
+        assert faq_id is None
+        # 高分同量级 (通用词让次名也高分) → 旁路放行
+        es_hi = fake_es(
+            results=[
+                {"_score": 8.0, "_source": {"doc_id": FAQ_ID}},
+                {"_score": 7.0, "_source": {"doc_id": "other"}},
+            ]
+        )
+        fid_hi, _ = await fs._bm25_faq_match(es_hi, "信用卡怎么挂失")
+        assert fid_hi == FAQ_ID
+
+    @pytest.mark.asyncio
+    async def test_bm25_no_hits(self, fake_es) -> None:
+        import lumio.services.common.faq_service as fs
+
+        es = fake_es(results=[])
+        faq_id, _ = await fs._bm25_faq_match(es, "完全无关的内容查询")
+        assert faq_id is None
+
+    @pytest.mark.asyncio
+    async def test_bm25_es_down_degrades(self, fake_es) -> None:
+        """ES 故障 → 静默降级 (None), 不抛异常"""
+        import lumio.services.common.faq_service as fs
+
+        es = fake_es(exc=RuntimeError("es down"))
+        faq_id, score = await fs._bm25_faq_match(es, "积分")
+        assert faq_id is None and score == 0.0
+
+
+FAQ_ID = "01a048ee-136e-7192-8f60-6f3857bf542c"
+
+
+def _faq_row():
+    row = MagicMock()
+    row.id = FAQ_ID
+    row.question = "积分可以兑换什么？"
+    row.answer = "积分可兑换航空里程/商城商品/话费/年费抵扣"
+    row.category = "积分"
+    row.card_types = []
+    row.allowed_roles = []
+    return row
+
+
+def _async_ctx(session):
+    class _Ctx:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *a):
+            return False
+
+    return _Ctx()
+
+
+class TestBm25CoverageGate:
+    """BM25 主体词覆盖门 (会话 sf2 复盘: "信用卡逾期后果"仅凭"信用卡"命中年费 FAQ@7.74)"""
+
+    def test_coverage_rejects_single_term_overlap(self) -> None:
+        """主体词 3 个只覆盖 1 个 (信用卡) → 拒绝"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        # 主体词: 信用卡/逾期/后果; 命中文本只含"信用卡"
+        assert _bm25_coverage_ok(["信用卡", "逾期", "后果"], "信用卡年费是多少？") is False
+
+    def test_coverage_passes_full_overlap(self) -> None:
+        """主体词全覆盖 → 放行"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        assert _bm25_coverage_ok(["信用卡", "挂失"], "信用卡丢失了怎么挂失？") is True
+        assert _bm25_coverage_ok(["积分", "兑换", "礼品"], "积分怎么兑换礼品") is True
+
+    def test_coverage_two_of_three_passes(self) -> None:
+        """2/3 覆盖 (≥2 词且 ≥50%) → 放行 (变体措辞容忍)"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        assert _bm25_coverage_ok(["信用卡", "逾期", "后果"], "信用卡逾期一次会不会上征信") is True
+
+    def test_coverage_skipped_for_short_queries(self) -> None:
+        """主体词 <2 (单词问句) → 不拦, 交分数门"""
+        from lumio.services.common.faq_service import _bm25_coverage_ok
+
+        assert _bm25_coverage_ok(["年费"], "信用卡年费是多少") is True
+        assert _bm25_coverage_ok(None, "随便") is True
+
+    def test_bm25_match_applies_coverage(self) -> None:
+        """_bm25_faq_match 集成: 高分单词共现被覆盖门拦下"""
+        import lumio.services.common.faq_service as fs
+
+        class FakeES:
+            async def search(self, **kw):
+                return {
+                    "hits": {
+                        "hits": [
+                            {"_score": 7.74, "_source": {"doc_id": "d1", "content": "信用卡年费是多少？"}},
+                            {"_score": 2.0, "_source": {"doc_id": "d2", "content": "其他"}},
+                        ]
+                    }
+                }
+
+            class _Indices:
+                @staticmethod
+                async def analyze(**kw):
+                    return {"tokens": [{"token": "信用卡"}, {"token": "逾期"}, {"token": "后果"}]}
+
+            indices = _Indices()
+
+        import asyncio
+
+        faq_id, score = asyncio.run(fs._bm25_faq_match(FakeES(), "信用卡逾期了会有什么后果"))
+        assert faq_id is None and score == 0.0

@@ -444,7 +444,7 @@ async def write_to_milvus(
     chunks: list[dict],
     collection: Any,
 ) -> int:
-    """将文本块写入 Milvus (v2.1)
+    """将文本块写入 Milvus
 
     字段: chunk_id, doc_id, content, embedding, category, doc_type,
     keywords(ARRAY), card_type, customer_tier, security_level,
@@ -466,7 +466,7 @@ async def write_to_milvus(
             [c["embedding"] for c in chunks],
             [c.get("category", "") for c in chunks],
             [c.get("doc_type", "") for c in chunks],
-            # v2.1: keywords 直接传 list（ARRAY 类型）
+            # keywords 直接传 list（ARRAY 类型）
             [
                 c.get("keywords", [])
                 if isinstance(c.get("keywords"), list)

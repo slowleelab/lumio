@@ -67,7 +67,7 @@ import type { SessionPhase } from "@/api/types"
 
 const assistStore = useAssistStore()
 
-// v2.0: per-agent WS, 坐席登录时建连, 不再按会话
+// per-agent WS: 坐席登录时建连, 不再按会话
 const agentId = computed(() => assistStore.currentAgentId)
 const { connect, activateSession, notifyAgentMessage } = useWebSocket(agentId)
 

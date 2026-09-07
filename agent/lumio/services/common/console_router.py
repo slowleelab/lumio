@@ -17,6 +17,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import and_, case, func, or_, select
 
+from lumio.services.common.decision_log import DecisionAction
 from lumio.services.common.deps import DbSession
 from lumio.shared.auth import AuthUser, require_role
 from lumio.shared.exceptions import LumioError
@@ -623,4 +624,127 @@ async def rag_live_metrics(user: AdminAgentUser) -> dict[str, Any]:
             "attempts_total": counter_by("lumio_injection_attempts_total"),
             "blocked_total": counter_by("lumio_injection_blocked_total"),
         },
+    }
+
+
+# ── 8. 路由漂移监控 (P0 整改: 意图漂移检测提前) ──
+
+
+@router.get("/routing/drift")
+async def routing_drift(
+    user: AdminAgentUser,
+    db: DbSession,
+    days: int = Query(7, ge=1, le=90, description="统计窗口（天）"),
+) -> dict[str, Any]:
+    """路由健康/漂移指标：意图分类退化会导致 fallback/澄清率爬升与置信度下滑，
+    本端点把「该报警的信号」聚合在一处，供周期巡检与阈值复盘（模糊带调优依据）。
+
+    - source 分布: clarify/fallback/clarify 类占比过高 = 意图覆盖在退化
+    - chitchat 率: 闲聊流量占比 (健康基线 ~10-15%, 模拟器场景配比不同则另算)
+    - 置信带分布: <0.3 / 0.3-0.7 / ≥0.7 — 模糊带占比 = LLM 慢路径成本占比
+    - 分类延迟: decision_log intent_classify 平均/分位延迟 (按 source 细分)
+    """
+    since = datetime.now(UTC) - timedelta(days=days)
+
+    # bot 轮次口径 (客户行 intent 为 None, 不计入)
+    bot_cond = and_(DialogueLog.timestamp >= since, DialogueLog.speaker == "bot")
+    source_rows = (
+        await db.execute(
+            select(DialogueLog.response_source, func.count())
+            .where(and_(bot_cond, DialogueLog.response_source.isnot(None)))
+            .group_by(DialogueLog.response_source)
+            .order_by(func.count().desc())
+        )
+    ).all()
+    intent_rows = (
+        await db.execute(
+            select(DialogueLog.intent, func.count())
+            .where(and_(bot_cond, DialogueLog.intent.isnot(None)))
+            .group_by(DialogueLog.intent)
+            .order_by(func.count().desc())
+            .limit(20)
+        )
+    ).all()
+
+    conf_bands = (
+        await db.execute(
+            select(
+                func.sum(case((DialogueLog.confidence < 0.3, 1), else_=0)).label("band_low"),
+                func.sum(
+                    case((and_(DialogueLog.confidence >= 0.3, DialogueLog.confidence < 0.7), 1), else_=0)
+                ).label("band_mid"),
+                func.sum(case((DialogueLog.confidence >= 0.7, 1), else_=0)).label("band_high"),
+                func.count().label("total"),
+                func.avg(DialogueLog.confidence).label("avg_conf"),
+            ).where(and_(bot_cond, DialogueLog.confidence.isnot(None)))
+        )
+    ).one()
+
+    # 决策侧: 分类延迟 + 噪声拦截 + 闲聊短路 (按日序列, 看趋势不看单点)
+    dec_day = func.date_trunc("day", DecisionLog.created_at)
+    classify_daily = (
+        await db.execute(
+            select(
+                dec_day,
+                func.count(),
+                func.avg(DecisionLog.latency_ms),
+                func.max(DecisionLog.latency_ms),
+            )
+            .where(and_(DecisionLog.created_at >= since, DecisionLog.action == DecisionAction.INTENT_CLASSIFY))
+            .group_by(dec_day)
+            .order_by(dec_day)
+        )
+    ).all()
+    action_rows = (
+        await db.execute(
+            select(DecisionLog.action, func.count())
+            .where(DecisionLog.created_at >= since)
+            .group_by(DecisionLog.action)
+            .order_by(func.count().desc())
+        )
+    ).all()
+
+    total_turns = int(conf_bands.total or 0)
+    source_dist = {s or "unknown": int(c) for s, c in source_rows}
+    source_total = sum(source_dist.values()) or 1
+
+    def _rate(source: str) -> float:
+        return round(source_dist.get(source, 0) / source_total, 4)
+
+    band_total = total_turns or 1
+    daily = [
+        {
+            "date": str(d.date() if d else None),
+            "classify_count": int(c),
+            "avg_classify_ms": _round(v) if v is not None else None,
+            "max_classify_ms": _round(m) if m is not None else None,
+        }
+        for d, c, v, m in classify_daily
+    ]
+
+    return {
+        "window_days": days,
+        "bot_turns": total_turns,
+        "source_dist": source_dist,
+        # 意图退化三信号: 澄清率 / 兜底率 / 模板率 (clarify+fallback 高 = 覆盖在退化)
+        "clarify_rate": _rate("clarify"),
+        "fallback_rate": _rate("fallback"),
+        "template_rate": _rate("template"),
+        "knowledge_rate": _rate("knowledge"),
+        "tool_rate": _rate("tool"),
+        "faq_rate": _rate("faq"),
+        "chitchat_rate": round(
+            sum(c for i, c in intent_rows if i and "chitchat" in str(i)) / (sum(c for _, c in intent_rows) or 1), 4
+        ),
+        "intent_top": {i or "unknown": int(c) for i, c in intent_rows},
+        "confidence": {
+            "avg": _round(float(conf_bands.avg_conf)) if conf_bands.avg_conf is not None else None,
+            "band_low_lt_030": int(conf_bands.band_low or 0),
+            "band_mid_030_070": int(conf_bands.band_mid or 0),
+            "band_high_ge_070": int(conf_bands.band_high or 0),
+            "band_mid_rate": round(int(conf_bands.band_mid or 0) / band_total, 4),
+        },
+        "decisions": {str(a): int(c) for a, c in action_rows},
+        "classify_daily": daily,
+        "notes": "band_mid_rate = LLM 慢路径成本占比 (0.3-0.7 模糊带); 周期复盘用于收窄/校准带宽",
     }

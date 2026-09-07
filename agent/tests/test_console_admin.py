@@ -355,3 +355,38 @@ class TestMetricInstrumentation:
             if s.labels.get("name") == "test-console-cb"
         ]
         assert samples and samples[0].value == 2
+
+
+# ── 路由漂移监控 ────────────────────────────────────────────────────────────
+
+
+class TestRoutingDrift:
+    async def test_drift_shape_and_rates(self) -> None:
+        results = [
+            _Result(rows=[("knowledge", 60), ("clarify", 30), ("fallback", 10)]),  # source_dist
+            _Result(rows=[("nb_chitchat", 20), ("account_bill_query", 80)]),  # intent_top
+            _Result(
+                one=SimpleNamespace(band_low=10, band_mid=40, band_high=50, total=100, avg_conf=0.62)
+            ),  # conf bands
+            _Result(rows=[(_NOW, 100, 350.0, 1200.0)]),  # classify daily
+            _Result(rows=[("intent_classify", 100), ("noise_blocked", 12), ("rag_retrieve", 60)]),  # actions
+        ]
+        fake = FakeSession(results)
+        resp = await _get(_make_app(ADMIN, fake), "/api/admin/routing/drift?days=7")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["window_days"] == 7
+        assert body["bot_turns"] == 100
+        # clarify 30 / source_total 100
+        assert body["clarify_rate"] == 0.3
+        assert body["fallback_rate"] == 0.1
+        assert body["chitchat_rate"] == 0.2
+        # 模糊带占比 40% = LLM 慢路径成本占比
+        assert body["confidence"]["band_mid_rate"] == 0.4
+        assert body["classify_daily"][0]["avg_classify_ms"] == 350.0
+        assert body["decisions"]["noise_blocked"] == 12
+
+    async def test_drift_denied_for_customer(self) -> None:
+        fake = FakeSession([])
+        resp = await _get(_make_app(CUSTOMER, fake), "/api/admin/routing/drift")
+        assert resp.status_code == 403

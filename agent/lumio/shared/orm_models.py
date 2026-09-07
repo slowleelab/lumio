@@ -1164,3 +1164,114 @@ class ClassifierSample(Base):
         # 有界留存清理: 按创建时间
         Index("ix_classifier_sample_created", "created_at"),
     )
+
+
+class Badcase(Base):
+    """Badcase 资产表 (事后优化闭环 ⑧, 方案 §7.4)
+
+    五路信号采集 → 粗筛去重 → LLM 自动归因 (模块A) → 修复策略路由
+    (A 知识库 / B 意图库 / C 规则配置 / D 模型) → 回归评测集 (L2 只增不减)。
+    append-only 语义: 修复状态流转用 update, 记录永不物理删除。
+    """
+
+    __tablename__ = "badcase"
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    trace_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    customer_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    channel: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    signal_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    signal_detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    user_input: Mapped[str] = mapped_column(Text, nullable=False)
+    bot_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    root_cause_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    root_cause_category: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    attribution_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attribution_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    attribution_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    needs_human_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    human_confirmed_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    fix_table: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    fix_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    fix_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    # 会话时间锚点 (该会话最后一轮对话时间): 工作台按对话发生顺序排列,
+    # 而非采集时间 (qa_scan 批量回扫时 created_at 只是巡检时刻, 会打乱现场时序)
+    session_time: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    input_embedding: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    dedup_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=datetime.now,
+        onupdate=datetime.now,
+        server_default=text("now()"),
+    )
+
+    __table_args__ = (
+        Index("ix_badcase_session", "session_id"),
+        Index("ix_badcase_signal", "signal_source"),
+        Index("ix_badcase_fix_status", "fix_status"),
+        Index("ix_badcase_root_layer", "root_cause_layer"),
+        Index("ix_badcase_created", "created_at"),
+        Index("ix_badcase_session_time", "session_time"),
+        Index("ix_badcase_trace", "trace_id"),
+    )
+
+
+class QualityRecord(Base):
+    """质检记录表 (qa_scan 全量会话质检的持久化层)
+
+    每个被巡检会话一条判定记录 (pass/warn/fail 全量落库):
+    - pass/warn 此前只写 Redis (30 天 TTL) — 会话清单在工作台不可见,
+      "每一个会话都纳入质检列表"无从谈起; 本表把判定变成可查询资产
+    - fail 额外采集 badcase (badcase_id 关联), 走归因/修复闭环
+    - 同会话 reinspect 会产生多条记录 (append-only 审计口径)
+    """
+
+    __tablename__ = "quality_record"
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)  # pass/warn/fail
+    problems: Mapped[list | None] = mapped_column(JSON, nullable=True)  # [{type,turn,reason}]
+    summary: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 代表性话轮预览 (首个客户输入, 列表页直读, 免回放 transcript)
+    preview: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    judge_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    turns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 会话时间锚点 (对话最后一轮时间) + 质检时间
+    session_time: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    scanned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
+    )
+    badcase_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index("ix_quality_record_session", "session_id"),
+        Index("ix_quality_record_verdict", "verdict"),
+        Index("ix_quality_record_session_time", "session_time"),
+        Index("ix_quality_record_scanned", "scanned_at"),
+    )

@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "purpose": "BERT 快路径按类采纳阈值 (校准产物, 运行时加载; 缺类沿用全局 0.7)",
+    "precision_target": 1.0,
+    "floor": 0.7,
+    "seed_version": "0.3.2",
+    "examples": 191,
+    "generated_by": "scripts/intent_threshold_calibrate.py"
+  },
+  "global_default": 0.7,
+  "thresholds": {
+    "bill_query": 0.7,
+    "card_loss": 0.7,
+    "chitchat": 0.7,
+    "complaint": 0.7,
+    "faq": 0.7,
+    "installment_inquiry": 0.7,
+    "limit_query": 0.7,
+    "reward_query": 0.7,
+    "transaction_query": 0.7,
+    "transfer_agent": 0.7
+  }
+}
