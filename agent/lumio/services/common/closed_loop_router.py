@@ -512,6 +512,33 @@ async def quality_sessions_endpoint(
     return {"total": total, "sessions": items}
 
 
+@router.post("/quality/human-verdict")
+async def quality_human_verdict_endpoint(
+    user: AdminAgentUser,
+    db: DbSession,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """人工判定: 追加一条 judge_model=人工判定 的质检记录, 覆盖当前判定。
+
+    与复检 (AI 重跑) 互补: 人对会话质量下结论 (合格/不合格), 状态列随之变为「人工质检」。
+    """
+    from lumio.services.common.badcase_store import record_human_verdict
+
+    session_id = str((body or {}).get("session_id") or "").strip()
+    verdict = str((body or {}).get("verdict") or "").strip()
+    note = (body or {}).get("note")
+    if not session_id:
+        raise LumioError(code=2001, message="session_id 必填")
+    rec = await record_human_verdict(db, session_id, verdict, note if isinstance(note, str) else None)
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "verdict": rec.verdict,
+        "judge_model": rec.judge_model,
+        "scanned_at": rec.scanned_at.isoformat() if rec.scanned_at else None,
+    }
+
+
 @router.post("/quality/rescan")
 async def quality_rescan_endpoint(user: AdminAgentUser, request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """单会话强制复检: 绕过 30 天 Redis 去重重跑裁判 (整改效果验证)。

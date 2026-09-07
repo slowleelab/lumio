@@ -15,6 +15,7 @@ from lumio.services.common.badcase_loop import (
     BadcaseJudge,
     dedup_key,
 )
+from lumio.shared.exceptions import LumioError
 from lumio.shared.orm_models import Badcase, DialogueLog, QualityRecord
 
 logger = logging.getLogger(__name__)
@@ -400,9 +401,64 @@ async def list_qc_sessions(
         d["badcase_id"] = str(d["badcase_id"]) if d.get("badcase_id") else None
         for k in ("session_time", "scanned_at", "collected_at"):
             d[k] = d[k].isoformat() if d.get(k) else None
+        # 状态列: 谁做出的质检 (未质检 / AI 裁判 / 人工判定) — 人工判定以 judge_model 标记
+        if d.get("verdict") is None:
+            d["qc_status"] = "unscanned"
+        elif d.get("judge_model") == "人工判定":
+            d["qc_status"] = "human"
+        else:
+            d["qc_status"] = "ai"
+        # 复核状态列: 问题案例人工复核流程 (无案例 → 无需复核)
+        if not d.get("badcase_id"):
+            d["review_status"] = None
+        elif d.get("needs_human_review"):
+            d["review_status"] = "pending"
+        else:
+            d["review_status"] = "reviewed"
         d.pop("order_ts", None)
         out.append(d)
     return out, total
+
+
+async def record_human_verdict(
+    session: AsyncSession,
+    session_id: str,
+    verdict: str,
+    note: str | None = None,
+) -> QualityRecord:
+    """人工判定落库: 追加一条 judge_model=人工判定 的质检记录 (append-only 审计口径)。
+
+    会话维度列表按 scanned_at 取最新 → 人工判定即成为当前判定, 原AI判定保留可追溯。
+    session_time / turns / badcase_id 沿用最新一条 AI 记录, 保持列表锚点与整改闭环关联。
+    """
+    if verdict not in ("pass", "warn", "fail"):
+        raise LumioError(code=2001, message=f"verdict 非法: {verdict}")
+    latest = (
+        (
+            await session.execute(
+                select(QualityRecord)
+                .where(QualityRecord.session_id == session_id)
+                .order_by(QualityRecord.scanned_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    rec = QualityRecord(
+        session_id=session_id,
+        verdict=verdict,
+        problems=[],
+        summary=(note or "").strip()[:255] or None,
+        judge_model="人工判定",
+        turns=latest.turns if latest else None,
+        session_time=latest.session_time if latest else None,
+        badcase_id=latest.badcase_id if latest else None,
+    )
+    session.add(rec)
+    await session.commit()
+    await session.refresh(rec)
+    return rec
 
 
 async def quality_coverage_stats(
