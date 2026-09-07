@@ -222,7 +222,7 @@
       <el-table-column label="操作" width="130" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
-          <el-button link size="small" @click.stop="openQcDetail(row, true)">回放</el-button>
+          <el-button link size="small" @click.stop="openQcDetail(row, true)">决策链</el-button>
           <el-button v-if="row.badcase_id" link type="warning" size="small" @click.stop="openBadcaseById(row.badcase_id)">整改</el-button>
         </template>
       </el-table-column>
@@ -427,9 +427,9 @@
           </div>
         </template>
 
-        <div class="section-title">会话回放 <span class="muted section-hint">({{ qcPanorama.length }} 轮 · 问题轮标红 · 含每轮链路)</span></div>
+        <div class="section-title">决策链 <span class="muted section-hint">({{ qcPanorama.length }} 轮 · 问题轮标红 · 悬停链路节点看依据)</span></div>
         <el-collapse v-if="qcPanorama.length" v-model="panoActiveNames">
-          <el-collapse-item name="pano" :title="`共 ${qcPanorama.length} 轮对话`">
+          <el-collapse-item name="pano" :title="`共 ${qcPanorama.length} 轮 · 每轮含决策链与回复`">
             <div
               v-for="r in qcPanorama"
               :key="r.round"
@@ -444,7 +444,10 @@
                   <el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag>
                 </div>
                 <div v-if="qcTurnChains[r.round - 1]" class="qc-turn-chain">
-                  链路: {{ qcTurnChains[r.round - 1].steps.join(" → ") }}
+                  <template v-for="(s, si) in qcTurnChains[r.round - 1].details" :key="si">
+                    <span v-if="si > 0" class="chain-arrow">→</span>
+                    <span class="chain-step" :title="s.title">{{ s.label }}</span>
+                  </template>
                 </div>
               </div>
             </div>
@@ -504,7 +507,7 @@
         </el-descriptions>
 
         <div class="qc-actions">
-          <el-button type="primary" @click="toggleReplayView">{{ panoActiveNames.length ? "收起会话回放" : "展开会话回放" }}</el-button>
+          <el-button type="primary" @click="toggleChainView">{{ panoActiveNames.length ? "收起决策链" : "查看决策链" }}</el-button>
           <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
           <el-button :loading="qcRescanning" @click="doRescan">复检此会话</el-button>
         </div>
@@ -669,13 +672,21 @@ function problemTurnDialog(turn?: number | null): { customer: string; bot: strin
   return { customer: ts[ci].content, bot: bi >= 0 ? ts[bi].content : "", source: bi >= 0 ? ts[bi].response_source : null }
 }
 
-// 会话决策链按轮分组 (turn_start 起组, 组序 = 轮序)
+// 会话决策链按轮分组 (turn_start 起组, 组序 = 轮序); details 供链路节点悬停查看依据与耗时
 const qcTurnChains = computed(() => {
   const ds = qcReplay.value?.decisions ?? []
-  const groups: { round: number; steps: string[] }[] = []
+  const groups: { round: number; steps: string[]; details: { label: string; title: string }[] }[] = []
   for (const d of ds) {
-    if (d.action === "turn_start" || !groups.length) groups.push({ round: groups.length + 1, steps: [] })
-    if (d.action !== "turn_start") groups[groups.length - 1]?.steps.push(ACTION_STEP[d.action] ?? d.action)
+    if (d.action === "turn_start" || !groups.length) groups.push({ round: groups.length + 1, steps: [], details: [] })
+    if (d.action !== "turn_start") {
+      const label = ACTION_STEP[d.action] ?? d.action
+      const g = groups[groups.length - 1]
+      g?.steps.push(label)
+      g?.details.push({
+        label,
+        title: [d.reasoning, d.latency_ms != null ? `${d.latency_ms}ms` : null].filter(Boolean).join(" · ") || label,
+      })
+    }
   }
   return groups
 })
@@ -714,9 +725,9 @@ const qcPanorama = computed(() => {
   return rounds
 })
 
-// 内嵌回放展开 (操作列"回放"或处置按钮自动展开)
+// 决策链内嵌展开 (操作列"决策链"或底部按钮触发, 当前页展开不跳转)
 const panoActiveNames = ref<string[]>([])
-function toggleReplayView() {
+function toggleChainView() {
   panoActiveNames.value = panoActiveNames.value.length ? [] : ["pano"]
   if (panoActiveNames.value.length) {
     document.querySelector(".qc-detail .el-collapse")?.scrollIntoView({ behavior: "smooth", block: "center" })
@@ -1582,6 +1593,16 @@ onUnmounted(() => {
   background: var(--color-bg-page);
   border-radius: 6px;
 }
+.chain-step {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--el-border-color, #dcdfe6);
+  border-radius: 10px;
+  background: var(--el-bg-color, #fff);
+  cursor: default;
+  white-space: nowrap;
+}
+.chain-arrow { margin: 0 4px; color: var(--color-text-placeholder, #c0c4cc); }
 .pano-round {
   display: flex;
   gap: 8px;
