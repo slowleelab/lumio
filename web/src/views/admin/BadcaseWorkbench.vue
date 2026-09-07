@@ -86,12 +86,12 @@
         <span class="hint">点击查看待人工判定会话</span>
       </div>
       <div class="stat-card" :class="{ active: qcFilters.category === 'fail' }" @click="setCategory('fail')">
-        <span class="label">判定有问题</span>
+        <span class="label">不合格</span>
         <span class="num danger">{{ coverage?.by_verdict?.fail ?? "-" }}</span>
-        <span class="hint">质检不合格会话</span>
+        <span class="hint">质检不合格会话 (另提醒级 {{ coverage?.by_verdict?.warn ?? 0 }})</span>
       </div>
       <div class="stat-card" :class="{ active: qcFilters.category === 'pass' }" @click="setCategory('pass')">
-        <span class="label">正常</span>
+        <span class="label">合格</span>
         <span class="num ok">{{ coverage?.by_verdict?.pass ?? "-" }}</span>
         <span class="hint">质检合格会话</span>
       </div>
@@ -126,10 +126,10 @@
 
     <div class="filters">
       <el-select v-model="qcFilters.category" placeholder="分类" clearable size="small" style="width: 130px" @change="reloadQc">
-        <el-option label="正常" value="pass" />
-        <el-option label="提醒" value="warn" />
-        <el-option label="判定有问题" value="fail" />
-        <el-option label="待人工判定" value="pending_review" />
+        <el-option label="合格" value="pass" />
+        <el-option label="提醒级" value="warn" />
+        <el-option label="不合格" value="fail" />
+        <el-option label="待复核" value="pending_review" />
         <el-option label="未质检" value="unscanned" />
       </el-select>
       <el-input
@@ -176,10 +176,25 @@
       <el-table-column label="轮数" width="54" align="center">
         <template #default="{ row }">{{ row.turns ?? "-" }}</template>
       </el-table-column>
-      <el-table-column label="判定" width="110">
+      <el-table-column label="判定" width="76" align="center">
         <template #default="{ row }">
-          <el-tag size="small" :type="verdictType(row.verdict || '')">{{ verdictLabel(row.verdict || "") || "未质检" }}</el-tag>
-          <el-tag v-if="row.category === 'pending_review'" size="small" type="warning" style="margin-left: 2px">待人工</el-tag>
+          <el-tag v-if="row.verdict === 'pass'" size="small" type="success">合格</el-tag>
+          <el-tag v-else-if="row.verdict" size="small" type="danger" :title="row.verdict === 'warn' ? '提醒级问题 (原判定: 提醒)' : ''">不合格</el-tag>
+          <span v-else class="muted">-</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="状态" width="84" align="center">
+        <template #default="{ row }">
+          <el-tag v-if="row.qc_status === 'human'" size="small" type="warning">人工质检</el-tag>
+          <el-tag v-else-if="row.qc_status === 'ai'" size="small" type="primary">AI质检</el-tag>
+          <el-tag v-else size="small" type="info">未质检</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="复核状态" width="84" align="center">
+        <template #default="{ row }">
+          <el-tag v-if="row.review_status === 'pending'" size="small" type="warning">待复核</el-tag>
+          <el-tag v-else-if="row.review_status === 'reviewed'" size="small" type="success">已复核</el-tag>
+          <span v-else class="muted" title="无问题案例, 无需复核">-</span>
         </template>
       </el-table-column>
       <el-table-column label="质检问题" min-width="160">
@@ -509,7 +524,9 @@
 
         <div class="qc-actions">
           <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
-          <el-button :loading="qcRescanning" @click="doRescan">复检此会话</el-button>
+          <el-button :loading="humanJudging === 'pass'" type="success" plain @click="doHumanVerdict('pass')">人工判合格</el-button>
+          <el-button :loading="humanJudging === 'fail'" type="danger" plain @click="doHumanVerdict('fail')">人工判不合格</el-button>
+          <el-button :loading="qcRescanning" @click="doRescan">复检此会话 (AI)</el-button>
         </div>
       </div>
     </el-drawer>
@@ -534,6 +551,7 @@ import {
   listQcSessions,
   rescanQualitySession,
   replayQualitySession,
+  humanVerdictQualitySession,
   endChatSession,
   type QcSessionRow,
   getQualityCoverage,
@@ -805,6 +823,41 @@ async function doReplay() {
   } catch {
     replayState.value.running = false
     ElMessage.error("重放启动失败")
+  }
+}
+
+// 人工判定: 追加 judge_model=人工判定 的质检记录, 状态列转为「人工质检」
+const humanJudging = ref<"pass" | "fail" | null>(null)
+async function doHumanVerdict(v: "pass" | "fail") {
+  if (!qcDetail.value) return
+  const label = v === "pass" ? "合格" : "不合格"
+  try {
+    await ElMessageBox.confirm(
+      `以人工质检身份将该会话判定为「${label}」? 判定记录追加落库, 原 AI 判定保留可追溯。`,
+      "人工判定",
+      { type: "warning", confirmButtonText: `判定为${label}`, cancelButtonText: "取消" },
+    )
+  } catch {
+    return
+  }
+  humanJudging.value = v
+  try {
+    await humanVerdictQualitySession(qcDetail.value.session_id, v)
+    if (qcDetail.value) {
+      qcDetail.value = {
+        ...qcDetail.value,
+        verdict: v,
+        qc_status: "human",
+        judge_model: "人工判定",
+        problems: v === "pass" ? [] : qcDetail.value.problems,
+      }
+    }
+    await Promise.all([loadQc(), loadCoverage()])
+    ElMessage.success(`人工判定完成: ${label}`)
+  } catch {
+    ElMessage.error("人工判定失败")
+  } finally {
+    humanJudging.value = null
   }
 }
 

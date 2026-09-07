@@ -203,6 +203,8 @@ export interface QcSessionRow {
   attribution_confidence: number | null
   collected_at: string | null
   category: "pass" | "warn" | "fail" | "pending_review" | "unscanned"
+  qc_status: "ai" | "human" | "unscanned" | null
+  review_status: "pending" | "reviewed" | null
 }
 
 export interface QcSessionListResponse {
@@ -234,6 +236,14 @@ export function rescanQualitySession(sessionId: string): Promise<{
   summary?: string
 }> {
   return client.post("/admin/closed-loop/quality/rescan", { session_id: sessionId })
+}
+
+export function humanVerdictQualitySession(
+  sessionId: string,
+  verdict: "pass" | "fail",
+  note?: string,
+): Promise<{ status: string; session_id: string; verdict: string; judge_model: string }> {
+  return client.post("/admin/closed-loop/quality/human-verdict", { session_id: sessionId, verdict, note })
 }
 
 export function listQualityRecords(params?: {
