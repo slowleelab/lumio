@@ -43,6 +43,10 @@
         </el-menu-item>
 
         <div class="menu-section">质量与审计</div>
+        <el-menu-item index="/admin/quality-report">
+          <el-icon><PieChart /></el-icon>
+          <template #title>质量监控报表</template>
+        </el-menu-item>
         <el-menu-item index="/admin/rag-metrics">
           <el-icon><TrendCharts /></el-icon>
           <template #title>RAG 指标</template>
@@ -85,6 +89,7 @@ import {
   ChatDotRound,
   Memo,
   TrendCharts,
+  PieChart,
   DataAnalysis,
   Notebook,
   VideoPlay,

@@ -50,10 +50,6 @@
         </span>
       </template>
     </el-progress>
-    <div v-else-if="scan.lastRun" class="scan-summary muted">
-      上轮全量质检 {{ scan.lastRun.total }} 个会话 · 合格率 {{ ((scan.lastRun.pass_rate ?? 0) * 100).toFixed(1) }}%
-      · 不合格 {{ scan.lastRun.n_fail }} 已采入待复核 ({{ scan.lastRun.finished_at?.slice(5, 16).replace("T", " ") }})
-    </div>
 
     <!-- 批量归因进度条 -->
     <el-progress
@@ -73,58 +69,7 @@
       </template>
     </el-progress>
 
-        <div v-if="coverage" class="coverage-line">
-      近 30 天应检会话 <b>{{ coverage.total_sessions }}</b> · 已质检 <b class="ok">{{ coverage.scanned_sessions }}</b>
-      · 覆盖率 <b>{{ fmtPct(coverage.coverage) }}</b> · 合格率 <b>{{ fmtPct(coverage.pass_rate) }}</b>
-      <span class="muted"> (不合格 {{ coverage.by_verdict.fail ?? 0 }} / 提醒 {{ coverage.by_verdict.warn ?? 0 }})</span>
-    </div>
-
-    <div class="stat-cards">
-      <div class="stat-card" :class="{ active: qcFilters.category === 'pending_review' }" @click="setCategory('pending_review')">
-        <span class="label">待复核</span>
-        <span class="num warn">{{ stats?.pending_review ?? "-" }}</span>
-        <span class="hint">点击查看待人工判定会话</span>
-      </div>
-      <div class="stat-card" :class="{ active: qcFilters.category === 'fail' }" @click="setCategory('fail')">
-        <span class="label">不合格</span>
-        <span class="num danger">{{ coverage?.by_verdict?.fail ?? "-" }}</span>
-        <span class="hint">质检不合格会话 (另提醒级 {{ coverage?.by_verdict?.warn ?? 0 }})</span>
-      </div>
-      <div class="stat-card" :class="{ active: qcFilters.category === 'pass' }" @click="setCategory('pass')">
-        <span class="label">合格</span>
-        <span class="num ok">{{ coverage?.by_verdict?.pass ?? "-" }}</span>
-        <span class="hint">质检合格会话</span>
-      </div>
-      <div class="stat-card">
-        <span class="label">今日新增案例</span>
-        <span class="num">{{ stats?.today_new ?? "-" }}</span>
-        <span class="hint">近 24 小时采集</span>
-      </div>
-      <div class="stat-card">
-        <span class="label">已全量</span>
-        <span class="num">{{ stats?.deployed ?? "-" }}</span>
-        <span class="hint">修复完成上线</span>
-      </div>
-      <div class="stat-card">
-        <span class="label">LLM 直通率</span>
-        <span class="num">{{ fmtPct(stats?.llm_pass_rate ?? null) }}</span>
-        <span class="hint">免人工确认占比</span>
-      </div>
-      <!-- 根因分布条 -->
-      <div class="dist-card">
-        <span class="label">根因层分布</span>
-        <div class="dist-bars">
-          <div v-for="d in layerDist" :key="d.key" class="dist-row" :title="`${d.label}: ${d.count}`">
-            <span class="dist-label">{{ d.label }}</span>
-            <div class="dist-track"><div class="dist-fill" :style="{ width: distWidth(d.count) }"></div></div>
-            <span class="dist-count">{{ d.count }}</span>
-          </div>
-          <div v-if="!layerDist.length" class="muted dist-empty">暂无归因数据 — 先跑批量归因</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="filters">
+        <div class="filters">
       <el-select v-model="qcFilters.category" placeholder="分类" clearable size="small" style="width: 130px" @change="reloadQc">
         <el-option label="合格" value="pass" />
         <el-option label="提醒级" value="warn" />
@@ -535,7 +480,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue"
-import { useRouter } from "vue-router"
+import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
 import {
@@ -544,7 +489,6 @@ import {
   startBatchAttribution,
   getBatchAttributionStatus,
   expandGoldenSet,
-  getBadcaseStats,
   getBadcase,
   startQualityScan,
   getQualityScanStatus,
@@ -554,9 +498,7 @@ import {
   humanVerdictQualitySession,
   endChatSession,
   type QcSessionRow,
-  getQualityCoverage,
   type Badcase,
-  type QualityCoverage,
   type QualityProblem,
   type QualityScanStatus,
 } from "@/api/closedLoop"
@@ -564,6 +506,7 @@ import { getConversationReplay, type ReplayResponse } from "@/api/console"
 import DecisionChainView from "@/components/common/DecisionChainView.vue"
 
 const router = useRouter()
+const route = useRoute()
 
 // ── 页签: 质检记录 (全量会话判定) / 问题案例 (归因整改闭环) ──
 // ── 统一会话质检列表 (判定 ⟕ 问题案例, 会话维度一行) ──
@@ -574,7 +517,6 @@ const qcPageSize = ref(50)
 const qcLoading = ref(false)
 const qcFilters = ref<{ category: string; keyword: string }>({ category: "", keyword: "" })
 const selected = ref<QcSessionRow[]>([])
-const coverage = ref<QualityCoverage | null>(null)
 
 async function loadQc() {
   qcLoading.value = true
@@ -604,24 +546,11 @@ function clearQcFilters() {
   reloadQc()
 }
 
-function setCategory(cat: string) {
-  qcFilters.value.category = qcFilters.value.category === cat ? "" : cat
-  reloadQc()
-}
-
 function sessionTimeTitle(row: QcSessionRow): string {
   const parts = [`会话 ${fmtTime(row.session_time)}`]
   if (row.scanned_at) parts.push(`质检 ${fmtTime(row.scanned_at)}`)
   if (row.collected_at) parts.push(`案例采集 ${fmtTime(row.collected_at)}`)
   return parts.join(" · ")
-}
-
-async function loadCoverage() {
-  try {
-    coverage.value = await getQualityCoverage()
-  } catch {
-    /* handled */
-  }
 }
 
 function verdictLabel(v: string) {
@@ -852,7 +781,7 @@ async function doHumanVerdict(v: "pass" | "fail") {
         problems: v === "pass" ? [] : qcDetail.value.problems,
       }
     }
-    await Promise.all([loadQc(), loadCoverage()])
+    await loadQc()
     ElMessage.success(`人工判定完成: ${label}`)
   } catch {
     ElMessage.error("人工判定失败")
@@ -873,7 +802,7 @@ async function doRescan() {
         problems: r.problems ?? qcDetail.value.problems,
         summary: r.summary ?? qcDetail.value.summary,
       }
-      await Promise.all([loadQc(), loadCoverage()])
+      await loadQc()
       ElMessage.success(`复检完成: ${verdictLabel(r.verdict ?? "")}`)
     } else {
       ElMessage.info(r.status === "skipped" ? "对话不足 2 轮, 跳过" : "复检完成")
@@ -893,9 +822,6 @@ async function openBadcaseById(badcaseId: string) {
     /* handled */
   }
 }
-
-// ── 统计与分布 ──
-const stats = ref<(Awaited<ReturnType<typeof getBadcaseStats>>) | null>(null)
 
 const LAYER_LABELS: Record<string, string> = {
   layer_1: "① 预处理",
@@ -930,18 +856,6 @@ const FIX_TABLE_LABELS: Record<string, string> = {
   none: "无需修复",
 }
 
-const layerDist = computed(() => {
-  const dist = stats.value?.layer_dist ?? {}
-  return Object.entries(dist)
-    .map(([key, count]) => ({ key, count, label: LAYER_LABELS[key] ?? key }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 5)
-})
-const distMax = computed(() => Math.max(1, ...layerDist.value.map((d) => d.count)))
-function distWidth(count: number) {
-  return `${Math.max(4, Math.round((count / distMax.value) * 100))}%`
-}
-
 // ── 列表 ──
 function onSelection(rows: QcSessionRow[]) {
   // 批量操作作用于问题案例: 行携带 badcase_id 才可选 (模板 :selectable 已限)
@@ -951,13 +865,6 @@ function fixTableFor(_row: QcSessionRow): string | undefined {
   return undefined // 统一行不携带分流表; 后端 resolve 按根因层自动落表
 }
 
-async function loadStats() {
-  try {
-    stats.value = await getBadcaseStats()
-  } catch {
-    /* handled */
-  }
-}
 
 // ── 详情抽屉 ──
 const detailVisible = ref(false)
@@ -1061,7 +968,7 @@ const qaProblems = computed<QualityProblem[]>(() => qaDetail.value?.problems ?? 
 async function refreshAfterAction(msg: string) {
   ElMessage.success(msg)
   detailVisible.value = false
-  await Promise.all([loadQc(), loadStats()])
+  await loadQc()
 }
 
 async function runAttribution(row: Badcase) {
@@ -1069,7 +976,7 @@ async function runAttribution(row: Badcase) {
   try {
     const r = (await attributeBadcase(row.id)) as { root_cause_layer?: string; needs_human_review?: boolean }
     ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
-    await Promise.all([loadQc(), loadStats()])
+    await loadQc()
     if (detailVisible.value && detail.value?.id === row.id) {
       const fresh = await getBadcase(row.id)
       if (fresh) openDetail(fresh)
@@ -1219,7 +1126,7 @@ async function batchConfirm() {
     }
   }
   ElMessage.success(`批量确认完成: ${ok}/${rows.length}`)
-  await Promise.all([loadQc(), loadStats()])
+  await loadQc()
 }
 
 async function batchTransition(status: string) {
@@ -1235,7 +1142,7 @@ async function batchTransition(status: string) {
     }
   }
   ElMessage.success(`批量流转完成: ${ok}/${rows.length}`)
-  await Promise.all([loadQc(), loadStats()])
+  await loadQc()
 }
 
 // ── 批量归因 (后台任务轮询, 跟随当前筛选范围) ──
@@ -1274,7 +1181,7 @@ async function pollBatch() {
       }
       if (st.total > 0) {
         ElMessage.success(`批量归因完成: 成功 ${st.done} / 失败 ${st.failed} / 共 ${st.total}`)
-        await Promise.all([loadQc(), loadStats()])
+        await loadQc()
       }
     }
   } catch {
@@ -1330,7 +1237,7 @@ async function pollScan() {
       }
       if (st.total > 0) {
         ElMessage.success(`全量质检完成: 不合格 ${st.n_fail} 已采入待复核 (合格率 ${((st.last_run?.pass_rate ?? 0) * 100).toFixed(1)}%)`)
-        await Promise.all([loadQc(), loadStats(), loadCoverage()])
+        await loadQc()
       }
     }
   } catch {
@@ -1396,18 +1303,18 @@ function shortModel(m?: string | null) {
   if (m.includes("qwen")) return "qwen 裁判"
   return m.length > 10 ? m.slice(0, 10) : m
 }
-function fmtPct(v: number | null | undefined) {
-  return v == null ? "-" : `${Math.round(v * 100)}%`
-}
 function fmtTime(iso?: string | null) {
   return iso ? iso.slice(0, 19).replace("T", " ") : "-"
 }
 onMounted(() => {
   pollScan() // 恢复可能进行中的全量质检进度
+  // 质量监控报表卡片跳转带入分类筛选
+  const q = route.query.category as string | undefined
+  if (q && ["pass", "warn", "fail", "pending_review", "unscanned"].includes(q)) {
+    qcFilters.value.category = q
+  }
   loadQc()
   pollBatch()
-  loadStats()
-  loadCoverage()
 })
 onUnmounted(() => {
   if (replayTimer) clearInterval(replayTimer)
@@ -1430,55 +1337,11 @@ onUnmounted(() => {
   margin-left: 8px;
 }
 
-.stat-cards {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(110px, 1fr)) minmax(220px, 1.6fr);
-  gap: 10px;
-  margin-top: 12px;
-}
-.stat-card {
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  background: var(--el-fill-color-extra-light);
-  cursor: pointer;
-  transition: border-color 0.2s;
-  &:hover { border-color: var(--el-color-primary-light-5); }
-  &.active { border-color: var(--el-color-primary); background: var(--el-color-primary-light-9); }
-  .label { font-size: var(--fs-sm); color: var(--color-text-secondary); }
-  .num { font-size: 20px; font-weight: 600; }
-  .num.warn { color: var(--el-color-warning); }
-  .hint { font-size: var(--fs-xs, 11px); color: var(--color-text-placeholder); }
-}
-.dist-card {
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  padding: 8px 12px;
-  background: var(--el-fill-color-extra-light);
-  .label { font-size: var(--fs-sm); color: var(--color-text-secondary); }
-  .dist-bars { margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
-  .dist-row { display: flex; align-items: center; gap: 6px; }
-  .dist-label { font-size: 11px; width: 62px; color: var(--color-text-secondary); flex-shrink: 0; }
-  .dist-track { flex: 1; height: 8px; border-radius: 4px; background: var(--el-fill-color); overflow: hidden; }
-  .dist-fill { height: 100%; border-radius: 4px; background: var(--el-color-primary-light-3); }
-  .dist-count { font-size: 11px; width: 24px; text-align: right; }
-  .dist-empty { font-size: var(--fs-sm); }
-}
 
 .batch-progress-text { font-size: var(--fs-sm); color: var(--color-text-secondary); }
 .qa-tabs {
   margin-top: 8px;
   .tab-hint { font-size: var(--fs-xs, 11px); color: var(--color-text-placeholder); margin-left: 4px; }
-}
-.coverage-line {
-  font-size: var(--fs-sm);
-  color: var(--color-text-secondary);
-  padding: 4px 2px 0;
-  b { color: var(--color-text-primary); margin: 0 2px; }
-  b.ok { color: var(--el-color-success); }
 }
 .problem-tag { margin-right: 4px; margin-bottom: 2px; cursor: default; }
 .qa-verdict {
