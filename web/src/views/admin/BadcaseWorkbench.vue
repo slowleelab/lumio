@@ -429,7 +429,7 @@
 
         <div class="section-title">会话回放 <span class="muted section-hint">({{ qcPanorama.length }} 轮 · 问题轮标红 · 含每轮链路)</span></div>
         <el-collapse v-if="qcPanorama.length" v-model="panoActiveNames">
-          <el-collapse-item name="pano" :title="panoActiveNames.length ? '收起回放' : `共 ${qcPanorama.length} 轮对话 (点击展开)`">
+          <el-collapse-item name="pano" :title="`共 ${qcPanorama.length} 轮对话`">
             <div
               v-for="r in qcPanorama"
               :key="r.round"
@@ -504,7 +504,7 @@
         </el-descriptions>
 
         <div class="qc-actions">
-          <el-button type="primary" @click="expandReplayView">展开会话回放</el-button>
+          <el-button type="primary" @click="toggleReplayView">{{ panoActiveNames.length ? "收起会话回放" : "展开会话回放" }}</el-button>
           <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
           <el-button :loading="qcRescanning" @click="doRescan">复检此会话</el-button>
         </div>
@@ -716,10 +716,11 @@ const qcPanorama = computed(() => {
 
 // 内嵌回放展开 (操作列"回放"或处置按钮自动展开)
 const panoActiveNames = ref<string[]>([])
-function expandReplayView() {
-  panoActiveNames.value = ["pano"]
-  document.querySelector(".qc-detail")?.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" })
-  document.querySelector(".qc-detail .el-collapse")?.scrollIntoView({ behavior: "smooth", block: "center" })
+function toggleReplayView() {
+  panoActiveNames.value = panoActiveNames.value.length ? [] : ["pano"]
+  if (panoActiveNames.value.length) {
+    document.querySelector(".qc-detail .el-collapse")?.scrollIntoView({ behavior: "smooth", block: "center" })
+  }
 }
 
 // 重放执行: 原客户消息按序重发 → 轮询完成 → 结束会话触发质检 → 前后对比
