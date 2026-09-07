@@ -219,11 +219,9 @@
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="130" fixed="right">
+      <el-table-column label="操作" width="70" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
-          <el-button link size="small" @click.stop="openQcDetail(row, true)">决策链</el-button>
-          <el-button v-if="row.badcase_id" link type="warning" size="small" @click.stop="openBadcaseById(row.badcase_id)">整改</el-button>
         </template>
       </el-table-column>
       <template #empty>
@@ -519,7 +517,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
@@ -636,13 +634,13 @@ const qcReplay = ref<ReplayResponse | null>(null)
 const qcReplayLoading = ref(false)
 const qcRescanning = ref(false)
 
-async function openQcDetail(row: QcSessionRow, scrollChain = false) {
+async function openQcDetail(row: QcSessionRow) {
   qcDetail.value = row
   qcDetailVisible.value = true
   qcReplay.value = null
   qcReplayLoading.value = true
   panoActiveNames.value = ["pano"]
-  chainActiveNames.value = scrollChain ? ["chain"] : []
+  chainActiveNames.value = []
   replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null }
   replayNewReplay.value = null
   try {
@@ -651,10 +649,6 @@ async function openQcDetail(row: QcSessionRow, scrollChain = false) {
     /* 回放拉取失败时抽屉降级为仅判定视图 */
   } finally {
     qcReplayLoading.value = false
-    if (scrollChain) {
-      await nextTick()
-      document.querySelector(".qc-detail .qc-chain")?.scrollIntoView({ behavior: "smooth", block: "start" })
-    }
   }
 }
 
