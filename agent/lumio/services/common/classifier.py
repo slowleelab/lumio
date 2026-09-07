@@ -414,6 +414,7 @@ INTENT_DOMAINS: dict[IntentLabel, str] = {
     IntentLabel.HANDOFF_HOTLINE: "knowledge",
     IntentLabel.HANDOFF_VERIFY: "knowledge",
     # 1.13 faq
+    IntentLabel.KNOWLEDGE_QA: "knowledge",
     IntentLabel.FAQ_PRODUCT: "knowledge",
     IntentLabel.FAQ_CREDIT_REPORT: "knowledge",
     IntentLabel.FAQ_CONTRACT: "knowledge",
@@ -571,7 +572,7 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 - limit_query: 额度查询
 - installment_inquiry: 分期咨询
 - reward_query: 积分查询
-- faq: 常见问题
+- faq: 知识问答 (知识库/政策通用咨询: 年费/免息期/账单日等)
 - card_loss: 挂失/补卡
 - complaint: 投诉
 - transfer_agent: 转人工

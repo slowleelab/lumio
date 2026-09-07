@@ -25,7 +25,7 @@ _DOMAIN_COUNTS = {
     "risk": 13,
     "dispute": 12,
     "handoff": 8,
-    "faq": 9,
+    "faq": 10,
     "nb": 3,
 }
 _OLD_FLAT = {
@@ -48,9 +48,9 @@ def _canonical() -> set[IntentLabel]:
 
 
 def test_canonical_label_counts_match_draft03() -> None:
-    """149 个主名, 各域数量与 draft-0.3 主表一致."""
+    """150 个主名 (faq→knowledge_qa 更名后 1.13 域 +1), 各域数量与主表一致."""
     canon = _canonical()
-    assert len(canon) == 149
+    assert len(canon) == 150
     by_domain: dict[str, int] = {}
     for label in canon:
         prefix = label.value.split("_")[0]
@@ -58,6 +58,8 @@ def test_canonical_label_counts_match_draft03() -> None:
     # 值前缀 → 域归并: benefit/campaign 属 points 域, transfer_agent 属 handoff 域
     by_domain["points"] = by_domain.get("points", 0) + by_domain.pop("benefit", 0) + by_domain.pop("campaign", 0)
     by_domain["handoff"] = by_domain.get("handoff", 0) + by_domain.pop("transfer", 0)
+    # knowledge_qa (faq 更名主名) 归并进 1.13 知识问答域
+    by_domain["faq"] = by_domain.get("faq", 0) + by_domain.pop("knowledge", 0)
     assert by_domain == _DOMAIN_COUNTS
 
 
@@ -74,7 +76,7 @@ def test_normalize_roundtrip_and_old_alias() -> None:
         assert normalize_intent(label.value) == label
     # 旧 flat → 主名 (非 FAQ 兜底, 除 identity 外旧值 ≠ 主名)
     assert normalize_intent("bill_query") == IntentLabel.ACCOUNT_BILL_QUERY
-    assert normalize_intent("faq") == IntentLabel.FAQ_PRODUCT
+    assert normalize_intent("faq") == IntentLabel.KNOWLEDGE_QA
     assert normalize_intent("chitchat") == IntentLabel.NB_CHITCHAT
 
 

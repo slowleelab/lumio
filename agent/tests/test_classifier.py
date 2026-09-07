@@ -442,13 +442,14 @@ def test_normalize_intent_identity_and_fallback() -> None:
     assert normalize_intent("card_loss") == IntentLabel.CARD_LOSS_REPORT
     assert normalize_intent("complaint") == IntentLabel.DISPUTE_SUBMIT
     assert normalize_intent("chitchat") == IntentLabel.NB_CHITCHAT
-    assert normalize_intent("faq") == IntentLabel.FAQ_PRODUCT
+    # faq → knowledge_qa: FAQ 是知识检索来源不是意图, 通用知识问答主名 knowledge_qa
+    assert normalize_intent("faq") == IntentLabel.KNOWLEDGE_QA
     # 主名/identity 值原样返回
     assert normalize_intent("limit_query") == IntentLabel.LIMIT_QUERY
     assert normalize_intent("transfer_agent") == IntentLabel.TRANSFER_AGENT
     assert normalize_intent("account_bill_query") == IntentLabel.ACCOUNT_BILL_QUERY
-    # 未知旧值兜底 FAQ, 不抛异常 (存量 ReadIsolation 兼容)
-    assert normalize_intent("some_old_unknown_label") == IntentLabel.FAQ
+    # 未知旧值兜底知识问答, 不抛异常 (存量 ReadIsolation 兼容)
+    assert normalize_intent("some_old_unknown_label") == IntentLabel.KNOWLEDGE_QA
 
 
 # ── P1 能量-OOD + 校准 (纯函数, 无 torch 依赖) ──

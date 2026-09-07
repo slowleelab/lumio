@@ -59,10 +59,11 @@ const ACTION_META: Record<string, { label: string; tag: string; dot: string; col
   route_decision: { label: "路由决策", tag: "warning", dot: "warning" },
   intent_classify: { label: "意图分类", tag: "primary", dot: "primary" },
   tool_call: { label: "工具执行", tag: "success", dot: "success" },
-  rag_retrieve: { label: "知识检索", tag: "primary", dot: "primary" },
+  faq_retrieve: { label: "FAQ 检索", tag: "primary", dot: "primary" },
+  rag_retrieve: { label: "文档检索 (RAG)", tag: "primary", dot: "primary" },
   llm_generate: { label: "回复生成", tag: "warning", dot: "warning" },
   chain_complete: { label: "链路完成", tag: "info", dot: "" },
-  faq_direct: { label: "FAQ 直出", tag: "success", dot: "success" },
+  faq_direct: { label: "FAQ 检索·直出", tag: "success", dot: "success" },
   noise_blocked: { label: "噪声拦截", tag: "danger", dot: "danger", color: "#f56c6c" },
   transfer_agent: { label: "转人工", tag: "warning", dot: "warning" },
   user_confirm: { label: "客户确认", tag: "info", dot: "" },
@@ -150,6 +151,8 @@ const VALUE_ZH: Record<string, string> = {
   query: "查询", business: "业务办理", knowledge: "知识咨询", fallback: "闲聊/兜底",
   risk: "风险操作", complain: "投诉", transfer: "转人工", consulting: "咨询",
   transaction: "交易", service: "人工服务", chitchat: "闲聊",
+  // 意图 (intent): faq 为旧意图名, 归一化主名 knowledge_qa — FAQ 是检索来源不是意图
+  faq: "知识问答", knowledge_qa: "知识问答",
   // 链路 (traffic_class / chain)
   read_only_query: "查询直达", financial_transaction: "交易办理", high_risk: "高风险→人工",
 }
@@ -189,7 +192,7 @@ function evidenceSummary(ev: Record<string, unknown> | null): Array<{ k: string;
 const INTENT_ZH: Record<string, string> = {
   bill_query: "账单查询", account_bill_query: "账单查询", transaction_query: "交易明细查询",
   txn_query: "交易明细查询", limit_query: "额度查询", installment_inquiry: "分期咨询",
-  reward_query: "积分相关", faq: "常见咨询", faq_product: "产品咨询", chitchat: "闲聊/无明确业务",
+  reward_query: "积分相关", faq: "知识问答", knowledge_qa: "知识问答", faq_product: "产品咨询", chitchat: "闲聊/无明确业务",
   nb_chitchat: "闲聊/无明确业务", nb_noise: "无效输入", complaint: "投诉", transfer_agent: "要求转人工",
   card_loss: "卡片挂失", card_loss_report: "卡片挂失",
 }
@@ -262,17 +265,19 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
       if (ev.traffic_class === null && "composite" in ev) return "意图属于咨询类，进入知识问答流程"
       return d.reasoning
     }
+    case "faq_retrieve":
+      return "在 FAQ 标准问答库三路检索（逐字精确/语义/BM25），未命中 —— 继续走文档知识库 RAG 检索"
     case "rag_retrieve": {
       if (ev.hit) {
         const n = Array.isArray(ev.citations) ? (ev.citations as unknown[]).length : 0
-        return `从知识库检索到相关内容（引用 ${n} 个知识来源），供下一步 AI 生成回答时参考`
+        return `从文档知识库检索到相关内容（引用 ${n} 个知识来源），供下一步 AI 生成回答时参考`
       }
-      return "知识库中未找到与这句话相关的内容"
+      return "文档知识库中未找到与这句话相关的内容"
     }
     case "llm_generate":
       return ev.rag_used ? "AI 参考检索到的知识内容组织回复（非凭空生成）" : "AI 直接生成回复（无知识库参考）"
     case "faq_direct":
-      return `命中常见问题「${String(ev.question ?? "").slice(0, 30)}」，直接返回人工审核过的标准答案（非 AI 生成）`
+      return `在 FAQ 标准问答库命中「${String(ev.question ?? "").slice(0, 30)}」，直接返回人工审核过的标准答案（非 AI 生成）`
     case "chain_complete":
       return `本轮处理结束，客户收到「${sourceZh(ev.source)}」类型的回复`
     case "noise_blocked": {

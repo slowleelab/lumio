@@ -51,6 +51,8 @@ class DecisionAction(str, Enum):
     INTENT_CLASSIFY = "intent_classify"
     TOOL_CALL = "tool_call"
     RAG_RETRIEVE = "rag_retrieve"
+    # 知识检索网关: FAQ 通道检索留痕 (命中=faq_direct 直出; 未命中=本动作, 转文档 RAG)
+    FAQ_RETRIEVE = "faq_retrieve"
     LLM_GENERATE = "llm_generate"
     TRANSFER_AGENT = "transfer_agent"
     INJECTION_BLOCKED = "injection_blocked"

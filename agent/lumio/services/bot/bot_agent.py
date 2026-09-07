@@ -94,6 +94,11 @@ def _domain_zh(domain: str) -> str:
     return _DOMAIN_ZH.get(domain, domain)
 
 
+def _intent_display(intent: IntentLabel) -> str:
+    """意图叙事名: faq 为 BERT 旧标签 (批 2 重训前), 语义即知识问答。"""
+    return "知识问答 (faq)" if intent == IntentLabel.FAQ else intent.value
+
+
 def _effective_knowledge_source(raw_source: str, context: str) -> str:
     """回复来源记账: LLM 成功生成且本轮带 RAG 上下文 → knowledge.
 
@@ -411,7 +416,7 @@ class LumioAgent:
 
                             f"未识别（{'分类器异常' if _cls_src is None else _cls_src}，按兜底意图落档），置信度 {intent_result.primary_confidence:.0%} — 输入超出已知意图范围，交噪声门拦截澄清"
                             if _unrecognized
-                            else f"识别意图：{intent_result.primary_intent.value}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
+                            else f"识别意图：{_intent_display(intent_result.primary_intent)}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
 
                     ),
                     evidence={
@@ -1410,7 +1415,7 @@ class LumioAgent:
                 session_id=session_id,
                 agent_name="bot_agent",
                 action=DecisionAction.RAG_RETRIEVE,
-                reasoning=f"RAG 检索{'命中' if context else '未命中'}",
+                reasoning=f"文档 RAG 检索{'命中' if context else '未命中'}",
                 evidence={
                     "hit": bool(context),
                     "context_len": len(context or ""),
@@ -2710,6 +2715,24 @@ class LumioAgent:
             )
             accepted = ("exact",) if exact_only else ("exact", "semantic", "bm25")
             if faq_res["match_type"] not in accepted or not faq_res["results"]:
+                # 检索留痕: FAQ 通道未命中 → 调用方继续文档 RAG 通道 (决策链可分辨两条知识来源)
+                try:
+                    log_decision(
+                        session_id=session_id,
+                        agent_name="bot_agent",
+                        action=DecisionAction.FAQ_RETRIEVE,
+                        reasoning=f"FAQ 检索未命中 ({faq_res.get('match_type') or '无结果'}{', 仅精确通道' if exact_only else ''})",
+                        evidence={
+                            "match_type": faq_res.get("match_type", ""),
+                            "scope": "exact" if exact_only else "full",
+                            "query": user_input[:60],
+                        },
+                        latency_ms=(time.monotonic() - _t0) * 1000,
+                        turn_id="",  # 继承本轮 turn_id (contextvar)
+                        customer_id=customer_id,
+                    )
+                except Exception:
+                    logger.debug("decision_log 记录失败(不阻断)")
                 return None
             top = faq_res["results"][0]
             answer = top.get("answer")
@@ -2731,7 +2754,7 @@ class LumioAgent:
                     session_id=session_id,
                     agent_name="bot_agent",
                     action=DecisionAction.FAQ_DIRECT,
-                    reasoning=f"FAQ 直出 ({faq_res['match_type']})",
+                    reasoning=f"FAQ 检索命中 ({faq_res['match_type']}) → 直出标准答案",
                     evidence={"faq_id": top.get("faq_id", ""), "question": top.get("question", "")[:80]},
                     latency_ms=(time.monotonic() - _t0) * 1000,
                     turn_id="",  # 继承本轮 turn_id (contextvar)
@@ -3640,7 +3663,7 @@ class LumioAgent:
         if intent is None:
             return False
         primary = normalize_intent(intent.primary_intent.value)
-        if primary in (IntentLabel.FAQ, IntentLabel.FAQ_PRODUCT, IntentLabel.NB_CHITCHAT, IntentLabel.CHITCHAT):
+        if primary in (IntentLabel.FAQ, IntentLabel.KNOWLEDGE_QA, IntentLabel.FAQ_PRODUCT, IntentLabel.NB_CHITCHAT, IntentLabel.CHITCHAT):
             return False
         return intent.primary_confidence >= 0.7
 
