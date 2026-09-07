@@ -53,7 +53,7 @@ class IntentLabel(StrEnum):
     """
 
     # ── 旧 flat 别名 (存量兼容; 归一化目标见 _INTENT_NORMALIZATION) ──
-    FAQ = "faq"  # → faq_product
+    FAQ = "faq"  # → knowledge_qa (FAQ 是知识来源不是意图, 批 2 重训改输出主名)
     BILL_QUERY = "bill_query"  # → account_bill_query
     TRANSACTION_QUERY = "transaction_query"  # → txn_query
     LIMIT_QUERY = "limit_query"  # 旧值=主名 identity
@@ -224,7 +224,10 @@ class IntentLabel(StrEnum):
     HANDOFF_HOTLINE = "handoff_hotline"
     HANDOFF_VERIFY = "handoff_verify"
 
-    # ── 1.13 知识问答与政策域 (faq, 9) ──
+    # ── 1.13 知识问答与政策域 (knowledge, 10) ──
+    # faq 旧别名与未知字符串均归一到 knowledge_qa: "知识问答"是意图 (客户想咨询
+    # 知识), FAQ 库/文档库只是检索来源 (决策链区分 faq_retrieve / rag_retrieve)。
+    KNOWLEDGE_QA = "knowledge_qa"
     FAQ_PRODUCT = "faq_product"
     FAQ_CREDIT_REPORT = "faq_credit_report"
     FAQ_CONTRACT = "faq_contract"
@@ -244,7 +247,7 @@ class IntentLabel(StrEnum):
 # 旧 flat 意图值 -> 归一化后的主意图 (draft-0.3 §3.1 兼容映射)。
 # 存量 Redis/PG/回流样本里的旧字符串在此归一化; 未知字符串兜底 FAQ。
 _INTENT_NORMALIZATION: dict[str, IntentLabel] = {
-    "faq": IntentLabel.FAQ_PRODUCT,
+    "faq": IntentLabel.KNOWLEDGE_QA,
     "bill_query": IntentLabel.ACCOUNT_BILL_QUERY,
     "transaction_query": IntentLabel.TXN_QUERY,
     "limit_query": IntentLabel.LIMIT_QUERY,  # identity
@@ -262,7 +265,7 @@ def normalize_intent(value: str) -> IntentLabel:
 
     - 旧 flat 值 → 归一化到主名 (存量兼容, 查 _INTENT_NORMALIZATION)
     - 已是主名/合法枚举值 → 直接返回
-    - 未知字符串 → 兜底 FAQ, 不抛异常
+    - 未知字符串 → 兜底知识问答 (knowledge_qa), 不抛异常
     """
     canonical = _INTENT_NORMALIZATION.get(value)
     if canonical is not None:
@@ -271,7 +274,7 @@ def normalize_intent(value: str) -> IntentLabel:
         return IntentLabel(value)
     except ValueError:
         pass
-    return IntentLabel.FAQ
+    return IntentLabel.KNOWLEDGE_QA
 
 
 # 敏感写意图: 命中必须紧急转人工 / assist URGENT, 不允许走工具或 RAG 兜底 (合规底线)。

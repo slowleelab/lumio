@@ -50,7 +50,7 @@ def make_admin():
 def seed_env(tmp_path):
     data = _seed_data()
     app = _make_app(data, tmp_path)
-    # 隔离运营注册表 (真实文件可能含运行期登记的意图, 影响 149 条断言)
+    # 隔离运营注册表 (真实文件可能含运行期登记的意图, 影响 150 条断言)
     import lumio.shared.intent_registry as ir
 
     ir.REGISTRY_PATH = tmp_path / "intent_registry.json"
@@ -130,13 +130,13 @@ async def test_seeds_delete_denied_customer(seed_env) -> None:
 
 
 @pytest.mark.asyncio
-async def test_attribute_table_149_intents(seed_env) -> None:
+async def test_attribute_table_150_intents(seed_env) -> None:
     app, _ = seed_env
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         r = await c.get("/api/admin/intent-library/attributes")
     assert r.status_code == 200
     rows = r.json()["rows"]
-    assert len(rows) == 149
+    assert len(rows) == 150
     by_intent = {x["intent"]: x for x in rows}
     assert by_intent["account_bill_query"]["traffic_class"] == "read_only_query"
     assert by_intent["card_loss_report"]["traffic_class"] == "financial_transaction"

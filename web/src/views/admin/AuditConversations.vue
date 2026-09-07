@@ -119,7 +119,7 @@
                   <div class="bubble">
                     <div class="bubble-content">{{ t.content }}</div>
                     <div class="bubble-meta">
-                      <el-tag v-if="t.intent" size="small" type="info">{{ t.intent }}</el-tag>
+                      <el-tag v-if="t.intent" size="small" type="info">{{ intentZh(t.intent) }}</el-tag>
                       <el-tag v-if="t.response_source" size="small">{{ sourceLabel(t.response_source) }}</el-tag>
                       <span v-if="t.confidence != null" class="meta-num">置信 {{ fmtConf(t.confidence) }}</span>
                       <span class="meta-time">{{ formatTime(t.timestamp) }}</span>
@@ -140,7 +140,9 @@
                   <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
                 </el-table-column>
                 <el-table-column prop="content" label="消息" min-width="220" show-overflow-tooltip />
-                <el-table-column prop="intent" label="意图" width="140" show-overflow-tooltip />
+                <el-table-column label="意图" width="140" show-overflow-tooltip>
+                  <template #default="{ row }">{{ intentZh(row.intent) }}</template>
+                </el-table-column>
                 <el-table-column label="状态" width="90" align="center">
                   <template #default="{ row }">
                     <el-tag size="small" :type="statusType(row.processing_status)">
@@ -285,6 +287,16 @@ function confClass(v: number | null) {
 
 function formatTime(s: string | null) {
   return s?.slice(0, 19).replace("T", " ") || "-"
+}
+
+// 意图中文名: faq 为旧意图名 (归一化主名 knowledge_qa, "知识问答")
+const _INTENT_ZH: Record<string, string> = {
+  faq: "知识问答",
+  knowledge_qa: "知识问答",
+}
+function intentZh(v: string | null) {
+  if (!v) return "-"
+  return _INTENT_ZH[v] ?? v
 }
 
 const route = useRoute()

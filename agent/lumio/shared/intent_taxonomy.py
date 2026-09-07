@@ -11,7 +11,7 @@
     service 服务域(人工转接/投诉) → HIGH_RISK → 人工
     chitchat 闲聊域 → CONSULTING/兜底
 
-既有 149 个 IntentLabel 通过 INTENT_DOMAINS 归并映射进五域, 不新增第三处
+既有 150 个 IntentLabel 通过 INTENT_DOMAINS 归并映射进五域, 不新增第三处
 意图清单 —— 本模块只是骨架视图 + 域判定函数。
 """
 
