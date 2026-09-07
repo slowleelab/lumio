@@ -449,9 +449,14 @@
         </el-collapse>
         <div v-else class="muted">无对话记录 (可能仅被信号采集, 尚未质检)</div>
 
-        <!-- 决策链: 与对话审计「决策链」页签同一组件渲染, 打开即原地展开 -->
-        <div class="section-title">决策链 <span class="muted section-hint">({{ qcReplay?.decisions.length ?? 0 }} 步 · 与对话审计一致 · 可展开原始数据)</span></div>
-        <DecisionChainView v-if="qcReplay" :decisions="qcReplay.decisions" class="qc-chain" />
+        <!-- 决策链: 与对话审计「决策链」页签同一组件渲染, 默认收起, 点条目展开 -->
+        <div class="section-title">决策链 <span class="muted section-hint">(与对话审计一致 · 默认收起)</span></div>
+        <el-collapse v-if="qcReplay" v-model="chainActiveNames" class="qc-chain">
+          <el-collapse-item name="chain" :title="`共 ${qcReplay.decisions.length} 步决策 · 每步含解释与依据`">
+            <DecisionChainView :decisions="qcReplay.decisions" />
+          </el-collapse-item>
+        </el-collapse>
+        <div v-else class="muted">无决策记录</div>
 
         <!-- 重放执行: 原客户消息按序重发, 修复前后逐轮对比 -->
         <div class="section-title">重放验证 <span class="muted section-hint">(用原客户消息再走一遍当前链路)</span></div>
@@ -637,6 +642,7 @@ async function openQcDetail(row: QcSessionRow, scrollChain = false) {
   qcReplay.value = null
   qcReplayLoading.value = true
   panoActiveNames.value = ["pano"]
+  chainActiveNames.value = scrollChain ? ["chain"] : []
   replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null }
   replayNewReplay.value = null
   try {
@@ -727,8 +733,9 @@ const qcPanorama = computed(() => {
   return rounds
 })
 
-// 会话回放折叠面板: 打开详情即默认展开 (长会话可手动收起); 决策链区常驻展示
+// 会话回放默认展开 (长会话可手动收起); 决策链默认收起, 点条目标题或操作列「决策链」展开
 const panoActiveNames = ref<string[]>(["pano"])
+const chainActiveNames = ref<string[]>([])
 
 // 重放执行: 原客户消息按序重发 → 轮询完成 → 结束会话触发质检 → 前后对比
 const replayState = ref<{
