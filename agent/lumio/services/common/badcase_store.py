@@ -461,6 +461,48 @@ async def record_human_verdict(
     return rec
 
 
+async def quality_trend(session: AsyncSession, *, days: int = 14) -> list[dict[str, Any]]:
+    """质检判定按天趋势 (锚点: 会话时间, 缺失回退质检时间) + 每日新增案例。
+
+    日期序列补零; 供质量监控报表趋势图与合格率环比 (调用方取双倍窗口分半对比)。
+    """
+    from datetime import timedelta
+
+    today = datetime.now(UTC).date()
+    since = today - timedelta(days=days - 1)
+    since_ts = datetime(since.year, since.month, since.day, tzinfo=UTC)
+    anchor = func.coalesce(QualityRecord.session_time, QualityRecord.scanned_at)
+    rows = (
+        await session.execute(
+            select(
+                func.to_char(anchor, "YYYY-MM-DD").label("d"),
+                QualityRecord.verdict,
+                func.count().label("n"),
+            )
+            .where(anchor >= since_ts)
+            .group_by("d", QualityRecord.verdict)
+        )
+    ).all()
+    bc_rows = (
+        await session.execute(
+            select(func.to_char(Badcase.created_at, "YYYY-MM-DD").label("d"), func.count().label("n"))
+            .where(Badcase.created_at >= since_ts)
+            .group_by("d")
+        )
+    ).all()
+    by_date: dict[str, dict[str, int]] = {}
+    for i in range(days):
+        d = (since + timedelta(days=i)).isoformat()
+        by_date[d] = {"pass": 0, "warn": 0, "fail": 0, "new_cases": 0}
+    for d, verdict, n in rows:
+        if d in by_date:
+            by_date[d][verdict] = n
+    for d, n in bc_rows:
+        if d in by_date:
+            by_date[d]["new_cases"] = n
+    return [{"date": d, **v} for d, v in by_date.items()]
+
+
 async def quality_coverage_stats(
     session: AsyncSession,
     *,

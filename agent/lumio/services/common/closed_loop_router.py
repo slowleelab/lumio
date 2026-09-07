@@ -644,6 +644,21 @@ async def quality_coverage_endpoint(
     return await quality_coverage_stats(db, lookback_hours=lookback_hours)
 
 
+@router.get("/quality/trend")
+async def quality_trend_endpoint(
+    user: AdminAgentUser,
+    db: DbSession,
+    days: int = Query(14, ge=1, le=90),
+) -> dict[str, Any]:
+    """质检判定按天趋势 (合格/提醒/不合格 + 每日新增案例) — 质量监控报表趋势图数据源。
+
+    锚点为会话时间 (缺失回退质检时间): 反映"当天对话的质量", 不受巡检批量回扫时点影响。
+    """
+    from lumio.services.common.badcase_store import quality_trend
+
+    return {"days": await quality_trend(db, days=days)}
+
+
 def _build_judge_llm_only(request: Request) -> Any:
     """质检巡检裁判: 远程 GLM 优先 (与归因裁判同源), 未配置走本地"""
     from lumio.services.common import quality_scan

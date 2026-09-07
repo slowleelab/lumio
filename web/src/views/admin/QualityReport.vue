@@ -1,12 +1,27 @@
 <template>
   <div class="quality-report-page">
     <div class="page-header">
-      <h2>质量监控报表 <span class="page-subtitle">质检覆盖 · 判定分布 · 根因分布 (30 秒自动刷新)</span></h2>
+      <h2>质量监控报表 <span class="page-subtitle">质检结果 · 趋势 · 闭环运营 (30 秒自动刷新)</span></h2>
       <div class="header-actions">
+        <el-radio-group v-model="trendWindow" size="small" @change="reloadTrend">
+          <el-radio-button :value="7">近 7 天</el-radio-button>
+          <el-radio-button :value="14">近 14 天</el-radio-button>
+          <el-radio-button :value="30">近 30 天</el-radio-button>
+        </el-radio-group>
         <el-button size="small" :loading="refreshing" @click="refreshAll">立即刷新</el-button>
         <el-button size="small" type="success" plain @click="gotoScan">前往全量质检</el-button>
       </div>
     </div>
+
+    <!-- 数据时效提示: 巡检停止超过 1 天即提示覆盖缺口 -->
+    <el-alert
+      v-if="scanStaleDays >= 1 && !scan.running"
+      type="warning"
+      show-icon
+      :closable="false"
+      style="margin-top: 10px"
+      :title="`上轮全量质检为 ${scanStaleDays} 天前 (${fmtTime(scan.lastRun?.finished_at)})，之后的新会话尚未质检 — 覆盖率将持续下降，建议触发全量质检`"
+    />
 
     <!-- 全量质检进行中: 实时进度 (巡检在智能质检页触发) -->
     <el-progress
@@ -26,79 +41,200 @@
         </span>
       </template>
     </el-progress>
-    <div v-else-if="scan.lastRun" class="scan-summary muted">
-      上轮全量质检 {{ scan.lastRun.total }} 个会话 · 合格率 {{ ((scan.lastRun.pass_rate ?? 0) * 100).toFixed(1) }}%
-      · 不合格 {{ scan.lastRun.n_fail }} 已采入待复核 ({{ scan.lastRun.finished_at?.slice(5, 16).replace("T", " ") }})
-    </div>
 
-    <div v-if="coverage" class="coverage-line">
-      近 30 天应检会话 <b>{{ coverage.total_sessions }}</b> · 已质检 <b class="ok">{{ coverage.scanned_sessions }}</b>
-      · 覆盖率 <b>{{ fmtPct(coverage.coverage) }}</b> · 合格率 <b>{{ fmtPct(coverage.pass_rate) }}</b>
-      <span class="muted"> (不合格 {{ coverage.by_verdict.fail ?? 0 }} / 提醒 {{ coverage.by_verdict.warn ?? 0 }})</span>
-    </div>
-
+    <!-- ══ 质检结果 (近 30 天) ══ -->
+    <div class="section-label">质检结果 <span class="muted">近 30 天 · 点击卡片进入对应会话列表</span></div>
     <div class="stat-cards">
-      <div class="stat-card clickable" @click="gotoCategory('pending_review')">
-        <span class="label">待复核</span>
-        <span class="num warn">{{ stats?.pending_review ?? "-" }}</span>
-        <span class="hint">点击查看待人工判定会话</span>
+      <div class="stat-card clickable" @click="gotoCategory('unscanned')">
+        <span class="label">覆盖率</span>
+        <span class="num">{{ fmtPct(coverage?.coverage) }}</span>
+        <span class="hint">已检 {{ coverage?.scanned_sessions ?? "-" }} / 应检 {{ coverage?.total_sessions ?? "-" }} · 未检 {{ unscannedCount }} 会话</span>
+      </div>
+      <div class="stat-card clickable" @click="gotoCategory('pass')">
+        <span class="label">合格率</span>
+        <span class="num ok">
+          {{ fmtPct(coverage?.pass_rate) }}
+          <span v-if="passRateDelta != null" class="delta" :class="passRateDelta >= 0 ? 'up' : 'down'" :title="`近 ${trendWindow} 天 vs 前 ${trendWindow} 天`">
+            {{ passRateDelta >= 0 ? "▲" : "▼" }} {{ Math.abs(passRateDelta).toFixed(1) }}pct
+          </span>
+        </span>
+        <span class="hint">合格 {{ coverage?.by_verdict?.pass ?? "-" }} 会话</span>
       </div>
       <div class="stat-card clickable" @click="gotoCategory('fail')">
         <span class="label">不合格</span>
         <span class="num danger">{{ coverage?.by_verdict?.fail ?? "-" }}</span>
-        <span class="hint">质检不合格会话 (另提醒级 {{ coverage?.by_verdict?.warn ?? 0 }})</span>
+        <span class="hint">另有提醒级 {{ coverage?.by_verdict?.warn ?? 0 }} (轻问题, 不合格另计)</span>
       </div>
-      <div class="stat-card clickable" @click="gotoCategory('pass')">
-        <span class="label">合格</span>
-        <span class="num ok">{{ coverage?.by_verdict?.pass ?? "-" }}</span>
-        <span class="hint">质检合格会话</span>
+      <div class="stat-card clickable" @click="gotoCategory('pending_review')">
+        <span class="label">待复核</span>
+        <span class="num warn">{{ stats?.pending_review ?? "-" }}</span>
+        <span class="hint">待人工判定会话 (问题已发现, 等人确认)</span>
       </div>
+    </div>
+
+    <!-- ══ 趋势图 ══ -->
+    <el-card shadow="never" class="trend-card">
+      <template #header>
+        <div class="card-head">
+          <span>质检判定趋势 <span class="muted">近 {{ trendWindow }} 天 · 按会话时间 · 柱=判定数 线=当日合格率</span></span>
+          <span v-if="trendLoaded" class="muted trend-meta">
+            期初 → 期末: 日均质检 {{ trendAvgRecent }} 会话
+          </span>
+        </div>
+      </template>
+      <div ref="chartEl" class="trend-chart"></div>
+    </el-card>
+
+    <!-- ══ 闭环运营 ══ -->
+    <div class="section-label">闭环运营 <span class="muted">问题案例的确认、修复与上线进度</span></div>
+    <div class="stat-cards">
       <div class="stat-card">
         <span class="label">今日新增案例</span>
         <span class="num">{{ stats?.today_new ?? "-" }}</span>
         <span class="hint">近 24 小时采集</span>
       </div>
       <div class="stat-card">
-        <span class="label">已全量</span>
-        <span class="num">{{ stats?.deployed ?? "-" }}</span>
-        <span class="hint">修复完成上线</span>
+        <span class="label">已全量上线</span>
+        <span class="num ok">{{ stats?.deployed ?? "-" }}</span>
+        <span class="hint">修复完成并上线</span>
       </div>
       <div class="stat-card">
         <span class="label">LLM 直通率</span>
         <span class="num">{{ fmtPct(stats?.llm_pass_rate ?? null) }}</span>
-        <span class="hint">免人工确认占比</span>
+        <span class="hint">归因免人工确认占比</span>
       </div>
-      <!-- 根因分布条 -->
-      <div class="dist-card">
-        <span class="label">根因层分布</span>
-        <div class="dist-bars">
-          <div v-for="d in layerDist" :key="d.key" class="dist-row" :title="`${d.label}: ${d.count}`">
-            <span class="dist-label">{{ d.label }}</span>
-            <div class="dist-track"><div class="dist-fill" :style="{ width: distWidth(d.count) }"></div></div>
-            <span class="dist-count">{{ d.count }}</span>
+      <div class="funnel-card">
+        <span class="label">案例流转盘点 <span class="muted">(各状态案例数 · 占采集总数比例)</span></span>
+        <div class="funnel-rows">
+          <div v-for="f in funnel" :key="f.label" class="funnel-row">
+            <span class="funnel-label">{{ f.label }}</span>
+            <div class="dist-track"><div class="dist-fill" :class="f.cls" :style="{ width: f.width }"></div></div>
+            <span class="dist-count">{{ f.count }}</span>
+            <span class="funnel-pct muted">{{ f.pct }}</span>
           </div>
-          <div v-if="!layerDist.length" class="muted dist-empty">暂无归因数据 — 先跑批量归因</div>
         </div>
       </div>
     </div>
+
+    <!-- ══ 分布 ══ -->
+    <el-row :gutter="12" class="dist-row-cards">
+      <el-col :span="12">
+        <el-card shadow="never">
+          <template #header><span>根因层分布 <span class="muted">全部问题案例 · 点击进入智能质检处置</span></span></template>
+          <div class="dist-bars">
+            <div v-for="d in layerDist" :key="d.key" class="dist-row clickable" :title="`${d.label}: ${d.count} (${d.pct})`" @click="gotoScan">
+              <span class="dist-label">{{ d.label }}</span>
+              <div class="dist-track"><div class="dist-fill" :style="{ width: d.width }"></div></div>
+              <span class="dist-count">{{ d.count }}</span>
+              <span class="funnel-pct muted">{{ d.pct }}</span>
+            </div>
+            <div v-if="!layerDist.length" class="muted dist-empty">暂无归因数据 — 先在智能质检页跑批量归因</div>
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="12">
+        <el-card shadow="never">
+          <template #header><span>信号来源分布 <span class="muted">问题案例从哪些渠道被发现</span></span></template>
+          <div class="dist-bars">
+            <div v-for="d in signalDist" :key="d.key" class="dist-row" :title="`${d.label}: ${d.count} (${d.pct})`">
+              <span class="dist-label">{{ d.label }}</span>
+              <div class="dist-track"><div class="dist-fill warn" :style="{ width: d.width }"></div></div>
+              <span class="dist-count">{{ d.count }}</span>
+              <span class="funnel-pct muted">{{ d.pct }}</span>
+            </div>
+            <div v-if="!signalDist.length" class="muted dist-empty">暂无案例信号</div>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue"
 import { useRouter } from "vue-router"
+import type { EChartsCoreOption } from "echarts/core"
 import {
   getBadcaseStats,
   getQualityCoverage,
   getQualityScanStatus,
+  getQualityTrend,
   type QualityScanStatus,
+  type QualityTrendPoint,
 } from "@/api/closedLoop"
+import { useChart } from "@/composables/useChart"
 
 const router = useRouter()
 
 const refreshing = ref(false)
 const stats = ref<Awaited<ReturnType<typeof getBadcaseStats>> | null>(null)
 const coverage = ref<Awaited<ReturnType<typeof getQualityCoverage>> | null>(null)
+
+// ── 趋势: 取双倍窗口, 后半段=本期, 前半段=基线 (合格率环比) ──
+const trendWindow = ref(7)
+const trend = ref<QualityTrendPoint[]>([])
+const trendLoaded = ref(false)
+async function reloadTrend() {
+  try {
+    const r = await getQualityTrend(trendWindow.value * 2)
+    trend.value = r.days
+    trendLoaded.value = true
+  } catch {
+    /* handled */
+  }
+}
+
+const recentTrend = computed(() => trend.value.slice(-trendWindow.value))
+function rateOf(list: QualityTrendPoint[]): number | null {
+  const judged = list.reduce((s, d) => s + d.pass + d.warn + d.fail, 0)
+  if (!judged) return null
+  return (list.reduce((s, d) => s + d.pass, 0) / judged) * 100
+}
+const passRateDelta = computed(() => {
+  if (trend.value.length < trendWindow.value * 2) return null
+  const base = rateOf(trend.value.slice(0, trendWindow.value))
+  const cur = rateOf(recentTrend.value)
+  if (base == null || cur == null) return null
+  return cur - base
+})
+const trendAvgRecent = computed(() => {
+  const n = recentTrend.value.reduce((s, d) => s + d.pass + d.warn + d.fail, 0)
+  return Math.round(n / Math.max(1, recentTrend.value.length))
+})
+
+const chartEl = ref<HTMLElement | null>(null)
+const chartOption = computed<EChartsCoreOption | null>(() => {
+  const s = recentTrend.value
+  if (!s.length) return null
+  return {
+    tooltip: { trigger: "axis" },
+    legend: { data: ["合格", "提醒", "不合格", "合格率"], top: 0, textStyle: { fontSize: 11 } },
+    grid: { left: 40, right: 46, top: 40, bottom: 24 },
+    xAxis: { type: "category", data: s.map((d) => d.date.slice(5)) },
+    yAxis: [
+      { type: "value", name: "会话", minInterval: 1 },
+      { type: "value", name: "合格率", min: 0, max: 100, axisLabel: { formatter: "{value}%" } },
+    ],
+    series: [
+      { name: "合格", type: "bar", stack: "v", data: s.map((d) => d.pass), itemStyle: { color: "#67c23a" }, barMaxWidth: 26 },
+      { name: "提醒", type: "bar", stack: "v", data: s.map((d) => d.warn), itemStyle: { color: "#e6a23c" } },
+      { name: "不合格", type: "bar", stack: "v", data: s.map((d) => d.fail), itemStyle: { color: "#f56c6c" } },
+      {
+        name: "合格率",
+        type: "line",
+        yAxisIndex: 1,
+        smooth: true,
+        connectNulls: true,
+        itemStyle: { color: "#409eff" },
+        data: s.map((d) => {
+          const t = d.pass + d.warn + d.fail
+          return t ? Math.round((d.pass / t) * 100) : null
+        }),
+      },
+    ],
+  }
+})
+useChart(chartEl, chartOption)
 
 // ── 全量质检巡检状态 (触发在智能质检页, 此处只读展示) ──
 const scan = ref({
@@ -114,6 +250,13 @@ const scan = ref({
 const scanPct = computed(() => (scan.value.total > 0 ? Math.round((scan.value.done / scan.value.total) * 100) : 0))
 let scanTimer: ReturnType<typeof setInterval> | null = null
 let refreshTimer: ReturnType<typeof setInterval> | null = null
+
+const scanStaleDays = computed(() => {
+  const t = scan.value.lastRun?.finished_at
+  if (!t) return 0
+  const ms = Date.now() - new Date(t).getTime() // ISO 带时区偏移, 原生可解析
+  return Number.isFinite(ms) ? Math.floor(ms / 86_400_000) : 0
+})
 
 async function pollScan() {
   try {
@@ -132,7 +275,7 @@ async function pollScan() {
     if (!st.running && scanTimer) {
       clearInterval(scanTimer)
       scanTimer = null
-      await Promise.all([loadStats(), loadCoverage()])
+      await Promise.all([loadStats(), loadCoverage(), reloadTrend()])
     }
   } catch {
     /* handled */
@@ -158,11 +301,16 @@ async function loadCoverage() {
 async function refreshAll() {
   refreshing.value = true
   try {
-    await Promise.all([loadStats(), loadCoverage(), pollScan()])
+    await Promise.all([loadStats(), loadCoverage(), reloadTrend(), pollScan()])
   } finally {
     refreshing.value = false
   }
 }
+
+const unscannedCount = computed(() => {
+  if (!coverage.value) return "-"
+  return Math.max(0, coverage.value.total_sessions - coverage.value.scanned_sessions)
+})
 
 function gotoCategory(category: string) {
   router.push({ path: "/admin/badcase", query: { category } })
@@ -182,20 +330,54 @@ const LAYER_LABELS: Record<string, string> = {
   layer_7: "⑦ 风控合规",
   uncertain: "待人工判定",
 }
-const layerDist = computed(() => {
-  const dist = stats.value?.layer_dist ?? {}
-  return Object.entries(dist)
-    .map(([key, count]) => ({ key, count, label: LAYER_LABELS[key] ?? key }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 5)
-})
-const distMax = computed(() => Math.max(1, ...layerDist.value.map((d) => d.count)))
-function distWidth(count: number) {
-  return `${Math.max(4, Math.round((count / distMax.value) * 100))}%`
+const SIGNAL_LABELS: Record<string, string> = {
+  negative_feedback: "负面反馈",
+  transfer: "转人工",
+  agent_revoke: "人工撤回",
+  behavior_anomaly: "行为异常",
+  compliance_alert: "合规告警",
+  qa_scan: "质检巡检",
 }
+
+function distOf(dist: Record<string, number> | undefined, labels: Record<string, string>) {
+  const entries = Object.entries(dist ?? {}).map(([key, count]) => ({ key, count, label: labels[key] ?? key }))
+  const total = entries.reduce((s, e) => s + e.count, 0) || 1
+  const max = Math.max(1, ...entries.map((e) => e.count))
+  return entries
+    .sort((a, b) => b.count - a.count)
+    .map((e) => ({
+      ...e,
+      width: `${Math.max(4, Math.round((e.count / max) * 100))}%`,
+      pct: `${Math.round((e.count / total) * 100)}%`,
+    }))
+}
+const layerDist = computed(() => distOf(stats.value?.layer_dist, LAYER_LABELS))
+const signalDist = computed(() => distOf(stats.value?.signal_dist, SIGNAL_LABELS))
+
+// 修复闭环漏斗: 采集 → 待复核 → 已确认 → 已上线
+const funnel = computed(() => {
+  const s = stats.value
+  if (!s) return []
+  const total = Math.max(1, s.total)
+  const steps = [
+    { label: "采集", count: s.total, cls: "" },
+    { label: "待复核", count: s.pending_review, cls: "warn" },
+    { label: "已确认", count: s.confirmed, cls: "ok" },
+    { label: "已上线", count: s.deployed, cls: "done" },
+  ]
+  const max = Math.max(1, ...steps.map((x) => x.count))
+  return steps.map((x) => ({
+    ...x,
+    width: `${Math.max(4, Math.round((x.count / max) * 100))}%`,
+    pct: `${Math.round((x.count / total) * 100)}%`,
+  }))
+})
 
 function fmtPct(v: number | null | undefined) {
   return v == null ? "-" : `${Math.round(v * 100)}%`
+}
+function fmtTime(iso?: string | null) {
+  return iso ? iso.slice(0, 16).replace("T", " ") : "-"
 }
 
 onMounted(() => {
@@ -221,30 +403,30 @@ onUnmounted(() => {
   font-weight: 400;
   color: var(--color-text-secondary);
 }
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .progress-text {
   font-size: 12px;
   white-space: nowrap;
 }
-.scan-summary {
-  margin-top: 10px;
-  font-size: var(--fs-sm);
-}
 .muted { color: var(--color-text-secondary); }
 
-.coverage-line {
-  margin-top: 10px;
+.section-label {
+  margin: 18px 0 8px;
   font-size: var(--fs-sm);
-  color: var(--color-text-secondary);
-  padding: 4px 2px 0;
-  b { color: var(--color-text-primary); margin: 0 2px; }
-  b.ok { color: var(--el-color-success); }
+  font-weight: 600;
+  color: var(--color-text-primary);
+  .muted { font-weight: 400; margin-left: 6px; }
 }
 
 .stat-cards {
   display: grid;
-  grid-template-columns: repeat(5, minmax(110px, 1fr)) minmax(220px, 1.6fr);
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
   gap: 10px;
-  margin-top: 12px;
 }
 .stat-card {
   border: 1px solid var(--el-border-color-lighter);
@@ -266,18 +448,59 @@ onUnmounted(() => {
     &:hover { border-color: var(--el-color-primary-light-5); }
   }
 }
-.dist-card {
+.delta {
+  font-size: 12px;
+  font-weight: 600;
+  margin-left: 6px;
+  &.up { color: var(--el-color-success); }
+  &.down { color: var(--el-color-danger); }
+}
+
+.trend-card { margin-top: 12px; }
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  .muted { font-weight: 400; }
+}
+.trend-meta { font-size: 12px; }
+.trend-chart { height: 300px; width: 100%; }
+
+.funnel-card {
+  grid-column: span 2;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 8px;
-  padding: 8px 12px;
+  padding: 10px 12px;
   background: var(--el-fill-color-extra-light);
-  .label { font-size: var(--fs-sm); color: var(--color-text-secondary); }
-  .dist-bars { margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
-  .dist-row { display: flex; align-items: center; gap: 6px; }
-  .dist-label { font-size: 11px; width: 62px; color: var(--color-text-secondary); flex-shrink: 0; }
-  .dist-track { flex: 1; height: 8px; border-radius: 4px; background: var(--el-fill-color); overflow: hidden; }
-  .dist-fill { height: 100%; border-radius: 4px; background: var(--el-color-primary-light-3); }
-  .dist-count { font-size: 11px; width: 24px; text-align: right; }
-  .dist-empty { font-size: var(--fs-sm); }
+  .label { font-size: var(--fs-sm); color: var(--color-text-secondary); .muted { font-weight: 400; } }
 }
+.funnel-rows { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+.funnel-row { display: flex; align-items: center; gap: 6px; }
+.funnel-label { font-size: 11px; width: 48px; color: var(--color-text-secondary); flex-shrink: 0; }
+.funnel-pct { font-size: 11px; width: 34px; text-align: right; flex-shrink: 0; }
+
+.dist-row-cards { margin-top: 12px; }
+.dist-bars { display: flex; flex-direction: column; gap: 4px; }
+.dist-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  &.clickable { cursor: pointer; &:hover .dist-label { color: var(--el-color-primary); } }
+}
+.dist-label { font-size: 11px; width: 72px; color: var(--color-text-secondary); flex-shrink: 0; }
+.dist-track { flex: 1; height: 8px; border-radius: 4px; background: var(--el-fill-color); overflow: hidden; }
+.dist-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--el-color-primary-light-3);
+  &.warn { background: var(--el-color-warning-light-5); }
+  &.ok { background: var(--el-color-success-light-5); }
+  &.done { background: var(--el-color-success); }
+}
+.dist-count { font-size: 11px; width: 30px; text-align: right; font-weight: 600; }
+.dist-empty { font-size: var(--fs-sm); }
 </style>

@@ -267,3 +267,15 @@ export interface QualityCoverage {
 export function getQualityCoverage(lookbackHours = 720): Promise<QualityCoverage> {
   return client.get("/admin/closed-loop/quality/coverage", { params: { lookback_hours: lookbackHours } })
 }
+
+export interface QualityTrendPoint {
+  date: string
+  pass: number
+  warn: number
+  fail: number
+  new_cases: number
+}
+
+export function getQualityTrend(days = 14): Promise<{ days: QualityTrendPoint[] }> {
+  return client.get("/admin/closed-loop/quality/trend", { params: { days } })
+}
