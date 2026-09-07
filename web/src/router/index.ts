@@ -10,6 +10,7 @@ import AuditConversations from "@/views/admin/AuditConversations.vue"
 import OperationLogs from "@/views/admin/OperationLogs.vue"
 import RagMetrics from "@/views/admin/RagMetrics.vue"
 import BadcaseWorkbench from "@/views/admin/BadcaseWorkbench.vue"
+import QualityReport from "@/views/admin/QualityReport.vue"
 import IntentLibrary from "@/views/admin/IntentLibrary.vue"
 import DialogueSimulator from "@/views/admin/DialogueSimulator.vue"
 
@@ -31,6 +32,7 @@ const router = createRouter({
         { path: "ops-logs", name: "admin-ops-logs", component: OperationLogs },
         { path: "rag-metrics", name: "admin-rag-metrics", component: RagMetrics },
         { path: "badcase", name: "admin-badcase", component: BadcaseWorkbench },
+        { path: "quality-report", name: "admin-quality-report", component: QualityReport },
         { path: "intent-library", name: "admin-intent-library", component: IntentLibrary },
         { path: "simulator", name: "admin-simulator", component: DialogueSimulator },
       ],
