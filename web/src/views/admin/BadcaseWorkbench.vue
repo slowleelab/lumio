@@ -427,9 +427,9 @@
           </div>
         </template>
 
-        <div class="section-title">决策链 <span class="muted section-hint">({{ qcPanorama.length }} 轮 · 问题轮标红 · 悬停链路节点看依据)</span></div>
+        <div class="section-title">会话回放 <span class="muted section-hint">({{ qcPanorama.length }} 轮 · 问题轮标红)</span></div>
         <el-collapse v-if="qcPanorama.length" v-model="panoActiveNames">
-          <el-collapse-item name="pano" :title="`共 ${qcPanorama.length} 轮 · 每轮含决策链与回复`">
+          <el-collapse-item name="pano" :title="`共 ${qcPanorama.length} 轮对话`">
             <div
               v-for="r in qcPanorama"
               :key="r.round"
@@ -443,17 +443,15 @@
                   {{ r.bot }}
                   <el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag>
                 </div>
-                <div v-if="qcTurnChains[r.round - 1]" class="qc-turn-chain">
-                  <template v-for="(s, si) in qcTurnChains[r.round - 1].details" :key="si">
-                    <span v-if="si > 0" class="chain-arrow">→</span>
-                    <span class="chain-step" :title="s.title">{{ s.label }}</span>
-                  </template>
-                </div>
               </div>
             </div>
           </el-collapse-item>
         </el-collapse>
         <div v-else class="muted">无对话记录 (可能仅被信号采集, 尚未质检)</div>
+
+        <!-- 决策链: 与对话审计「决策链」页签同一组件渲染, 打开即原地展开 -->
+        <div class="section-title">决策链 <span class="muted section-hint">({{ qcReplay?.decisions.length ?? 0 }} 步 · 与对话审计一致 · 可展开原始数据)</span></div>
+        <DecisionChainView v-if="qcReplay" :decisions="qcReplay.decisions" class="qc-chain" />
 
         <!-- 重放执行: 原客户消息按序重发, 修复前后逐轮对比 -->
         <div class="section-title">重放验证 <span class="muted section-hint">(用原客户消息再走一遍当前链路)</span></div>
@@ -507,7 +505,6 @@
         </el-descriptions>
 
         <div class="qc-actions">
-          <el-button type="primary" @click="toggleChainView">{{ panoActiveNames.length ? "收起决策链" : "查看决策链" }}</el-button>
           <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
           <el-button :loading="qcRescanning" @click="doRescan">复检此会话</el-button>
         </div>
@@ -517,7 +514,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue"
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
@@ -543,6 +540,7 @@ import {
   type QualityScanStatus,
 } from "@/api/closedLoop"
 import { getConversationReplay, type ReplayResponse } from "@/api/console"
+import DecisionChainView from "@/components/common/DecisionChainView.vue"
 
 const router = useRouter()
 
@@ -633,12 +631,12 @@ const qcReplay = ref<ReplayResponse | null>(null)
 const qcReplayLoading = ref(false)
 const qcRescanning = ref(false)
 
-async function openQcDetail(row: QcSessionRow, expandReplay = false) {
+async function openQcDetail(row: QcSessionRow, scrollChain = false) {
   qcDetail.value = row
   qcDetailVisible.value = true
   qcReplay.value = null
   qcReplayLoading.value = true
-  panoActiveNames.value = expandReplay ? ["pano"] : []
+  panoActiveNames.value = ["pano"]
   replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null }
   replayNewReplay.value = null
   try {
@@ -647,6 +645,10 @@ async function openQcDetail(row: QcSessionRow, expandReplay = false) {
     /* 回放拉取失败时抽屉降级为仅判定视图 */
   } finally {
     qcReplayLoading.value = false
+    if (scrollChain) {
+      await nextTick()
+      document.querySelector(".qc-detail .qc-chain")?.scrollIntoView({ behavior: "smooth", block: "start" })
+    }
   }
 }
 
@@ -725,14 +727,8 @@ const qcPanorama = computed(() => {
   return rounds
 })
 
-// 决策链内嵌展开 (操作列"决策链"或底部按钮触发, 当前页展开不跳转)
-const panoActiveNames = ref<string[]>([])
-function toggleChainView() {
-  panoActiveNames.value = panoActiveNames.value.length ? [] : ["pano"]
-  if (panoActiveNames.value.length) {
-    document.querySelector(".qc-detail .el-collapse")?.scrollIntoView({ behavior: "smooth", block: "center" })
-  }
-}
+// 会话回放折叠面板: 打开详情即默认展开 (长会话可手动收起); 决策链区常驻展示
+const panoActiveNames = ref<string[]>(["pano"])
 
 // 重放执行: 原客户消息按序重发 → 轮询完成 → 结束会话触发质检 → 前后对比
 const replayState = ref<{
@@ -1593,16 +1589,6 @@ onUnmounted(() => {
   background: var(--color-bg-page);
   border-radius: 6px;
 }
-.chain-step {
-  display: inline-block;
-  padding: 1px 8px;
-  border: 1px solid var(--el-border-color, #dcdfe6);
-  border-radius: 10px;
-  background: var(--el-bg-color, #fff);
-  cursor: default;
-  white-space: nowrap;
-}
-.chain-arrow { margin: 0 4px; color: var(--color-text-placeholder, #c0c4cc); }
 .pano-round {
   display: flex;
   gap: 8px;
