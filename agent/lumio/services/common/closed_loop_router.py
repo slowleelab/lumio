@@ -569,21 +569,118 @@ async def quality_rescan_endpoint(user: AdminAgentUser, request: Request, body: 
     }
 
 
-@router.post("/quality/replay")
-async def quality_replay_endpoint(user: AdminAgentUser, request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """重放执行: 取原会话全部客户消息, 按原顺序重新发给机器人 (新会话)。
+# 会话重放后台任务引用 (防 asyncio GC; 见 AGENTS.md 后台 task 规范)
+_replay_tasks: set = set()
 
-    修复验证口径 — 同样的输入过当前链路, 逐轮对比新旧回复 (前端轮询新会话
-    回放直至客服轮数齐, 再结束会话触发自动质检)。走真实消息管线 (审计/闸门
-    /队列全量生效), per-session worker 串行消费保证轮序。
+# 单轮重放等待机器人回复落库的上限 (秒); 超时计 timeouts 继续下一轮
+_REPLAY_TURN_TIMEOUT = 90.0
+
+
+async def _run_serial_replay(app: Any, sf: Any, redis: Any, new_sid: str, msgs: list[str]) -> None:
+    """串行重放任务: 发一条 → 等机器人回复落库 → 再发下一条。
+
+    一次性全发会让多轮消息瞬时入队, 轮次节奏失真且上下文/状态机门
+    (等待快照、噪声门) 行为不可信; 逐轮等待才是对原会话的忠实重放。
+    进度写 Redis hash (qa:replay:progress:{sid}) 供前端轮询; 全部轮次
+    后结束新会话并触发自动质检 (镜像 /chat/end 链路, 不再依赖前端收尾)。
     """
     import asyncio as _asyncio
     import contextlib as _cl
     import time as _time
     import uuid as _uuid
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
 
     from lumio.services.bot.router import CHAT_STREAM_KEY
     from lumio.services.common.audit import write_chat_message
+    from lumio.shared.orm_models import DialogueLog
+
+    key = f"qa:replay:progress:{new_sid}"
+    timeouts = 0
+    try:
+        for msg in msgs:
+            await redis.hset(key, mapping={"current": msg[:60]})
+            t_send = _datetime.now(_UTC)
+            message_id = _uuid.uuid4().hex
+            with _cl.suppress(Exception):  # 审计失败不阻断重放
+                await write_chat_message(sf, session_id=new_sid, message_id=message_id, content=msg, customer_id="replay-bot")
+            await redis.xadd(
+                CHAT_STREAM_KEY,
+                {
+                    "session_id": new_sid,
+                    "message_id": message_id,
+                    "message": msg,
+                    "verification_result": "",
+                    "_trace_context": "",
+                    "_enqueue_time": _asyncio.get_event_loop().time(),
+                    "customer_id": "replay-bot",
+                    "customer_name": "重放执行",
+                    "channel": "web",
+                },
+            )
+            # 等本轮机器人回复落库 (上一轮回复是下一轮的上下文, 必须串行)
+            deadline = _time.monotonic() + _REPLAY_TURN_TIMEOUT
+            replied = False
+            while _time.monotonic() < deadline:
+                await _asyncio.sleep(1.0)
+                async with sf() as db:
+                    n = (
+                        await db.execute(
+                            select(func.count()).where(
+                                DialogueLog.session_id == new_sid,
+                                DialogueLog.speaker == "bot",
+                                DialogueLog.timestamp > t_send,
+                            )
+                        )
+                    ).scalar() or 0
+                if n > 0:
+                    replied = True
+                    break
+            if not replied:
+                timeouts += 1
+                await redis.hset(key, mapping={"timeouts": str(timeouts)})
+            await redis.hincrby(key, "done", 1)
+
+        # 结束会话 + 触发自动质检 (与 /chat/end 同链路)
+        sm = getattr(app.state, "session_manager", None)
+        if sm is not None:
+            with _cl.suppress(Exception):
+                from lumio.shared.models import SessionPhase
+
+                await sm.transition_phase(new_sid, SessionPhase.ENDED, reason="replay_ended")
+        settings = get_settings()
+        if settings.llm.qa_scan_on_session_end:
+            judge_llm = None
+            with _cl.suppress(Exception):
+                from lumio.services.common import quality_scan as _qs
+
+                judge_llm = _qs.build_judge_llm(getattr(app.state, "llm_client", None), settings)
+            if judge_llm is not None:
+                with _cl.suppress(Exception):
+                    import lumio.services.common.quality_scan as quality_scan
+
+                    await quality_scan.scan_session_by_id(
+                        sf, judge_llm, redis, new_sid, quality_scan.judge_model_name(settings)
+                    )
+        await redis.hset(
+            key, mapping={"status": "done", "error": "" if not timeouts else f"{timeouts} 轮等待回复超时"}
+        )
+    except Exception as exc:
+        logger.warning("串行重放任务异常: session=%s err=%s", new_sid, exc)
+        with _cl.suppress(Exception):
+            await redis.hset(key, mapping={"status": "error", "error": str(exc)[:200]})
+
+
+@router.post("/quality/replay")
+async def quality_replay_endpoint(user: AdminAgentUser, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """重放执行: 串行重发原客户消息 — 发一条等机器人回复落库后再发下一条。
+
+    后台任务逐轮推进 (轮次节奏忠实还原, 上一轮回复作为下一轮上下文);
+    进度经 GET /quality/replay/status 轮询; 完成后自动结束新会话并触发
+    质检, 前端无需收尾。走真实消息管线 (审计/闸门/队列全量生效)。
+    """
+    import time as _time
+
     from lumio.shared.orm_models import DialogueLog
 
     session_id = str((body or {}).get("session_id") or "").strip()
@@ -593,6 +690,8 @@ async def quality_replay_endpoint(user: AdminAgentUser, request: Request, body: 
     redis = getattr(request.app.state, "redis_client", None)
     if sf is None or redis is None:
         raise LumioError(code=5001, message="DB/Redis 未就绪")
+
+    import asyncio as _asyncio
 
     async with sf() as db:
         msgs = (
@@ -611,25 +710,50 @@ async def quality_replay_endpoint(user: AdminAgentUser, request: Request, body: 
         raise LumioError(code=2001, message="原会话无客户消息, 无法重放")
 
     new_sid = f"replay-{session_id[:20]}-{int(_time.time() * 1000) % 100000}"
-    for msg in msgs:
-        message_id = _uuid.uuid4().hex
-        with _cl.suppress(Exception):  # 审计失败不阻断重放
-            await write_chat_message(sf, session_id=new_sid, message_id=message_id, content=msg, customer_id="replay-bot")
-        await redis.xadd(
-            CHAT_STREAM_KEY,
-            {
-                "session_id": new_sid,
-                "message_id": message_id,
-                "message": msg,
-                "verification_result": "",
-                "_trace_context": "",
-                "_enqueue_time": _asyncio.get_event_loop().time(),
-                "customer_id": "replay-bot",
-                "customer_name": "重放执行",
-                "channel": "web",
-            },
-        )
+    key = f"qa:replay:progress:{new_sid}"
+    await redis.hset(
+        key,
+        mapping={
+            "status": "running",
+            "total": str(len(msgs)),
+            "done": "0",
+            "timeouts": "0",
+            "error": "",
+            "current": "",
+            "origin": session_id[:64],
+        },
+    )
+    await redis.expire(key, 7 * 24 * 3600)
+    task = _asyncio.create_task(_run_serial_replay(request.app, sf, redis, new_sid, msgs))
+    _replay_tasks.add(task)
+    task.add_done_callback(_replay_tasks.discard)
     return {"status": "ok", "new_session_id": new_sid, "total_rounds": len(msgs)}
+
+
+@router.get("/quality/replay/status")
+async def quality_replay_status_endpoint(user: AdminAgentUser, request: Request, session_id: str = Query(...)) -> dict[str, Any]:
+    """重放进度: 后台串行任务逐轮上报 (done/total/当前消息/超时数/错误)。"""
+    redis = getattr(request.app.state, "redis_client", None)
+    if redis is None:
+        raise LumioError(code=5001, message="Redis 未就绪")
+    data = await redis.hgetall(f"qa:replay:progress:{session_id}")
+    if not data:
+        return {"status": "unknown", "total": 0, "done": 0}
+
+    def _int(v: str | None) -> int:
+        try:
+            return int(v or 0)
+        except ValueError:
+            return 0
+
+    return {
+        "status": data.get("status", "unknown"),
+        "total": _int(data.get("total")),
+        "done": _int(data.get("done")),
+        "timeouts": _int(data.get("timeouts")),
+        "error": data.get("error", ""),
+        "current": data.get("current", ""),
+    }
 
 
 @router.get("/quality/coverage")

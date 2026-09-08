@@ -225,6 +225,19 @@ export function replayQualitySession(sessionId: string): Promise<{ status: strin
   return client.post("/admin/closed-loop/quality/replay", { session_id: sessionId })
 }
 
+export interface ReplayStatus {
+  status: "running" | "done" | "error" | "unknown"
+  total: number
+  done: number
+  timeouts: number
+  error: string
+  current: string
+}
+
+export function getReplayStatus(sessionId: string): Promise<ReplayStatus> {
+  return client.get("/admin/closed-loop/quality/replay/status", { params: { session_id: sessionId } })
+}
+
 export function endChatSession(sessionId: string): Promise<{ status: string }> {
   return client.post("/chat/end", { session_id: sessionId })
 }
