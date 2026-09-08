@@ -424,7 +424,9 @@
         <div v-else class="replay-panel">
           <div v-if="replayState.running" class="replay-progress">
             <el-progress :percentage="replayProgressPct" :stroke-width="8" striped striped-flow status="success" />
-            <span class="muted">重放中 {{ replayState.done }}/{{ replayState.total }} 轮 · 新会话 {{ replayState.newSessionId?.slice(0, 28) }}…</span>
+            <span class="muted">
+              重放中 {{ replayState.done }}/{{ replayState.total }} 轮{{ replayState.current ? ` · 正在发: ${replayState.current.slice(0, 16)}…` : "" }} · 串行逐轮 (等回复再发下一条) · 新会话 {{ replayState.newSessionId?.slice(0, 24) }}…
+            </span>
           </div>
           <template v-if="!replayState.running && replayCompare.length">
             <div class="replay-compare-head">
@@ -513,8 +515,8 @@ import {
   listQcSessions,
   rescanQualitySession,
   replayQualitySession,
+  getReplayStatus,
   humanVerdictQualitySession,
-  endChatSession,
   type QcSessionRow,
   type Badcase,
   type QualityProblem,
@@ -606,7 +608,7 @@ async function openQcDetail(row: QcSessionRow) {
   qcReplayLoading.value = true
   panoActiveNames.value = ["pano"]
   chainActiveNames.value = []
-  replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null }
+  replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null, current: "" }
   replayNewReplay.value = null
   try {
     qcReplay.value = await getConversationReplay(row.session_id)
@@ -703,7 +705,8 @@ const replayState = ref<{
   total: number
   done: number
   finishedAt: string | null
-}>({ running: false, newSessionId: null, total: 0, done: 0, finishedAt: null })
+  current: string
+}>({ running: false, newSessionId: null, total: 0, done: 0, finishedAt: null, current: "" })
 const replayNewReplay = ref<ReplayResponse | null>(null)
 let replayTimer: ReturnType<typeof setInterval> | null = null
 
@@ -740,33 +743,44 @@ const replayChangedCount = computed(() => replayCompare.value.filter((c) => c.ch
 
 async function doReplay() {
   if (!qcDetail.value || replayState.value.running) return
-  replayState.value = { running: true, newSessionId: null, total: 0, done: 0, finishedAt: null }
+  replayState.value = { running: true, newSessionId: null, total: 0, done: 0, finishedAt: null, current: "" }
   replayNewReplay.value = null
   try {
     const r = await replayQualitySession(qcDetail.value.session_id)
     replayState.value.newSessionId = r.new_session_id
     replayState.value.total = r.total_rounds
     let waited = 0
+    // 轮询后端串行重放进度 (逐轮推进: 发一条 → 等回复 → 下一条; 完成后后端自动结束会话并触发质检)
     replayTimer = setInterval(async () => {
-      waited += 3
+      waited += 2
       try {
-        const nr = await getConversationReplay(r.new_session_id)
-        replayNewReplay.value = nr
-        const doneCount = nr.turns.filter((t) => t.speaker === "bot").length
-        replayState.value.done = doneCount
-        if (doneCount >= r.total_rounds || waited > 120) {
+        const st = await getReplayStatus(r.new_session_id)
+        replayState.value.done = Math.min(st.done, r.total_rounds)
+        replayState.value.current = st.current || ""
+        if (st.status === "done" || st.status === "error" || waited > 600) {
           clearInterval(replayTimer!)
           replayTimer = null
           replayState.value.running = false
           replayState.value.finishedAt = new Date().toISOString()
-          // 结束重放会话 → 触发自动质检, 新判定稍后可查
-          endChatSession(r.new_session_id).catch(() => {})
-          ElMessage.success(waited > 120 ? "重放超时收尾 (已尽力)" : "重放完成, 已触发新会话质检")
+          try {
+            replayNewReplay.value = await getConversationReplay(r.new_session_id)
+          } catch {
+            /* 对比回放拉取失败, 进度结论仍有效 */
+          }
+          if (st.status === "error") {
+            ElMessage.warning(`重放异常: ${st.error || "未知错误"} · 已完成 ${st.done}/${st.total || r.total_rounds} 轮`)
+          } else if (st.timeouts > 0) {
+            ElMessage.warning(`重放完成 (${st.timeouts} 轮等待回复超时已跳过) · 已结束新会话并触发质检`)
+          } else if (waited > 600) {
+            ElMessage.warning("重放超时收尾 (后台仍在执行, 稍后可搜新会话查看)")
+          } else {
+            ElMessage.success("重放完成, 已结束新会话并触发质检")
+          }
         }
       } catch {
-        /* 新会话回放未就绪, 继续等 */
+        /* 进度暂不可读, 继续等 */
       }
-    }, 3000)
+    }, 2000)
   } catch {
     replayState.value.running = false
     ElMessage.error("重放启动失败")
