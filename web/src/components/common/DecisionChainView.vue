@@ -57,6 +57,7 @@ const props = defineProps<{ decisions: ReplayDecision[] }>()
 const ACTION_META: Record<string, { label: string; tag: string; dot: string; color?: string }> = {
   turn_start: { label: "消息出队", tag: "info", dot: "" },
   route_decision: { label: "路由决策", tag: "warning", dot: "warning" },
+  query_rewrite: { label: "追问补全", tag: "primary", dot: "primary" },
   intent_classify: { label: "意图分类", tag: "primary", dot: "primary" },
   tool_call: { label: "工具执行", tag: "success", dot: "success" },
   faq_retrieve: { label: "FAQ 检索", tag: "primary", dot: "primary" },
@@ -226,6 +227,8 @@ function decisionExplain(d: { action: string; reasoning: string; evidence?: Reco
       }
       return "意图属于咨询类，进入知识问答流程（检索知识库 + AI 组织回答）"
     }
+    case "query_rewrite":
+      return `客户在接上文追问 — 已把「${String(ev.original ?? "").slice(0, 20)}」补全为完整问题「${String(ev.rewritten ?? "").slice(0, 30)}」再理解和检索${ev.context_answer ? "；上轮结果中已有答案，将直接复述" : ""}`
     case "intent_classify": {
       // 路由预备决策 (traffic_class 存在) vs 纯意图决策
       if ("traffic_class" in ev && ev.traffic_class != null) {

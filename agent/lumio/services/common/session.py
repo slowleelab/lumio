@@ -777,6 +777,8 @@ class SessionManager:
             # P0 修复: pending_action 必须序列化 —— 此前缺失, 每次 _save_meta 全量 SET
             # 都会把 patch_state 刚写入的待确认操作整体擦除 (转人工/敏感工具确认链全断).
             "pending_action": state.pending_action.model_dump(mode="json") if state.pending_action else None,
+            # 对话理解升级: 最近一次系统查询结果 (patch_state 写入, 全量序列化防擦除)
+            "last_tool_result": state.last_tool_result,
             "created_at": state.created_at.isoformat(),
             "last_active_at": state.last_active_at.isoformat(),
             "version": state.version,

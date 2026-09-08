@@ -94,6 +94,22 @@ def _domain_zh(domain: str) -> str:
     return _DOMAIN_ZH.get(domain, domain)
 
 
+def _answer_grounded(answer: str, source: str) -> bool:
+    """复述守卫: 答案句中的每个数字 (日期/金额) 都必须在来源的数字集合里。
+
+    数值集合比较而非子串匹配 — "26" 不得借 "2026" 混过; "8650" 与 "8650.00"
+    数值相等视为一致。无数字的短复述 (如"是的") 放行; 任一数字对不上 → 判为
+    转述走样, 退回真实查询。
+    """
+    import re
+
+    ans_nums = {float(n) for n in re.findall(r"\d+(?:\.\d+)?", answer)}
+    if not ans_nums:
+        return True
+    src_nums = {float(n) for n in re.findall(r"\d+(?:\.\d+)?", source)}
+    return ans_nums <= src_nums
+
+
 def _intent_display(intent: IntentLabel) -> str:
     """意图叙事名: faq 为 BERT 旧标签 (批 2 重训前), 语义即知识问答。"""
     return "知识问答 (faq)" if intent == IntentLabel.FAQ else intent.value
@@ -440,6 +456,29 @@ class LumioAgent:
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
 
+            # 追问补全留痕 (对话理解升级): 慢路径把接话补全成自包含问题后,
+            # 下游检索/抽参消费补全句 — 原句 vs 补全句对照入链, 审计可直接
+            # 看到"系统当时把话理解成了什么" (replay-5ac11e27 复盘)。
+            _rq = (getattr(intent_result, "rewritten_query", None) or "").strip()
+            if _rq and _rq != user_input.strip():
+                try:
+                    log_decision(
+                        session_id=session_id,
+                        agent_name="bot_agent",
+                        action=DecisionAction.QUERY_REWRITE,
+                        reasoning=f"追问补全: 「{user_input[:24]}」→「{_rq[:40]}」",
+                        evidence={
+                            "original": user_input[:80],
+                            "rewritten": _rq[:120],
+                            "refers_to_last": bool(intent_result.refers_to_last),
+                            "context_answer": bool(intent_result.context_answer),
+                        },
+                        turn_id="",  # 继承本轮 turn_id (contextvar)
+                        customer_id=customer_id,
+                    )
+                except Exception:
+                    logger.debug("query_rewrite 留痕失败(不阻断): session=%s", session_id)
+
             # 2.5 渐进式工具暴露：仅当开关开启 + 有可用工具 + 命中查询类工具意图时，
             #     打通 MCP 工具编排路径（在 domain 分派之前）。开关关闭时整段不进入，路由 100% 同现状。
             # P-指代修复: 统一出口 —— 所有 handler 的 result 在此补入真实 entities.
@@ -658,17 +697,20 @@ class LumioAgent:
         """
         try:
             history = await self._classify_context(session_id)
+            followup_ctx = await self._build_followup_context(session_id, history)
             from lumio.shared.tracing import _TRACING_ENABLED, _get_tracer
 
             tracer = _get_tracer() if _TRACING_ENABLED else None
             if tracer is None:
-                intent_result, entities, sentiment, _ = await self._classifier.classify(user_input, history=history)
+                intent_result, entities, sentiment, _ = await self._classifier.classify(
+                    user_input, history=history, followup_context=followup_ctx
+                )
                 return intent_result, entities, sentiment
 
             with tracer.start_as_current_span("Agent: intent_classify") as span:
                 try:
                     intent_result, entities, sentiment, source = await self._classifier.classify(
-                        user_input, history=history
+                        user_input, history=history, followup_context=followup_ctx
                     )
                 except Exception:
                     span.set_attribute("error", True)
@@ -679,6 +721,35 @@ class LumioAgent:
                 return intent_result, entities, sentiment
         except Exception:
             return IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0), [], SentimentLabel.NEUTRAL
+
+    async def _build_followup_context(
+        self, session_id: str | None, history: list[dict[str, Any]] | None
+    ) -> str | None:
+        """LLM 慢路径的对话上下文区块: 最近轮次 + 上一轮系统查询结果。
+
+        追问轮 ("那还款日是哪一天") 的语义在上下文里; 慢路径带此区块才能
+        补全出自包含问题 (rewritten_query) 并识别"答案已在手" (context_answer)。
+        无历史时返回 None — 首句自包含, 走原单句分类, 零变化。
+        """
+        if not history:
+            return None
+        lines = []
+        for t in history[-4:]:
+            who = "客户" if t.get("speaker") == "customer" else "客服"
+            content = (t.get("content") or "").strip()
+            if content:
+                lines.append(f"{who}: {content[:120]}")
+        ctx = "\n".join(lines)
+        if session_id and self._session_manager is not None:
+            try:
+                sid = await self._session_manager.resolve_session_id(session_id)
+                raw = await self._session_manager.read_state(sid)
+                lt = (raw or {}).get("last_tool_result") if isinstance(raw, dict) else None
+                if lt and lt.get("summary"):
+                    ctx += f"\n[上一轮系统动作]\n工具 {lt.get('tool', '')} 返回: {str(lt.get('summary'))[:200]}"
+            except Exception:
+                pass
+        return ctx or None
 
     async def _classify_context(self, session_id: str | None) -> list[dict[str, Any]] | None:
         """拉取最近对话轮次, 拼成 BERT 多轮上下文 (speaker/content, 时间升序)。
@@ -1003,12 +1074,58 @@ class LumioAgent:
         """
         from lumio.services.bot.tool_selection import select_tools_for_intent
 
+        # 对话理解升级: 追问轮补全句 (自包含) — 精确出口与参数抽取都用它,
+        # 客户原句仅保留在展示/审计层。
+        effective_q = (getattr(intent_result, "rewritten_query", None) or "").strip() or user_input
+
+        # 答案已在手复述 (replay-5ac11e27 复盘): 慢路径判定本句答案已完整出现在
+        # 上一轮系统查询结果中 → 零调用直接复述, 与上轮回答 100% 一致。
+        # 守卫: 复述句中的数字/日期必须逐个出现在上轮结果原文里 (防 LLM 转述
+        # 走样), 且同会话内 (last_tool_result 未过期清理)。
+        _ca = (getattr(intent_result, "context_answer", None) or "").strip()
+        if (
+            _ca
+            and getattr(intent_result, "refers_to_last", False)
+            and not _has_emergency_marker(user_input)
+            and self._session_manager is not None
+        ):
+            try:
+                _rsid = await self._session_manager.resolve_session_id(session_id)
+                raw = await self._session_manager.read_state(_rsid)
+                _lt = (raw or {}).get("last_tool_result") if isinstance(raw, dict) else None
+                _summary = str((_lt or {}).get("summary") or "")
+                if _summary and _answer_grounded(_ca, _summary):
+                    try:
+                        log_decision(
+                            session_id=session_id,
+                            agent_name="query_chain",
+                            action=DecisionAction.TOOL_CALL,
+                            reasoning=f"答案已在手: 复述上轮 {_lt.get('tool', '')} 查询结果 (零调用)",
+                            evidence={"tool": _lt.get("tool", ""), "cache_hit": True, "result_preview": _ca[:120]},
+                            turn_id="",
+                            customer_id=customer_id,
+                        )
+                    except Exception:
+                        logger.debug("decision_log 记录失败(不阻断)")
+                    return self._build_result(
+                        session_id,
+                        user_input,
+                        _ca,
+                        "tool",
+                        intent_result.primary_intent.value,
+                        intent_result.primary_confidence,
+                        entities=entities,
+                        sentiment=sentiment,
+                    )
+            except Exception:
+                pass  # 状态读取失败 → 退回正常工具查询, 不阻断
+
         # 逐字精确 FAQ 出口 (防分类抖动, E2E p3faq 复盘): 客户原句与运营标准问
         # 完全一致 (变体归一化查表, 非语义猜测) 时直接给标准答案 — 分类把标准
         # 问句抖成查询意图时, 工具答的是账户数据而非问题本身 ("临时需要用卡
         # 怎么办?"→查临时额度, 答非所问)。语义/BM25 不在此截胡; 紧急标记跳过。
         if not _has_emergency_marker(user_input):
-            exact_hit = await self._try_faq_direct(session_id, user_input, customer_id, exact_only=True)
+            exact_hit = await self._try_faq_direct(session_id, effective_q, customer_id, exact_only=True)
             if exact_hit is not None:
                 return exact_hit
 
@@ -1028,7 +1145,7 @@ class LumioAgent:
         )
         qc = await self._query_chain.run(
             intent_label=intent_result.primary_intent.value,
-            user_input=user_input,
+            user_input=effective_q,
             tool_names=tool_names,
             slot_values=slot_values,
             customer_id=customer_id,
@@ -1070,6 +1187,29 @@ class LumioAgent:
             )
         except Exception:
             logger.debug("查询直达决策日志失败(不阻断): session=%s", session_id)
+        # 记录最近一次系统查询结果 (追问轮"答案已在手"复述的数据源)
+        if qc.tool_name and not qc.error and self._session_manager is not None:
+            try:
+                _summary_txt = mask_pii_in_text(
+                    (qc.raw_result if (qc.raw_result and qc.raw_result != "(cache)") else (qc.content or "")) or ""
+                )[:300]
+                if _summary_txt:
+                    _sid = await self._session_manager.resolve_session_id(session_id)
+                    _raw = await self._session_manager.read_state(_sid)
+                    if isinstance(_raw, dict):
+                        import time as _time_mod
+
+                        _patched = await self._session_manager.patch_state(
+                            _sid,
+                            int(_raw.get("version", 0) or 0),
+                            {"last_tool_result": {"tool": qc.tool_name, "summary": _summary_txt, "at": int(_time_mod.time())}},
+                        )
+                        if not _patched.get("ok"):
+                            logger.warning(
+                                "last_tool_result 写入被 CAS 拒绝 (version 冲突), 本轮跳过: session=%s", session_id
+                            )
+            except Exception:
+                logger.debug("last_tool_result 写入失败(不阻断): session=%s", session_id)
         if qc.error:
             logger.info("查询链路失败回落: session=%s err=%s", session_id, qc.error)
             return None
@@ -1401,12 +1541,15 @@ class LumioAgent:
         # 交易/查询意图上游已走工具直达。FAQ 通道优先于文档 RAG — 人工审核过的
         # 标准答案高于模型生成答案; 未命中继续文档通道。紧急标记输入跳过 FAQ
         # (敏感诉求不得被字面相似词条劫持), 敏感重路由轮跳过 (防二次绕开状态机)。
+        # 追问轮检索用补全句 (rewritten_query): 接话原句 ("那还款日是哪一天") 的
+        # 向量/BM25 会命中无关文档, 自包含补全句才检得准 (对话理解升级)。
+        retrieval_query = (getattr(intent, "rewritten_query", None) or "").strip() or user_input
         if not _sensitive_rerouted and not _has_emergency_marker(user_input):
-            faq_hit = await self._try_faq_direct(session_id, user_input)
+            faq_hit = await self._try_faq_direct(session_id, retrieval_query)
             if faq_hit is not None:
                 return faq_hit
         _rag_t0 = time.monotonic()
-        context = await self._retrieve(user_input, intent=intent.primary_intent, confidence=intent.primary_confidence)
+        context = await self._retrieve(retrieval_query, intent=intent.primary_intent, confidence=intent.primary_confidence)
         if extra_context:
             context = f"{extra_context}\n\n{context}" if context else extra_context
         # E2 决策可解释: 记录 RAG 检索决策 (命中与否)
@@ -1419,7 +1562,7 @@ class LumioAgent:
                 evidence={
                     "hit": bool(context),
                     "context_len": len(context or ""),
-                    "query": user_input[:60],
+                    "query": retrieval_query[:60],
                     "citations": (self._last_citation_docids or [])[:5],
                 },
                 turn_id="",  # 继承本轮 turn_id (contextvar)
