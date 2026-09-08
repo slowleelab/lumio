@@ -467,11 +467,29 @@
           </el-descriptions-item>
         </el-descriptions>
 
+        <!-- 操作区分组: 左=处置主操作; 右=判定操作 (人工改判强动作收纳进下拉防误触) -->
         <div class="qc-actions">
-          <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
-          <el-button :loading="humanJudging === 'pass'" type="success" plain @click="doHumanVerdict('pass')">人工判合格</el-button>
-          <el-button :loading="humanJudging === 'fail'" type="danger" plain @click="doHumanVerdict('fail')">人工判不合格</el-button>
-          <el-button :loading="qcRescanning" @click="doRescan">复检此会话 (AI)</el-button>
+          <div class="qc-actions-main">
+            <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
+            <span v-else-if="qcDetail.verdict === 'pass'" class="muted action-hint">质检合格 · 无问题案例, 无需整改</span>
+          </div>
+          <div class="qc-actions-judge">
+            <span class="muted action-hint">判定操作</span>
+            <el-dropdown :disabled="humanJudging != null" @command="doHumanVerdict">
+              <el-button type="primary" plain :loading="humanJudging != null">
+                {{ qcDetail.qc_status === "human" ? "重新人工判定" : "人工判定" }} ▾
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="pass">标记为合格</el-dropdown-item>
+                  <el-dropdown-item command="fail">标记为不合格</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+            <el-tooltip content="重跑 AI 裁判 (覆盖为最新 AI 判定, 用于修复效果验证)" placement="top">
+              <el-button :loading="qcRescanning" @click="doRescan">AI 复检</el-button>
+            </el-tooltip>
+          </div>
         </div>
       </div>
     </el-drawer>
@@ -1476,9 +1494,19 @@ onUnmounted(() => {
 }
 .qc-actions {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: var(--space-2);
   margin-top: var(--space-4);
+  flex-wrap: wrap;
 }
+.qc-actions-main,
+.qc-actions-judge {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.action-hint { font-size: var(--fs-xs, 12px); }
 /* 问题轮现场还原 */
 .scene-bubble {
   max-width: 92%;
