@@ -586,7 +586,9 @@ class SimCustomer:
                     if keys:
                         second = SCENARIO_MAP[self._rng.choice(keys)]
                         records += await self.run_scenario(second, chained=True)
-                        state.stats.sessions -= 1  # 连问不重复计会话
+                        # 连问不重复计会话: chained 轮自身的 sessions+=1 被 `if not chained`
+                        # 守卫跳过, 外层末尾只计 1 次 — 此处不再扣减 (历史扣减与外层
+                        # 计数叠加, 连问会话被计成 0, 覆盖率加固测试实测发现)
                 # 对话完成主动结束会话: 服务端立即回收 + 触发会话结束自动质检
                 # (挂断/超时路径不走到这 — 挂断模拟真实客户消失, 超时已在轮询层结束)
                 if not chained:

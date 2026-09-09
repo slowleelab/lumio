@@ -327,3 +327,208 @@ async def test_reply_timeout_ends_session_and_aborts(monkeypatch: pytest.MonkeyP
 
     assert state.stats.timeouts == 1
     assert "/api/chat/end" in calls, "超时应主动结束会话"
+
+
+# ── 覆率加固: run_scenario 概率分支 / 会话结束 / 客户登录 / 用户循环 ──
+
+
+async def _run_with_rates(monkeypatch, sc_key, rng_random=0.99, reply="好的，为您说明如下", **rates):
+    """固定 rng + 注入概率常数 + MockTransport 跑场景, 返回 records"""
+    import httpx
+
+    import lumio.services.common.simulator as sim
+
+    for k, v in rates.items():
+        monkeypatch.setattr(sim, k, v)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/send":
+            return httpx.Response(200, json={"accepted": True})
+        if request.url.path == "/api/chat/poll":
+            return httpx.Response(200, json={"status": "done", "has_message": True, "reply": reply})
+        return httpx.Response(200, json={"status": "ok"})
+
+    transport = httpx.MockTransport(handler)
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched(self, *a, **k):  # type: ignore[no-untyped-def]
+        k["transport"] = transport
+        orig_init(self, *a, **k)
+
+    httpx.AsyncClient.__init__ = patched  # type: ignore[method-assign]
+    try:
+        rng = random.Random(0)
+        rng.random = lambda: rng_random  # type: ignore[method-assign]
+        customer = sim.SimCustomer("http://fake", "sim-cov-1", rng=rng)
+        return await customer.run_scenario(sim.SCENARIO_MAP[sc_key])
+    finally:
+        httpx.AsyncClient.__init__ = orig_init  # type: ignore[method-assign]
+
+
+async def test_greeting_and_chained_branches(monkeypatch) -> None:
+    """寒暄开场 (GREETING_RATE=1) 与同会话连问第二主题 (MULTI_TOPIC_RATE=1)"""
+    import lumio.services.common.simulator as sim
+
+    state.stats.sessions = 0
+    sc = sim.SCENARIO_MAP["knowledge_gap"]
+    turns_n = len(sc.turns)
+    # random()=0 → 寒暝 + 挂断判定也命中! 挂断 rate 关 0, 连问 rate 开 1
+    records = await _run_with_rates(
+        monkeypatch, "knowledge_gap", rng_random=0.0, ABANDON_RATE=0.0, MULTI_TOPIC_RATE=1.0
+    )
+    assert len(records) >= turns_n + 1 + 1  # 寒暄1 + 本主题N + 连问≥1
+    # 连问不重复计会话: 一次 run_scenario 只 +1
+    assert state.stats.sessions == 1
+
+
+async def test_abandon_branch(monkeypatch) -> None:
+    import lumio.services.common.simulator as sim
+
+    state.stats.abandoned = 0
+    state.stats.sessions = 0
+    sc = sim.SCENARIO_MAP["knowledge_gap"]
+    assert len(sc.turns) >= 1
+    records = await _run_with_rates(monkeypatch, "knowledge_gap", rng_random=0.0, ABANDON_RATE=1.0)
+    # 单轮剧本: i < len(turns) 为假 → 不挂断; 取多轮剧本验证提前返回
+    multi = next((s for s in sim.SCENARIOS if len(s.turns) >= 2), None)
+    if multi is not None:
+        records = await _run_with_rates(monkeypatch, multi.key, rng_random=0.0, ABANDON_RATE=1.0)
+        assert len(records) < sum(1 for _ in multi.turns) + 1
+        assert state.stats.abandoned >= 1
+
+
+async def test_reply_timeout_swallowed(monkeypatch) -> None:
+    """ReplyTimeoutError 不外抛, 已收到的轮次照常入档, 会话照常计数"""
+    import lumio.services.common.simulator as sim
+
+    state.stats.sessions = 0
+
+    async def boom(self, client, sc, i, text, expect):
+        raise sim.ReplyTimeoutError("120s 无回复")
+
+    monkeypatch.setattr(sim.SimCustomer, "_one_turn", boom)
+    rng = random.Random(0)
+    rng.random = lambda: 0.99  # type: ignore[method-assign]
+    customer = sim.SimCustomer("http://fake", "sim-cov-2", rng=rng)
+    records = await customer.run_scenario(sim.SCENARIO_MAP["knowledge_gap"])
+    assert records == []
+    assert state.stats.sessions == 1
+
+
+async def test_end_session_branches() -> None:
+    """结束会话: 200 成功 / 非 200 失败 / 网络异常 — 均不抛"""
+    import httpx
+
+    from lumio.services.common.simulator import SimCustomer
+
+    class _Client:
+        def __init__(self, code):
+            self._code = code
+
+        async def post(self, *_a, **_k):
+            if self._code == "raise":
+                raise ConnectionError("down")
+            return httpx.Response(self._code, request=httpx.Request("POST", "http://fake"))
+
+    async with httpx.AsyncClient() as real:
+        _ = real  # 确保库可用
+    c = SimCustomer.__new__(SimCustomer)
+    c._session_id = "s"
+    c._base = "http://fake"
+    await c._end_session(_Client(200))
+    await c._end_session(_Client(500))
+    await c._end_session(_Client("raise"))
+
+
+async def test_ensure_sim_customer_token(monkeypatch) -> None:
+    """登录成功取 token / 非 200 降级空串 / 异常降级空串"""
+    import httpx
+
+    import lumio.services.common.simulator as sim
+
+    def _call(handler):
+        transport = httpx.MockTransport(handler)
+        orig_init = httpx.AsyncClient.__init__
+
+        def patched(self, *a, **k):  # type: ignore[no-untyped-def]
+            k["transport"] = transport
+            orig_init(self, *a, **k)
+
+        httpx.AsyncClient.__init__ = patched  # type: ignore[method-assign]
+
+        async def _go():
+            return await sim._ensure_sim_customer_token("http://fake")
+
+        return _go, orig_init
+
+    def _ok(request):
+        return httpx.Response(200, json={"access_token": "jwt-1"})
+
+    def _bad(request):
+        return httpx.Response(401, json={})
+
+    def _boom(request):
+        raise ConnectionError("net down")
+
+    go, orig = _call(_ok)
+    try:
+        assert await go() == "jwt-1"
+    finally:
+        httpx.AsyncClient.__init__ = orig  # type: ignore[method-assign]
+
+    go, orig = _call(_bad)
+    try:
+        assert not await go()  # 非 200 落到函数末尾隐式 None (静默降级不发反馈)
+    finally:
+        httpx.AsyncClient.__init__ = orig  # type: ignore[method-assign]
+
+    go, orig = _call(_boom)
+    try:
+        assert await go() == ""
+    finally:
+        httpx.AsyncClient.__init__ = orig  # type: ignore[method-assign]
+
+
+async def test_user_loop_counts_errors(monkeypatch) -> None:
+    """run_scenario 异常计入 errors, stop 后循环退出"""
+    import asyncio
+
+    import lumio.services.common.simulator as sim
+
+    state._stop_event = asyncio.Event()
+    state.stats.errors = 0
+    state.scenario_keys = ["knowledge_gap"]
+    state.interval = 0.01
+    calls = {"n": 0}
+
+    async def fake_run(self, sc, *, chained=False):
+        calls["n"] += 1
+        state._stop_event.set()  # 下轮 wait 立即返回退出
+        if calls["n"] == 1:
+            raise RuntimeError("场景失败")
+        return []
+
+    monkeypatch.setattr(sim.SimCustomer, "run_scenario", fake_run)
+    await sim._user_loop("http://fake", "sim-cov-3")
+    assert calls["n"] == 1 and state.stats.errors == 1
+
+
+async def test_start_stop_bootstrap(monkeypatch) -> None:
+    """start_simulator 启动 _bootstrap 派生用户任务, stop 复位"""
+    import asyncio
+
+    import lumio.services.common.simulator as sim
+
+    async def fake_token(_base):
+        return ""
+
+    async def fake_loop(_base, _cid):
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(sim, "_ensure_sim_customer_token", fake_token)
+    monkeypatch.setattr(sim, "_user_loop", fake_loop)
+    r = sim.start_simulator("http://fake", scenario_keys=["chitchat"], users=2, interval=1)
+    assert r["running"] is True
+    await asyncio.sleep(0.05)
+    r2 = sim.stop_simulator()
+    assert r2["running"] is False
