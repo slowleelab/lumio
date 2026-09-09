@@ -1377,7 +1377,7 @@ async def test_llm_classify_cache_isolated_by_context() -> None:
     """缓存 key 随上下文隔离: 同一句接话在不同上下文里不得复用改写结果。"""
     call_count = 0
 
-    async def _fake(**kwargs):  # noqa: ANN001
+    async def _fake(**kwargs):
         nonlocal call_count
         call_count += 1
         return {
