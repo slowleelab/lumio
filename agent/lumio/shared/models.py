@@ -429,7 +429,7 @@ class IntentResult(BaseModel):
     # 异常未识别。兜底轮的 faq 标签是存储兼容残差, 不代表"识别为知识咨询"。
     classification_source: str | None = Field(default=None, exclude=True)
     # 对话理解升级 (追问轮, 会话 replay-5ac11e27 复盘): 慢路径带上下文的产物。
-    # rewritten_query = 把接话补全成的自包含问题 (None=用原句); refers_to_last =
+    # rewritten_query = 上下文改写 (query rewriting) 后的自包含问题 (None=用原句); refers_to_last =
     # 是否指涉上一轮系统结果; context_answer = 上轮工具结果中已有答案的复述
     # (查询链以数字一致性守卫后零调用作答)。下游检索/抽参消费 rewritten_query,
     # 生成 prompt 仍用客户原句。

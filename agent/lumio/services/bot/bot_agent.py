@@ -456,8 +456,8 @@ class LumioAgent:
             except Exception:
                 logger.debug("decision_log 记录失败(不阻断): session=%s", session_id)
 
-            # 追问补全留痕 (对话理解升级): 慢路径把接话补全成自包含问题后,
-            # 下游检索/抽参消费补全句 — 原句 vs 补全句对照入链, 审计可直接
+            # 上下文改写留痕 (对话理解升级): 慢路径把接话改写成自包含问题后,
+            # 下游检索/抽参消费改写句 — 原句 vs 改写句对照入链, 审计可直接
             # 看到"系统当时把话理解成了什么" (replay-5ac11e27 复盘)。
             _rq = (getattr(intent_result, "rewritten_query", None) or "").strip()
             if _rq and _rq != user_input.strip():
@@ -466,7 +466,7 @@ class LumioAgent:
                         session_id=session_id,
                         agent_name="bot_agent",
                         action=DecisionAction.QUERY_REWRITE,
-                        reasoning=f"追问补全: 「{user_input[:24]}」→「{_rq[:40]}」",
+                        reasoning=f"上下文改写: 「{user_input[:24]}」→「{_rq[:40]}」",
                         evidence={
                             "original": user_input[:80],
                             "rewritten": _rq[:120],
@@ -728,7 +728,7 @@ class LumioAgent:
         """LLM 慢路径的对话上下文区块: 最近轮次 + 上一轮系统查询结果。
 
         追问轮 ("那还款日是哪一天") 的语义在上下文里; 慢路径带此区块才能
-        补全出自包含问题 (rewritten_query) 并识别"答案已在手" (context_answer)。
+        改写出自包含问题 (rewritten_query) 并识别"答案已在手" (context_answer)。
         无历史时返回 None — 首句自包含, 走原单句分类, 零变化。
         """
         if not history:
@@ -1074,7 +1074,7 @@ class LumioAgent:
         """
         from lumio.services.bot.tool_selection import select_tools_for_intent
 
-        # 对话理解升级: 追问轮补全句 (自包含) — 精确出口与参数抽取都用它,
+        # 对话理解升级: 上下文改写句 (自包含) — 精确出口与参数抽取都用它,
         # 客户原句仅保留在展示/审计层。
         effective_q = (getattr(intent_result, "rewritten_query", None) or "").strip() or user_input
 
@@ -1541,8 +1541,8 @@ class LumioAgent:
         # 交易/查询意图上游已走工具直达。FAQ 通道优先于文档 RAG — 人工审核过的
         # 标准答案高于模型生成答案; 未命中继续文档通道。紧急标记输入跳过 FAQ
         # (敏感诉求不得被字面相似词条劫持), 敏感重路由轮跳过 (防二次绕开状态机)。
-        # 追问轮检索用补全句 (rewritten_query): 接话原句 ("那还款日是哪一天") 的
-        # 向量/BM25 会命中无关文档, 自包含补全句才检得准 (对话理解升级)。
+        # 追问轮检索用上下文改写句 (rewritten_query): 接话原句 ("那还款日是哪一天")
+        # 的向量/BM25 会命中无关文档, 自包含改写句才检得准 (对话理解升级)。
         retrieval_query = (getattr(intent, "rewritten_query", None) or "").strip() or user_input
         if not _sensitive_rerouted and not _has_emergency_marker(user_input):
             faq_hit = await self._try_faq_direct(session_id, retrieval_query)

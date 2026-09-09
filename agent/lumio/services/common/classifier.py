@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # 规则分类器阈值：Fast Path 置信度 >= 此值直接使用
 _FAST_PATH_THRESHOLD = 0.7
 
-# 追问轮词法闸 (对话理解升级): 疑似接话 (代词/省略/追问上轮) 即使快路径高置信
+# 上下文改写闸 (对话理解升级): 疑似接话 (代词/省略/追问上轮) 即使快路径高置信
 # 也放行进慢路径带上下文理解 — 单句分类器对上下文相关输入没有视野。
 # 只有一条规则、一个职责; 命中仅"多走一次慢路径", 无其他副作用。
 _FOLLOWUP_PREFIXES = ("那", "这个", "那个", "它", "他", "她", "再问", "具体", "刚才", "前面", "上一个")
@@ -595,10 +595,10 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 - transfer_agent: 转人工
 - chitchat: 闲聊
 
-## 追问补全 (仅当用户输入前提供了 [对话上下文] 区块)
-- 当前输入若依赖上下文 (代词"那/它/这个"、省略句、对上轮结果的追问), 先在内心把它补全成不依赖上下文的完整问题, intent 与 confidence 按补全后的问题判定, 并输出 rewritten_query=补全后的完整问题
+## 上下文改写 (仅当用户输入前提供了 [对话上下文] 区块)
+- 当前输入若依赖上下文 (代词"那/它/这个"、省略句、对上轮结果的追问), 先把它改写成不依赖上下文的自包含问题 (指代消解+省略恢复), intent 与 confidence 按改写后的问题判定, 并输出 rewritten_query=改写后的自包含问题
 - 例: 上文刚查过账单, 当前输入"那还款日具体是哪一天" → rewritten_query="我的信用卡还款日是哪一天", intent=bill_query
-- 当前输入与上下文无关时 rewritten_query 输出 null
+- 当前输入与上下文无关 (自包含) 时 rewritten_query 输出 null
 - 若补全后问题的答案已完整出现在 [上一轮系统动作] 给出的结果里, 输出 refers_to_last=true 和 context_answer=从该结果原文摘出的答案短句 (数字/日期必须与原文完全一致); 否则 refers_to_last=false, context_answer=null
 
 ## input_class 判定（与意图分类同一次输出，独立打分）
@@ -803,7 +803,7 @@ class LLMClassifier:
         Args:
             text: 用户输入文本
             context: 对话上下文区块 (最近轮次 + 上一轮系统动作), 非空时拼在
-                输入前, 模型按"追问补全"规则输出 rewritten_query/context_answer。
+                输入前, 模型按"上下文改写"规则输出 rewritten_query/context_answer。
                 缓存 key 随 context 隔离 — 同一句接话在不同上下文里改写不同。
 
         Returns:
@@ -856,8 +856,8 @@ class LLMClassifier:
         # (此前需第二次独立仲裁 LLM 调用, 弱证据输入整轮 10s 中一半花在这)
         raw_input_class = str(result.get("input_class") or "").strip().lower()
         input_class = raw_input_class if raw_input_class in ("business", "chitchat", "noise") else None
-        # 追问补全产物 (仅带上下文调用时模型会输出): rewritten_query 供下游检索/
-        # 抽参; context_answer + refers_to_last 供查询链"答案已在手"复述。
+        # 上下文改写产物 (仅带上下文调用时模型会输出): rewritten_query 即自包含问题
+        # # (standalone question), 供下游检索/抽参; context_answer + refers_to_last 供查询链"答案已在手"复述。
         rewritten_query = str(result.get("rewritten_query") or "").strip() or None
         refers_to_last = result.get("refers_to_last") is True
         context_answer = str(result.get("context_answer") or "").strip() or None
@@ -998,7 +998,7 @@ class IntentClassifier:
         Args:
             text: 用户输入文本
             history: 可选多轮上下文 (speaker/content), 透传给 BERT 快路径做对话级意图判定
-            followup_context: 对话上下文区块 (拼给 LLM 慢路径做追问补全, 见 LLMClassifier)
+            followup_context: 对话上下文区块 (拼给 LLM 慢路径做上下文改写, 见 LLMClassifier)
 
         Returns:
             (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback"|"bert:lowconf")

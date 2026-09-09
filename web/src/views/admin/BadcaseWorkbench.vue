@@ -662,7 +662,7 @@ const qcTurnChains = computed(() => {
 const ACTION_STEP: Record<string, string> = {
   intent_classify: "意图分类",
   route_decision: "路由",
-  query_rewrite: "追问补全",
+  query_rewrite: "上下文改写",
   tool_call: "工具",
   rag_retrieve: "检索",
   llm_generate: "生成",
