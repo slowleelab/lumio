@@ -46,6 +46,7 @@ def _looks_followup(text: str) -> bool:
         return True
     return len(t) <= 10 and t.endswith(("呢", "怎么样", "是多少", "是哪天", "是哪一天"))
 
+
 # ── 快路径按类采纳阈值 (架构整改 Phase 3: 数据驱动替代全局常数) ──────────
 # 各意图类的 softmax 可分性不同, 一刀切全局阈值两头误伤。校准产物
 # fast_path_thresholds.json 由 scripts/intent_threshold_calibrate.py 用种子
@@ -84,6 +85,7 @@ def _load_fast_thresholds(path: str | None = None) -> dict[str, float]:
 def _fast_accept_threshold(label: IntentLabel, default: float = _FAST_PATH_THRESHOLD) -> float:
     """快路径采纳阈值: 按预测类查表, 缺类沿用调用方默认 (实例 fast_threshold)。"""
     return _load_fast_thresholds().get(label.value, default)
+
 
 # 办理词规则覆盖 (会话 48882b05 同型消歧): BERT 标签空间是旧扁平 10 类, 发不出
 # 写类主名意图; 规则层对这些意图高置信命中时覆盖 BERT 快路径结果。仅收办理动作词
@@ -1149,10 +1151,7 @@ class IntentClassifier:
         _rule_override = (
             rule_fast.primary_intent in _APPLY_INTENT_RULE_OVERRIDE
             and rule_fast.primary_confidence >= _APPLY_OVERRIDE_CONF
-            and (
-                fast_result.primary_intent != rule_fast.primary_intent
-                or fast_result.primary_confidence < 0.8
-            )
+            and (fast_result.primary_intent != rule_fast.primary_intent or fast_result.primary_confidence < 0.8)
         )
         if _rule_override:
             logger.info(
@@ -1184,10 +1183,7 @@ class IntentClassifier:
             fast_result.primary_intent != rule_fast.primary_intent
             and rule_fast.primary_confidence >= 0.8
             and normalize_intent(rule_fast.primary_intent.value) in _QUERY_INTENT_OVERRIDES
-            and (
-                not any(m in text for m in _CONSULTIVE_MARKERS)
-                or any(a in text for a in _STRONG_QUERY_ACTIONS)
-            )
+            and (not any(m in text for m in _CONSULTIVE_MARKERS) or any(a in text for a in _STRONG_QUERY_ACTIONS))
         ):
             logger.info(
                 "查询词规则覆盖快路径: %s@%.2f -> %s@%.2f (text=%r)",
@@ -1212,9 +1208,8 @@ class IntentClassifier:
         # 带上下文理解 (词法只判"可能不是自包含句", 语义判断仍归 LLM)。
         _followup_gate = bool(followup_context) and bool(history) and _looks_followup(text)
 
-        if (
-            not _followup_gate
-            and fast_result.primary_confidence >= _fast_accept_threshold(fast_result.primary_intent, self._threshold)
+        if not _followup_gate and fast_result.primary_confidence >= _fast_accept_threshold(
+            fast_result.primary_intent, self._threshold
         ):
             logger.debug(
                 "Fast Path 命中: intent=%s, confidence=%.2f, source=%s",

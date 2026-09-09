@@ -220,7 +220,9 @@ async def scan_session(
     }
     if redis_client is not None:
         try:
-            await redis_client.setex(_VERDICT_KEY.format(sid=session_id), _VERDICT_TTL, json.dumps(record, ensure_ascii=False))
+            await redis_client.setex(
+                _VERDICT_KEY.format(sid=session_id), _VERDICT_TTL, json.dumps(record, ensure_ascii=False)
+            )
         except Exception:
             logger.debug("qa_scan 判定写入 Redis 失败 (不阻断): session=%s", session_id)
 
@@ -296,8 +298,16 @@ async def scan_session(
 
 # 注意键名用 n_pass/n_warn/n_fail/n_error — "pass" 是 Python 关键字, 不能作 kwarg
 _scan_state: dict[str, Any] = {
-    "running": False, "total": 0, "done": 0, "n_pass": 0, "n_warn": 0, "n_fail": 0, "n_error": 0,
-    "started_at": 0.0, "finished_at": 0.0, "error_msg": "",
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "n_pass": 0,
+    "n_warn": 0,
+    "n_fail": 0,
+    "n_error": 0,
+    "started_at": 0.0,
+    "finished_at": 0.0,
+    "error_msg": "",
 }
 _scan_tasks: set[asyncio.Task] = set()
 _JUDGE_CONCURRENCY = 3
@@ -321,7 +331,9 @@ async def _scan_task(
     async def one(sid: str, turns: list[dict[str, Any]], session_time: datetime | None) -> None:
         async with sem:
             try:
-                v = await scan_session(session_factory, judge_llm, redis_client, sid, turns, model, session_time=session_time)
+                v = await scan_session(
+                    session_factory, judge_llm, redis_client, sid, turns, model, session_time=session_time
+                )
                 async with lock:
                     stats[verdict_key.get(v["verdict"], "n_error")] += 1
             except Exception as exc:
@@ -330,7 +342,9 @@ async def _scan_task(
                     stats["n_error"] += 1
             async with lock:
                 stats["done"] += 1
-                _scan_state.update(done=stats["done"], **{k: stats[k] for k in ("n_pass", "n_warn", "n_fail", "n_error")})
+                _scan_state.update(
+                    done=stats["done"], **{k: stats[k] for k in ("n_pass", "n_warn", "n_fail", "n_error")}
+                )
 
     try:
         # 全量补扫 (用户反馈: 没把所有会话纳入 — 旧实现单批 limit 扫完即停,
@@ -399,8 +413,16 @@ def start_scan(
     if _scan_state["running"]:
         return False
     _scan_state.update(
-        running=True, total=0, done=0, n_pass=0, n_warn=0, n_fail=0, n_error=0,
-        started_at=time.time(), finished_at=0.0, error_msg="",
+        running=True,
+        total=0,
+        done=0,
+        n_pass=0,
+        n_warn=0,
+        n_fail=0,
+        n_error=0,
+        started_at=time.time(),
+        finished_at=0.0,
+        error_msg="",
     )
     task = asyncio.create_task(
         _scan_task(session_factory, judge_llm, redis_client, model, limit, sample_rate, lookback_hours, reinspect)
@@ -497,7 +519,9 @@ async def scan_session_by_id(
     turns, session_time = await _load_session_turns(session_factory, session_id)
     if len(turns) < 2:
         return None
-    return await scan_session(session_factory, judge_llm, redis_client, session_id, turns, model, session_time=session_time)
+    return await scan_session(
+        session_factory, judge_llm, redis_client, session_id, turns, model, session_time=session_time
+    )
 
 
 def _parse_redis_verdict(session_id: str, raw: str | bytes) -> dict[str, Any] | None:

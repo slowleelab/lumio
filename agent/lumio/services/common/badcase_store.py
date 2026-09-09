@@ -160,7 +160,6 @@ async def list_badcases(
     return [_to_dict(b) for b in rows], total
 
 
-
 def _to_dict(b: Badcase) -> dict[str, Any]:
     return {
         "id": str(b.id),
@@ -284,8 +283,7 @@ async def list_quality_records(
             func.row_number()
             .over(partition_by=QualityRecord.session_id, order_by=QualityRecord.scanned_at.desc())
             .label("rn"),
-        )
-        .where(*conds)
+        ).where(*conds)
     ).subquery()
     qr = aliased(QualityRecord, sub)
 
@@ -322,6 +320,7 @@ async def list_qc_sessions(
     排序锚: 会话时间 → 质检时刻 → 采集时刻。
     """
     from sqlalchemy import and_, case
+
     qr_sub = (
         select(
             QualityRecord,
@@ -334,9 +333,7 @@ async def list_qc_sessions(
     bc_sub = (
         select(
             Badcase,
-            func.row_number()
-            .over(partition_by=Badcase.session_id, order_by=Badcase.created_at.desc())
-            .label("rn"),
+            func.row_number().over(partition_by=Badcase.session_id, order_by=Badcase.created_at.desc()).label("rn"),
         )
     ).subquery()
 
@@ -356,11 +353,7 @@ async def list_qc_sessions(
         conds.append(category_expr == category)
     if keyword:
         kw = f"%{keyword}%"
-        conds.append(
-            (qr_sub.c.preview.ilike(kw))
-            | (qr_sub.c.session_id.ilike(kw))
-            | (bc_sub.c.user_input.ilike(kw))
-        )
+        conds.append((qr_sub.c.preview.ilike(kw)) | (qr_sub.c.session_id.ilike(kw)) | (bc_sub.c.user_input.ilike(kw)))
 
     joined = qr_sub.join(bc_sub, qr_sub.c.session_id == bc_sub.c.session_id, full=True)
 
@@ -528,7 +521,9 @@ async def quality_coverage_stats(
     ).scalar() or 0
     verdict_rows = (
         await session.execute(
-            select(QualityRecord.verdict, func.count()).where(QualityRecord.scanned_at >= since).group_by(QualityRecord.verdict)
+            select(QualityRecord.verdict, func.count())
+            .where(QualityRecord.scanned_at >= since)
+            .group_by(QualityRecord.verdict)
         )
     ).all()
     by_verdict = {str(k): v for k, v in verdict_rows}

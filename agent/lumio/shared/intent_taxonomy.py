@@ -117,9 +117,7 @@ def is_definition_query(text: str) -> bool:
     """定义句式判定: 询问概念/规则本身, 而非查询个人账户数据"""
     t = (text or "").strip().rstrip("？！?!")
     return (
-        t.endswith(_DEFINITION_SUFFIX)
-        or t.startswith(_DEFINITION_PREFIX)
-        or t.startswith(_DEFINITION_PREFIX_ALT)
+        t.endswith(_DEFINITION_SUFFIX) or t.startswith(_DEFINITION_PREFIX) or t.startswith(_DEFINITION_PREFIX_ALT)
     ) and not any(k in t for k in ("我的", "查一下我的", "帮我看下我的", "帮我查我的"))
 
 

@@ -40,6 +40,8 @@ POLL_TIMEOUT = 120.0
 
 class ReplyTimeoutError(Exception):
     """单轮等待回复超过 POLL_TIMEOUT — 会话已被主动结束, 场景应终止。"""
+
+
 TURN_GAP = 2.0  # 轮间隔 (秒), 模拟人打字
 
 # ── 会话级行为概率 (真实客户不总是走完剧本) ──
@@ -149,7 +151,11 @@ SCENARIOS: list[Scenario] = [
                 ],
                 "expect": ["卡号", "账单"],
             },
-            {"variants": ["卡号是 {card_no}", "{card_no}", "用 {card_no} 这张查"], "expect": "", "only_if_asked": "卡号"},
+            {
+                "variants": ["卡号是 {card_no}", "{card_no}", "用 {card_no} 这张查"],
+                "expect": "",
+                "only_if_asked": "卡号",
+            },
         ],
         tags=["chain_b", "slot"],
     ),
@@ -372,8 +378,6 @@ SCENARIOS: list[Scenario] = [
         ],
         tags=["long", "chain_b", "anaphora"],
     ),
-
-
     # ── 对抗场景组 (闭环防线③): 历史 badcase 同型输入自动进质检 ──
     # 每个历史击穿点 (会话 8700/22ad/9ed5 等) 的变体, 模拟器自动复测防线,
     # fail 由全量质检采回 — 把"用户当测试员"变成"系统自找问题"。
@@ -397,7 +401,14 @@ SCENARIOS: list[Scenario] = [
         key="adv_loss_colloquial",
         name_zh="对抗·挂失口语变体 (22ad 型)",
         turns=[
-            {"variants": ["信用卡找不到了, 怎么办呢", "卡好像被盗了, 赶紧给我停了", "我卡的丢了, 要挂失？", "钱包被偷了, 卡也在里面"]},
+            {
+                "variants": [
+                    "信用卡找不到了, 怎么办呢",
+                    "卡好像被盗了, 赶紧给我停了",
+                    "我卡的丢了, 要挂失？",
+                    "钱包被偷了, 卡也在里面",
+                ]
+            },
         ],
         tags=["adversarial"],
     ),
@@ -405,7 +416,14 @@ SCENARIOS: list[Scenario] = [
         key="adv_mixed_intent",
         name_zh="对抗·混合句与语气变体",
         turns=[
-            {"variants": ["哈哈帮我查下账单", "积分怎么兑换礼品啊", "那个 帮我查下账单呢", "请问一下 我的信用卡额度是多少，谢谢"]},
+            {
+                "variants": [
+                    "哈哈帮我查下账单",
+                    "积分怎么兑换礼品啊",
+                    "那个 帮我查下账单呢",
+                    "请问一下 我的信用卡额度是多少，谢谢",
+                ]
+            },
         ],
         tags=["adversarial"],
     ),
@@ -527,9 +545,7 @@ class SimCustomer:
     async def _end_session(self, client: httpx.AsyncClient, *, reason: str = "scenario_complete") -> None:
         """主动结束会话: 服务端立即回收 + 触发会话结束自动质检 (质检覆盖闭环)。"""
         try:
-            r = await client.post(
-                f"{self._base}/api/chat/end", json={"session_id": self._session_id, "reason": reason}
-            )
+            r = await client.post(f"{self._base}/api/chat/end", json={"session_id": self._session_id, "reason": reason})
             if r.status_code == 200:
                 logger.debug("模拟会话已主动结束: session=%s reason=%s", self._session_id, reason)
             else:
@@ -547,7 +563,9 @@ class SimCustomer:
                     if self._rng.random() < GREETING_RATE:
                         records.append(await self._one_turn(client, sc, 0, self._rng.choice(_GREETING_VARIANTS), None))
                 for i, turn in enumerate(sc.turns, start=1):
-                    records.append(await self._one_turn(client, sc, i, pick_turn_text(turn, self._rng), turn.get("expect")))
+                    records.append(
+                        await self._one_turn(client, sc, i, pick_turn_text(turn, self._rng), turn.get("expect"))
+                    )
                     # 中途挂断: 剧本没走完就消失 (真实客户行为; 最后一轮之后不算挂断)
                     if i < len(sc.turns) and self._rng.random() < ABANDON_RATE:
                         state.stats.abandoned += 1

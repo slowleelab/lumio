@@ -429,11 +429,9 @@ class LumioAgent:
                     agent_name="bot_agent",
                     action=DecisionAction.INTENT_CLASSIFY,
                     reasoning=(
-
-                            f"未识别（{'分类器异常' if _cls_src is None else _cls_src}，按兜底意图落档），置信度 {intent_result.primary_confidence:.0%} — 输入超出已知意图范围，交噪声门拦截澄清"
-                            if _unrecognized
-                            else f"识别意图：{_intent_display(intent_result.primary_intent)}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
-
+                        f"未识别（{'分类器异常' if _cls_src is None else _cls_src}，按兜底意图落档），置信度 {intent_result.primary_confidence:.0%} — 输入超出已知意图范围，交噪声门拦截澄清"
+                        if _unrecognized
+                        else f"识别意图：{_intent_display(intent_result.primary_intent)}（{_domain_zh(domain)}），置信度 {intent_result.primary_confidence:.0%}"
                     ),
                     evidence={
                         "intent": intent_result.primary_intent.value,
@@ -722,9 +720,7 @@ class LumioAgent:
         except Exception:
             return IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.0), [], SentimentLabel.NEUTRAL
 
-    async def _build_followup_context(
-        self, session_id: str | None, history: list[dict[str, Any]] | None
-    ) -> str | None:
+    async def _build_followup_context(self, session_id: str | None, history: list[dict[str, Any]] | None) -> str | None:
         """LLM 慢路径的对话上下文区块: 最近轮次 + 上一轮系统查询结果。
 
         追问轮 ("那还款日是哪一天") 的语义在上下文里; 慢路径带此区块才能
@@ -1202,7 +1198,13 @@ class LumioAgent:
                         _patched = await self._session_manager.patch_state(
                             _sid,
                             int(_raw.get("version", 0) or 0),
-                            {"last_tool_result": {"tool": qc.tool_name, "summary": _summary_txt, "at": int(_time_mod.time())}},
+                            {
+                                "last_tool_result": {
+                                    "tool": qc.tool_name,
+                                    "summary": _summary_txt,
+                                    "at": int(_time_mod.time()),
+                                }
+                            },
                         )
                         if not _patched.get("ok"):
                             logger.warning(
@@ -1549,7 +1551,9 @@ class LumioAgent:
             if faq_hit is not None:
                 return faq_hit
         _rag_t0 = time.monotonic()
-        context = await self._retrieve(retrieval_query, intent=intent.primary_intent, confidence=intent.primary_confidence)
+        context = await self._retrieve(
+            retrieval_query, intent=intent.primary_intent, confidence=intent.primary_confidence
+        )
         if extra_context:
             context = f"{extra_context}\n\n{context}" if context else extra_context
         # E2 决策可解释: 记录 RAG 检索决策 (命中与否)
@@ -3806,7 +3810,13 @@ class LumioAgent:
         if intent is None:
             return False
         primary = normalize_intent(intent.primary_intent.value)
-        if primary in (IntentLabel.FAQ, IntentLabel.KNOWLEDGE_QA, IntentLabel.FAQ_PRODUCT, IntentLabel.NB_CHITCHAT, IntentLabel.CHITCHAT):
+        if primary in (
+            IntentLabel.FAQ,
+            IntentLabel.KNOWLEDGE_QA,
+            IntentLabel.FAQ_PRODUCT,
+            IntentLabel.NB_CHITCHAT,
+            IntentLabel.CHITCHAT,
+        ):
             return False
         return intent.primary_confidence >= 0.7
 

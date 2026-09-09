@@ -387,9 +387,7 @@ class MCPToolClient:
             # 外部绑定会话 (use_session/测试) 无直连可重建, 原样抛出
             if self._exit_stack is None:
                 raise
-            logger.warning(
-                "MCP 工具调用失败, 尝试重建直连后重试: tool=%s err=%s", name, first_err
-            )
+            logger.warning("MCP 工具调用失败, 尝试重建直连后重试: tool=%s err=%s", name, first_err)
             if not await self._reconnect(self._generation):
                 raise
             return await self._call_tool_once(name, arguments)

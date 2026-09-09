@@ -670,9 +670,9 @@ async def routing_drift(
         await db.execute(
             select(
                 func.sum(case((DialogueLog.confidence < 0.3, 1), else_=0)).label("band_low"),
-                func.sum(
-                    case((and_(DialogueLog.confidence >= 0.3, DialogueLog.confidence < 0.7), 1), else_=0)
-                ).label("band_mid"),
+                func.sum(case((and_(DialogueLog.confidence >= 0.3, DialogueLog.confidence < 0.7), 1), else_=0)).label(
+                    "band_mid"
+                ),
                 func.sum(case((DialogueLog.confidence >= 0.7, 1), else_=0)).label("band_high"),
                 func.count().label("total"),
                 func.avg(DialogueLog.confidence).label("avg_conf"),

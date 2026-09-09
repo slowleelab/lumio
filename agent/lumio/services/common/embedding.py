@@ -37,6 +37,7 @@ def _query_instruction_for(model: str) -> str:
         return BGE_QUERY_INSTRUCTION
     return ""
 
+
 # mxbai-embed-large 上下文约 512 token；实测 480~640 中文字符之间即超限报 400。
 # 超过该上限的输入在 provider 内切段均值池化，避免整条文本被 ollama 拒绝。
 _EMBED_MAX_CHARS = 460

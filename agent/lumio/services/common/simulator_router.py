@@ -58,7 +58,12 @@ def _read_state() -> dict[str, Any]:
     try:
         st = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return {"running": False, "config": {"scenario_keys": [], "users": 0, "interval": 0.0}, "stats": {}, "recent": []}
+        return {
+            "running": False,
+            "config": {"scenario_keys": [], "users": 0, "interval": 0.0},
+            "stats": {},
+            "recent": [],
+        }
     pid = st.get("pid")
     hb = float(st.get("heartbeat_at") or 0.0)
     if st.get("running") and (not _pid_alive(pid) or time.time() - hb > _HEARTBEAT_STALE_SECONDS):
