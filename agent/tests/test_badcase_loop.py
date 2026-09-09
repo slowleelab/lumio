@@ -82,7 +82,6 @@ async def test_capture_persists_and_dedup_key() -> None:
     assert bc.dedup_group_id == dedup_key("我要挂失信用卡")
     assert bc.fix_status == "pending"
 
-
     @pytest.mark.asyncio
     async def test_update_fix_status(self) -> None:
         """状态流转持久化"""
@@ -90,10 +89,13 @@ async def test_capture_persists_and_dedup_key() -> None:
 
         from uuid_utils import uuid7
 
-
         bc = Badcase(
-            id=uuid7(), trace_id="t", session_id="s", signal_source="transfer",
-            user_input="x", fix_status="pending",
+            id=uuid7(),
+            trace_id="t",
+            session_id="s",
+            signal_source="transfer",
+            user_input="x",
+            fix_status="pending",
         )
         session = MagicMock()
         session.get = AsyncMock(return_value=bc)
@@ -270,7 +272,9 @@ async def test_capture_dedup_aggregates_same_input() -> None:
     assert second.signal_detail["last_seen_session"] == "s"
 
     # 不同信号源 → 各自一行
-    await capture_badcase(factory, trace_id="t", session_id="s", signal_source="negative_feedback", user_input="我的卡丢了, 要挂失")
+    await capture_badcase(
+        factory, trace_id="t", session_id="s", signal_source="negative_feedback", user_input="我的卡丢了, 要挂失"
+    )
     assert len(store["badcases"]) == 2
 
 
@@ -307,9 +311,7 @@ async def test_list_orders_by_session_time_and_searches_session() -> None:
     items, total = await list_badcases(Session(), keyword="sim-123", limit=10)
     assert (items, total) == ([], 0)
     # str(Select) 对长查询会截断成省略号, 用 literal_binds 完整渲染
-    sql = str(
-        captured[-1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
-    ).lower()
+    sql = str(captured[-1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})).lower()
     # 会话时间锚点排序: coalesce(session_time, created_at) 为主序 + created_at 次序键
     assert "coalesce" in sql and "session_time" in sql
     # 按会话查询: keyword 命中 用户输入 或 会话 ID
@@ -382,7 +384,9 @@ async def test_remote_judge_falls_back_to_local(monkeypatch) -> None:
     monkeypatch.setattr(get_settings().llm, "judge_strict", False)  # 免受部署 env 污染
     calls = {"local": 0}
     local = MagicMock()
-    local.chat = AsyncMock(side_effect=lambda m, timeout=None: (calls.__setitem__("local", calls["local"] + 1) or "本地回复"))
+    local.chat = AsyncMock(
+        side_effect=lambda m, timeout=None: (calls.__setitem__("local", calls["local"] + 1) or "本地回复")
+    )
     client = jc.RemoteJudgeClient(fallback_llm=local)
 
     async def boom(messages, timeout):

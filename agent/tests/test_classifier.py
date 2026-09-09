@@ -147,7 +147,9 @@ async def test_llm_classify_parses_input_class() -> None:
     assert intent.llm_input_class is None
 
     # 缺失 → None
-    mock_llm.classify = AsyncMock(return_value={"intent": "bill_query", "confidence": 0.9, "entities": [], "sentiment": "neutral"})
+    mock_llm.classify = AsyncMock(
+        return_value={"intent": "bill_query", "confidence": 0.9, "entities": [], "sentiment": "neutral"}
+    )
     intent, _, _ = await classifier.classify("查账单")
     assert intent.llm_input_class is None
 
@@ -161,7 +163,13 @@ async def test_llm_classify_input_class_cached() -> None:
     try:
         mock_llm = MagicMock()
         mock_llm.classify = AsyncMock(
-            return_value={"intent": "faq", "confidence": 0.4, "entities": [], "sentiment": "neutral", "input_class": "noise"}
+            return_value={
+                "intent": "faq",
+                "confidence": 0.4,
+                "entities": [],
+                "sentiment": "neutral",
+                "input_class": "noise",
+            }
         )
         classifier = LLMClassifier(mock_llm)
         _, _, _ = await classifier.classify("hjfw 什么")
@@ -1272,9 +1280,7 @@ async def test_subword_short_circuits_slow_path() -> None:
     fake_bert = _fake_bert(IntentLabel.FAQ, 0.61)  # BERT 弱识别, 不够快路径采纳
     mock_llm = MagicMock()
     mock_llm.classify = AsyncMock(side_effect=AssertionError("子词不应进 LLM 慢路径"))
-    classifier = IntentClassifier(
-        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
-    )
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert)
     intent, _, _, source = await classifier.classify("信用")
     assert source == "subword"
     assert intent.classification_source == "subword"
@@ -1293,9 +1299,7 @@ async def test_subword_spared_for_rule_signaled_action_word() -> None:
             SentimentLabel.NEUTRAL,
         )
     )
-    classifier = IntentClassifier(
-        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
-    )
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert)
     intent, _, _, source = await classifier.classify("挂失")
     assert source == "llm"
     assert intent.primary_intent == IntentLabel.CARD_LOSS

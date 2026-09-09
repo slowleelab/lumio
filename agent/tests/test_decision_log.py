@@ -280,6 +280,7 @@ def test_turn_context_inheritance(monkeypatch):
     bind_turn_context("turn-abc")
     assert current_turn_id() == "turn-abc"
     captured: list[DecisionRecord] = []
+
     def _fake_record(self, **kw):
         captured.append(DecisionRecord(decision_id=f"d{len(captured)}", **kw))
         return "id"
@@ -303,5 +304,5 @@ def test_turn_start_action_value():
 
 
 def test_route_decision_action_value():
-    """路由决策专用动作存在 — 此前借用 TOOL_CALL, 审计链把路由判定标成"工具执行\""""
+    """路由决策专用动作存在 — 此前借用 TOOL_CALL, 审计链把路由判定标成"工具执行\" """
     assert DecisionAction.ROUTE_DECISION.value == "route_decision"

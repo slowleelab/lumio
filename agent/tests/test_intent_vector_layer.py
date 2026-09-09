@@ -22,9 +22,7 @@ def classifier_with_vector(monkeypatch):
     rule = MagicMock()
     rule.classify.return_value = IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.3)
     llm = MagicMock()
-    llm.classify = AsyncMock(
-        return_value={"intent": "faq", "confidence": 0.5, "entities": [], "sentiment": "neutral"}
-    )
+    llm.classify = AsyncMock(return_value={"intent": "faq", "confidence": 0.5, "entities": [], "sentiment": "neutral"})
     vec = MagicMock()
     vec.search = AsyncMock(return_value=_vm())
 

@@ -50,15 +50,18 @@ def test_route_loss_direct_imperative() -> None:
     """祈使挂失 → 直连条件全满足 (意图≥0.8 + 非咨询句式 + 映射唯一)"""
     c = CASES["qa9-loss-direct-imperative"]
     from lumio.services.bot.tool_selection import select_tools_for_intent
-    from lumio.shared.config import get_settings
+    from lumio.shared.config import MCPSettings
+    from lumio.shared.models import IntentLabel
 
     lex = _lexicon()
     assert not any(m in c["input"] for m in lex("consultative_loss_markers")), "不应命中咨询句式"
-    tools = select_tools_for_intent(
-        __import__("lumio.shared.models", fromlist=["IntentLabel"]).IntentLabel.CARD_LOSS,
-        0.96,
-        get_settings().mcp,
+    # hermetic 构造: 不依赖 get_settings 的 env/.env 装载 (CI 无 .env 时映射缺省为空)
+    mcp = MCPSettings(
+        progressive_disclosure_enabled=True,
+        pd_confidence_threshold=0.8,
+        intent_tool_map={"card_loss": ["report_card_lost"]},
     )
+    tools = select_tools_for_intent(IntentLabel.CARD_LOSS, 0.96, mcp)
     assert tools is not None and len(tools) == 1 and tools[0] == "report_card_lost"
 
 

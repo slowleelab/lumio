@@ -122,7 +122,9 @@ async def test_scenario_runner_with_fake_transport() -> None:
             return httpx.Response(200, json={"accepted": True})
         if request.url.path == "/api/chat/poll":
             # 差评条件化后: 回复需含拒答话术才触发差评
-            return httpx.Response(200, json={"status": "done", "has_message": True, "reply": "抱歉，无法直接查询，请通过官方渠道"})
+            return httpx.Response(
+                200, json={"status": "done", "has_message": True, "reply": "抱歉，无法直接查询，请通过官方渠道"}
+            )
         if request.url.path == "/api/chat/feedback":
             return httpx.Response(200, json={"status": "ok"})
         return httpx.Response(404)
@@ -199,9 +201,7 @@ class TestWorkerProcessManagement:
         monkeypatch.setattr(sr, "_STATE_FILE", f)
         assert sr._read_state()["running"] is True  # 自己的 pid 活着 + 心跳新鲜
 
-    def test_read_state_stale_heartbeat_corrected_to_stopped(
-        self, tmp_path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_read_state_stale_heartbeat_corrected_to_stopped(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         import json
 
         from lumio.services.common import simulator_router as sr

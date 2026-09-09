@@ -256,10 +256,14 @@ class TestRagQualitySummary:
             _Result(rows=[("exact", 1), ("semantic", 2), ("miss", 1)]),  # faq_total
             _Result(rows=[SimpleNamespace(intent="faq", cnt=8, avg_conf=0.9)]),  # intent_top
             _Result(one=SimpleNamespace(bot_turns=10, avg_conf=0.75, low_conf_bot=2)),  # confidence
-            _Result(rows=[
-                SimpleNamespace(agent_name="bot_agent", action="intent_classify", cnt=5, avg_ms=300.0, p95_ms=400.0),
-                SimpleNamespace(agent_name="bot_agent", action="rag_retrieve", cnt=4, avg_ms=100.0, p95_ms=250.0),
-            ]),  # latency
+            _Result(
+                rows=[
+                    SimpleNamespace(
+                        agent_name="bot_agent", action="intent_classify", cnt=5, avg_ms=300.0, p95_ms=400.0
+                    ),
+                    SimpleNamespace(agent_name="bot_agent", action="rag_retrieve", cnt=4, avg_ms=100.0, p95_ms=250.0),
+                ]
+            ),  # latency
         ]
         fake = FakeSession(results)
         resp = await _get(_make_app(ADMIN, fake), "/api/admin/rag/quality-summary?days=7")

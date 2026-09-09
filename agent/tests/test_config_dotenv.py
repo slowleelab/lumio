@@ -61,7 +61,8 @@ def test_repo_root_env_wins_when_cwd_inside_repo(monkeypatch: pytest.MonkeyPatch
     repo_root = cm.Path(__file__).resolve().parents[2]
     # 模拟: 仓库根 .env 定义 A, cwd(模拟为仓库内子目录)的 .env 定义 B —— 根应胜出
     root_env = repo_root / ".env"
-    assert root_env.is_file(), "测试前置: 仓库根需存在 .env"
+    if not root_env.is_file():
+        pytest.skip("仓库根无 .env (CI 全新 checkout) — 本测试仅在有本地 .env 的环境运行")
 
     monkeypatch.delenv("POSTGRES_USER", raising=False)
     monkeypatch.chdir(repo_root / "agent")

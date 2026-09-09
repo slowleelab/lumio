@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,12 +28,18 @@ class TestBuildEsFilters:
         assert {"term": {"doc_type": "rule"}} in clauses
 
     def test_date_range_filter(self):
+        from datetime import datetime
+
+        def utc_ms(y: int, m: int, d: int) -> int:
+            return int(datetime(y, m, d, tzinfo=UTC).timestamp() * 1000)
+
         filters = {"effective_date": {"gte": "2026-01-01", "lte": "2026-12-31"}}
         clauses = build_es_filters(filters)
         assert len(clauses) == 1
-        # ES 数值型 range 边界按内部毫秒解释（即使 mapping 声明 epoch_second），需转毫秒
-        assert clauses[0]["range"]["effective_date"]["gte"] == 1767196800000  # 2026-01-01 in ms
-        assert clauses[0]["range"]["effective_date"]["lte"] == 1798646400000  # 2026-12-31 in ms
+        # ES 数值型 range 边界按内部毫秒解释（即使 mapping 声明 epoch_second），需转毫秒;
+        # 日期锚定 UTC 零点 (与部署时区无关, CI/生产同值)
+        assert clauses[0]["range"]["effective_date"]["gte"] == utc_ms(2026, 1, 1)
+        assert clauses[0]["range"]["effective_date"]["lte"] == utc_ms(2026, 12, 31)
 
     def test_keywords_filter(self):
         filters = {"keywords": ["年费", "积分"]}

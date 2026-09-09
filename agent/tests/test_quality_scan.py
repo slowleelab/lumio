@@ -43,7 +43,9 @@ class TestBuildTranscript:
 
 class TestParseVerdict:
     def test_normal_fail(self) -> None:
-        v = _parse_verdict({"verdict": "fail", "problems": [{"type": "A", "turn": 2, "reason": "答非所问"}], "summary": "x"})
+        v = _parse_verdict(
+            {"verdict": "fail", "problems": [{"type": "A", "turn": 2, "reason": "答非所问"}], "summary": "x"}
+        )
         assert v["verdict"] == "fail" and len(v["problems"]) == 1
 
     def test_fail_without_problems_downgrades_to_pass(self) -> None:
@@ -116,6 +118,7 @@ class TestScanSession:
     @pytest.mark.asyncio
     async def test_pass_no_capture_but_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """pass 不采集 badcase, 但判定照样落质检记录 (全量纳入口径)"""
+
         async def fake_capture(sf, **kw):
             raise AssertionError("pass 不应采集")
 
@@ -123,8 +126,12 @@ class TestScanSession:
         rec_mock = AsyncMock()
         monkeypatch.setattr("lumio.services.common.badcase_store.record_quality", rec_mock)
         judge = MagicMock()
-        judge.chat_json = AsyncMock(return_value={"verdict": "warn", "problems": [{"type": "E", "reason": "引导不足"}], "summary": "ok"})
-        v = await scan_session(MagicMock(), judge, MagicMock(), "s2", [{"speaker": "customer", "content": "怎么分期"}], "m")
+        judge.chat_json = AsyncMock(
+            return_value={"verdict": "warn", "problems": [{"type": "E", "reason": "引导不足"}], "summary": "ok"}
+        )
+        v = await scan_session(
+            MagicMock(), judge, MagicMock(), "s2", [{"speaker": "customer", "content": "怎么分期"}], "m"
+        )
         assert v["verdict"] == "warn"
         assert rec_mock.await_count == 1
         kw = rec_mock.await_args.kwargs
@@ -194,7 +201,10 @@ class TestRedisBackfill:
 
     def test_parse_redis_verdict_rejects_bad(self) -> None:
         assert quality_scan._parse_redis_verdict("s1", "not-json") is None
-        assert quality_scan._parse_redis_verdict("s1", '{"verdict": "BANANA", "scanned_at": "2026-09-01T10:00:00+00:00"}') is None
+        assert (
+            quality_scan._parse_redis_verdict("s1", '{"verdict": "BANANA", "scanned_at": "2026-09-01T10:00:00+00:00"}')
+            is None
+        )
         # scanned_at 缺失 = 幂等键缺失, 宁可不回填
         assert quality_scan._parse_redis_verdict("s1", '{"verdict": "pass"}') is None
 
