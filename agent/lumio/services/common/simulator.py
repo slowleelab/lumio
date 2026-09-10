@@ -435,6 +435,61 @@ SCENARIOS: list[Scenario] = [
         ],
         tags=["adversarial"],
     ),
+    # ── 长对话剧本 (≥10 轮, 压测多轮上下文/追问改写/跨域切换) ──
+    Scenario(
+        key="long_bill_marathon",
+        name_zh="账单连环深挖 (12轮, 追问改写压测)",
+        turns=[
+            {"variants": ["帮我查一下信用卡账单", "我要查这期的账单"], "expect": ["账单"]},
+            {"variants": ["卡号是 {card_no}", "{card_no}"], "expect": "", "only_if_asked": "卡号"},
+            {"variants": ["那还款日具体是哪一天", "还款日是几号来着"], "expect": ""},
+            {"variants": ["最低还款额是多少", "那最低还款要还多少"], "expect": ""},
+            {"variants": ["最低还款和全额还款差在哪里", "只还最低还款会怎么样"], "expect": ""},
+            {"variants": ["那分期的话手续费多少", "这笔账单分12期手续费多少"], "expect": ""},
+            {"variants": ["帮我办这个分期", "那帮我办12期的"], "expect": ""},
+            {"variants": ["对, 就办12期", "确认办理"], "expect": ""},
+            {"variants": ["对了 年费怎么减免", "年费有什么减免政策"], "expect": ""},
+            {"variants": ["积分能抵扣年费吗", "我的积分可以抵年费吗"], "expect": ""},
+            {"variants": ["那帮我看看积分有多少", "查下我的积分"], "expect": ""},
+            {"variants": ["好的谢谢", "行, 都清楚了, 谢谢"], "expect": ""},
+        ],
+        tags=["long", "chain_b", "chain_c", "slot", "rewrite"],
+    ),
+    Scenario(
+        key="long_loss_journey",
+        name_zh="挂失全旅程 (10轮, 敏感确认+补卡咨询)",
+        turns=[
+            {"variants": ["我钱包被偷了, 信用卡也在里面", "钱包丢了卡也在里面"], "expect": ["挂失", "冻结", "确认"]},
+            {"variants": ["对, 帮我立即挂失", "确认, 马上挂失"], "expect": ""},
+            {"variants": ["卡号我不记得了", "我记不住卡号"], "expect": ""},
+            {"variants": ["我上周在杭州用的这张卡", "上周在杭州消费过"], "expect": ""},
+            {"variants": ["那先冻结可以吗", "先冻结住行吗"], "expect": ""},
+            {"variants": ["补卡要多久能拿到", "新卡几天能到"], "expect": ""},
+            {"variants": ["补卡收费吗", "补卡要多少钱"], "expect": ""},
+            {"variants": ["新卡寄到老地址怎么办, 我搬家了", "我地址变了新卡寄哪"], "expect": ""},
+            {"variants": ["这期间要是有人盗刷怎么办", "冻结前被盗刷算谁的"], "expect": ""},
+            {"variants": ["好的, 谢谢, 就先这样", "行, 谢谢帮我处理"], "expect": ""},
+        ],
+        tags=["long", "chain_a", "sensitive", "slot"],
+    ),
+    Scenario(
+        key="long_mixed_consult",
+        name_zh="混合咨询马拉松 (11轮, 指代追问+跨域切换)",
+        turns=[
+            {"variants": ["你们的白金卡有什么权益", "白金卡都有什么好处"], "expect": ""},
+            {"variants": ["白金卡年费多少", "那白金卡年费是多少"], "expect": ""},
+            {"variants": ["那金卡呢", "金卡年费呢"], "expect": ""},
+            {"variants": ["金卡免息期有多长", "那免息期呢"], "expect": ""},
+            {"variants": ["帮我查下我这张卡的账单", "查下我的账单"], "expect": ["账单"]},
+            {"variants": ["卡号是 {card_no}", "{card_no}"], "expect": "", "only_if_asked": "卡号"},
+            {"variants": ["上个月我在超市消费了多少", "上月超市类的消费有多少"], "expect": ""},
+            {"variants": ["那笔最大的是多少来着", "里面最大那笔多少钱"], "expect": ""},
+            {"variants": ["临时额度怎么提", "临时额度怎么申请"], "expect": ""},
+            {"variants": ["那帮我提一下临时额度", "给我提个临时额度"], "expect": ""},
+            {"variants": ["好的, 谢谢", "清楚了, 谢谢"], "expect": ""},
+        ],
+        tags=["long", "chain_b", "rewrite"],
+    ),
 ]
 
 SCENARIO_MAP = {s.key: s for s in SCENARIOS}
@@ -566,8 +621,10 @@ class SimCustomer:
                     records.append(
                         await self._one_turn(client, sc, i, pick_turn_text(turn, self._rng), turn.get("expect"))
                     )
-                    # 中途挂断: 剧本没走完就消失 (真实客户行为; 最后一轮之后不算挂断)
-                    if i < len(sc.turns) and self._rng.random() < ABANDON_RATE:
+                    # 中途挂断: 剧本没走完就消失 (真实客户行为; 最后一轮之后不算挂断)。
+                    # long 剧本豁免 — 长旅程客户画像本就走完全程, 8%/轮在 12 轮上
+                    # 有 ~60% 概率腰斩, 与"长对话压测"目标冲突 (挂断覆盖由短剧本承担)。
+                    if i < len(sc.turns) and "long" not in (sc.tags or []) and self._rng.random() < ABANDON_RATE:
                         state.stats.abandoned += 1
                         logger.debug("模拟客户中途挂断: session=%s 场景=%s 第 %d 轮", self._session_id, sc.key, i)
                         state.stats.sessions += 1
