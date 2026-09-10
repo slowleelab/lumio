@@ -1412,3 +1412,58 @@ def test_looks_followup_gate() -> None:
     assert not _looks_followup("我想查询信用卡账单和还款日")
     assert not _looks_followup("你好")
     assert not _looks_followup("那我就先不办了这个之后再说我还有别的事要处理呢今天")  # 长句不误伤
+
+
+# ── 改写确定性校验: 错误改写不得生效 (长对话模拟卡号轮实测驱动) ──
+
+
+def test_rewrite_valid_entity_preservation() -> None:
+    """原句数字 (卡号/金额) 必须保留在改写句里 — 丢实体即弃用。"""
+    from lumio.services.common.classifier import _rewrite_valid
+
+    assert _rewrite_valid("那还款日具体是哪一天", "我的信用卡还款日是哪一天") is True
+    assert _rewrite_valid("那笔最大的是多少来着", "上月超市类消费中最大的一笔交易金额是多少") is True
+    # 卡号轮实测案例: 补卡号被改写成丢卡号的问句 → 拒绝
+    assert _rewrite_valid("卡号是 6225 8801 2345", "我的信用卡账单是什么") is False
+    # 金额被改走样 → 拒绝
+    assert _rewrite_valid("那8650元的分期手续费多少", "1000元的分期手续费是多少") is False
+
+
+def test_rewrite_valid_form_conservation() -> None:
+    """原句是陈述/回话 (无问句标记) 时, 改写句不得反转成问句。"""
+    from lumio.services.common.classifier import _rewrite_valid
+
+    # 确认回话被反转成问句 → 拒绝 (语义倒置)
+    assert _rewrite_valid("对, 就办12期", "是否确认办理12期分期?") is False
+    # 陈述保持陈述 → 通过
+    assert _rewrite_valid("我上周在杭州用的这张卡", "客户自述上周在杭州使用该卡") is True
+    # 原句是问句, 改写仍问句 → 通过
+    assert _rewrite_valid("那金卡呢", "金卡年费多少") is True
+
+
+def test_rewrite_valid_empty_and_identity() -> None:
+    from lumio.services.common.classifier import _rewrite_valid
+
+    assert _rewrite_valid("随便什么", "") is False
+    assert _rewrite_valid("原样输出", "原样输出") is False
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_invalid_rewrite_stripped() -> None:
+    """端到端: LLM 输出的非法改写 (丢实体) 被校验剥除, 退回原句行为。"""
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value={
+            "intent": "bill_query",
+            "confidence": 0.9,
+            "rewritten_query": "我的信用卡账单是什么",  # 丢了卡号 → 必须被拒
+            "refers_to_last": True,
+            "context_answer": "幻觉答案",
+        }
+    )
+    classifier = LLMClassifier(mock_llm)
+    intent, _, _ = await classifier.classify("卡号是 6225 8801 2345", context="上文")
+
+    assert intent.rewritten_query is None
+    assert intent.refers_to_last is False
+    assert intent.context_answer is None

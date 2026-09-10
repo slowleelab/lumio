@@ -38,6 +38,35 @@ _FAST_PATH_THRESHOLD = 0.7
 _FOLLOWUP_PREFIXES = ("那", "这个", "那个", "它", "他", "她", "再问", "具体", "刚才", "前面", "上一个")
 
 
+_INTERROGATIVE_MARKERS = ("?", "？", "吗", "呢", "多少", "什么", "几号", "几", "哪", "怎么", "为什么", "如何")
+
+
+def _looks_question(text: str) -> bool:
+    """问句形态判定 (词法): 命中任一疑问标记即视为问句。"""
+    t = (text or "").strip()
+    return any(m in t for m in _INTERROGATIVE_MARKERS)
+
+
+def _rewrite_valid(original: str, rewritten: str) -> bool:
+    """改写确定性校验 — 三道闸, 任一不过则弃用改写退回原句:
+
+    1. 实体保全: 原句中的每个数字串 (卡号/金额/日期) 必须保留在改写句里 —
+       客户补卡号被改写成"我的账单是什么"丢掉卡号, 即此例 (长对话模拟实测)。
+    2. 问句形态守恒: 原句是陈述/回答 (无问句标记) 时, 改写句不得变成问句 —
+       消灭"回话被反转成新问题"这类语义倒置。
+    3. 非空且确实发生了变化 (原样输出不算改写)。
+    """
+    import re
+
+    rw = (rewritten or "").strip()
+    if not rw or rw == (original or "").strip():
+        return False
+    orig_nums = {n for n in re.findall(r"\d+(?:\.\d+)?", original)}
+    if orig_nums and not orig_nums <= {n for n in re.findall(r"\d+(?:\.\d+)?", rw)}:
+        return False
+    return _looks_question(original) or not _looks_question(rw)
+
+
 def _looks_followup(text: str) -> bool:
     t = (text or "").strip()
     if not t or len(t) > 24:
@@ -865,6 +894,13 @@ class LLMClassifier:
         context_answer = str(result.get("context_answer") or "").strip() or None
         if not context:
             # 无上下文调用不存在"补全"语义, 防模型幻觉输出污染自包含轮
+            rewritten_query = None
+            refers_to_last = False
+            context_answer = None
+        elif rewritten_query and not _rewrite_valid(text, rewritten_query):
+            # 确定性校验不过 (实体丢失/陈述变问句) → 弃用改写退回原句, 行为降级
+            # 到升级前基线, 错误改写不存在"生效"态 (长对话模拟卡号轮实测驱动)
+            logger.info("改写校验未过, 弃用退回原句: %r -> %r", text[:30], rewritten_query[:40])
             rewritten_query = None
             refers_to_last = False
             context_answer = None
