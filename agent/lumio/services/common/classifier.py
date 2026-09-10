@@ -900,9 +900,7 @@ class LLMClassifier:
         elif rewritten_query and not _rewrite_valid(text, rewritten_query):
             # 确定性校验不过 (实体丢失/陈述变问句) → 弃用改写退回原句, 行为降级
             # 到升级前基线, 错误改写不存在"生效"态 (长对话模拟卡号轮实测驱动)
-            logger.info(
-                "改写校验未过, 弃用退回原句: %r -> %r", text[:30], rewritten_query[:40]
-            )
+            logger.info("改写校验未过, 弃用退回原句: %r -> %r", text[:30], rewritten_query[:40])
             rewritten_query = None
             refers_to_last = False
             context_answer = None
