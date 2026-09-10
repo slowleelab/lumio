@@ -377,7 +377,8 @@ async def list_qc_sessions(
                 qr_sub.c.problems,
                 qr_sub.c.summary,
                 qr_sub.c.turns,
-                qr_sub.c.session_time,
+                # 显示与排序同源 (dialogue_log 实时会话时间): 质检快照可能滞后于对话追加
+                func.coalesce(sess_sub.c.session_ts, qr_sub.c.session_time).label("session_time"),
                 qr_sub.c.scanned_at,
                 qr_sub.c.judge_model,
                 qr_sub.c.preview,
