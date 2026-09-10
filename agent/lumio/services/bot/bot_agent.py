@@ -740,9 +740,15 @@ class LumioAgent:
             try:
                 sid = await self._session_manager.resolve_session_id(session_id)
                 raw = await self._session_manager.read_state(sid)
-                lt = (raw or {}).get("last_tool_result") if isinstance(raw, dict) else None
-                if lt and lt.get("summary"):
-                    ctx += f"\n[上一轮系统动作]\n工具 {lt.get('tool', '')} 返回: {str(lt.get('summary'))[:200]}"
+                if isinstance(raw, dict):
+                    # 回话轮闸 (构造性消除误改写): 机器人正等客户回答 (补槽/待确认) 时,
+                    # 本轮按定义是"回话"而非"新问题" — 不带改写上下文, 该轮交由槽位/确认
+                    # 状态机处理。卡号补答被改写成问句即缺此闸 (长对话模拟实测)。
+                    if raw.get("awaiting_slots") or raw.get("pending_action"):
+                        return None
+                    lt = raw.get("last_tool_result")
+                    if lt and lt.get("summary"):
+                        ctx += f"\n[上一轮系统动作]\n工具 {lt.get('tool', '')} 返回: {str(lt.get('summary'))[:200]}"
             except Exception:
                 pass
         return ctx or None
