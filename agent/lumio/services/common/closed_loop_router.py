@@ -651,7 +651,10 @@ async def _run_serial_replay(app: Any, sf: Any, redis: Any, new_sid: str, msgs: 
                         if _st is not None and _st.current_phase.value == "agent":
                             await redis.hset(
                                 key,
-                                mapping={"status": "done", "error": f"第 {timeouts + 1} 轮后会话转人工, 重放提前终止 (已发 {timeouts + 1}/{len(msgs)} 轮)"},
+                                mapping={
+                                    "status": "done",
+                                    "error": f"第 {timeouts + 1} 轮后会话转人工, 重放提前终止 (已发 {timeouts + 1}/{len(msgs)} 轮)",
+                                },
                             )
                             return
                 timeouts += 1

@@ -171,11 +171,7 @@ class TransferChecker:
         primary_domain = INTENT_DOMAINS.get(intent.primary_intent) or INTENT_DOMAINS.get(
             normalize_intent(intent.primary_intent.value)
         )
-        if (
-            alt_labels & SENSITIVE_INTENTS
-            and conf >= TRANSFER_CONFIDENT_CONF
-            and primary_domain == "business"
-        ):
+        if alt_labels & SENSITIVE_INTENTS and conf >= TRANSFER_CONFIDENT_CONF and primary_domain == "business":
             sensitive = next(iter(alt_labels & SENSITIVE_INTENTS))
             return True, f"L2_INTENT_SENSITIVE: 命中敏感意图={sensitive.value}"
 
