@@ -317,7 +317,7 @@ async def list_qc_sessions(
     分类 (category): all | pass | warn | fail | pending_review | unscanned
     - pending_review: 有待人工复核的问题案例 (归因闸门未过) — 待判断口径
     - unscanned: 有问题案例但尚无质检判定 (如会话未结束先被信号采集)
-    排序锚: 会话时间 → 质检时刻 → 采集时刻。
+    排序锚: 会话最后活跃时间 (dialogue_log 聚合, 未质检会话同口径) → 质检时刻。
     """
     from sqlalchemy import and_, case
 
@@ -337,8 +337,18 @@ async def list_qc_sessions(
         )
     ).subquery()
 
+    # 会话最后活跃时间 (与质检扫描同源): 未质检会话也有真实会话时间, 排序口径统一
+    sess_sub = (
+        select(
+            DialogueLog.session_id.label("sid"),
+            func.max(DialogueLog.timestamp).label("session_ts"),
+        )
+        .group_by(DialogueLog.session_id)
+        .subquery()
+    )
+
     sid = func.coalesce(qr_sub.c.session_id, bc_sub.c.session_id)
-    order_anchor = func.coalesce(qr_sub.c.session_time, qr_sub.c.scanned_at, bc_sub.c.created_at)
+    order_anchor = func.coalesce(sess_sub.c.session_ts, qr_sub.c.session_time, qr_sub.c.scanned_at, bc_sub.c.created_at)
     category_expr = case(
         (
             and_(bc_sub.c.needs_human_review.is_(True), bc_sub.c.fix_status == "pending"),
@@ -356,6 +366,7 @@ async def list_qc_sessions(
         conds.append((qr_sub.c.preview.ilike(kw)) | (qr_sub.c.session_id.ilike(kw)) | (bc_sub.c.user_input.ilike(kw)))
 
     joined = qr_sub.join(bc_sub, qr_sub.c.session_id == bc_sub.c.session_id, full=True)
+    with_sess = joined.outerjoin(sess_sub, sid == sess_sub.c.sid)
 
     total = (await session.execute(select(func.count()).select_from(joined).where(*conds))).scalar() or 0
     rows = (
@@ -381,9 +392,9 @@ async def list_qc_sessions(
                 category_expr.label("category"),
                 order_anchor.label("order_ts"),
             )
-            .select_from(joined)
+            .select_from(with_sess)
             .where(*conds)
-            .order_by(order_anchor.desc(), qr_sub.c.scanned_at.desc().nullslast())
+            .order_by(order_anchor.desc().nullslast(), qr_sub.c.scanned_at.desc().nullslast())
             .limit(limit)
             .offset(offset)
         )

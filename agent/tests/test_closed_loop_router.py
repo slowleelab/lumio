@@ -111,6 +111,19 @@ class TestHumanVerdictLoop:
         assert rows and rows[0]["session_id"] == sid
         assert rows[0]["qc_status"] == "human" and rows[0]["verdict"] == "pass"
 
+        # 自清: 假会话无 dialogue_log, 残留会靠 scanned_at 兜底浮顶质检列表
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from lumio.shared.config import get_settings
+
+        engine = create_async_engine(get_settings().database.dsn)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("DELETE FROM quality_record WHERE session_id=:s"), {"s": sid})
+        finally:
+            await engine.dispose()
+
 
 class TestRescanAndReplay:
     async def test_rescan_missing_sid_and_skipped(self, admin_client: httpx.AsyncClient) -> None:

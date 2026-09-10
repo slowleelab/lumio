@@ -1,75 +1,10 @@
 <template>
   <div class="badcase-page">
     <div class="page-header">
-      <h2>智能质检 <span class="page-subtitle">全量会话质检记录 · 问题案例归因整改闭环</span></h2>
-      <div class="header-actions">
-        <el-tooltip placement="left" effect="light">
-          <template #content>
-            <div class="judge-tip">
-              <b>GLM-5.3-Flash 裁判 · 批量归因</b><br />
-              对全部「未归因」坏例逐条跑 LLM 裁判 (n=3 多数票),<br />
-              每条约 20-40 秒后台执行, 完成后自动刷新。<br />
-              采集落库后不会自动归因 —— 由你在此触发。
-            </div>
-          </template>
-          <el-button size="small" type="primary" plain :loading="batch.running" @click="doBatchAttribution">
-            {{ batch.running ? `GLM 裁判中 ${batch.done}/${batch.total}` : "GLM 裁判 · 批量归因待归因项" }}
-          </el-button>
-        </el-tooltip>
-        <el-tooltip placement="left" effect="light">
-          <template #content>
-            <div class="judge-tip">
-              <b>全量质检巡检</b><br />
-              所有会话从<b>原始对话内容</b>过 GLM 裁判质检,<br />
-              不依赖置信度/差评信号 — 高置信但答非所问也逃不掉。<br />
-              fail 自动采集进待复核队列; 合格率见按钮下方。
-            </div>
-          </template>
-          <el-button size="small" type="success" plain :loading="scan.running" @click="doQualityScan">
-            {{ scan.running ? `全量质检中 ${scan.done}/${scan.total}` : "全量质检 · 扫描全部会话" }}
-          </el-button>
-        </el-tooltip>
-      </div>
+      <h2>智能质检</h2>
     </div>
 
-    <!-- 全量质检进度条 -->
-    <el-progress
-      v-if="scan.running"
-      :percentage="scanPct"
-      :stroke-width="10"
-      striped
-      striped-flow
-      status="success"
-      style="margin-top: 10px"
-    >
-      <template #default>
-        <span class="batch-progress-text">
-          全量质检中 {{ scan.done }}/{{ scan.total }}
-          · 合格 {{ scan.n_pass }} / 提醒 {{ scan.n_warn }} / 不合格 {{ scan.n_fail }}
-          <template v-if="scan.n_error"> (失败 {{ scan.n_error }})</template>
-        </span>
-      </template>
-    </el-progress>
-
-    <!-- 批量归因进度条 -->
-    <el-progress
-      v-if="batch.running"
-      :percentage="batchPct"
-      :stroke-width="10"
-      striped
-      striped-flow
-      style="margin-top: 10px"
-    >
-      <template #default>
-        <span class="batch-progress-text">
-          GLM 裁判批量归因中 {{ batch.done }}/{{ batch.total }}
-          <template v-if="batch.failed"> (失败 {{ batch.failed }})</template>
-          <template v-if="batch.scope?.signal_source || batch.scope?.keyword"> · 范围: {{ batchScopeText }}</template>
-        </span>
-      </template>
-    </el-progress>
-
-        <div class="filters">
+    <div class="filters">
       <el-select v-model="qcFilters.category" placeholder="分类" clearable size="small" style="width: 130px" @change="reloadQc">
         <el-option label="合格" value="pass" />
         <el-option label="提醒级" value="warn" />
@@ -506,12 +441,8 @@ import { Search } from "@element-plus/icons-vue"
 import {
   attributeBadcase,
   resolveBadcase,
-  startBatchAttribution,
-  getBatchAttributionStatus,
   expandGoldenSet,
   getBadcase,
-  startQualityScan,
-  getQualityScanStatus,
   listQcSessions,
   rescanQualitySession,
   replayQualitySession,
@@ -520,7 +451,6 @@ import {
   type QcSessionRow,
   type Badcase,
   type QualityProblem,
-  type QualityScanStatus,
 } from "@/api/closedLoop"
 import { getConversationReplay, type ReplayResponse } from "@/api/console"
 import DecisionChainView from "@/components/common/DecisionChainView.vue"
@@ -1178,116 +1108,6 @@ async function batchTransition(status: string) {
   await loadQc()
 }
 
-// ── 批量归因 (后台任务轮询, 跟随当前筛选范围) ──
-const batch = ref({
-  running: false,
-  total: 0,
-  done: 0,
-  failed: 0,
-  scope: null as { signal_source?: string; keyword?: string } | null,
-})
-let batchTimer: ReturnType<typeof setInterval> | null = null
-
-const batchPct = computed(() => (batch.value.total > 0 ? Math.round((batch.value.done / batch.value.total) * 100) : 0))
-
-const batchScopeText = computed(() => {
-  const parts: string[] = []
-  if (batch.value.scope?.signal_source) parts.push(signalLabel(batch.value.scope.signal_source))
-  if (batch.value.scope?.keyword) parts.push(`"${batch.value.scope.keyword}"`)
-  return parts.join(" + ") || "全部"
-})
-
-async function pollBatch() {
-  try {
-    const st = await getBatchAttributionStatus()
-    batch.value = {
-      running: st.running,
-      total: st.total,
-      done: st.done,
-      failed: st.failed,
-      scope: (st.scope as { signal_source?: string; keyword?: string }) ?? null,
-    }
-    if (!st.running) {
-      if (batchTimer) {
-        clearInterval(batchTimer)
-        batchTimer = null
-      }
-      if (st.total > 0) {
-        ElMessage.success(`批量归因完成: 成功 ${st.done} / 失败 ${st.failed} / 共 ${st.total}`)
-        await loadQc()
-      }
-    }
-  } catch {
-    /* handled */
-  }
-}
-
-async function doBatchAttribution() {
-  const scope: { signal_source?: string; keyword?: string } = {}
-  if (qcFilters.value.keyword) scope.keyword = qcFilters.value.keyword
-  const scopeText = Object.keys(scope).length ? " (按当前筛选范围)" : ""
-  try {
-    await startBatchAttribution(200, scope)
-    ElMessage.success(`GLM 裁判批量归因已启动${scopeText}, 每条约 20-40 秒`)
-    if (!batchTimer) batchTimer = setInterval(pollBatch, 4000)
-  } catch {
-    /* handled */
-  }
-}
-
-// ── 全量质检巡检 (后台任务轮询) ──
-const scan = ref({
-  running: false,
-  total: 0,
-  done: 0,
-  n_pass: 0,
-  n_warn: 0,
-  n_fail: 0,
-  n_error: 0,
-  lastRun: null as QualityScanStatus["last_run"],
-})
-let scanTimer: ReturnType<typeof setInterval> | null = null
-
-const scanPct = computed(() => (scan.value.total > 0 ? Math.round((scan.value.done / scan.value.total) * 100) : 0))
-
-async function pollScan() {
-  try {
-    const st = await getQualityScanStatus()
-    scan.value = {
-      running: st.running,
-      total: st.total,
-      done: st.done,
-      n_pass: st.n_pass,
-      n_warn: st.n_warn,
-      n_fail: st.n_fail,
-      n_error: st.n_error,
-      lastRun: st.last_run ?? scan.value.lastRun,
-    }
-    if (!st.running) {
-      if (scanTimer) {
-        clearInterval(scanTimer)
-        scanTimer = null
-      }
-      if (st.total > 0) {
-        ElMessage.success(`全量质检完成: 不合格 ${st.n_fail} 已采入待复核 (合格率 ${((st.last_run?.pass_rate ?? 0) * 100).toFixed(1)}%)`)
-        await loadQc()
-      }
-    }
-  } catch {
-    /* handled */
-  }
-}
-
-async function doQualityScan() {
-  try {
-    await startQualityScan({ limit: 5000 })  // 全量补扫: 后端批次循环至无未检会话
-    ElMessage.success("全量质检已启动, 后台逐会话审查原始对话")
-    if (!scanTimer) scanTimer = setInterval(pollScan, 4000)
-  } catch {
-    /* handled */
-  }
-}
-
 async function addToGolden(row: Badcase) {
   try {
     const r = await expandGoldenSet([row.user_input])
@@ -1340,18 +1160,15 @@ function fmtTime(iso?: string | null) {
   return iso ? iso.slice(0, 19).replace("T", " ") : "-"
 }
 onMounted(() => {
-  pollScan() // 恢复可能进行中的全量质检进度
   // 质量监控报表卡片跳转带入分类筛选
   const q = route.query.category as string | undefined
   if (q && ["pass", "warn", "fail", "pending_review", "unscanned"].includes(q)) {
     qcFilters.value.category = q
   }
   loadQc()
-  pollBatch()
 })
 onUnmounted(() => {
   if (replayTimer) clearInterval(replayTimer)
-  if (batchTimer) clearInterval(batchTimer)
 })
 </script>
 
@@ -1363,15 +1180,6 @@ onUnmounted(() => {
   flex-wrap: wrap;
   gap: var(--space-2);
 }
-.page-subtitle {
-  font-size: var(--fs-sm);
-  font-weight: 400;
-  color: var(--color-text-secondary);
-  margin-left: 8px;
-}
-
-
-.batch-progress-text { font-size: var(--fs-sm); color: var(--color-text-secondary); }
 .qa-tabs {
   margin-top: 8px;
   .tab-hint { font-size: var(--fs-xs, 11px); color: var(--color-text-placeholder); margin-left: 4px; }
