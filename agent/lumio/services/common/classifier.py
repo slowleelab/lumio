@@ -32,6 +32,21 @@ logger = logging.getLogger(__name__)
 # 规则分类器阈值：Fast Path 置信度 >= 此值直接使用
 _FAST_PATH_THRESHOLD = 0.7
 
+# 上下文改写闸 (对话理解升级): 疑似接话 (代词/省略/追问上轮) 即使快路径高置信
+# 也放行进慢路径带上下文理解 — 单句分类器对上下文相关输入没有视野。
+# 只有一条规则、一个职责; 命中仅"多走一次慢路径", 无其他副作用。
+_FOLLOWUP_PREFIXES = ("那", "这个", "那个", "它", "他", "她", "再问", "具体", "刚才", "前面", "上一个")
+
+
+def _looks_followup(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 24:
+        return False
+    if any(t.startswith(p) for p in _FOLLOWUP_PREFIXES):
+        return True
+    return len(t) <= 10 and t.endswith(("呢", "怎么样", "是多少", "是哪天", "是哪一天"))
+
+
 # ── 快路径按类采纳阈值 (架构整改 Phase 3: 数据驱动替代全局常数) ──────────
 # 各意图类的 softmax 可分性不同, 一刀切全局阈值两头误伤。校准产物
 # fast_path_thresholds.json 由 scripts/intent_threshold_calibrate.py 用种子
@@ -70,6 +85,7 @@ def _load_fast_thresholds(path: str | None = None) -> dict[str, float]:
 def _fast_accept_threshold(label: IntentLabel, default: float = _FAST_PATH_THRESHOLD) -> float:
     """快路径采纳阈值: 按预测类查表, 缺类沿用调用方默认 (实例 fast_threshold)。"""
     return _load_fast_thresholds().get(label.value, default)
+
 
 # 办理词规则覆盖 (会话 48882b05 同型消歧): BERT 标签空间是旧扁平 10 类, 发不出
 # 写类主名意图; 规则层对这些意图高置信命中时覆盖 BERT 快路径结果。仅收办理动作词
@@ -560,6 +576,9 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 {
   "intent": "意图标签",
   "confidence": 0.0-1.0的置信度,
+  "rewritten_query": "改写后的完整问题或null",
+  "refers_to_last": true或false,
+  "context_answer": "上轮结果中已有的答案原文或null",
   "entities": [{"entity_type": "类型", "value": "值"}],
   "sentiment": "positive/neutral/negative/angry",
   "input_class": "business|chitchat|noise"
@@ -578,6 +597,12 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 - transfer_agent: 转人工
 - chitchat: 闲聊
 
+## 上下文改写 (仅当用户输入前提供了 [对话上下文] 区块)
+- 当前输入若依赖上下文 (代词"那/它/这个"、省略句、对上轮结果的追问), 先把它改写成不依赖上下文的自包含问题 (指代消解+省略恢复), intent 与 confidence 按改写后的问题判定, 并输出 rewritten_query=改写后的自包含问题
+- 例: 上文刚查过账单, 当前输入"那还款日具体是哪一天" → rewritten_query="我的信用卡还款日是哪一天", intent=bill_query
+- 当前输入与上下文无关 (自包含) 时 rewritten_query 输出 null
+- 若补全后问题的答案已完整出现在 [上一轮系统动作] 给出的结果里, 输出 refers_to_last=true 和 context_answer=从该结果原文摘出的答案短句 (数字/日期必须与原文完全一致); 否则 refers_to_last=false, context_answer=null
+
 ## input_class 判定（与意图分类同一次输出，独立打分）
 - business: 与银行业务相关的真实诉求（查账/分期/挂失/投诉/额度/积分/转人工等）
 - chitchat: 闲聊/寒暄/玩笑/与银行业务无关的话题（如动物名、天气、表情）
@@ -586,19 +611,27 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个银行信用卡客服意图分类器。
 
 ## 示例
 用户: 我上个月花了多少钱
-输出: {"intent": "bill_query", "confidence": 0.9, "entities": [{"entity_type": "time_range", "value": "上个月"}], "sentiment": "neutral", "input_class": "business"}
+输出: {"intent": "bill_query", "confidence": 0.9, "rewritten_query": null, "refers_to_last": false, "context_answer": null, "entities": [{"entity_type": "time_range", "value": "上个月"}], "sentiment": "neutral", "input_class": "business"}
 
 用户: 额度太低了能不能提一下
-输出: {"intent": "limit_query", "confidence": 0.85, "entities": [{"entity_type": "action", "value": "提额"}], "sentiment": "neutral", "input_class": "business"}
+输出: {"intent": "limit_query", "confidence": 0.85, "rewritten_query": null, "refers_to_last": false, "context_answer": null, "entities": [{"entity_type": "action", "value": "提额"}], "sentiment": "neutral", "input_class": "business"}
 
 用户: 你们的年费怎么这么贵，我要投诉
-输出: {"intent": "complaint", "confidence": 0.95, "entities": [{"entity_type": "topic", "value": "年费"}], "sentiment": "angry", "input_class": "business"}
+输出: {"intent": "complaint", "confidence": 0.95, "rewritten_query": null, "refers_to_last": false, "context_answer": null, "entities": [{"entity_type": "topic", "value": "年费"}], "sentiment": "angry", "input_class": "business"}
 
 用户: 你好呀
-输出: {"intent": "chitchat", "confidence": 0.9, "entities": [], "sentiment": "positive", "input_class": "chitchat"}
+输出: {"intent": "chitchat", "confidence": 0.9, "rewritten_query": null, "refers_to_last": false, "context_answer": null, "entities": [], "sentiment": "positive", "input_class": "chitchat"}
 
 用户: 卡皮巴拉
-输出: {"intent": "faq", "confidence": 0.3, "entities": [], "sentiment": "neutral", "input_class": "chitchat"}
+输出: {"intent": "faq", "confidence": 0.3, "rewritten_query": null, "refers_to_last": false, "context_answer": null, "entities": [], "sentiment": "neutral", "input_class": "chitchat"}
+
+[对话上下文]
+客户: 我想查询信用卡账单和还款日
+客服: 您的信用卡账单已出账，账单金额为8650.00元，还款日为2026年7月25日。
+[上一轮系统动作]
+工具 query_card_bill 返回: 账单金额 8650.00元, 还款日 2026年7月25日
+用户: 那还款日具体是哪一天
+输出: {"intent": "bill_query", "confidence": 0.9, "rewritten_query": "我的信用卡还款日是哪一天", "refers_to_last": true, "context_answer": "您的还款日为2026年7月25日", "entities": [], "sentiment": "neutral", "input_class": "business"}
 
 ## 要求
 - 只输出 JSON，不要其他文字
@@ -766,18 +799,22 @@ class LLMClassifier:
         intent, entities, sentiment = result
         return intent.model_copy(deep=True), [e.model_copy(deep=True) for e in entities], sentiment
 
-    async def classify(self, text: str) -> tuple[IntentResult, list[Entity], SentimentLabel]:
-        """LLM 意图分类
+    async def classify(self, text: str, context: str = "") -> tuple[IntentResult, list[Entity], SentimentLabel]:
+        """LLM 意图分类 (对话理解)
 
         Args:
             text: 用户输入文本
+            context: 对话上下文区块 (最近轮次 + 上一轮系统动作), 非空时拼在
+                输入前, 模型按"上下文改写"规则输出 rewritten_query/context_answer。
+                缓存 key 随 context 隔离 — 同一句接话在不同上下文里改写不同。
 
         Returns:
             (IntentResult, 实体列表, 情感标签)
         """
         llm_settings = get_settings().llm
-        cache_key = text.strip()
-        if llm_settings.classify_cache_enabled and cache_key:
+        context = (context or "").strip()
+        cache_key = f"{context}|{text.strip()}" if llm_settings.classify_cache_enabled and text.strip() else ""
+        if cache_key:
             now = time.monotonic()
             hit = self._cache.get(cache_key)
             if hit is not None:
@@ -787,6 +824,7 @@ class LLMClassifier:
                     logger.debug("LLM 分类缓存命中 (免一次分类调用): %r", text[:40])
                     return self._copy_cached(cached)
                 del self._cache[cache_key]
+        user_msg = f"{context}\n\n[当前输入]\n{text}" if context else text
         try:
             # 强制总时长上限: 此前 timeout 只透传给 OpenAI SDK 作 per-read 超时, 对
             # 流式输出(小 token 持续到达)永不触发 → LLM 分类可跑 8s+ (拖垮整轮应答).
@@ -796,7 +834,7 @@ class LLMClassifier:
             result = await asyncio.wait_for(
                 self._llm.classify(
                     system_prompt=build_classify_system_prompt(),
-                    user_input=text,
+                    user_input=user_msg,
                     timeout=timeout,
                 ),
                 timeout=timeout,
@@ -820,12 +858,25 @@ class LLMClassifier:
         # (此前需第二次独立仲裁 LLM 调用, 弱证据输入整轮 10s 中一半花在这)
         raw_input_class = str(result.get("input_class") or "").strip().lower()
         input_class = raw_input_class if raw_input_class in ("business", "chitchat", "noise") else None
+        # 上下文改写产物 (仅带上下文调用时模型会输出): rewritten_query 即自包含问题
+        # # (standalone question), 供下游检索/抽参; context_answer + refers_to_last 供查询链"答案已在手"复述。
+        rewritten_query = str(result.get("rewritten_query") or "").strip() or None
+        refers_to_last = result.get("refers_to_last") is True
+        context_answer = str(result.get("context_answer") or "").strip() or None
+        if not context:
+            # 无上下文调用不存在"补全"语义, 防模型幻觉输出污染自包含轮
+            rewritten_query = None
+            refers_to_last = False
+            context_answer = None
 
         parsed = (
             IntentResult(
                 primary_intent=intent_label,
                 primary_confidence=confidence,
                 llm_input_class=input_class,
+                rewritten_query=rewritten_query,
+                refers_to_last=refers_to_last,
+                context_answer=context_answer,
             ),
             entities,
             sentiment,
@@ -942,18 +993,20 @@ class IntentClassifier:
         self,
         text: str,
         history: list[dict[str, str]] | None = None,
+        followup_context: str | None = None,
     ) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
         """执行双通道分类 (公共入口: 出口处统一做闲聊/噪声置信封顶)
 
         Args:
             text: 用户输入文本
             history: 可选多轮上下文 (speaker/content), 透传给 BERT 快路径做对话级意图判定
+            followup_context: 对话上下文区块 (拼给 LLM 慢路径做上下文改写, 见 LLMClassifier)
 
         Returns:
             (IntentResult, 实体列表, 情感标签, 分类来源 "bert"|"rule"|"llm"|"fallback"|"bert:lowconf")
         """
         _t_start = time.monotonic()
-        intent_result, entities, sentiment, source = await self._classify_impl(text, history)
+        intent_result, entities, sentiment, source = await self._classify_impl(text, history, followup_context)
         # 闲聊/噪声置信封顶 (会话 8700a2ea): 无论快慢路径, NB_CHITCHAT/NB_NOISE 的
         # primary_confidence 一律压到 _NONBUSINESS_CONF_CAP — LLM 自评通胀的 0.7+
         # 会跳过低置信护栏。fast_conf 不动 (保留原始分歧证据)。
@@ -987,6 +1040,7 @@ class IntentClassifier:
         self,
         text: str,
         history: list[dict[str, str]] | None = None,
+        followup_context: str | None = None,
     ) -> tuple[IntentResult, list[Entity], SentimentLabel, str]:
         """双通道分类主体 (classify 的实现, 出口置信封顶在 classify 包装层)"""
         # ①预处理·乱序纠错 (layer_1 坏例根治): 修正文本进入全部三级分类
@@ -1097,10 +1151,7 @@ class IntentClassifier:
         _rule_override = (
             rule_fast.primary_intent in _APPLY_INTENT_RULE_OVERRIDE
             and rule_fast.primary_confidence >= _APPLY_OVERRIDE_CONF
-            and (
-                fast_result.primary_intent != rule_fast.primary_intent
-                or fast_result.primary_confidence < 0.8
-            )
+            and (fast_result.primary_intent != rule_fast.primary_intent or fast_result.primary_confidence < 0.8)
         )
         if _rule_override:
             logger.info(
@@ -1132,10 +1183,7 @@ class IntentClassifier:
             fast_result.primary_intent != rule_fast.primary_intent
             and rule_fast.primary_confidence >= 0.8
             and normalize_intent(rule_fast.primary_intent.value) in _QUERY_INTENT_OVERRIDES
-            and (
-                not any(m in text for m in _CONSULTIVE_MARKERS)
-                or any(a in text for a in _STRONG_QUERY_ACTIONS)
-            )
+            and (not any(m in text for m in _CONSULTIVE_MARKERS) or any(a in text for a in _STRONG_QUERY_ACTIONS))
         ):
             logger.info(
                 "查询词规则覆盖快路径: %s@%.2f -> %s@%.2f (text=%r)",
@@ -1156,7 +1204,13 @@ class IntentClassifier:
             )
             fast_source = "rule:query"
 
-        if fast_result.primary_confidence >= _fast_accept_threshold(fast_result.primary_intent, self._threshold):
+        # 追问闸: 疑似接话且手上有上下文时, 快路径高置信也不短路 — 交给慢路径
+        # 带上下文理解 (词法只判"可能不是自包含句", 语义判断仍归 LLM)。
+        _followup_gate = bool(followup_context) and bool(history) and _looks_followup(text)
+
+        if not _followup_gate and fast_result.primary_confidence >= _fast_accept_threshold(
+            fast_result.primary_intent, self._threshold
+        ):
             logger.debug(
                 "Fast Path 命中: intent=%s, confidence=%.2f, source=%s",
                 fast_result.primary_intent.value,
@@ -1228,7 +1282,7 @@ class IntentClassifier:
         )
 
         try:
-            llm_result, entities, sentiment = await self._llm.classify(text)
+            llm_result, entities, sentiment = await self._llm.classify(text, context=followup_context or "")
         except Exception:
             logger.warning("LLM 分类调用失败，使用 Fast Path 结果兜底")
             await self._emit_sample(text, fast_source, fast_result, fast_result, "fallback")

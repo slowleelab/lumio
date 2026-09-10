@@ -20,9 +20,7 @@ def _make_app(seed_data: dict, tmp_path) -> FastAPI:
     app = FastAPI()
     app.include_router(router, prefix="/api")
     register_exception_handlers(app)
-    app.dependency_overrides[get_current_user] = lambda: AuthUser(
-        user_id="admin-1", role="admin", session_id=None
-    )
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(user_id="admin-1", role="admin", session_id=None)
     patcher = patch(
         "lumio.services.common.intent_library_router.SEED_PATH",
         seed_file,
@@ -32,9 +30,7 @@ def _make_app(seed_data: dict, tmp_path) -> FastAPI:
 
 
 def _override_role(app: FastAPI, role: str) -> None:
-    app.dependency_overrides[get_current_user] = lambda: AuthUser(
-        user_id=f"{role}-x", role=role, session_id=None
-    )
+    app.dependency_overrides[get_current_user] = lambda: AuthUser(user_id=f"{role}-x", role=role, session_id=None)
 
 
 async def _req(app: FastAPI, method: str, url: str, **kwargs):

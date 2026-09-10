@@ -19,7 +19,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "account_stmt_query": ("交易流水查询", "查询账户交易流水"),
     "account_stmt_dispute": ("流水异议", "对交易流水存在异议"),
     "account_balance_query": ("余额查询", "查询信用卡可用额度/余额"),
-
     # ── 1.2 交易与消费域 ──
     "txn_query": ("交易明细查询", "查询具体交易记录/消费明细"),
     "txn_cash_advance_query": ("取现记录查询", "查询预借现金/取现记录"),
@@ -30,7 +29,7 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "txn_currency_set": ("交易币种设置", "设置记账币种"),
     "txn_overseas_lock": ("境外交易锁定", "锁定/解锁境外交易"),
     "txn_category_stat": ("消费分类统计", "按类目统计消费"),
-        "txn_export": ("交易导出", "导出交易明细文件"),
+    "txn_export": ("交易导出", "导出交易明细文件"),
     # ── 支付域 ──
     "pay_method_query": ("支付方式查询", "查询可用支付方式/渠道"),
     "pay_contactless": ("闪付", "闪付/免密支付咨询"),
@@ -41,7 +40,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "pay_pause": ("暂停支付", "临时暂停支付功能"),
     "pay_wallet_bind": ("钱包绑卡", "第三方钱包绑卡/解绑"),
     "pay_wallet_unbind": ("钱包解绑", "第三方钱包解绑"),
-
     # ── 1.3 还款域 ──
     "repay_plan_query": ("还款计划查询", "查询分期还款计划"),
     "repay_record_query": ("还款记录查询", "查询历史还款记录"),
@@ -57,7 +55,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "repay_voucher": ("还款凭证", "获取/补发还款凭证"),
     "repay_settle": ("结清证明", "申请结清证明"),
     "repay_deduction_order": ("冲抵顺序查询", "查询还款冲抵顺序"),
-
     # ── 1.4 额度域 ──
     "limit_query": ("额度查询", "查询当前信用额度/可用额度"),
     "limit_apply_increase": ("提额申请", "申请提升信用额度"),
@@ -66,9 +63,8 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "limit_policy_query": ("额度政策查询", "查询额度管理政策/规则"),
     "limit_history_query": ("额度变更历史", "查询历史额度调整记录"),
     "limit_tying_query": ("关联额度查询", "查询主卡/附属卡共享额度"),
-        "limit_pool_query": ("额度池查询", "查询预审批额度池"),
+    "limit_pool_query": ("额度池查询", "查询预审批额度池"),
     "limit_usage_alert_set": ("额度提醒设置", "设置额度使用预警"),
-
     # ── 1.5 分期域 ──
     "inst_apply": ("分期申请", "申请账单/消费分期"),
     "inst_param_query": ("分期参数查询", "查询分期期数/费率/额度"),
@@ -81,7 +77,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "inst_forex": ("分期外汇", "外币交易分期"),
     "inst_promotion": ("分期优惠", "查询分期费率优惠活动"),
     "inst_contract": ("分期合同", "获取分期合同/协议"),
-
     # ── 1.6 积分域 ──
     "points_balance_query": ("积分余额查询", "查询当前积分余额"),
     "points_redeem": ("积分兑换", "积分兑换商品/权益"),
@@ -94,7 +89,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "benefit_claim": ("权益领取", "领取卡片权益/优惠券"),
     "benefit_reassign": ("权益重指派", "变更权益受益人"),
     "benefit_upgrade": ("权益升级", "升级权益等级"),
-
     # ── 1.7 卡片域 ──
     "card_apply_new": ("新卡申请", "申请新的信用卡"),
     "card_activate": ("卡片激活", "激活新卡"),
@@ -111,7 +105,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "card_loss_report": ("挂失", "卡片遗失/被盗后挂失"),
     "card_reissue": ("补卡", "申请补发新卡"),
     "card_limit_temporary": ("临时额度", "申请/查询临时额度"),
-
     # ── 1.8 风险域 ──
     "risk_fraud_report": ("欺诈上报", "报告可疑交易/盗刷"),
     "risk_account_freeze": ("账户冻结", "因风险冻结账户"),
@@ -121,13 +114,12 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "risk_money_laundry": ("洗钱嫌疑", "疑似洗钱相关风险"),
     "risk_overseas_travel": ("境外出行登记", "出境前卡片境外使用登记"),
     "risk_pos_anomaly": ("POS 异常", "POS 机交易异常反馈"),
-        "risk_wallet_safety": ("钱包安全", "数字钱包绑定安全咨询"),
+    "risk_wallet_safety": ("钱包安全", "数字钱包绑定安全咨询"),
     "risk_atm_anomaly": ("ATM 异常", "ATM 机交易异常反馈"),
     "risk_cash_advance_warn": ("预借现金预警", "预借现金风险提示"),
     "risk_fraud_hotline": ("欺诈热线", "欺诈举报热线咨询"),
     "risk_kyc": ("KYC 核验", "实名认证/KYC 核验要求"),
     "risk_dispute": ("交易争议", "对交易存在争议"),
-
     # ── 1.9 客服域 ──
     "complaint": ("投诉", "客户投诉/不满"),
     "dispute_submit": ("争议提交", "提交交易争议"),
@@ -137,7 +129,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "transfer_agent": ("转人工", "要求转接人工客服"),
     "handoff_restart": ("重机会话", "人工服务重新开始"),
     "handoff_schedule": ("预约人工", "预约人工客服回电"),
-
     # ── 1.10 通用 ──
     "knowledge_qa": ("知识问答", "知识库/政策通用咨询 (年费/免息期/账单日等); FAQ 库与文档库只是检索来源"),
     "faq": ("知识问答", "通用知识问答 (旧意图名, 已归一到 knowledge_qa)"),
@@ -145,13 +136,12 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "chitchat": ("闲聊", "与业务无关的日常对话"),
     "nb_chitchat": ("闲聊(边界)", "疑似闲聊的边界输入"),
     "nb_noise": ("噪声", "无意义/乱码输入"),
-        "handoff_end": ("人工结束", "人工服务结束标记"),
+    "handoff_end": ("人工结束", "人工服务结束标记"),
     "handoff_hotline": ("客服热线", "客服热线号码咨询"),
     "handoff_hours_query": ("服务时间查询", "查询人工客服服务时间"),
     "handoff_queue_query": ("排队查询", "查询人工客服排队状态"),
     "handoff_verify": ("人工核验", "转人工前的身份核验"),
     "nb_help": ("求助", "客户表达需要帮助"),
-
     # ── 费用域 ──
     "fee_annual": ("年费", "信用卡年费标准/减免政策"),
     "fee_card_material": ("工本费", "卡片工本费/换卡费"),
@@ -165,15 +155,12 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "fee_service": ("服务费", "增值服务费咨询"),
     "fee_settle_inquiry": ("结算费用", "结算/结清相关费用"),
     "fee_transfer": ("转账手续费", "信用卡转账费用"),
-
     # ── 活动域 ──
     "campaign_query": ("活动查询", "营销活动规则/进度查询"),
     "campaign_signup": ("活动报名", "报名参加营销活动"),
-
     # ── 卡片补充 ──
     "card_expire_renew": ("到期换卡", "卡片到期后换新卡"),
     "card_loss_cancel": ("挂失撤销", "撤销之前的挂失"),
-
     # ── 争议补充 ──
     "dispute_close": ("争议关闭", "关闭已提交的争议"),
     "dispute_compensation": ("争议赔付", "争议处理赔付申请"),
@@ -184,7 +171,6 @@ INTENT_LABELS_ZH: dict[str, tuple[str, str]] = {
     "dispute_status": ("争议进度", "争议处理进度查询"),
     "dispute_urge": ("争议催办", "催促争议处理进度"),
     "dispute_withdraw": ("争议撤回", "撤回已提交的争议"),
-
     # ── FAQ 补充 ──
     "faq_account_policy": ("账户政策", "账户管理政策咨询"),
     "faq_any": ("通用咨询", "通用银行业务咨询"),

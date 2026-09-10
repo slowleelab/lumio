@@ -147,7 +147,9 @@ async def test_llm_classify_parses_input_class() -> None:
     assert intent.llm_input_class is None
 
     # 缺失 → None
-    mock_llm.classify = AsyncMock(return_value={"intent": "bill_query", "confidence": 0.9, "entities": [], "sentiment": "neutral"})
+    mock_llm.classify = AsyncMock(
+        return_value={"intent": "bill_query", "confidence": 0.9, "entities": [], "sentiment": "neutral"}
+    )
     intent, _, _ = await classifier.classify("查账单")
     assert intent.llm_input_class is None
 
@@ -161,7 +163,13 @@ async def test_llm_classify_input_class_cached() -> None:
     try:
         mock_llm = MagicMock()
         mock_llm.classify = AsyncMock(
-            return_value={"intent": "faq", "confidence": 0.4, "entities": [], "sentiment": "neutral", "input_class": "noise"}
+            return_value={
+                "intent": "faq",
+                "confidence": 0.4,
+                "entities": [],
+                "sentiment": "neutral",
+                "input_class": "noise",
+            }
         )
         classifier = LLMClassifier(mock_llm)
         _, _, _ = await classifier.classify("hjfw 什么")
@@ -1272,9 +1280,7 @@ async def test_subword_short_circuits_slow_path() -> None:
     fake_bert = _fake_bert(IntentLabel.FAQ, 0.61)  # BERT 弱识别, 不够快路径采纳
     mock_llm = MagicMock()
     mock_llm.classify = AsyncMock(side_effect=AssertionError("子词不应进 LLM 慢路径"))
-    classifier = IntentClassifier(
-        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
-    )
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert)
     intent, _, _, source = await classifier.classify("信用")
     assert source == "subword"
     assert intent.classification_source == "subword"
@@ -1293,9 +1299,7 @@ async def test_subword_spared_for_rule_signaled_action_word() -> None:
             SentimentLabel.NEUTRAL,
         )
     )
-    classifier = IntentClassifier(
-        rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert
-    )
+    classifier = IntentClassifier(rule_classifier=RuleClassifier(), llm_classifier=mock_llm, bert_classifier=fake_bert)
     intent, _, _, source = await classifier.classify("挂失")
     assert source == "llm"
     assert intent.primary_intent == IntentLabel.CARD_LOSS
@@ -1319,3 +1323,92 @@ async def test_full_sentence_not_subword() -> None:
     )
     _, _, _, source = await classifier.classify("信用卡的年费政策是什么样的")
     assert source in ("llm", "fallback")
+
+
+# ── 对话理解升级: 追问补全 (rewritten_query / refers_to_last / context_answer) ──
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_context_rewrite_parsed() -> None:
+    """带上下文调用: LLM 输出的追问补全三字段应解析进 IntentResult。"""
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value={
+            "intent": "bill_query",
+            "confidence": 0.9,
+            "rewritten_query": "我的信用卡还款日是哪一天",
+            "refers_to_last": True,
+            "context_answer": "您的还款日为2026年7月25日",
+            "entities": [],
+            "sentiment": "neutral",
+        }
+    )
+    classifier = LLMClassifier(mock_llm)
+    ctx = "[对话上下文]\n客户: 我想查询信用卡账单和还款日\n客服: 还款日为2026年7月25日。\n[上一轮系统动作]\n工具 query_card_bill 返回: 还款日 2026年7月25日"
+    intent, _, _ = await classifier.classify("那还款日具体是哪一天", context=ctx)
+
+    assert intent.rewritten_query == "我的信用卡还款日是哪一天"
+    assert intent.refers_to_last is True
+    assert intent.context_answer == "您的还款日为2026年7月25日"
+    # 上下文区块应拼进用户消息
+    sent = mock_llm.classify.call_args.kwargs.get("user_input", "")
+    assert "[对话上下文]" in sent and "那还款日具体是哪一天" in sent
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_no_context_strips_rewrite_fields() -> None:
+    """无上下文调用: 模型幻觉输出的补全字段必须被剥掉 (自包含轮零污染)。"""
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(
+        return_value={
+            "intent": "bill_query",
+            "confidence": 0.9,
+            "rewritten_query": "幻觉出来的补全",
+            "refers_to_last": True,
+            "context_answer": "幻觉答案",
+        }
+    )
+    classifier = LLMClassifier(mock_llm)
+    intent, _, _ = await classifier.classify("帮我查账单")
+
+    assert intent.rewritten_query is None
+    assert intent.refers_to_last is False
+    assert intent.context_answer is None
+
+
+@pytest.mark.asyncio
+async def test_llm_classify_cache_isolated_by_context() -> None:
+    """缓存 key 随上下文隔离: 同一句接话在不同上下文里不得复用改写结果。"""
+    call_count = 0
+
+    async def _fake(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return {
+            "intent": "bill_query",
+            "confidence": 0.8,
+            "rewritten_query": f"改写-{call_count}",
+        }
+
+    mock_llm = MagicMock()
+    mock_llm.classify = AsyncMock(side_effect=_fake)
+    classifier = LLMClassifier(mock_llm)
+
+    r1, _, _ = await classifier.classify("那还款日是哪一天", context="上文A")
+    r2, _, _ = await classifier.classify("那还款日是哪一天", context="上文B")
+    assert r1.rewritten_query == "改写-1"
+    assert r2.rewritten_query == "改写-2"  # 不同上下文 → 不同缓存条目, 各自查 LLM
+    r3, _, _ = await classifier.classify("那还款日是哪一天", context="上文A")
+    assert r3.rewritten_query == "改写-1"  # 同上下文命中缓存
+
+
+def test_looks_followup_gate() -> None:
+    """词法闸: 疑似接话命中, 自包含长句不命中。"""
+    from lumio.services.common.classifier import _looks_followup
+
+    assert _looks_followup("那还款日具体是哪一天")
+    assert _looks_followup("它呢")
+    assert _looks_followup("刚才那个费用的事")
+    assert not _looks_followup("我想查询信用卡账单和还款日")
+    assert not _looks_followup("你好")
+    assert not _looks_followup("那我就先不办了这个之后再说我还有别的事要处理呢今天")  # 长句不误伤

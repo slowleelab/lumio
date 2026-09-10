@@ -29,7 +29,9 @@ def _make_agent() -> LumioAgent:
     )
 
 
-def _topic(intent: str = "card_loss", urgency: str = "high", status: TopicRequestStatus = TopicRequestStatus.OPEN) -> TopicRequest:
+def _topic(
+    intent: str = "card_loss", urgency: str = "high", status: TopicRequestStatus = TopicRequestStatus.OPEN
+) -> TopicRequest:
     return TopicRequest(
         id=intent,
         intent=intent,
@@ -51,11 +53,19 @@ class TestIntentAsTopic:
 
     def test_low_conf_faq_not_a_topic(self) -> None:
         agent = _make_agent()
-        assert agent._intent_as_topic(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), "knowledge", 3) is None
+        assert (
+            agent._intent_as_topic(IntentResult(primary_intent=IntentLabel.FAQ, primary_confidence=0.5), "knowledge", 3)
+            is None
+        )
 
     def test_unknown_intent_not_a_topic(self) -> None:
         agent = _make_agent()
-        assert agent._intent_as_topic(IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.9), "fallback", 3) is None
+        assert (
+            agent._intent_as_topic(
+                IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.9), "fallback", 3
+            )
+            is None
+        )
 
 
 class TestMergeTopicRequests:
@@ -143,7 +153,11 @@ class TestTrackAndFollowup:
         state = MagicMock(version=7, turn_count=3, active_requests=[_topic()])
         result = {"response": "哈哈~", "response_source": "template"}
         await agent._track_and_followup(
-            "s1", state, IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.29), "fallback", result
+            "s1",
+            state,
+            IntentResult(primary_intent=IntentLabel.NB_CHITCHAT, primary_confidence=0.29),
+            "fallback",
+            result,
         )
         assert "未办理完成" not in result["response"]
 
@@ -154,7 +168,15 @@ class TestClassifyContextAntiBias:
     @pytest.mark.asyncio
     async def test_fulfilled_history_narrowed(self) -> None:
         agent = _make_agent()
-        turns = [MagicMock(speaker="customer" if i % 2 == 0 else "bot", content=f"t{i}", confidence=0.8, response_source="knowledge") for i in range(6)]
+        turns = [
+            MagicMock(
+                speaker="customer" if i % 2 == 0 else "bot",
+                content=f"t{i}",
+                confidence=0.8,
+                response_source="knowledge",
+            )
+            for i in range(6)
+        ]
         agent._session_manager.get_history = AsyncMock(return_value=turns)
         agent._session_manager.get_session = AsyncMock(
             return_value=MagicMock(active_requests=[_topic(status=TopicRequestStatus.FULFILLED)])
@@ -165,7 +187,15 @@ class TestClassifyContextAntiBias:
     @pytest.mark.asyncio
     async def test_live_request_keeps_full_context(self) -> None:
         agent = _make_agent()
-        turns = [MagicMock(speaker="customer" if i % 2 == 0 else "bot", content=f"t{i}", confidence=0.8, response_source="knowledge") for i in range(6)]
+        turns = [
+            MagicMock(
+                speaker="customer" if i % 2 == 0 else "bot",
+                content=f"t{i}",
+                confidence=0.8,
+                response_source="knowledge",
+            )
+            for i in range(6)
+        ]
         agent._session_manager.get_history = AsyncMock(return_value=turns)
         agent._session_manager.get_session = AsyncMock(return_value=MagicMock(active_requests=[_topic()]))  # open
         ctx = await agent._classify_context("s1")

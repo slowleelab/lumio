@@ -379,9 +379,7 @@ async def embed_chunks(
             except Exception as exc:
                 if attempt == 2:
                     raise
-                logger.warning(
-                    "批量嵌入第 %s 批失败 (attempt %s), 重试: %s", i // batch_size + 1, attempt + 1, exc
-                )
+                logger.warning("批量嵌入第 %s 批失败 (attempt %s), 重试: %s", i // batch_size + 1, attempt + 1, exc)
                 await asyncio.sleep(2 * (attempt + 1))
         assert embeddings is not None
         all_embeddings.extend(embeddings)

@@ -185,7 +185,9 @@ async def update_faq_endpoint(faq_id: str, body: FaqUpdateRequest, request: Requ
     faq = await _load_faq_orm(session_factory, faq_id)
     if faq is not None and faq.approval_status == "PUBLISHED":
         embedding_breaker = getattr(request.app.state, "embedding_breaker", None)
-        embedding_provider = embedding_breaker.provider if embedding_breaker and embedding_breaker.is_available else None
+        embedding_provider = (
+            embedding_breaker.provider if embedding_breaker and embedding_breaker.is_available else None
+        )
         milvus_collection = getattr(request.app.state, "milvus_collection", None)
         try:
             redis_client = getattr(request.app.state, "redis_client", None)

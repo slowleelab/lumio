@@ -1202,9 +1202,7 @@ class Badcase(Base):
     human_confirmed_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     fix_table: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    fix_status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="pending", server_default="pending"
-    )
+    fix_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
     fix_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 

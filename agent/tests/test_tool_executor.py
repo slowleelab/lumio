@@ -40,7 +40,9 @@ def _make_executor(mcp=None, llm=None, settings=None, audit_factory=None):
     llm = llm or MagicMock()
     # sensitive_confirm_enabled=True: 既有用例测的是两段式确认逻辑本身;
     # 默认放行行为见 TestSensitiveAutoPassed
-    settings = settings or MCPSettings(enabled=True, max_tool_iterations=5, confirmation_ttl_seconds=300, sensitive_confirm_enabled=True)
+    settings = settings or MCPSettings(
+        enabled=True, max_tool_iterations=5, confirmation_ttl_seconds=300, sensitive_confirm_enabled=True
+    )
     return ToolCallingExecutor(mcp_client=mcp, llm_client=llm, audit_session_factory=audit_factory, settings=settings)
 
 
@@ -316,7 +318,9 @@ class TestSensitiveAutoPassed:
             tool_calls=[ToolCall(id="t1", name="card_loss", arguments={"card": "1234"})],
             raw_message={"role": "assistant", "content": "", "tool_calls": []},
         )
-        llm.chat_with_tools = AsyncMock(side_effect=[first, ToolCallResult(content="已为您办理挂失, 请问还有其他需要吗?")])
+        llm.chat_with_tools = AsyncMock(
+            side_effect=[first, ToolCallResult(content="已为您办理挂失, 请问还有其他需要吗?")]
+        )
         settings = MCPSettings(enabled=True, max_tool_iterations=5, sensitive_confirm_enabled=False)
         ex = ToolCallingExecutor(mcp_client=mcp, llm_client=llm, audit_session_factory=None, settings=settings)
 

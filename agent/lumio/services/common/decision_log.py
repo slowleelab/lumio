@@ -67,9 +67,10 @@ class DecisionAction(str, Enum):
     # 诉求跟踪 (多轮会话管理): 诉求状态流转 / 高紧急回访
     TOPIC_TRACK = "topic_track"
     CONTEXT_REPLY_PASS = "context_reply_pass"
-    # 全链路监控 (输入→输出关键步骤): 消息出队 / 路由决策 / FAQ 直出 / 出站闸门 / 链路完成(含总耗时)
+    # 全链路监控 (输入→输出关键步骤): 消息出队 / 路由决策 / 上下文改写 / FAQ 直出 / 出站闸门 / 链路完成(含总耗时)
     TURN_START = "turn_start"
     ROUTE_DECISION = "route_decision"
+    QUERY_REWRITE = "query_rewrite"
     FAQ_DIRECT = "faq_direct"
     OUTBOUND_GUARD = "outbound_guard"
     CHAIN_COMPLETE = "chain_complete"

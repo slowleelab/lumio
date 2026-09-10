@@ -42,6 +42,7 @@ def _build_judge(request: Request) -> BadcaseJudge:
     # 未配置远程端点: 本地兜底走 primary_model (本地没有 GLM 权重, 不能用 judge_model 名)
     return BadcaseJudge(llm_client, model=settings.llm.primary_model, min_confidence=0.7, samples=3)
 
+
 router = APIRouter(prefix="/admin/closed-loop", tags=["closed-loop"])
 
 AdminOnlyUser = Annotated[AuthUser, Depends(require_role("admin"))]
@@ -158,7 +159,15 @@ async def attribute_badcase(
 
 # ── 批量归因 (后台任务, 每条 ~21s 本地 n=3; 大库存一条条点不现实) ──
 
-_batch_state: dict[str, Any] = {"running": False, "total": 0, "done": 0, "failed": 0, "started_at": 0.0, "error": "", "scope": None}
+_batch_state: dict[str, Any] = {
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "failed": 0,
+    "started_at": 0.0,
+    "error": "",
+    "scope": None,
+}
 _batch_tasks: set = set()
 
 
@@ -182,14 +191,7 @@ async def _batch_attribute_task(request: Request, limit: int, flt: dict[str, Any
             if flt.get("layer") == "uncertain":
                 conds.append(or_(Badcase.root_cause_layer.is_(None), Badcase.root_cause_layer == "uncertain"))
             rows = (
-                (
-                    await db.execute(
-                        select(Badcase.id)
-                        .where(*conds)
-                        .order_by(Badcase.created_at.desc())
-                        .limit(limit)
-                    )
-                )
+                (await db.execute(select(Badcase.id).where(*conds).order_by(Badcase.created_at.desc()).limit(limit)))
                 .scalars()
                 .all()
             )
@@ -603,7 +605,9 @@ async def _run_serial_replay(app: Any, sf: Any, redis: Any, new_sid: str, msgs: 
             t_send = _datetime.now(_UTC)
             message_id = _uuid.uuid4().hex
             with _cl.suppress(Exception):  # 审计失败不阻断重放
-                await write_chat_message(sf, session_id=new_sid, message_id=message_id, content=msg, customer_id="replay-bot")
+                await write_chat_message(
+                    sf, session_id=new_sid, message_id=message_id, content=msg, customer_id="replay-bot"
+                )
             await redis.xadd(
                 CHAT_STREAM_KEY,
                 {
@@ -662,9 +666,7 @@ async def _run_serial_replay(app: Any, sf: Any, redis: Any, new_sid: str, msgs: 
                     await quality_scan.scan_session_by_id(
                         sf, judge_llm, redis, new_sid, quality_scan.judge_model_name(settings)
                     )
-        await redis.hset(
-            key, mapping={"status": "done", "error": "" if not timeouts else f"{timeouts} 轮等待回复超时"}
-        )
+        await redis.hset(key, mapping={"status": "done", "error": "" if not timeouts else f"{timeouts} 轮等待回复超时"})
     except Exception as exc:
         logger.warning("串行重放任务异常: session=%s err=%s", new_sid, exc)
         with _cl.suppress(Exception):
@@ -731,7 +733,9 @@ async def quality_replay_endpoint(user: AdminAgentUser, request: Request, body: 
 
 
 @router.get("/quality/replay/status")
-async def quality_replay_status_endpoint(user: AdminAgentUser, request: Request, session_id: str = Query(...)) -> dict[str, Any]:
+async def quality_replay_status_endpoint(
+    user: AdminAgentUser, request: Request, session_id: str = Query(...)
+) -> dict[str, Any]:
     """重放进度: 后台串行任务逐轮上报 (done/total/当前消息/超时数/错误)。"""
     redis = getattr(request.app.state, "redis_client", None)
     if redis is None:

@@ -757,7 +757,9 @@ class SessionManager:
             "awaiting_slots": state.awaiting_slots,
             # 诉求跟踪 (2026-09-04): 必须序列化 — 同 pending_action 的 P0 前车之鉴,
             # 缺失时每次 _save_meta 全量 SET 都会擦掉 patch_state 写入的诉求清单
-            "active_requests": [t.model_dump(mode="json") if hasattr(t, "model_dump") else t for t in state.active_requests],
+            "active_requests": [
+                t.model_dump(mode="json") if hasattr(t, "model_dump") else t for t in state.active_requests
+            ],
             "confidence_history": state.confidence_history,
             "low_confidence_streak": state.low_confidence_streak,
             "human_request_score": state.human_request_score,
@@ -777,6 +779,8 @@ class SessionManager:
             # P0 修复: pending_action 必须序列化 —— 此前缺失, 每次 _save_meta 全量 SET
             # 都会把 patch_state 刚写入的待确认操作整体擦除 (转人工/敏感工具确认链全断).
             "pending_action": state.pending_action.model_dump(mode="json") if state.pending_action else None,
+            # 对话理解升级: 最近一次系统查询结果 (patch_state 写入, 全量序列化防擦除)
+            "last_tool_result": state.last_tool_result,
             "created_at": state.created_at.isoformat(),
             "last_active_at": state.last_active_at.isoformat(),
             "version": state.version,

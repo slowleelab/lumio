@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+from datetime import UTC
 from typing import TYPE_CHECKING, Any
 
 from lumio.shared.config import get_settings
@@ -219,7 +220,9 @@ def _date_to_epoch(date_str: str) -> int | None:
     try:
         from datetime import datetime
 
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        # 显式 UTC 锚定: naive timestamp() 随部署时区漂移 (CI=UTC 与 +8 生产相差 8h,
+        # 同一政策日期得到不同过滤边界); yyyy-MM-dd 日期语义取 UTC 零点, 确定性优先。
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC)
         return int(dt.timestamp())
     except (ValueError, TypeError):
         return None

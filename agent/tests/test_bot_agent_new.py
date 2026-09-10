@@ -2542,7 +2542,10 @@ class TestFaqGateway:
         agent = self._make_agent()
 
         async def fake_search(**kw):
-            return {"match_type": "exact", "results": [{"faq_id": "f1#0", "question": "年费多少钱", "answer": "普卡年费 80 元/年"}]}
+            return {
+                "match_type": "exact",
+                "results": [{"faq_id": "f1#0", "question": "年费多少钱", "answer": "普卡年费 80 元/年"}],
+            }
 
         import lumio.services.common.faq_service as fs
 
@@ -2584,7 +2587,10 @@ class TestFaqGateway:
         agent = self._make_agent()
 
         async def fake_search(**kw):
-            return {"match_type": "semantic", "results": [{"faq_id": "f1#0", "question": "临时用卡", "answer": "标准答案"}]}
+            return {
+                "match_type": "semantic",
+                "results": [{"faq_id": "f1#0", "question": "临时用卡", "answer": "标准答案"}],
+            }
 
         import lumio.services.common.faq_service as fs
 
@@ -2622,7 +2628,7 @@ class TestSubwordGate:
 
 
 class TestEmergencyOodExemption:
-    """模拟复盘: 等待补槽期间的紧急挂失诉求不得被 OOD 门拦成"没太明白\""""
+    """模拟复盘: 等待补槽期间的紧急挂失诉求不得被 OOD 门拦成"没太明白\" """
 
     def _make_agent(self) -> LumioAgent:
         classifier = MagicMock()

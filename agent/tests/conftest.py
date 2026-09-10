@@ -143,6 +143,23 @@ def _clear_tool_quota() -> None:
         pass  # Redis 不可达/无 key 时静默跳过, 不影响测试
 
 
+@pytest_asyncio.fixture(scope="session")
+async def db_schema():
+    """幂等建表 (Base.metadata.create_all): CI Unit job 的 PG 是裸库不跑迁移,
+    服务器型路由测试 (closed-loop/faq/simulator) 首批踩库前先补齐 schema。"""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from lumio.shared.config import get_settings
+    from lumio.shared.orm_models import Base
+
+    engine = create_async_engine(get_settings().database.dsn)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    finally:
+        await engine.dispose()
+
+
 @pytest.fixture(scope="session")
 def bot_server():
     """Session-scoped: 启动机器人服务 uvicorn 子进程"""

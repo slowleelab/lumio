@@ -428,6 +428,14 @@ class IntentResult(BaseModel):
     # 真识别; "fallback"|"bert:lowconf"|"bert:ood" = 弱识别/兜底; None = 分类器
     # 异常未识别。兜底轮的 faq 标签是存储兼容残差, 不代表"识别为知识咨询"。
     classification_source: str | None = Field(default=None, exclude=True)
+    # 对话理解升级 (追问轮, 会话 replay-5ac11e27 复盘): 慢路径带上下文的产物。
+    # rewritten_query = 上下文改写 (query rewriting) 后的自包含问题 (None=用原句); refers_to_last =
+    # 是否指涉上一轮系统结果; context_answer = 上轮工具结果中已有答案的复述
+    # (查询链以数字一致性守卫后零调用作答)。下游检索/抽参消费 rewritten_query,
+    # 生成 prompt 仍用客户原句。
+    rewritten_query: str | None = Field(default=None, exclude=True)
+    refers_to_last: bool = Field(default=False, exclude=True)
+    context_answer: str | None = Field(default=None, exclude=True)
 
 
 class SentimentResult(BaseModel):
@@ -597,6 +605,9 @@ class SessionState(BaseModel):
     confidence_history: list[float] = Field(default_factory=list)
     low_confidence_streak: int = 0
     human_request_score: int = 0
+    # 最近一次系统查询结果摘要 (追问轮"答案已在手"复述的数据源):
+    # {"tool": 工具名, "summary": 结果文本(已脱敏), "at": Unix 秒}
+    last_tool_result: dict | None = None
 
     # 槽位已填值（生产级: 随会话 meta 持久化, 单一真相源, 跨意图保留）
     slot_values: dict[str, SlotValue] = Field(default_factory=dict)

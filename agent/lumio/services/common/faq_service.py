@@ -96,7 +96,10 @@ async def _index_faq_to_es(es_client: Any, faq: KbFaq) -> int:
             continue
         try:
             await es_client.index(
-                index=_FAQ_ES_INDEX, id=f"{faq.id}#{i}", document={"content": q, "doc_id": str(faq.id), "category": faq.category or ""}, refresh="wait_for"
+                index=_FAQ_ES_INDEX,
+                id=f"{faq.id}#{i}",
+                document={"content": q, "doc_id": str(faq.id), "category": faq.category or ""},
+                refresh="wait_for",
             )
             written += 1
         except Exception as exc:
@@ -627,7 +630,9 @@ async def search_faq(
                             "card_types": row.card_types,
                             "allowed_roles": row.allowed_roles,
                         }
-                        if not (user_role and faq_data.get("allowed_roles") and user_role not in faq_data["allowed_roles"]):
+                        if not (
+                            user_role and faq_data.get("allowed_roles") and user_role not in faq_data["allowed_roles"]
+                        ):
                             await _log_search(
                                 session_factory, query, "bm25", faq_data["id"], bm25_score, user_role, session_id
                             )
