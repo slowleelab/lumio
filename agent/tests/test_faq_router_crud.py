@@ -10,7 +10,7 @@ import pytest_asyncio
 
 
 @pytest_asyncio.fixture
-async def admin_client(bot_server: str):
+async def admin_client(db_schema: None, bot_server: str):
     from lumio.shared.auth import create_access_token
 
     token = create_access_token("test-admin", "admin")
