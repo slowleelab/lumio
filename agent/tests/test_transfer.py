@@ -141,6 +141,42 @@ def test_l2_sensitive_alternative_high_confidence_trigger() -> None:
     assert level == TransferTriggerLevel.L2
 
 
+# ── L2 候补敏感意图: 主意图域门槛 (回归 replay-sim-long_mixed_consu-59752 误转) ──
+
+
+def test_l2_sensitive_alternative_knowledge_primary_no_trigger() -> None:
+    """主意图知识问答 + complaint 候补(高置信) → 不转.
+
+    "权益"类咨询高频带 complaint 候补(语义相关), 属分类噪声而非真实多意图;
+    曾据此把纯咨询答完第一句就误转人工, 后续轮次全部静默.
+    """
+    checker = TransferChecker()
+    intent = IntentResult(
+        primary_intent=IntentLabel.KNOWLEDGE_QA,
+        primary_confidence=0.87,
+        alternatives=[IntentLabel.COMPLAINT],
+    )
+
+    triggered, level, _reason = checker.check("你们的白金卡有什么权益啊", intent)
+    assert triggered is False
+    assert level is None
+
+
+def test_l2_sensitive_alternative_business_primary_still_triggers() -> None:
+    """主意图行动类查询 + 敏感候补(高置信) → 转: 真实多意图的敏感诉求仍即时转."""
+    checker = TransferChecker()
+    intent = IntentResult(
+        primary_intent=IntentLabel.BILL_QUERY,
+        primary_confidence=0.82,
+        alternatives=[IntentLabel.COMPLAINT],
+    )
+
+    triggered, level, reason = checker.check("帮我查下账单, 上次那笔扣费不对劲", intent)
+    assert triggered is True
+    assert level == TransferTriggerLevel.L2
+    assert "SENSITIVE" in reason
+
+
 # ── L3 累计触发 ──
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from lumio.services.common.classifier import INTENT_DOMAINS
 from lumio.shared.config import get_settings
 from lumio.shared.models import (
     SENSITIVE_INTENTS,
@@ -19,6 +20,7 @@ from lumio.shared.models import (
     SentimentLabel,
     SessionState,
     TransferTriggerLevel,
+    normalize_intent,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,9 +159,23 @@ class TransferChecker:
 
         # 次要意图里也含敏感写的场景 (如"卡丢了,顺便查最后一笔消费"挂失主+交易次),
         # 集合判断避免拆细后精确比较漏判敏感意图。
-        # 仅当整体置信不低时才据此即时转 —— 乱码被幻觉出 complaint 候补(已复现)必须被拦下。
+        # 双重门槛 — 整体置信 ≥ TRANSFER_CONFIDENT_CONF (乱码幻觉出的敏感候补必须拦下)
+        # 且主意图也在行动域 business (真实多意图: 行动类诉求 + 敏感诉求并存)。
+        # 主意图是 knowledge/chitchat 等咨询域时, 敏感词挤进候补只是分类噪声
+        # (如"权益"咨询高频带 complaint 候补 — 会话 replay-sim-long_mixed_consu-59752
+        # 曾据此把纯咨询误转人工, 答完第一句就拉真人, 后续轮次全部静默);
+        # 真投诉会成为主意图, 走上面的主意图分支即时转, 不存在漏转。
+        # 域查询经 normalize_intent 归一: 分类器仍输出旧 flat 别名 (bill_query 等),
+        # 别名不在 INTENT_DOMAINS 主名表里, 不归一会全部漏判。
         alt_labels = set(intent.alternatives or [])
-        if alt_labels & SENSITIVE_INTENTS and conf >= TRANSFER_CONFIDENT_CONF:
+        primary_domain = INTENT_DOMAINS.get(intent.primary_intent) or INTENT_DOMAINS.get(
+            normalize_intent(intent.primary_intent.value)
+        )
+        if (
+            alt_labels & SENSITIVE_INTENTS
+            and conf >= TRANSFER_CONFIDENT_CONF
+            and primary_domain == "business"
+        ):
             sensitive = next(iter(alt_labels & SENSITIVE_INTENTS))
             return True, f"L2_INTENT_SENSITIVE: 命中敏感意图={sensitive.value}"
 
