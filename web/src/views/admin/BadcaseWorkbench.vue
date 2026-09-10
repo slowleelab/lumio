@@ -303,7 +303,7 @@
           <div v-for="(p, i) in qcDetail.problems" :key="i" class="qc-problem">
             <div class="qc-problem-head">
               <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
-              <span v-if="p.turn" class="muted">第 {{ p.turn }} 轮</span>
+              <span v-if="p.turn" class="muted">第 {{ rowRound(p.turn) || p.turn }} 轮对话 · 日志第 {{ p.turn }} 行</span>
             </div>
             <div class="qc-problem-reason">{{ p.reason || "(未说明原因)" }}</div>
             <template v-if="problemTurnDialog(p.turn)">
@@ -316,7 +316,7 @@
                 该轮链路: {{ qcTurnChains[rowRound(p.turn!) - 1].steps.join(" → ") }}
               </div>
             </template>
-            <div v-else-if="p.turn && qcReplay" class="muted" style="font-size: 12px">第 {{ p.turn }} 轮内容超出回放范围</div>
+            <div v-else-if="p.turn && qcReplay" class="muted" style="font-size: 12px">第 {{ rowRound(p.turn) || p.turn }} 轮对话内容超出回放范围</div>
           </div>
         </template>
 
@@ -1307,6 +1307,7 @@ onUnmounted(() => {
 .qc-problem-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap; /* 轮次标注 (轮序+日志行号) 较长, 放不下时换行防截断 */
   gap: var(--space-2);
 }
 .qc-problem-reason {
