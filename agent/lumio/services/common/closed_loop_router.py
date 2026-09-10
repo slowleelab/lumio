@@ -641,6 +641,22 @@ async def _run_serial_replay(app: Any, sf: Any, redis: Any, new_sid: str, msgs: 
                     replied = True
                     break
             if not replied:
+                # 无回复先查会话是否中途转人工: agent 阶段 bot 走跳过路径只推话术
+                # 不落 bot 行, 等下去永远等不到 — 提前终止, 剩余轮次不再发送
+                # (会话已被坐席接管, 不代坐席结束会话/触发质检)
+                sm_check = getattr(app.state, "session_manager", None)
+                if sm_check is not None:
+                    with _cl.suppress(Exception):
+                        _st = await sm_check.get_session(new_sid)
+                        if _st is not None and _st.current_phase.value == "agent":
+                            await redis.hset(
+                                key,
+                                mapping={
+                                    "status": "done",
+                                    "error": f"第 {timeouts + 1} 轮后会话转人工, 重放提前终止 (已发 {timeouts + 1}/{len(msgs)} 轮)",
+                                },
+                            )
+                            return
                 timeouts += 1
                 await redis.hset(key, mapping={"timeouts": str(timeouts)})
             await redis.hincrby(key, "done", 1)

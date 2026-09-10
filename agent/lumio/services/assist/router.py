@@ -256,7 +256,9 @@ async def session_update(body: SessionUpdateRequest, request: Request):
         except ValueError:
             raise LumioError(code=2001, message=f"无效的子阶段: {body.sub_phase}") from None
 
-    reason = body.end_reason or body.agent_id or ""
+    # agent_id 是坐席标识不是转接原因, 不得流入 reason (曾致 transfer_reason="agent-1",
+    # 转接原因字段被坐席 ID 污染, 会话回放时无法归因)
+    reason = body.end_reason or "chat_svc_update"
     # chat-svc 回调可能携带 session-xxxx(别名), 需先反解回 Lumio 会话 id 再操作状态层;
     # 而 ws_pool/静音任务仍按 chat-svc id(body.session_id) 索引, 故二者分开使用。
     sid = await session_manager.resolve_session_id(body.session_id)
