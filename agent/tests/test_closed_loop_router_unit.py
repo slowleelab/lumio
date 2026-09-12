@@ -51,6 +51,7 @@ class TestListAndStats:
                 _SeqResult(109),  # confirmed
                 _SeqResult(1),  # today_new
                 _SeqResult(126),  # deployed
+                _SeqResult(11),  # verified
                 _SeqResult(4),  # human_confirmed
                 _SeqResult([("layer_3", 67), ("layer_5", 52)]),  # layer_dist
                 _SeqResult([("qa_scan", 358)]),  # signal_dist
@@ -59,7 +60,7 @@ class TestListAndStats:
         db.execute = AsyncMock(side_effect=lambda _q: next(script))
         out = await clr.badcase_stats(user=None, db=db)
         assert out["total"] == 628 and out["pending_review"] == 519
-        assert out["deployed"] == 126 and out["llm_pass_rate"] == round(105 / 109, 3)
+        assert out["deployed"] == 126 and out["verified"] == 11 and out["llm_pass_rate"] == round(105 / 109, 3)
         assert out["layer_dist"] == {"layer_3": 67, "layer_5": 52}
         assert out["signal_dist"] == {"qa_scan": 358}
 
