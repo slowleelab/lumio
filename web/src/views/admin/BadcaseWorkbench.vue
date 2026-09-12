@@ -150,7 +150,7 @@
         <el-steps :active="fixStepActive" align-center size="small" finish-status="success" class="fix-steps">
           <el-step title="归因" :description="detail.root_cause_layer ? layerLabel(detail.root_cause_layer) : '待裁判'" />
           <el-step title="人工确认" :description="detail.needs_human_review ? '待复核' : detail.root_cause_layer ? '已确认' : '-'" />
-          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已全量', rejected: '已驳回' }[detail.fix_status] || '-'" />
+          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已上线', rejected: '已驳回' }[detail.fix_status] || '-'" />
           <el-step title="验证" :description="detail.fix_status === 'deployed' ? '可复检' : '复检待上线'" />
         </el-steps>
         <el-alert v-if="detail.fix_status === 'rejected'" type="info" :closable="false" class="reject-alert" :title="`已驳回 — ${detail.fix_note || ''}`" />
@@ -266,7 +266,7 @@
             ② 确认归因并进入修复
           </el-button>
           <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">③ 修复完成 · 转灰度</el-button>
-          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">④ 灰度验证通过 · 全量上线</el-button>
+          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">④ 灰度验证通过 · 正式上线</el-button>
           <!-- 验证闭环: 上线后复检原会话确认修复生效 -->
           <el-button
             v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
@@ -1143,7 +1143,7 @@ function categoryLabel(s?: string | null) {
   return s ? (CATEGORY_LABELS[s] ?? s) : ""
 }
 function fixStatusLabel(s: string) {
-  const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "已灰度", deployed: "已全量", rejected: "已驳回" }
+  const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "已灰度", deployed: "已上线", rejected: "已驳回" }
   return m[s] ?? s
 }
 function fixStatusType(s: string): string {

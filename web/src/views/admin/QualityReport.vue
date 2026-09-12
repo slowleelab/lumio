@@ -136,7 +136,7 @@
         <span class="hint">近 24 小时采集</span>
       </div>
       <div class="stat-card">
-        <span class="label">已全量上线</span>
+        <span class="label">已上线</span>
         <span class="num ok">{{ stats?.deployed ?? "-" }}</span>
         <span class="hint">修复完成并上线</span>
       </div>
