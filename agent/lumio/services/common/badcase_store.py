@@ -632,7 +632,7 @@ async def update_fix_status(
             row.human_confirmed_layer = human_confirmed_layer
         if note:
             row.fix_note = note
-        if fix_status in ("deployed", "rejected"):
+        if fix_status in ("deployed", "verified", "rejected"):
             row.resolved_at = datetime.now(UTC)
         await session.commit()
         return True

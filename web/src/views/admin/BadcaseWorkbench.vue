@@ -150,8 +150,8 @@
         <el-steps :active="fixStepActive" align-center size="small" finish-status="success" class="fix-steps">
           <el-step title="归因" :description="detail.root_cause_layer ? layerLabel(detail.root_cause_layer) : '待裁判'" />
           <el-step title="人工确认" :description="detail.needs_human_review ? '待复核' : detail.root_cause_layer ? '已确认' : '-'" />
-          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已上线', rejected: '已驳回' }[detail.fix_status] || '-'" />
-          <el-step title="验证" :description="detail.fix_status === 'deployed' ? '可复检' : '复检待上线'" />
+          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已上线', reopened: '复检未过', rejected: '已驳回' }[detail.fix_status] || '-'" />
+          <el-step title="验证" :description="{ verified: '复检通过 · 已销项', deployed: '可复检', canary: '灰度可复检' }[detail.fix_status] || '待上线'" />
         </el-steps>
         <el-alert v-if="detail.fix_status === 'rejected'" type="info" :closable="false" class="reject-alert" :title="`已驳回 — ${detail.fix_note || ''}`" />
         <el-descriptions :column="3" border size="small">
@@ -267,11 +267,12 @@
           </el-button>
           <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">③ 修复完成 · 转灰度</el-button>
           <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">④ 灰度验证通过 · 正式上线</el-button>
-          <!-- 验证闭环: 上线后复检原会话确认修复生效 -->
+          <!-- 验证闭环: 重放原会话 (当前代码重新回答) → 按新判定自动流转 verified/reopened -->
           <el-button
             v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
-            size="small" type="primary" plain :loading="rescanningBadcase" @click="rescanFromBadcase"
-          >{{ detail.fix_status === 'deployed' ? "⑤" : "灰度" }}复检原会话</el-button>
+            size="small" type="primary" plain :loading="recheckState.running" @click="recheckFromBadcase"
+          >{{ recheckState.running ? `复检重放中 ${recheckState.done}/${recheckState.total || "…"}` : `${detail.fix_status === "deployed" ? "⑤" : "灰度"}复检原会话 (重放)` }}</el-button>
+          <el-button v-if="detail.fix_status === 'reopened'" size="small" type="warning" :loading="acting" @click="transition('fixing')">↩ 复检未过 · 重新修复</el-button>
           <!-- 次要操作 -->
           <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
           <el-button size="small" @click="gotoAudit(detail)">会话审计</el-button>
@@ -955,7 +956,8 @@ async function runAttribution(row: Badcase) {
 const fixStepActive = computed(() => {
   const d = detail.value
   if (!d) return 0
-  if (d.fix_status === "deployed") return 4
+  if (d.fix_status === "verified") return 4
+  if (d.fix_status === "deployed" || d.fix_status === "canary") return 3
   if (d.fix_status === "canary") return 3
   if (d.fix_status === "fixing") return 2
   if (d.root_cause_layer && !d.needs_human_review) return 2
@@ -1010,24 +1012,55 @@ async function transition(status: string) {
   }
 }
 
-// 复检原会话 (从整改闭环侧验证修复效果)
-const rescanningBadcase = ref(false)
-async function rescanFromBadcase() {
+// 复检 (从整改闭环侧验证修复效果): 重放 = 当前代码重新回答原会话全部问题。
+// rescan 只是对原对话历史重新打分 — bot 回答是历史固定的, 验证不了修复本身。
+// 重放完成 (status=done 时自动质检已落库) → 按新会话判定自动流转:
+// pass/warn → verified (验证通过, 销项); fail → reopened (打回重修)。
+const recheckState = ref({ running: false, done: 0, total: 0 })
+let recheckTimer: ReturnType<typeof setInterval> | null = null
+
+async function recheckFromBadcase() {
   if (!detail.value?.session_id) return
-  rescanningBadcase.value = true
+  recheckState.value = { running: true, done: 0, total: 0 }
   try {
-    const r = await rescanQualitySession(detail.value.session_id)
-    if (r.status === "ok") {
-      const v = verdictLabel(r.verdict ?? "")
-      const ok = r.verdict === "pass" || r.verdict === "warn"
-      ElMessage[ok ? "success" : "warning"](`复检完成: ${v}${ok ? " — 修复验证通过" : " — 仍有问题, 建议回退排查"}`)
-    } else {
-      ElMessage.info("对话不足 2 轮, 无法复检")
-    }
+    const r = await replayQualitySession(detail.value.session_id)
+    recheckState.value.total = r.total_rounds
+    if (!recheckTimer) recheckTimer = setInterval(() => void pollRecheck(r.new_session_id), 2000)
   } catch {
-    ElMessage.error("复检失败")
-  } finally {
-    rescanningBadcase.value = false
+    ElMessage.error("复检 (重放) 启动失败")
+    recheckState.value.running = false
+  }
+}
+
+async function pollRecheck(newSid: string) {
+  try {
+    const st = await getReplayStatus(newSid)
+    recheckState.value.done = st.done
+    if (st.status === "running") return
+    if (recheckTimer) {
+      clearInterval(recheckTimer)
+      recheckTimer = null
+    }
+    recheckState.value.running = false
+    if (st.status !== "done" || st.error) {
+      ElMessage.warning(`复检未完成: ${st.error || "重放中断"} — 案例状态未变, 可稍后重试`)
+      return
+    }
+    const res = await listQcSessions({ keyword: newSid, limit: 1 })
+    const verdict = res.sessions?.[0]?.verdict || ""
+    if (!verdict) {
+      ElMessage.warning("复检重放完成但新会话尚未出质检判定, 稍后可查看新会话手动流转")
+      return
+    }
+    const ok = verdict === "pass" || verdict === "warn"
+    await resolveBadcase(detail.value!.id, {
+      fix_status: ok ? "verified" : "reopened",
+      note: `复检重放 ${newSid}: ${verdictLabel(verdict)} — ${ok ? "验证通过, 销项" : "未通过, 打回重修"}`,
+    })
+    ElMessage[ok ? "success" : "warning"](`复检 ${verdictLabel(verdict)} — 已自动${ok ? "销项 (已验证)" : "打回 (已重开)"}`)
+    await refreshAfterAction(ok ? "复检通过, 案例已验证" : "复检未通过, 案例已重开")
+  } catch {
+    /* handled */
   }
 }
 
@@ -1143,11 +1176,11 @@ function categoryLabel(s?: string | null) {
   return s ? (CATEGORY_LABELS[s] ?? s) : ""
 }
 function fixStatusLabel(s: string) {
-  const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "已灰度", deployed: "已上线", rejected: "已驳回" }
+  const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "已灰度", deployed: "已上线", verified: "已验证", reopened: "已重开", rejected: "已驳回" }
   return m[s] ?? s
 }
 function fixStatusType(s: string): string {
-  const m: Record<string, string> = { pending: "info", fixing: "warning", canary: "warning", deployed: "success", rejected: "danger" }
+  const m: Record<string, string> = { pending: "info", fixing: "warning", canary: "warning", deployed: "success", verified: "success", reopened: "danger", rejected: "danger" }
   return m[s] ?? "info"
 }
 function shortModel(m?: string | null) {
@@ -1169,6 +1202,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   if (replayTimer) clearInterval(replayTimer)
+  if (recheckTimer) clearInterval(recheckTimer)
 })
 </script>
 

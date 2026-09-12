@@ -109,6 +109,38 @@ async def test_capture_persists_and_dedup_key() -> None:
         assert ok is True
         assert bc.fix_status == "deployed"
 
+    async def test_update_fix_status_verified_sets_resolved_at(self) -> None:
+        """复检通过销项 (verified) 与打回 (reopened): verified 记 resolved_at, reopened 不记 (还要重修)"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from uuid_utils import uuid7
+
+        bc = Badcase(
+            id=uuid7(),
+            trace_id="t",
+            session_id="s",
+            signal_source="transfer",
+            user_input="x",
+            fix_status="deployed",
+        )
+        session = MagicMock()
+        session.get = AsyncMock(return_value=bc)
+        session.commit = AsyncMock()
+
+        class F:
+            def __call__(self):
+                return session
+
+        ok = await update_fix_status(F(), str(bc.id), fix_status="reopened", note="复检 fail")
+        assert ok is True
+        assert bc.fix_status == "reopened"
+        assert bc.resolved_at is None
+
+        ok = await update_fix_status(F(), str(bc.id), fix_status="verified", note="复检 pass")
+        assert ok is True
+        assert bc.fix_status == "verified"
+        assert bc.resolved_at is not None
+
 
 # ── 模块 A 归因闸门 ──
 

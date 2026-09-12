@@ -138,7 +138,7 @@
       <div class="stat-card">
         <span class="label">已上线</span>
         <span class="num ok">{{ stats?.deployed ?? "-" }}</span>
-        <span class="hint">修复完成并上线</span>
+        <span class="hint">修复完成上线 · 其中已验证 {{ stats?.verified ?? 0 }} 销项</span>
       </div>
       <div class="stat-card">
         <span class="label">LLM 直通率</span>
@@ -457,6 +457,7 @@ const funnel = computed(() => {
     { label: "待复核", count: s.pending_review, cls: "warn" },
     { label: "已确认", count: s.confirmed, cls: "ok" },
     { label: "已上线", count: s.deployed, cls: "done" },
+    { label: "已验证", count: s.verified ?? 0, cls: "done" },
   ]
   const max = Math.max(1, ...steps.map((x) => x.count))
   return steps.map((x) => ({

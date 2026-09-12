@@ -56,7 +56,7 @@ _VALID_SIGNALS = (
     "compliance_alert",
     "qa_scan",  # 全量质检巡检 (从原始对话内容审查, 非信号触发)
 )
-_VALID_FIX_STATUS = ("pending", "fixing", "canary", "deployed", "rejected")
+_VALID_FIX_STATUS = ("pending", "fixing", "canary", "deployed", "verified", "reopened", "rejected")
 
 
 @router.post("/badcases/collect")
@@ -324,6 +324,10 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
     deployed = (
         await db.execute(select(func.count()).select_from(Badcase).where(Badcase.fix_status == "deployed"))
     ).scalar() or 0
+    # 已验证 = 复检 (重放) 通过的终态 — 闭环真正意义上的"销项"口径
+    verified = (
+        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.fix_status == "verified"))
+    ).scalar() or 0
     human_confirmed = (
         await db.execute(
             select(func.count())
@@ -348,6 +352,7 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
         "pending_review": pending_review,
         "confirmed": confirmed,
         "deployed": deployed,
+        "verified": verified,
         "llm_pass_rate": round(pass_rate, 3) if pass_rate is not None else None,
         "layer_dist": {str(k or "uncertain"): v for k, v in layer_rows},
         "signal_dist": {str(k): v for k, v in signal_rows},
