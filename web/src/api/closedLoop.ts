@@ -49,6 +49,7 @@ export interface ClosedLoopHealth {
 // ── Badcase 工作台 ──
 
 export function listBadcases(params?: {
+  session_id?: string
   signal_source?: string
   root_cause_layer?: string
   fix_status?: string
@@ -199,6 +200,7 @@ export interface QcSessionRow {
   root_cause_layer: string | null
   human_confirmed_layer: string | null
   fix_status: string | null
+  case_count?: number | null
   needs_human_review: boolean | null
   attribution_confidence: number | null
   collected_at: string | null

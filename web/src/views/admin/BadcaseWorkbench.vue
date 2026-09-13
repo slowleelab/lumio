@@ -131,7 +131,7 @@
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="根因层" width="112">
+      <el-table-column label="根因层" width="128">
         <template #default="{ row }">
           <el-tag v-if="row.human_confirmed_layer" size="small" type="success">{{ layerLabel(row.human_confirmed_layer) }}</el-tag>
           <el-tag v-else-if="row.root_cause_layer" size="small" :type="row.root_cause_layer === 'uncertain' ? 'warning' : 'primary'">
@@ -139,6 +139,9 @@
           </el-tag>
           <span v-else-if="row.badcase_id" class="muted">未归因</span>
           <span v-else class="muted">-</span>
+          <el-tooltip v-if="(row.case_count ?? 0) > 1" :content="`该会话有 ${row.case_count} 个未销项案例 (多方面问题各自闭环), 详情中逐案处理`" placement="top">
+            <el-tag size="small" type="info" effect="plain">+{{ (row.case_count ?? 1) - 1 }} 案</el-tag>
+          </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column label="修复状态" width="82">
@@ -480,6 +483,23 @@
             </el-tooltip>
           </div>
         </div>
+
+        <!-- 一通会话多方面问题 → 多案例: 各自独立根因与处置状态机, 逐案闭环 -->
+        <template v-if="qcCases.length > 1">
+          <div class="section-title" style="margin-top: 14px">
+            该会话全部案例 <span class="muted section-hint">({{ qcCases.length }} 案 — 多方面问题各自闭环, 列表行只显示最新一案)</span>
+          </div>
+          <div v-for="c in qcCases" :key="c.id" class="qc-case-row" :class="{ 'qc-case-current': c.id === qcDetail.badcase_id }">
+            <span class="qc-case-input" :title="c.user_input">{{ (c.user_input || "").slice(0, 26) }}</span>
+            <el-tag v-if="c.human_confirmed_layer" size="small" type="success">{{ layerLabel(c.human_confirmed_layer) }}</el-tag>
+            <el-tag v-else-if="c.root_cause_layer" size="small" :type="c.root_cause_layer === 'uncertain' ? 'warning' : 'primary'">
+              {{ layerLabel(c.root_cause_layer) }}
+            </el-tag>
+            <el-tag v-else size="small" type="info">未归因</el-tag>
+            <el-tag v-if="c.fix_status" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
+            <el-button size="small" link type="primary" @click="openBadcaseById(c.id)">处理 ›</el-button>
+          </div>
+        </template>
       </div>
     </el-drawer>
   </div>
@@ -492,6 +512,7 @@ import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
 import {
   attributeBadcase,
+  listBadcases,
   resolveBadcase,
   startBatchAttribution,
   getBatchAttributionStatus,
@@ -631,6 +652,8 @@ async function doBatchAttribution() {
 
 // ── 单笔归因 (质检详情内直达, 不必进两层抽屉) ──
 const qcAttributing = ref(false)
+// 一通会话多方面问题 → 多案例列表 (质检详情逐案处置入口)
+const qcCases = ref<Badcase[]>([])
 // ── 人工定根因 · 质检详情就地确认 (uncertain 案例的闭环出口) ──
 const qcJudgedLayer = ref("")
 const qcJudgedTable = ref("")
@@ -689,6 +712,14 @@ async function openQcDetail(row: QcSessionRow) {
   // 人工定根因初始值: 裁判明确层可改判, uncertain 强制人工选择 (不预填)
   qcJudgedLayer.value = row.root_cause_layer && row.root_cause_layer !== "uncertain" ? row.root_cause_layer : ""
   qcJudgedTable.value = row.fix_table || ""
+  // 一通会话可能多方面问题 → 多案例: 拉全量供逐案处置
+  qcCases.value = []
+  try {
+    const r = await listBadcases({ session_id: row.session_id, limit: 20 })
+    qcCases.value = r.badcases ?? []
+  } catch {
+    /* 案例列表拉取失败不阻断详情 */
+  }
   qcReplay.value = null
   qcReplayLoading.value = true
   panoActiveNames.value = ["pano"]
@@ -1534,6 +1565,17 @@ onUnmounted(() => {
   line-height: 1.6;
   color: var(--color-text-primary);
 }
+.qc-case-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 4px 8px;
+  border-radius: 6px;
+  & + & { margin-top: 4px; }
+  &:hover { background: var(--color-fill-light, #f5f7fa); }
+  .qc-case-input { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
+}
+.qc-case-current { outline: 1px dashed var(--el-color-primary-light-5, #a0cfff); }
 .qc-actions {
   display: flex;
   align-items: center;

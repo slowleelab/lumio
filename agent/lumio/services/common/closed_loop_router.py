@@ -103,6 +103,7 @@ async def collect_badcase(
 async def list_badcases_endpoint(
     user: AdminAgentUser,
     db: DbSession,
+    session_id: str | None = None,
     signal_source: str | None = None,
     root_cause_layer: str | None = None,
     fix_status: str | None = None,
@@ -115,6 +116,7 @@ async def list_badcases_endpoint(
     """Badcase 列表 (信号/根因层/修复状态/复核态过滤 + 输入关键字搜索)"""
     items, total = await list_badcases(
         db,
+        session_id=session_id,
         signal_source=signal_source,
         root_cause_layer=root_cause_layer,
         fix_status=fix_status,

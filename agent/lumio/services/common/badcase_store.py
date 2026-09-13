@@ -106,6 +106,7 @@ async def capture_badcase(
 async def list_badcases(
     session: AsyncSession,
     *,
+    session_id: str | None = None,
     signal_source: str | None = None,
     root_cause_layer: str | None = None,
     fix_status: str | None = None,
@@ -115,8 +116,10 @@ async def list_badcases(
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
-    """查询 Badcase 列表 (统计卡联动过滤 + 关键字搜索)"""
+    """查询 Badcase 列表 (统计卡联动过滤 + 关键字搜索; session_id 拉取一通会话的全部案例)"""
     conds = []
+    if session_id:
+        conds.append(Badcase.session_id == session_id)
     if signal_source:
         conds.append(Badcase.signal_source == signal_source)
     if root_cause_layer:
@@ -353,6 +356,17 @@ async def list_qc_sessions(
         .subquery()
     )
 
+    # 一通会话可多方面问题 → 多案例 (各自独立根因/状态机): 未销项案例数供列表提示
+    open_cnt_sub = (
+        select(
+            Badcase.session_id.label("sid"),
+            func.count().label("n"),
+        )
+        .where(Badcase.fix_status.notin_(("verified", "rejected")))
+        .group_by(Badcase.session_id)
+        .subquery()
+    )
+
     sid = func.coalesce(qr_sub.c.session_id, bc_sub.c.session_id)
     order_anchor = func.coalesce(sess_sub.c.session_ts, qr_sub.c.session_time, qr_sub.c.scanned_at, bc_sub.c.created_at)
     category_expr = case((qr_sub.c.verdict.is_(None), "unscanned"), else_=qr_sub.c.verdict)
@@ -369,7 +383,7 @@ async def list_qc_sessions(
         conds.append((qr_sub.c.preview.ilike(kw)) | (qr_sub.c.session_id.ilike(kw)) | (bc_sub.c.user_input.ilike(kw)))
 
     joined = qr_sub.join(bc_sub, qr_sub.c.session_id == bc_sub.c.session_id, full=True)
-    with_sess = joined.outerjoin(sess_sub, sid == sess_sub.c.sid)
+    with_sess = joined.outerjoin(sess_sub, sid == sess_sub.c.sid).outerjoin(open_cnt_sub, sid == open_cnt_sub.c.sid)
 
     total = (await session.execute(select(func.count()).select_from(joined).where(*conds))).scalar() or 0
     rows = (
@@ -393,6 +407,7 @@ async def list_qc_sessions(
                 bc_sub.c.needs_human_review,
                 bc_sub.c.attribution_confidence,
                 bc_sub.c.created_at.label("collected_at"),
+                func.coalesce(open_cnt_sub.c.n, 0).label("case_count"),
                 category_expr.label("category"),
                 order_anchor.label("order_ts"),
             )
