@@ -509,7 +509,7 @@ async def quality_sessions_endpoint(
 ) -> dict[str, Any]:
     """统一会话质检列表: 最新判定 ⟕ 最新问题案例 (全外联), 会话维度一行。
 
-    category: all | pass | warn | fail | pending_review(待人工判定) | unscanned
+    category: all | pass | warn | fail | pending_review(待复核) | unscanned
     """
     from lumio.services.common.badcase_store import list_qc_sessions
 
