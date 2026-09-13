@@ -77,10 +77,10 @@
         <span class="num danger">{{ coverage?.by_verdict?.fail ?? "-" }}</span>
         <span class="hint">另有提醒级 {{ coverage?.by_verdict?.warn ?? 0 }} (轻问题, 不合格另计)</span>
       </div>
-      <div class="stat-card clickable" @click="gotoCategory('pending_review')">
-        <span class="label">待复核</span>
+      <div class="stat-card clickable" @click="gotoCategory('pending', 'disposition')">
+        <span class="label">待处置</span>
         <span class="num warn">{{ stats?.pending_review ?? "-" }}</span>
-        <span class="hint">待复核会话 (问题已发现, 等人确认根因)</span>
+        <span class="hint">问题案例待归因/待确认根因 (根因 uncertain 需单笔人工确认)</span>
       </div>
     </div>
 
@@ -339,8 +339,8 @@ const unscannedCount = computed(() => {
   return Math.max(0, coverage.value.total_sessions - coverage.value.scanned_sessions)
 })
 
-function gotoCategory(category: string) {
-  router.push({ path: "/admin/badcase", query: { category } })
+function gotoCategory(category: string, dim: "category" | "disposition" = "category") {
+  router.push({ path: "/admin/badcase", query: { [dim]: category } })
 }
 
 function gotoScan() {
@@ -388,7 +388,7 @@ const funnel = computed(() => {
   const total = Math.max(1, s.total)
   const steps = [
     { label: "采集", count: s.total, cls: "" },
-    { label: "待复核", count: s.pending_review, cls: "warn" },
+    { label: "待处置", count: s.pending_review, cls: "warn" },
     { label: "已确认", count: s.confirmed, cls: "ok" },
     { label: "已上线", count: s.deployed, cls: "done" },
     { label: "已验证", count: s.verified ?? 0, cls: "done" },

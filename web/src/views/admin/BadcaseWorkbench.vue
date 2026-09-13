@@ -37,12 +37,20 @@
     </el-progress>
 
     <div class="filters">
-      <el-select v-model="qcFilters.category" placeholder="分类" clearable size="small" style="width: 130px" @change="reloadQc">
+      <el-select v-model="qcFilters.category" placeholder="判定" clearable size="small" style="width: 110px" @change="reloadQc">
         <el-option label="合格" value="pass" />
         <el-option label="提醒级" value="warn" />
         <el-option label="不合格" value="fail" />
-        <el-option label="待复核" value="pending_review" />
         <el-option label="未质检" value="unscanned" />
+      </el-select>
+      <el-select v-model="qcFilters.disposition" placeholder="处置" clearable size="small" style="width: 110px" @change="reloadQc">
+        <el-option label="待处置" value="pending" />
+        <el-option label="修复中" value="fixing" />
+        <el-option label="已灰度" value="canary" />
+        <el-option label="已上线" value="deployed" />
+        <el-option label="已验证" value="verified" />
+        <el-option label="已重开" value="reopened" />
+        <el-option label="已驳回" value="rejected" />
       </el-select>
       <el-input
         v-model="qcFilters.keyword"
@@ -55,7 +63,7 @@
         @clear="reloadQc"
       />
       <el-button size="small" @click="reloadQc">查询</el-button>
-      <el-button v-if="qcFilters.category || qcFilters.keyword" size="small" link @click="clearQcFilters">清除筛选</el-button>
+      <el-button v-if="qcFilters.category || qcFilters.disposition || qcFilters.keyword" size="small" link @click="clearQcFilters">清除筛选</el-button>
       <div class="filter-spacer"></div>
       <template v-if="selected.length">
         <el-button size="small" type="success" plain @click="batchConfirm">批量确认 ({{ selected.length }})</el-button>
@@ -100,13 +108,6 @@
           <el-tag v-if="row.qc_status === 'human'" size="small" type="warning">人工质检</el-tag>
           <el-tag v-else-if="row.qc_status === 'ai'" size="small" type="primary">AI质检</el-tag>
           <el-tag v-else size="small" type="info">未质检</el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="复核状态" width="84" align="center">
-        <template #default="{ row }">
-          <el-tag v-if="row.review_status === 'pending'" size="small" type="warning">待复核</el-tag>
-          <el-tag v-else-if="row.review_status === 'reviewed'" size="small" type="success">已复核</el-tag>
-          <span v-else class="muted" title="无问题案例, 无需复核">-</span>
         </template>
       </el-table-column>
       <el-table-column label="质检问题" min-width="160">
@@ -324,7 +325,7 @@
         <div class="drawer-title">
           <el-tag :type="verdictType(qcDetail?.verdict || '')" effect="dark">{{ verdictLabel(qcDetail?.verdict || "") || "未质检" }}</el-tag>
           <span class="session-id">{{ qcDetail?.session_id }}</span>
-          <el-tag v-if="qcDetail?.category === 'pending_review'" size="small" type="warning">待复核</el-tag>
+          <el-tag v-if="qcDetail?.fix_status === 'pending' && qcDetail?.badcase_id" size="small" type="warning">待处置</el-tag>
         </div>
       </template>
       <div v-if="qcDetail" class="qc-detail" v-loading="qcReplayLoading">
@@ -504,7 +505,7 @@ const qcTotal = ref(0)
 const qcPage = ref(1)
 const qcPageSize = ref(50)
 const qcLoading = ref(false)
-const qcFilters = ref<{ category: string; keyword: string }>({ category: "", keyword: "" })
+const qcFilters = ref<{ category: string; disposition: string; keyword: string }>({ category: "", disposition: "", keyword: "" })
 const selected = ref<QcSessionRow[]>([])
 
 async function loadQc() {
@@ -512,6 +513,7 @@ async function loadQc() {
   try {
     const res = await listQcSessions({
       category: qcFilters.value.category || undefined,
+      disposition: qcFilters.value.disposition || undefined,
       keyword: qcFilters.value.keyword || undefined,
       limit: qcPageSize.value,
       offset: (qcPage.value - 1) * qcPageSize.value,
@@ -531,7 +533,7 @@ function reloadQc() {
 }
 
 function clearQcFilters() {
-  qcFilters.value = { category: "", keyword: "" }
+  qcFilters.value = { category: "", disposition: "", keyword: "" }
   reloadQc()
 }
 
@@ -834,7 +836,7 @@ async function doHumanVerdict(v: "pass" | "fail") {
   }
   humanJudging.value = v
   try {
-    await humanVerdictQualitySession(qcDetail.value.session_id, v)
+    const r = await humanVerdictQualitySession(qcDetail.value.session_id, v)
     if (qcDetail.value) {
       qcDetail.value = {
         ...qcDetail.value,
@@ -846,6 +848,9 @@ async function doHumanVerdict(v: "pass" | "fail") {
     }
     await loadQc()
     ElMessage.success(`人工判定完成: ${label}`)
+    if (r?.open_badcase) {
+      ElMessage.warning("该会话仍有待处置的问题案例 — 判定已改合格, 建议进整改闭环驳回该案例", { duration: 6000 })
+    }
   } catch {
     ElMessage.error("人工判定失败")
   } finally {
@@ -1201,9 +1206,18 @@ async function rejectCase() {
 
 // ── 批量操作 ──
 async function batchConfirm() {
-  const rows = selected.value.filter((r) => r.root_cause_layer && r.needs_human_review)
+  // uncertain 是"GLM 没把握、等人定根因"——必须单笔人工选根因, 批量确认会把
+  // "不确定"郑重确认为根因 (曾真实发生); 只批量确认 GLM 已给出明确根因的
+  const rows = selected.value.filter(
+    (r) => r.root_cause_layer && r.root_cause_layer !== "uncertain" && r.needs_human_review,
+  )
+  const skipped = selected.value.length - rows.length
   if (!rows.length) {
-    ElMessage.warning("选中项中没有可确认的 (需已归因且待复核)")
+    ElMessage.warning(
+      skipped
+        ? `选中 ${skipped} 条均为待确认根因/已确认 — uncertain 案例需单笔进详情选根因`
+        : "选中项中没有可确认的 (需已归因且待复核)",
+    )
     return
   }
   try {
@@ -1292,10 +1306,16 @@ function fmtTime(iso?: string | null) {
   return iso ? iso.slice(0, 19).replace("T", " ") : "-"
 }
 onMounted(() => {
-  // 质量监控报表卡片跳转带入分类筛选
+  // 报表卡片跳转带入筛选: 判定域 query.category (兼容旧值 pending_review → 处置待处置) + 处置域 query.disposition
   const q = route.query.category as string | undefined
-  if (q && ["pass", "warn", "fail", "pending_review", "unscanned"].includes(q)) {
+  if (q === "pending_review") {
+    qcFilters.value.disposition = "pending"
+  } else if (q && ["pass", "warn", "fail", "unscanned"].includes(q)) {
     qcFilters.value.category = q
+  }
+  const d = route.query.disposition as string | undefined
+  if (d && ["pending", "fixing", "canary", "deployed", "verified", "reopened", "rejected"].includes(d)) {
+    qcFilters.value.disposition = d
   }
   loadQc()
   pollBatch() // 恢复可能进行中的批量归因进度

@@ -214,6 +214,7 @@ export interface QcSessionListResponse {
 
 export function listQcSessions(params?: {
   category?: string
+  disposition?: string
   keyword?: string
   limit?: number
   offset?: number
@@ -255,7 +256,7 @@ export function humanVerdictQualitySession(
   sessionId: string,
   verdict: "pass" | "fail",
   note?: string,
-): Promise<{ status: string; session_id: string; verdict: string; judge_model: string }> {
+): Promise<{ status: string; session_id: string; verdict: string; judge_model: string; open_badcase?: boolean }> {
   return client.post("/admin/closed-loop/quality/human-verdict", { session_id: sessionId, verdict, note })
 }
 

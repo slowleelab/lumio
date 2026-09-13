@@ -502,20 +502,27 @@ async def quality_records_endpoint(
 async def quality_sessions_endpoint(
     user: AdminAgentUser,
     db: DbSession,
-    category: str = Query("all"),
+    category: str = "all",
+    disposition: str = "all",
     keyword: str | None = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     """统一会话质检列表: 最新判定 ⟕ 最新问题案例 (全外联), 会话维度一行。
 
-    category: all | pass | warn | fail | pending_review(待复核) | unscanned
+    筛选两域正交:
+    - category (判定域): all | pass | warn | fail | unscanned (兼容旧值 pending_review → 待处置)
+    - disposition (处置域): all | pending | fixing | canary | deployed | verified | reopened | rejected
     """
     from lumio.services.common.badcase_store import list_qc_sessions
 
     if category not in ("all", "pass", "warn", "fail", "pending_review", "unscanned"):
         raise LumioError(code=2001, message=f"category 非法: {category}")
-    items, total = await list_qc_sessions(db, category=category, keyword=keyword, limit=limit, offset=offset)
+    if disposition not in ("all", "pending", "fixing", "canary", "deployed", "verified", "reopened", "rejected"):
+        raise LumioError(code=2001, message=f"disposition 非法: {disposition}")
+    items, total = await list_qc_sessions(
+        db, category=category, disposition=disposition, keyword=keyword, limit=limit, offset=offset
+    )
     return {"total": total, "sessions": items}
 
 
@@ -537,12 +544,30 @@ async def quality_human_verdict_endpoint(
     if not session_id:
         raise LumioError(code=2001, message="session_id 必填")
     rec = await record_human_verdict(db, session_id, verdict, note if isinstance(note, str) else None)
+    # 判定改合格但案例还挂着 → 提示驳回 (两域独立, 不自动联动只提醒)
+    open_badcase = False
+    if verdict == "pass":
+        from sqlalchemy import func, select
+
+        from lumio.shared.orm_models import Badcase
+
+        open_badcase = (
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(Badcase)
+                    .where(Badcase.session_id == session_id, Badcase.fix_status == "pending")
+                )
+            ).scalar()
+            or 0
+        ) > 0
     return {
         "status": "ok",
         "session_id": session_id,
         "verdict": rec.verdict,
         "judge_model": rec.judge_model,
         "scanned_at": rec.scanned_at.isoformat() if rec.scanned_at else None,
+        "open_badcase": bool(open_badcase),
     }
 
 
