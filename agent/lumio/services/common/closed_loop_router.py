@@ -312,11 +312,13 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
     from lumio.shared.orm_models import Badcase
 
     total = (await db.execute(select(func.count()).select_from(Badcase))).scalar() or 0
+    # 待处置 = 处置状态机口径 (fix_status=pending), 与列表 disposition=pending 筛选一致;
+    # 不再用 needs_human_review 计数 — 那是归因闸门标志 (未归因/uncertain), 覆盖不了高置信已归因待确认的
     pending_review = (
-        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.needs_human_review.is_(True)))
+        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.fix_status == "pending"))
     ).scalar() or 0
     confirmed = (
-        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.needs_human_review.is_(False)))
+        await db.execute(select(func.count()).select_from(Badcase).where(Badcase.fix_status != "pending"))
     ).scalar() or 0
     today_new = (
         await db.execute(select(func.count()).select_from(Badcase).where(Badcase.created_at >= day_ago))
