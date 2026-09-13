@@ -442,71 +442,78 @@
           </el-descriptions-item>
         </el-descriptions>
 
-        <!-- 操作区分组: 左=处置主操作; 右=判定操作 (人工改判强动作收纳进下拉防误触) -->
-        <div class="qc-actions">
-          <div class="qc-actions-main">
-            <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
-            <el-button
-              v-if="qcDetail.badcase_id && (!qcDetail.root_cause_layer || qcDetail.root_cause_layer === 'uncertain')"
-              plain :loading="qcAttributing" @click="doQcAttribute"
-            >GLM 裁判归因{{ qcDetail.root_cause_layer === "uncertain" ? " (重试)" : " (单笔)" }}</el-button>
-            <!-- 人工定根因 · 就地闭环 (uncertain/待确认案例不必进二层抽屉) -->
-            <template v-if="qcDetail.badcase_id && qcDetail.fix_status === 'pending' && qcDetail.root_cause_layer">
-              <el-select v-model="qcJudgedLayer" size="small" style="width: 126px" :placeholder="qcDetail.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'">
-                <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
-              </el-select>
-              <el-select v-model="qcJudgedTable" size="small" style="width: 136px" placeholder="修复分流表 (可选)">
-                <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key" />
-              </el-select>
-              <el-button type="success" plain :loading="qcConfirming" @click="doQcConfirm">确认根因 → 修复中</el-button>
-            </template>
-            <span v-else-if="!qcDetail.badcase_id && qcDetail.verdict === 'fail'" class="muted action-hint" title="同一问题句 30 天内只开一案, 重复出现累加出现次数 — 防同题刷屏">
-              判定不合格但未单独开案 — 同题已并入既有案例组, 在处置列表按问题句搜索主案例
-            </span>
-            <span v-else-if="!qcDetail.badcase_id && qcDetail.verdict === 'pass'" class="muted action-hint">质检合格 · 无问题案例, 无需整改</span>
-          </div>
-          <div class="qc-actions-judge">
-            <span class="muted action-hint">判定操作</span>
-            <el-dropdown :disabled="humanJudging != null" @command="doHumanVerdict">
-              <el-button type="primary" plain :loading="humanJudging != null">
-                {{ qcDetail.qc_status === "human" ? "重新人工判定" : "人工判定" }} ▾
-              </el-button>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item command="pass">标记为合格</el-dropdown-item>
-                  <el-dropdown-item command="fail">标记为不合格</el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
-            <el-tooltip content="重跑 AI 裁判 (覆盖为最新 AI 判定, 用于修复效果验证)" placement="top">
-              <el-button :loading="qcRescanning" @click="doRescan">AI 复检</el-button>
-            </el-tooltip>
-          </div>
+        <!-- 问题案例 · 逐案处置: 操作内联在案行 (多方面问题各自闭环, 互不混排) -->
+        <div class="section-title" style="margin-top: 14px">
+          问题案例
+          <span class="muted section-hint">
+            {{ qcCases.length ? `${qcCases.length} 案 · 每案独立根因与处置流转` : qcDetail.verdict === "fail" ? "同题已并入既有案例组 (30 天一案)" : "质检合格 · 无需整改" }}
+          </span>
+        </div>
+        <div v-if="!qcCases.length" class="muted case-empty" style="padding: 4px 2px">
+          <template v-if="qcDetail.verdict === 'fail'">
+            判定不合格但未单独开案 — 在处置列表按问题句搜索主案例处理
+          </template>
+          <template v-else>该会话无问题案例</template>
+        </div>
+        <div v-for="c in qcCases" :key="c.id" class="qc-case-row" :class="{ 'qc-case-current': c.id === qcDetail.badcase_id }">
+          <span class="qc-case-input" :title="c.user_input">{{ (c.user_input || "").slice(0, 26) }}</span>
+
+          <!-- 根因: 已确认/裁判明确 → 标签; 待处置 → 行内选择 (uncertain 不预填, 强制人工定层) -->
+          <el-tag v-if="c.human_confirmed_layer" size="small" type="success">{{ layerLabel(c.human_confirmed_layer) }}</el-tag>
+          <el-tag v-else-if="c.root_cause_layer && c.root_cause_layer !== 'uncertain' && c.fix_status !== 'pending'" size="small" type="primary">
+            {{ layerLabel(c.root_cause_layer) }}
+          </el-tag>
+          <el-select
+            v-else-if="c.fix_status === 'pending' && c.root_cause_layer"
+            :model-value="caseDraft(c.id).layer" size="small" style="width: 118px"
+            :placeholder="c.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'"
+            @update:model-value="caseDraft(c.id).layer = $event"
+          >
+            <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
+          </el-select>
+          <el-tag v-else-if="c.root_cause_layer === 'uncertain'" size="small" type="warning">待确认根因</el-tag>
+          <el-tag v-else size="small" type="info">未归因</el-tag>
+
+          <!-- 案内推进: 待处置 → 确认进修复; 未归因 → 行内归因; uncertain 可重试 -->
+          <el-button
+            v-if="c.fix_status === 'pending' && c.root_cause_layer"
+            size="small" type="success" plain :loading="qcCaseActing === c.id" @click="confirmCase(c)"
+          >确认 → 修复中</el-button>
+          <el-button
+            v-if="!c.root_cause_layer || (c.root_cause_layer === 'uncertain' && c.fix_status === 'pending')"
+            size="small" :type="c.root_cause_layer ? 'primary' : 'warning'" :text="!!c.root_cause_layer" :plain="!c.root_cause_layer"
+            :loading="qcCaseActing === c.id" @click="attributeCase(c)"
+          >{{ c.root_cause_layer ? "重试归因" : "GLM 归因" }}</el-button>
+
+          <el-tag v-if="c.fix_status && c.fix_status !== 'pending'" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
+          <el-button size="small" link type="primary" @click="openBadcaseById(c.id)">处理 ›</el-button>
         </div>
 
-        <!-- 一通会话多方面问题 → 多案例: 各自独立根因与处置状态机, 逐案闭环 -->
-        <template v-if="qcCases.length > 1">
-          <div class="section-title" style="margin-top: 14px">
-            该会话全部案例 <span class="muted section-hint">({{ qcCases.length }} 案 — 多方面问题各自闭环, 列表行只显示最新一案)</span>
-          </div>
-          <div v-for="c in qcCases" :key="c.id" class="qc-case-row" :class="{ 'qc-case-current': c.id === qcDetail.badcase_id }">
-            <span class="qc-case-input" :title="c.user_input">{{ (c.user_input || "").slice(0, 26) }}</span>
-            <el-tag v-if="c.human_confirmed_layer" size="small" type="success">{{ layerLabel(c.human_confirmed_layer) }}</el-tag>
-            <el-tag v-else-if="c.root_cause_layer" size="small" :type="c.root_cause_layer === 'uncertain' ? 'warning' : 'primary'">
-              {{ layerLabel(c.root_cause_layer) }}
-            </el-tag>
-            <el-tag v-else size="small" type="info">未归因</el-tag>
-            <el-tag v-if="c.fix_status" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
-            <el-button size="small" link type="primary" @click="openBadcaseById(c.id)">处理 ›</el-button>
-          </div>
-        </template>
+        <!-- 判定: 对会话质量下结论 (与案例处置正交) -->
+        <div class="qc-footer-actions">
+          <span class="muted action-hint">判定 (改判定不影响案例处置)</span>
+          <el-dropdown :disabled="humanJudging != null" @command="doHumanVerdict">
+            <el-button type="primary" plain :loading="humanJudging != null">
+              {{ qcDetail.qc_status === "human" ? "重新人工判定" : "人工判定" }} ▾
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="pass">标记为合格</el-dropdown-item>
+                <el-dropdown-item command="fail">标记为不合格</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <el-tooltip content="重跑 AI 裁判 (覆盖为最新 AI 判定, 用于修复效果验证)" placement="top">
+            <el-button :loading="qcRescanning" @click="doRescan">AI 复检</el-button>
+          </el-tooltip>
+        </div>
       </div>
     </el-drawer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
@@ -650,76 +657,83 @@ async function doBatchAttribution() {
   }
 }
 
-// ── 单笔归因 (质检详情内直达, 不必进两层抽屉) ──
-const qcAttributing = ref(false)
-// 一通会话多方面问题 → 多案例列表 (质检详情逐案处置入口)
+// ── 质检详情 · 问题案例逐案处置 (操作内联在案行, 不再堆顶部工具栏) ──
 const qcCases = ref<Badcase[]>([])
-// ── 人工定根因 · 质检详情就地确认 (uncertain 案例的闭环出口) ──
-const qcJudgedLayer = ref("")
-const qcJudgedTable = ref("")
-const qcConfirming = ref(false)
+const qcCaseActing = ref<string | null>(null) // 正在操作的案 id (行内 loading)
+// 案行根因选择草稿: 裁判明确层预填可改判, uncertain 强制人工选择
+const caseDrafts = reactive<Record<string, { layer: string }>>({})
 
-async function doQcConfirm() {
-  if (!qcDetail.value?.badcase_id) return
+function caseDraft(id: string): { layer: string } {
+  if (!caseDrafts[id]) caseDrafts[id] = { layer: "" }
+  return caseDrafts[id]
+}
+
+async function refreshQcCases(sessionId: string) {
+  try {
+    const r = await listBadcases({ session_id: sessionId, limit: 20 })
+    qcCases.value = r.badcases ?? []
+    for (const c of qcCases.value) {
+      caseDraft(c.id).layer = c.root_cause_layer && c.root_cause_layer !== "uncertain" ? c.root_cause_layer : ""
+    }
+  } catch {
+    /* handled */
+  }
+}
+
+async function confirmCase(c: Badcase) {
+  const layer = caseDraft(c.id)?.layer
   // uncertain 不可被"确认"为根因 — 人工确认的意义就是给出确定层
-  if (!qcJudgedLayer.value || qcJudgedLayer.value === "uncertain") {
-    ElMessage.warning("请先选择根因层 (uncertain 不能作为确认值, 人工确认就是来定层的)")
+  if (!layer || layer === "uncertain") {
+    ElMessage.warning("请先选择根因层 (uncertain 不能作为确认值)")
     return
   }
-  qcConfirming.value = true
+  qcCaseActing.value = c.id
   try {
-    const changed = qcJudgedLayer.value !== qcDetail.value.root_cause_layer
-    await resolveBadcase(qcDetail.value.badcase_id, {
+    const changed = layer !== c.root_cause_layer
+    await resolveBadcase(c.id, {
       fix_status: "fixing",
-      human_confirmed_layer: qcJudgedLayer.value,
-      fix_table: qcJudgedTable.value || undefined,
-      note: `人工定根因${changed ? ` (改判 ${layerLabel(qcDetail.value.root_cause_layer) || "uncertain"} → ${layerLabel(qcJudgedLayer.value)})` : ""}`,
+      human_confirmed_layer: layer,
+      note: `人工定根因${changed ? ` (改判 ${layerLabel(c.root_cause_layer) || "uncertain"} → ${layerLabel(layer)})` : ""}`,
     })
-    ElMessage.success(`根因已确认: ${layerLabel(qcJudgedLayer.value)} — 进入修复跟踪`)
+    ElMessage.success(`根因已确认: ${layerLabel(layer)} — 进入修复跟踪`)
     await loadQc()
+    await refreshQcCases(c.session_id)
     const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
     if (row) qcDetail.value = row
   } catch {
     /* handled */
   } finally {
-    qcConfirming.value = false
+    qcCaseActing.value = null
   }
 }
 
-async function doQcAttribute() {
-  if (!qcDetail.value?.badcase_id) return
-  qcAttributing.value = true
+async function attributeCase(c: Badcase) {
+  qcCaseActing.value = c.id
   try {
-    const r = (await attributeBadcase(qcDetail.value.badcase_id)) as { root_cause_layer?: string }
+    const r = (await attributeBadcase(c.id)) as { root_cause_layer?: string }
     if (r.root_cause_layer === "uncertain") {
-      ElMessage.warning("归因完成: 裁判证据不足 (置信过低) — 常见于问题轮无决策链中间产物 (如转人工静默/链路外路径), 请人工定根因", { duration: 7000 })
+      ElMessage.warning("归因完成: 裁判证据不足 — 常见于问题轮无决策链中间产物 (如转人工静默), 请人工定根因", { duration: 7000 })
     } else {
       ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
     }
     await loadQc()
+    await refreshQcCases(c.session_id)
     const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
     if (row) qcDetail.value = row
   } catch {
     /* handled */
   } finally {
-    qcAttributing.value = false
+    qcCaseActing.value = null
   }
 }
 
 async function openQcDetail(row: QcSessionRow) {
   qcDetail.value = row
   qcDetailVisible.value = true
-  // 人工定根因初始值: 裁判明确层可改判, uncertain 强制人工选择 (不预填)
-  qcJudgedLayer.value = row.root_cause_layer && row.root_cause_layer !== "uncertain" ? row.root_cause_layer : ""
-  qcJudgedTable.value = row.fix_table || ""
   // 一通会话可能多方面问题 → 多案例: 拉全量供逐案处置
   qcCases.value = []
-  try {
-    const r = await listBadcases({ session_id: row.session_id, limit: 20 })
-    qcCases.value = r.badcases ?? []
-  } catch {
-    /* 案例列表拉取失败不阻断详情 */
-  }
+  Object.keys(caseDrafts).forEach((k) => delete caseDrafts[k])
+  await refreshQcCases(row.session_id)
   qcReplay.value = null
   qcReplayLoading.value = true
   panoActiveNames.value = ["pano"]
