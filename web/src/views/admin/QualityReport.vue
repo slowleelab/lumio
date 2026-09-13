@@ -12,19 +12,6 @@
         <el-tooltip placement="left" effect="light">
           <template #content>
             <div class="judge-tip">
-              <b>GLM-5.3-Flash 裁判 · 批量归因</b><br />
-              对全部「未归因」坏例逐条跑 LLM 裁判 (n=3 多数票),<br />
-              每条约 20-40 秒后台执行, 完成后自动刷新。<br />
-              采集落库后不会自动归因 —— 由你在此触发。
-            </div>
-          </template>
-          <el-button size="small" type="primary" plain :loading="batch.running" @click="doBatchAttribution">
-            {{ batch.running ? `GLM 裁判中 ${batch.done}/${batch.total}` : "GLM 裁判 · 批量归因待归因项" }}
-          </el-button>
-        </el-tooltip>
-        <el-tooltip placement="left" effect="light">
-          <template #content>
-            <div class="judge-tip">
               <b>全量质检巡检</b><br />
               所有会话从<b>原始对话内容</b>过 GLM 裁判质检,<br />
               不依赖置信度/差评信号 — 高置信但答非所问也逃不掉。<br />
@@ -63,23 +50,6 @@
           全量质检中 {{ scan.done }}/{{ scan.total }}
           · 合格 {{ scan.n_pass }} / 提醒 {{ scan.n_warn }} / 不合格 {{ scan.n_fail }}
           <template v-if="scan.n_error"> (失败 {{ scan.n_error }})</template>
-        </span>
-      </template>
-    </el-progress>
-
-    <!-- GLM 批量归因进行中: 实时进度 -->
-    <el-progress
-      v-if="batch.running"
-      :percentage="batchPct"
-      :stroke-width="10"
-      striped
-      striped-flow
-      style="margin-top: 10px"
-    >
-      <template #default>
-        <span class="progress-text">
-          GLM 裁判批量归因中 {{ batch.done }}/{{ batch.total }}
-          <template v-if="batch.failed"> (失败 {{ batch.failed }})</template>
         </span>
       </template>
     </el-progress>
@@ -203,8 +173,6 @@ import {
   getQualityScanStatus,
   getQualityTrend,
   startQualityScan,
-  startBatchAttribution,
-  getBatchAttributionStatus,
   type QualityScanStatus,
   type QualityTrendPoint,
 } from "@/api/closedLoop"
@@ -341,40 +309,6 @@ async function doQualityScan() {
   }
 }
 
-// ── GLM 裁判批量归因 (本页触发, 处理全部未归因坏例) ──
-const batch = ref({ running: false, total: 0, done: 0, failed: 0 })
-const batchPct = computed(() => (batch.value.total > 0 ? Math.round((batch.value.done / batch.value.total) * 100) : 0))
-let batchTimer: ReturnType<typeof setInterval> | null = null
-
-async function pollBatch() {
-  try {
-    const st = await getBatchAttributionStatus()
-    batch.value = { running: st.running, total: st.total, done: st.done, failed: st.failed }
-    if (!st.running) {
-      if (batchTimer) {
-        clearInterval(batchTimer)
-        batchTimer = null
-      }
-      if (st.total > 0) {
-        ElMessage.success(`批量归因完成: 成功 ${st.done} / 失败 ${st.failed} / 共 ${st.total}`)
-        await Promise.all([loadStats(), reloadTrend()])
-      }
-    }
-  } catch {
-    /* handled */
-  }
-}
-
-async function doBatchAttribution() {
-  try {
-    await startBatchAttribution(200)
-    ElMessage.success("GLM 裁判批量归因已启动, 每条约 20-40 秒")
-    if (!batchTimer) batchTimer = setInterval(pollBatch, 4000)
-  } catch {
-    /* handled */
-  }
-}
-
 async function loadStats() {
   try {
     stats.value = await getBadcaseStats()
@@ -476,12 +410,10 @@ function fmtTime(iso?: string | null) {
 
 onMounted(() => {
   refreshAll()
-  pollBatch() // 恢复可能进行中的批量归因进度
   refreshTimer = setInterval(() => Promise.all([loadStats(), loadCoverage()]), 30_000)
 })
 onUnmounted(() => {
   if (scanTimer) clearInterval(scanTimer)
-  if (batchTimer) clearInterval(batchTimer)
   if (refreshTimer) clearInterval(refreshTimer)
 })
 </script>
