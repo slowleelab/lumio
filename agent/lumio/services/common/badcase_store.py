@@ -308,18 +308,24 @@ async def list_qc_sessions(
     session: AsyncSession,
     *,
     category: str = "all",
+    disposition: str = "all",
     keyword: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     """统一会话质检列表 · 会话维度: 最新质检判定 ⟕ 最新问题案例 (全外联)。
 
-    分类 (category): all | pass | warn | fail | pending_review | unscanned
-    - pending_review: 有待人工复核的问题案例 (归因闸门未过) — 待判断口径
-    - unscanned: 有问题案例但尚无质检判定 (如会话未结束先被信号采集)
+    筛选两域正交 (状态机重整):
+    - category (判定域): all | pass | warn | fail | unscanned
+      兼容旧值 pending_review → 自动映射 disposition=pending (待处置)
+    - disposition (处置域): all | pending | fixing | canary | deployed | verified | reopened | rejected
+      根因层列上 uncertain 显示"待确认根因", 是 pending 的细分, 不另设筛选项
     排序锚: 会话最后活跃时间 (dialogue_log 聚合, 未质检会话同口径) → 质检时刻。
     """
-    from sqlalchemy import and_, case
+    from sqlalchemy import case
+
+    if category == "pending_review":  # 旧链接/报表跳转兼容
+        category, disposition = "all", "pending"
 
     qr_sub = (
         select(
@@ -349,18 +355,15 @@ async def list_qc_sessions(
 
     sid = func.coalesce(qr_sub.c.session_id, bc_sub.c.session_id)
     order_anchor = func.coalesce(sess_sub.c.session_ts, qr_sub.c.session_time, qr_sub.c.scanned_at, bc_sub.c.created_at)
-    category_expr = case(
-        (
-            and_(bc_sub.c.needs_human_review.is_(True), bc_sub.c.fix_status == "pending"),
-            "pending_review",
-        ),
-        (qr_sub.c.verdict.is_(None), "unscanned"),
-        else_=qr_sub.c.verdict,
-    )
+    category_expr = case((qr_sub.c.verdict.is_(None), "unscanned"), else_=qr_sub.c.verdict)
 
     conds: list[Any] = [(qr_sub.c.rn == 1) | (qr_sub.c.rn.is_(None)), (bc_sub.c.rn == 1) | (bc_sub.c.rn.is_(None))]
-    if category and category != "all":
-        conds.append(category_expr == category)
+    if category == "unscanned":
+        conds.append(qr_sub.c.verdict.is_(None))
+    elif category in ("pass", "warn", "fail"):
+        conds.append(qr_sub.c.verdict == category)
+    if disposition and disposition != "all":
+        conds.append(bc_sub.c.fix_status == disposition)
     if keyword:
         kw = f"%{keyword}%"
         conds.append((qr_sub.c.preview.ilike(kw)) | (qr_sub.c.session_id.ilike(kw)) | (bc_sub.c.user_input.ilike(kw)))
@@ -413,13 +416,6 @@ async def list_qc_sessions(
             d["qc_status"] = "human"
         else:
             d["qc_status"] = "ai"
-        # 复核状态列: 问题案例人工复核流程 (无案例 → 无需复核)
-        if not d.get("badcase_id"):
-            d["review_status"] = None
-        elif d.get("needs_human_review"):
-            d["review_status"] = "pending"
-        else:
-            d["review_status"] = "reviewed"
         d.pop("order_ts", None)
         out.append(d)
     return out, total
@@ -609,6 +605,19 @@ async def attribute_and_save(
     return result
 
 
+# 处置状态机转移表: 后端守门, 前端按钮只是引导不是约束。
+# 终态 (verified/rejected) 拒绝一切流转 — 重开靠重新采集开新行 (去重机制按处置终态开新组)。
+_FIX_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending": frozenset({"fixing", "rejected"}),
+    "fixing": frozenset({"canary", "rejected"}),
+    "canary": frozenset({"deployed", "rejected"}),
+    "deployed": frozenset({"verified", "reopened", "rejected"}),
+    "reopened": frozenset({"fixing", "rejected"}),
+    "verified": frozenset(),
+    "rejected": frozenset(),
+}
+
+
 async def update_fix_status(
     session_factory: async_sessionmaker[AsyncSession],
     badcase_id: str,
@@ -618,21 +627,39 @@ async def update_fix_status(
     note: str | None = None,
     human_confirmed_layer: str | None = None,
 ) -> bool:
-    """人工裁决/状态流转 (方案 §7.4 错误案例库结构化字段)"""
+    """人工裁决/状态流转 (方案 §7.4 错误案例库结构化字段)
+
+    - 转移合法性按 _FIX_TRANSITIONS 校验, 非法转移抛 LumioError(3001)
+    - human_confirmed_layer 传入即"确认根因": root_cause_layer 覆写为确认值
+      (uncertain 消解), needs_human_review 同步翻转 — "待人工确认"由
+      root_cause_layer=uncertain 派生, 不再是独立平行布尔
+    - resolved_at 只在终态 (verified/rejected) 记录 — deployed 不是终点
+    """
     import uuid_utils
+
+    from lumio.shared.exceptions import LumioError
 
     async with session_factory() as session:
         row = await session.get(Badcase, uuid_utils.UUID(badcase_id))
         if row is None:
             return False
+        current = row.fix_status or "pending"
+        allowed = _FIX_TRANSITIONS.get(current)
+        if allowed is not None and fix_status not in allowed:
+            raise LumioError(
+                code=3001,
+                message=f"非法状态转移: {current} → {fix_status} (终态不可流转, 重开走重新采集开新行)",
+            )
         row.fix_status = fix_status
         if fix_table:
             row.fix_table = fix_table
         if human_confirmed_layer:
             row.human_confirmed_layer = human_confirmed_layer
+            row.root_cause_layer = human_confirmed_layer
+            row.needs_human_review = False
         if note:
             row.fix_note = note
-        if fix_status in ("deployed", "verified", "rejected"):
+        if fix_status in ("verified", "rejected"):
             row.resolved_at = datetime.now(UTC)
         await session.commit()
         return True

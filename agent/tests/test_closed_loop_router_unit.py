@@ -95,10 +95,14 @@ class TestHumanVerdictAndRescan:
     async def test_human_verdict(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = SimpleNamespace(verdict="pass", judge_model="人工判定", scanned_at=None)
         monkeypatch.setattr("lumio.services.common.badcase_store.record_human_verdict", AsyncMock(return_value=rec))
+        # 判定改 pass → 追查未处置案例 (open_badcase 提示联动)
+        db = MagicMock()
+        db.execute = AsyncMock(return_value=SimpleNamespace(scalar=lambda: 0))
         out = await clr.quality_human_verdict_endpoint(
-            user=None, db=MagicMock(), body={"session_id": "s1", "verdict": "pass", "note": "复核无误"}
+            user=None, db=db, body={"session_id": "s1", "verdict": "pass", "note": "复核无误"}
         )
         assert out["status"] == "ok" and out["judge_model"] == "人工判定"
+        assert out["open_badcase"] is False
 
         with pytest.raises(LumioError):
             await clr.quality_human_verdict_endpoint(user=None, db=MagicMock(), body={})

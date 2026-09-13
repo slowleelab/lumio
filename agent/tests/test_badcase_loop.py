@@ -84,7 +84,7 @@ async def test_capture_persists_and_dedup_key() -> None:
 
     @pytest.mark.asyncio
     async def test_update_fix_status(self) -> None:
-        """状态流转持久化"""
+        """状态流转持久化 (合法转移: pending → fixing)"""
         from unittest.mock import AsyncMock, MagicMock
 
         from uuid_utils import uuid7
@@ -105,12 +105,89 @@ async def test_capture_persists_and_dedup_key() -> None:
             def __call__(self):
                 return session
 
-        ok = await update_fix_status(F(), str(bc.id), fix_status="deployed", note="done")
+        ok = await update_fix_status(F(), str(bc.id), fix_status="fixing", note="done")
         assert ok is True
-        assert bc.fix_status == "deployed"
+        assert bc.fix_status == "fixing"
+
+    async def test_update_fix_status_rejects_skip_transition(self) -> None:
+        """状态机守门: pending 直跳 verified / 终态复活 均拒绝 (后端校验, 不靠前端按钮)"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        import pytest
+        from uuid_utils import uuid7
+
+        from lumio.shared.exceptions import LumioError
+
+        def _mk(status: str) -> tuple[Badcase, type]:
+            bc = Badcase(
+                id=uuid7(),
+                trace_id="t",
+                session_id="s",
+                signal_source="transfer",
+                user_input="x",
+                fix_status=status,
+            )
+            session = MagicMock()
+            session.get = AsyncMock(return_value=bc)
+            session.commit = AsyncMock()
+
+            class F:
+                def __call__(self):
+                    return session
+
+            return bc, F
+
+        # pending → verified 跳态
+        bc, f = _mk("pending")
+        with pytest.raises(LumioError):
+            await update_fix_status(f(), str(bc.id), fix_status="verified")
+        # verified 终态复活
+        bc, f = _mk("verified")
+        with pytest.raises(LumioError):
+            await update_fix_status(f(), str(bc.id), fix_status="fixing")
+        # rejected 终态复活
+        bc, f = _mk("rejected")
+        with pytest.raises(LumioError):
+            await update_fix_status(f(), str(bc.id), fix_status="pending")
+        # 合法: reopened → fixing
+        bc, f = _mk("reopened")
+        ok = await update_fix_status(f(), str(bc.id), fix_status="fixing")
+        assert ok is True and bc.fix_status == "fixing"
+
+    async def test_update_fix_status_confirm_layer_resolves_uncertain(self) -> None:
+        """确认根因即消解 uncertain: root_cause_layer 覆写为确认值, needs_review 翻转"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from uuid_utils import uuid7
+
+        bc = Badcase(
+            id=uuid7(),
+            trace_id="t",
+            session_id="s",
+            signal_source="transfer",
+            user_input="x",
+            fix_status="pending",
+            root_cause_layer="uncertain",
+            needs_human_review=True,
+        )
+        session = MagicMock()
+        session.get = AsyncMock(return_value=bc)
+        session.commit = AsyncMock()
+
+        class F:
+            def __call__(self):
+                return session
+
+        ok = await update_fix_status(
+            F(), str(bc.id), fix_status="fixing", human_confirmed_layer="layer_6", note="人工定根因"
+        )
+        assert ok is True
+        assert bc.root_cause_layer == "layer_6"  # uncertain 消解为确认值
+        assert bc.needs_human_review is False
+        assert bc.human_confirmed_layer == "layer_6"
 
     async def test_update_fix_status_verified_sets_resolved_at(self) -> None:
-        """复检通过销项 (verified) 与打回 (reopened): verified 记 resolved_at, reopened 不记 (还要重修)"""
+        """复检通过销项 (verified) 记 resolved_at; 打回 (reopened) 不记; deployed 上线也不记 (终态才记)"""
         from unittest.mock import AsyncMock, MagicMock
 
         from uuid_utils import uuid7
@@ -136,6 +213,11 @@ async def test_capture_persists_and_dedup_key() -> None:
         assert bc.fix_status == "reopened"
         assert bc.resolved_at is None
 
+        # reopened → fixing (重新修复) → canary → deployed → verified 走合法链
+        for st in ("fixing", "canary", "deployed"):
+            ok = await update_fix_status(F(), str(bc.id), fix_status=st)
+            assert ok is True
+            assert bc.resolved_at is None  # deployed 不是终点, 不记 resolved_at
         ok = await update_fix_status(F(), str(bc.id), fix_status="verified", note="复检 pass")
         assert ok is True
         assert bc.fix_status == "verified"
@@ -622,7 +704,8 @@ async def test_qc_sessions_unified_query_semantics() -> None:
     sql = str(captured[-1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})).lower()
     assert "full outer join" in sql, "判定与案例应全外联"
     assert "row_number()" in sql and "partition by" in sql, "两侧均按会话取最新"
-    assert "pending_review" in sql, "分类 CASE 应含待人工判定"
+    # 状态机重整: 旧 pending_review 兼容映射为 disposition=pending (fix_status 筛选)
+    assert "fix_status" in sql and "'pending'" in sql, "待处置走处置域筛选而非分类 CASE"
 
 
 # ── 覆率加固: 远程裁判 HTTP 本体 / 属性 / 无配置回退 / 恢复调度 ──
