@@ -626,7 +626,11 @@ async function doQcAttribute() {
   qcAttributing.value = true
   try {
     const r = (await attributeBadcase(qcDetail.value.badcase_id)) as { root_cause_layer?: string }
-    ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
+    if (r.root_cause_layer === "uncertain") {
+      ElMessage.warning("归因完成: 裁判证据不足 (置信过低) — 常见于问题轮无决策链中间产物 (如转人工静默/链路外路径), 请人工定根因", { duration: 7000 })
+    } else {
+      ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
+    }
     await loadQc()
     const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
     if (row) qcDetail.value = row
@@ -1047,7 +1051,11 @@ async function runAttribution(row: Badcase) {
   acting.value = true
   try {
     const r = (await attributeBadcase(row.id)) as { root_cause_layer?: string; needs_human_review?: boolean }
-    ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
+    if (r.root_cause_layer === "uncertain") {
+      ElMessage.warning("归因完成: 裁判证据不足 — 常见于问题轮无决策链中间产物, 请人工定根因", { duration: 7000 })
+    } else {
+      ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
+    }
     await loadQc()
     if (detailVisible.value && detail.value?.id === row.id) {
       const fresh = await getBadcase(row.id)
