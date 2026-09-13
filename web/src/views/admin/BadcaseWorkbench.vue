@@ -323,191 +323,185 @@
       </div>
     </el-drawer>
 
-    <!-- ══ 质检详情抽屉 (问题导向: 判定 → 问题 → 现场还原 → 链路 → 处置) ══ -->
-    <el-drawer v-model="qcDetailVisible" size="52%" destroy-on-close>
+    <!-- ══ 质检详情抽屉 · 工作台三段式: 结论 Hero → 证据 Tabs → 吸底行动区 ══ -->
+    <el-drawer v-model="qcDetailVisible" size="58%" destroy-on-close class="qc-drawer">
       <template #header>
         <div class="drawer-title">
-          <el-tag :type="verdictType(qcDetail?.verdict || '')" effect="dark">{{ verdictLabel(qcDetail?.verdict || "") || "未质检" }}</el-tag>
           <span class="session-id">{{ qcDetail?.session_id }}</span>
-          <el-tag v-if="qcDetail?.fix_status === 'pending' && qcDetail?.badcase_id" size="small" type="warning">待处置</el-tag>
+          <el-tag v-if="qcDetail?.qc_status === 'human'" size="small" type="warning">人工质检</el-tag>
+          <el-tag v-if="(qcDetail?.case_count ?? 0) > 1" size="small" type="info" effect="plain">{{ qcDetail?.case_count }} 案</el-tag>
         </div>
       </template>
-      <div v-if="qcDetail" class="qc-detail" v-loading="qcReplayLoading">
-        <div v-if="qcDetail.summary" class="qc-summary">{{ qcDetail.summary }}</div>
-        <div v-else-if="qcDetail.verdict" class="qc-summary muted">裁判未给出摘要</div>
 
-        <template v-if="qcDetail.problems?.length">
-          <div class="section-title">问题定位 · 现场还原</div>
-          <div v-for="(p, i) in qcDetail.problems" :key="i" class="qc-problem">
-            <div class="qc-problem-head">
-              <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
-              <span v-if="p.turn" class="muted">第 {{ rowRound(p.turn) || p.turn }} 轮对话 · 日志第 {{ p.turn }} 行</span>
+      <div v-if="qcDetail" class="qc-detail" v-loading="qcReplayLoading">
+        <!-- ── 结论 Hero: 10 秒扫视 (判定 · 摘要 · 元信息) ── -->
+        <div class="qc-hero" :class="`qc-hero--${qcDetail.verdict || 'none'}`">
+          <div class="qc-hero-main">
+            <div class="qc-hero-verdict">{{ verdictLabel(qcDetail.verdict || "") || "未质检" }}</div>
+            <div class="qc-hero-meta">
+              {{ shortModel(qcDetail.judge_model || "") || "AI 裁判" }} · {{ qcDetail.turns ?? "-" }} 轮对话 · {{ fmtTime(qcDetail.session_time || qcDetail.scanned_at) }}
+              <template v-if="qcDetail.signal_source"> · {{ signalLabel(qcDetail.signal_source) }}</template>
             </div>
-            <div class="qc-problem-reason">{{ p.reason || "(未说明原因)" }}</div>
-            <template v-if="problemTurnDialog(p.turn)">
-              <div class="scene-bubble customer">{{ problemTurnDialog(p.turn)!.customer }}</div>
-              <div class="scene-bubble bot">
-                {{ problemTurnDialog(p.turn)!.bot }}
-                <el-tag v-if="problemTurnDialog(p.turn)!.source" size="small" type="info" class="scene-src">{{ problemTurnDialog(p.turn)!.source }}</el-tag>
-              </div>
-              <div v-if="qcTurnChains[rowRound(p.turn!) - 1]" class="qc-turn-chain">
-                该轮链路: {{ qcTurnChains[rowRound(p.turn!) - 1].steps.join(" → ") }}
+          </div>
+          <div class="qc-hero-summary">{{ qcDetail.summary || "裁判未给出摘要" }}</div>
+        </div>
+
+        <!-- ── 证据: 三个视图共享同一空间, 切换替代滚动 ── -->
+        <el-tabs v-model="qcEvidenceTab" class="qc-evidence">
+          <el-tab-pane name="problems">
+            <template #label>问题定位<el-badge v-if="qcDetail.problems?.length" :value="qcDetail.problems.length" class="qc-tab-badge" /></template>
+            <template v-if="qcDetail.problems?.length">
+              <div v-for="(p, i) in qcDetail.problems" :key="i" class="qc-problem">
+                <div class="qc-problem-head">
+                  <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
+                  <span v-if="p.turn" class="muted">第 {{ rowRound(p.turn) || p.turn }} 轮对话 · 日志第 {{ p.turn }} 行</span>
+                </div>
+                <div class="qc-problem-reason">{{ p.reason || "(未说明原因)" }}</div>
+                <template v-if="problemTurnDialog(p.turn)">
+                  <div class="scene-bubble customer">{{ problemTurnDialog(p.turn)!.customer }}</div>
+                  <div class="scene-bubble bot">
+                    {{ problemTurnDialog(p.turn)!.bot }}
+                    <el-tag v-if="problemTurnDialog(p.turn)!.source" size="small" type="info" class="scene-src">{{ problemTurnDialog(p.turn)!.source }}</el-tag>
+                  </div>
+                  <div v-if="qcTurnChains[rowRound(p.turn!) - 1]" class="qc-turn-chain">
+                    该轮链路: {{ qcTurnChains[rowRound(p.turn!) - 1].steps.join(" → ") }}
+                  </div>
+                </template>
+                <div v-else-if="p.turn && qcReplay" class="muted" style="font-size: 12px">第 {{ rowRound(p.turn) || p.turn }} 轮对话内容超出回放范围</div>
               </div>
             </template>
-            <div v-else-if="p.turn && qcReplay" class="muted" style="font-size: 12px">第 {{ rowRound(p.turn) || p.turn }} 轮对话内容超出回放范围</div>
-          </div>
-        </template>
+            <div v-else class="muted qc-evi-empty">无问题项 ({{ verdictLabel(qcDetail.verdict || "") || "未质检" }})</div>
+          </el-tab-pane>
 
-        <div class="section-title">会话回放 <span class="muted section-hint">({{ qcPanorama.length }} 轮 · 问题轮标红)</span></div>
-        <el-collapse v-if="qcPanorama.length" v-model="panoActiveNames">
-          <el-collapse-item name="pano" :title="`共 ${qcPanorama.length} 轮对话`">
-            <div
-              v-for="r in qcPanorama"
-              :key="r.round"
-              class="pano-round"
-              :class="{ 'pano-problem': r.problem }"
-            >
-              <span class="pano-round-no">{{ r.round }}</span>
-              <div class="pano-text">
-                <div class="pano-customer">{{ r.customer }}</div>
-                <div class="pano-bot">
-                  {{ r.bot }}
-                  <el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag>
+          <el-tab-pane :label="`会话回放 (${qcPanorama.length})`" name="replay">
+            <template v-if="qcPanorama.length">
+              <div v-for="r in qcPanorama" :key="r.round" class="pano-round" :class="{ 'pano-problem': r.problem }">
+                <span class="pano-round-no">{{ r.round }}</span>
+                <div class="pano-text">
+                  <div class="pano-customer">{{ r.customer }}</div>
+                  <div class="pano-bot">
+                    {{ r.bot }}
+                    <el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag>
+                  </div>
                 </div>
               </div>
+            </template>
+            <div v-else class="muted qc-evi-empty">无对话记录 (可能仅被信号采集, 尚未质检)</div>
+          </el-tab-pane>
+
+          <el-tab-pane :label="`决策链 (${qcReplay?.decisions.length ?? 0})`" name="chain">
+            <DecisionChainView v-if="qcReplay?.decisions.length" :decisions="qcReplay.decisions" />
+            <div v-else class="muted qc-evi-empty">无决策记录</div>
+          </el-tab-pane>
+
+          <el-tab-pane v-if="replayState.newSessionId || replayState.running" name="diff">
+            <template #label>重放对比<el-tag v-if="replayChangedCount > 0" size="small" type="success" class="qc-tab-badge-tag">{{ replayChangedCount }} 变化</el-tag></template>
+            <div v-if="replayState.running" class="replay-progress">
+              <el-progress :percentage="replayProgressPct" :stroke-width="8" striped striped-flow status="success" />
+              <span class="muted">
+                重放中 {{ replayState.done }}/{{ replayState.total }} 轮{{ replayState.current ? ` · 正在发: ${replayState.current.slice(0, 16)}…` : "" }} · 新会话 {{ replayState.newSessionId?.slice(0, 24) }}…
+              </span>
             </div>
-          </el-collapse-item>
-        </el-collapse>
-        <div v-else class="muted">无对话记录 (可能仅被信号采集, 尚未质检)</div>
+            <template v-if="!replayState.running && replayCompare.length">
+              <div class="replay-compare-head">
+                <span>原会话 ({{ fmtTime(qcDetail.session_time) }})</span>
+                <span>重放会话 ({{ fmtTime(replayState.finishedAt) }})</span>
+              </div>
+              <div v-for="c in replayCompare" :key="c.round" class="replay-row">
+                <span class="pano-round-no" :class="{ 'is-problem': c.changed }">{{ c.round }}</span>
+                <div class="replay-cells">
+                  <div class="replay-cell">
+                    <div class="replay-customer">{{ c.customer }}</div>
+                    <div class="pano-bot">{{ c.oldBot }} <el-tag v-if="c.oldSource" size="small" type="info" class="scene-src">{{ c.oldSource }}</el-tag></div>
+                  </div>
+                  <div class="replay-cell" :class="{ 'replay-changed': c.changed }">
+                    <div class="pano-bot">{{ c.newBot || "…" }} <el-tag v-if="c.newSource" size="small" :type="c.changed ? 'success' : 'info'" class="scene-src">{{ c.newSource }}</el-tag></div>
+                  </div>
+                </div>
+              </div>
+              <div class="replay-summary">
+                <template v-if="replayChangedCount > 0">
+                  <el-tag type="success" size="small">{{ replayChangedCount }}/{{ replayCompare.length }} 轮回复变化</el-tag>
+                  已结束重放会话并触发质检 — 列表搜 <span class="session-id">{{ replayState.newSessionId }}</span> 查看新判定
+                </template>
+                <el-tag v-else type="info" size="small">回复与原会话一致</el-tag>
+              </div>
+            </template>
+          </el-tab-pane>
+        </el-tabs>
+      </div>
 
-        <!-- 决策链: 与对话审计「决策链」页签同一组件渲染, 默认收起, 点条目展开 -->
-        <div class="section-title">决策链 <span class="muted section-hint">(与对话审计一致 · 默认收起)</span></div>
-        <el-collapse v-if="qcReplay" v-model="chainActiveNames" class="qc-chain">
-          <el-collapse-item name="chain" :title="`共 ${qcReplay.decisions.length} 步决策 · 每步含解释与依据`">
-            <DecisionChainView :decisions="qcReplay.decisions" />
-          </el-collapse-item>
-        </el-collapse>
-        <div v-else class="muted">无决策记录</div>
-
-        <!-- 重放执行: 原客户消息按序重发, 修复前后逐轮对比 -->
-        <div class="section-title">重放验证 <span class="muted section-hint">(用原客户消息再走一遍当前链路)</span></div>
-        <div v-if="!replayState.running && !replayState.newSessionId" class="replay-idle">
-          <el-button size="small" type="primary" plain @click="doReplay">重放执行 ({{ qcPanorama.length }} 轮)</el-button>
-        </div>
-        <div v-else class="replay-panel">
-          <div v-if="replayState.running" class="replay-progress">
-            <el-progress :percentage="replayProgressPct" :stroke-width="8" striped striped-flow status="success" />
-            <span class="muted">
-              重放中 {{ replayState.done }}/{{ replayState.total }} 轮{{ replayState.current ? ` · 正在发: ${replayState.current.slice(0, 16)}…` : "" }} · 串行逐轮 (等回复再发下一条) · 新会话 {{ replayState.newSessionId?.slice(0, 24) }}…
+      <!-- ── 吸底行动区: 案例处置 + 工具行, 滚动不丢失 ── -->
+      <template #footer>
+        <div v-if="qcDetail" class="qc-actionbar">
+          <div class="qc-cases-head">
+            问题案例
+            <span class="muted section-hint">
+              {{ qcCases.length ? `${qcCases.length} 案 · 各自闭环` : qcDetail.verdict === "fail" ? "同题已并入既有案例组" : "无案例" }}
             </span>
           </div>
-          <template v-if="!replayState.running && replayCompare.length">
-            <div class="replay-compare-head">
-              <span>原会话 ({{ fmtTime(qcDetail.session_time) }})</span>
-              <span>重放会话 ({{ fmtTime(replayState.finishedAt) }})</span>
+          <div class="qc-cases-body">
+            <div v-if="!qcCases.length" class="muted case-empty">
+              <template v-if="qcDetail.verdict === 'fail'">判定不合格但未单独开案 — 在处置列表按问题句搜索主案例</template>
+              <template v-else>该会话无问题案例</template>
             </div>
-            <div v-for="c in replayCompare" :key="c.round" class="replay-row">
-              <span class="pano-round-no" :class="{ 'is-problem': c.changed }">{{ c.round }}</span>
-              <div class="replay-cells">
-                <div class="replay-cell">
-                  <div class="replay-customer">{{ c.customer }}</div>
-                  <div class="pano-bot">{{ c.oldBot }} <el-tag v-if="c.oldSource" size="small" type="info" class="scene-src">{{ c.oldSource }}</el-tag></div>
-                </div>
-                <div class="replay-cell" :class="{ 'replay-changed': c.changed }">
-                  <div class="pano-bot">{{ c.newBot || "…" }} <el-tag v-if="c.newSource" size="small" :type="c.changed ? 'success' : 'info'" class="scene-src">{{ c.newSource }}</el-tag></div>
-                </div>
-              </div>
+            <div v-for="c in qcCases" :key="c.id" class="qc-case-row" :class="{ 'qc-case-current': c.id === qcDetail.badcase_id }">
+              <span class="qc-case-input" :title="c.user_input">{{ (c.user_input || "").slice(0, 26) }}</span>
+              <el-tag v-if="c.human_confirmed_layer" size="small" type="success">{{ layerLabel(c.human_confirmed_layer) }}</el-tag>
+              <el-tag v-else-if="c.root_cause_layer && c.root_cause_layer !== 'uncertain' && c.fix_status !== 'pending'" size="small" type="primary">
+                {{ layerLabel(c.root_cause_layer) }}
+              </el-tag>
+              <el-select
+                v-else-if="c.fix_status === 'pending' && c.root_cause_layer"
+                :model-value="caseDraft(c.id).layer" size="small" style="width: 118px"
+                :placeholder="c.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'"
+                @update:model-value="caseDraft(c.id).layer = $event"
+              >
+                <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
+              </el-select>
+              <el-tag v-else-if="c.root_cause_layer === 'uncertain'" size="small" type="warning">待确认根因</el-tag>
+              <el-tag v-else size="small" type="info">未归因</el-tag>
+
+              <el-button
+                v-if="c.fix_status === 'pending' && c.root_cause_layer"
+                size="small" type="success" plain :loading="qcCaseActing === c.id" @click="confirmCase(c)"
+              >确认 → 修复中</el-button>
+              <el-button
+                v-if="!c.root_cause_layer || (c.root_cause_layer === 'uncertain' && c.fix_status === 'pending')"
+                size="small" :type="c.root_cause_layer ? 'primary' : 'warning'" :text="!!c.root_cause_layer" :plain="!c.root_cause_layer"
+                :loading="qcCaseActing === c.id" @click="attributeCase(c)"
+              >{{ c.root_cause_layer ? "重试归因" : "GLM 归因" }}</el-button>
+
+              <el-tag v-if="c.fix_status && c.fix_status !== 'pending'" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
+              <el-button size="small" link type="primary" @click="openBadcaseById(c.id)">处理 ›</el-button>
             </div>
-            <div class="replay-summary">
-              <template v-if="replayChangedCount > 0">
-                <el-tag type="success" size="small">{{ replayChangedCount }}/{{ replayCompare.length }} 轮回复变化</el-tag>
-                已自动结束重放会话并触发质检 — 稍后可在列表搜 <span class="session-id">{{ replayState.newSessionId }}</span> 查看新判定
+          </div>
+
+          <div class="qc-actionbar-tools">
+            <span class="muted action-hint">判定 (与案例处置正交)</span>
+            <el-dropdown :disabled="humanJudging != null" @command="doHumanVerdict">
+              <el-button size="small" type="primary" plain :loading="humanJudging != null">
+                {{ qcDetail.qc_status === "human" ? "重新人工判定" : "人工判定" }} ▾
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="pass">标记为合格</el-dropdown-item>
+                  <el-dropdown-item command="fail">标记为不合格</el-dropdown-item>
+                </el-dropdown-menu>
               </template>
-              <el-tag v-else type="info" size="small">回复与原会话一致</el-tag>
-            </div>
-          </template>
+            </el-dropdown>
+            <el-tooltip content="重跑 AI 裁判 (覆盖最新判定)" placement="top">
+              <el-button size="small" :loading="qcRescanning" @click="doRescan">AI 复检</el-button>
+            </el-tooltip>
+            <span class="qc-tools-sep"></span>
+            <el-tooltip content="原客户消息按序重发当前链路 — 修复前后对比验证" placement="top">
+              <el-button size="small" plain :disabled="replayState.running" @click="doReplay">
+                {{ replayState.running ? `重放中 ${replayState.done}/${replayState.total}` : `重放验证 (${qcPanorama.length} 轮)` }}
+              </el-button>
+            </el-tooltip>
+          </div>
         </div>
-
-        <div class="section-title">质检信息</div>
-        <el-descriptions :column="2" size="small" border>
-          <el-descriptions-item label="判定">
-            <el-tag size="small" :type="verdictType(qcDetail.verdict || '')">{{ verdictLabel(qcDetail.verdict || "") || "未质检" }}</el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="对话轮数">{{ qcDetail.turns ?? "-" }}</el-descriptions-item>
-          <el-descriptions-item label="裁判模型">{{ shortModel(qcDetail.judge_model || "") || "-" }}</el-descriptions-item>
-          <el-descriptions-item label="会话时间">{{ fmtTime(qcDetail.session_time || qcDetail.scanned_at) }}</el-descriptions-item>
-          <el-descriptions-item v-if="qcDetail.signal_source" label="案例信号" :span="2">
-            {{ signalLabel(qcDetail.signal_source) }}
-            <span v-if="qcDetail.fix_status"> · 修复状态: {{ fixStatusLabel(qcDetail.fix_status) }}</span>
-          </el-descriptions-item>
-        </el-descriptions>
-
-        <!-- 问题案例 · 逐案处置: 操作内联在案行 (多方面问题各自闭环, 互不混排) -->
-        <div class="section-title" style="margin-top: 14px">
-          问题案例
-          <span class="muted section-hint">
-            {{ qcCases.length ? `${qcCases.length} 案 · 每案独立根因与处置流转` : qcDetail.verdict === "fail" ? "同题已并入既有案例组 (30 天一案)" : "质检合格 · 无需整改" }}
-          </span>
-        </div>
-        <div v-if="!qcCases.length" class="muted case-empty" style="padding: 4px 2px">
-          <template v-if="qcDetail.verdict === 'fail'">
-            判定不合格但未单独开案 — 在处置列表按问题句搜索主案例处理
-          </template>
-          <template v-else>该会话无问题案例</template>
-        </div>
-        <div v-for="c in qcCases" :key="c.id" class="qc-case-row" :class="{ 'qc-case-current': c.id === qcDetail.badcase_id }">
-          <span class="qc-case-input" :title="c.user_input">{{ (c.user_input || "").slice(0, 26) }}</span>
-
-          <!-- 根因: 已确认/裁判明确 → 标签; 待处置 → 行内选择 (uncertain 不预填, 强制人工定层) -->
-          <el-tag v-if="c.human_confirmed_layer" size="small" type="success">{{ layerLabel(c.human_confirmed_layer) }}</el-tag>
-          <el-tag v-else-if="c.root_cause_layer && c.root_cause_layer !== 'uncertain' && c.fix_status !== 'pending'" size="small" type="primary">
-            {{ layerLabel(c.root_cause_layer) }}
-          </el-tag>
-          <el-select
-            v-else-if="c.fix_status === 'pending' && c.root_cause_layer"
-            :model-value="caseDraft(c.id).layer" size="small" style="width: 118px"
-            :placeholder="c.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'"
-            @update:model-value="caseDraft(c.id).layer = $event"
-          >
-            <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
-          </el-select>
-          <el-tag v-else-if="c.root_cause_layer === 'uncertain'" size="small" type="warning">待确认根因</el-tag>
-          <el-tag v-else size="small" type="info">未归因</el-tag>
-
-          <!-- 案内推进: 待处置 → 确认进修复; 未归因 → 行内归因; uncertain 可重试 -->
-          <el-button
-            v-if="c.fix_status === 'pending' && c.root_cause_layer"
-            size="small" type="success" plain :loading="qcCaseActing === c.id" @click="confirmCase(c)"
-          >确认 → 修复中</el-button>
-          <el-button
-            v-if="!c.root_cause_layer || (c.root_cause_layer === 'uncertain' && c.fix_status === 'pending')"
-            size="small" :type="c.root_cause_layer ? 'primary' : 'warning'" :text="!!c.root_cause_layer" :plain="!c.root_cause_layer"
-            :loading="qcCaseActing === c.id" @click="attributeCase(c)"
-          >{{ c.root_cause_layer ? "重试归因" : "GLM 归因" }}</el-button>
-
-          <el-tag v-if="c.fix_status && c.fix_status !== 'pending'" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
-          <el-button size="small" link type="primary" @click="openBadcaseById(c.id)">处理 ›</el-button>
-        </div>
-
-        <!-- 判定: 对会话质量下结论 (与案例处置正交) -->
-        <div class="qc-footer-actions">
-          <span class="muted action-hint">判定 (改判定不影响案例处置)</span>
-          <el-dropdown :disabled="humanJudging != null" @command="doHumanVerdict">
-            <el-button type="primary" plain :loading="humanJudging != null">
-              {{ qcDetail.qc_status === "human" ? "重新人工判定" : "人工判定" }} ▾
-            </el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="pass">标记为合格</el-dropdown-item>
-                <el-dropdown-item command="fail">标记为不合格</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-          <el-tooltip content="重跑 AI 裁判 (覆盖为最新 AI 判定, 用于修复效果验证)" placement="top">
-            <el-button :loading="qcRescanning" @click="doRescan">AI 复检</el-button>
-          </el-tooltip>
-        </div>
-      </div>
+      </template>
     </el-drawer>
   </div>
 </template>
@@ -736,8 +730,7 @@ async function openQcDetail(row: QcSessionRow) {
   await refreshQcCases(row.session_id)
   qcReplay.value = null
   qcReplayLoading.value = true
-  panoActiveNames.value = ["pano"]
-  chainActiveNames.value = []
+  qcEvidenceTab.value = "problems"
   replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null, current: "" }
   replayNewReplay.value = null
   try {
@@ -825,9 +818,8 @@ const qcPanorama = computed(() => {
   return rounds
 })
 
-// 会话回放默认展开 (长会话可手动收起); 决策链默认收起, 点条目标题或操作列「决策链」展开
-const panoActiveNames = ref<string[]>(["pano"])
-const chainActiveNames = ref<string[]>([])
+// 证据视图: tabs 共享空间 (问题定位默认), 重放启动后自动切对比
+const qcEvidenceTab = ref("problems")
 
 // 重放执行: 原客户消息按序重发 → 轮询完成 → 结束会话触发质检 → 前后对比
 const replayState = ref<{
@@ -876,6 +868,7 @@ async function doReplay() {
   if (!qcDetail.value || replayState.value.running) return
   replayState.value = { running: true, newSessionId: null, total: 0, done: 0, finishedAt: null, current: "" }
   replayNewReplay.value = null
+  qcEvidenceTab.value = "diff" // 启动即切对比视图, 进度与前后对照同屏
   try {
     const r = await replayQualitySession(qcDetail.value.session_id)
     replayState.value.newSessionId = r.new_session_id
@@ -1552,15 +1545,52 @@ onUnmounted(() => {
   border-radius: 6px;
   font-size: var(--fs-sm);
 }
-/* 质检详情抽屉 (问题导向) */
-.qc-summary {
-  padding: var(--space-3);
-  font-size: 14px;
-  line-height: 1.7;
-  background: var(--color-bg-page);
-  border-left: 3px solid var(--color-primary, #409eff);
+/* 质检详情抽屉 · 工作台三段式 */
+.qc-hero {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-md);
+  background: var(--color-bg-page);
+  border-left: 4px solid var(--color-text-placeholder);
+  margin-bottom: var(--space-2);
+  &--fail { border-left-color: var(--el-color-error, #f56c6c); }
+  &--warn { border-left-color: var(--el-color-warning, #e6a23c); }
+  &--pass { border-left-color: var(--el-color-success, #67c23a); }
 }
+.qc-hero-main { flex-shrink: 0; min-width: 96px; }
+.qc-hero-verdict {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  line-height: 1.2;
+}
+.qc-hero--fail .qc-hero-verdict { color: var(--el-color-error, #f56c6c); }
+.qc-hero--warn .qc-hero-verdict { color: var(--el-color-warning, #e6a23c); }
+.qc-hero--pass .qc-hero-verdict { color: var(--el-color-success, #67c23a); }
+.qc-hero-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.qc-hero-summary {
+  flex: 1;
+  align-self: center;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--color-text-primary);
+  border-left: 1px solid var(--color-border-light, #e4e7ed);
+  padding-left: var(--space-3);
+}
+.qc-evidence {
+  :deep(.el-tabs__header) { margin-bottom: 8px; }
+  :deep(.el-tabs__content) { overflow: visible; }
+  .qc-tab-badge { margin-left: 4px; transform: scale(0.85); }
+  .qc-tab-badge-tag { margin-left: 6px; }
+}
+.qc-evi-empty { padding: var(--space-6) 0; text-align: center; }
 .qc-problem {
   padding: var(--space-2) var(--space-3);
   margin-bottom: var(--space-2);
@@ -1579,31 +1609,44 @@ onUnmounted(() => {
   line-height: 1.6;
   color: var(--color-text-primary);
 }
+/* 吸底行动区: 案例处置永远在手边 */
+.qc-actionbar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.qc-cases-head {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.qc-cases-body {
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 2px 6px 2px 2px; /* 右侧留白防「处理 ›」贴边裁切 */
+}
 .qc-case-row {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 4px 8px;
+  padding: 6px 8px;
   border-radius: 6px;
   & + & { margin-top: 4px; }
   &:hover { background: var(--color-fill-light, #f5f7fa); }
   .qc-case-input { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
 }
-.qc-case-current { outline: 1px dashed var(--el-color-primary-light-5, #a0cfff); }
-.qc-actions {
+.qc-case-current { background: var(--el-color-primary-light-9, #ecf5ff); box-shadow: inset 2px 0 0 var(--el-color-primary, #409eff); }
+.qc-actionbar-tools {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--space-2);
-  margin-top: var(--space-4);
   flex-wrap: wrap;
+  border-top: 1px solid var(--color-border-light, #e4e7ed);
+  padding-top: var(--space-2);
 }
-.qc-actions-main,
-.qc-actions-judge {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
+.qc-tools-sep { flex: 1; }
 .action-hint { font-size: var(--fs-xs, 12px); }
 /* 问题轮现场还原 */
 .scene-bubble {
@@ -1663,7 +1706,6 @@ onUnmounted(() => {
 .reject-alert { margin-bottom: 12px; }
 .fix-guide { margin-top: 8px; }
 /* 重放验证 */
-.replay-idle { padding: 4px 0 8px; }
 .replay-progress { margin-bottom: 10px; }
 .replay-compare-head {
   display: grid;
