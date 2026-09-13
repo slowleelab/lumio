@@ -224,8 +224,8 @@
         <template v-if="detail.root_cause_layer">
           <div class="section-title">根因归因 <span class="muted section-hint">(裁判结论 · 可人工改判后确认)</span></div>
           <div class="attrib-row">
-            <el-select v-model="judgedLayer" size="small" style="width: 150px">
-              <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" />
+            <el-select v-model="judgedLayer" size="small" style="width: 150px" :placeholder="detail.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'">
+              <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
             </el-select>
             <el-select v-model="judgedTable" size="small" style="width: 170px" placeholder="修复分流表">
               <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key">
@@ -447,6 +447,16 @@
               v-if="qcDetail.badcase_id && (!qcDetail.root_cause_layer || qcDetail.root_cause_layer === 'uncertain')"
               plain :loading="qcAttributing" @click="doQcAttribute"
             >GLM 裁判归因{{ qcDetail.root_cause_layer === "uncertain" ? " (重试)" : " (单笔)" }}</el-button>
+            <!-- 人工定根因 · 就地闭环 (uncertain/待确认案例不必进二层抽屉) -->
+            <template v-if="qcDetail.badcase_id && qcDetail.fix_status === 'pending' && qcDetail.root_cause_layer">
+              <el-select v-model="qcJudgedLayer" size="small" style="width: 126px" :placeholder="qcDetail.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'">
+                <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
+              </el-select>
+              <el-select v-model="qcJudgedTable" size="small" style="width: 136px" placeholder="修复分流表 (可选)">
+                <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key" />
+              </el-select>
+              <el-button type="success" plain :loading="qcConfirming" @click="doQcConfirm">确认根因 → 修复中</el-button>
+            </template>
             <span v-else-if="!qcDetail.badcase_id && qcDetail.verdict === 'fail'" class="muted action-hint" title="同一问题句 30 天内只开一案, 重复出现累加出现次数 — 防同题刷屏">
               判定不合格但未单独开案 — 同题已并入既有案例组, 在处置列表按问题句搜索主案例
             </span>
@@ -621,6 +631,38 @@ async function doBatchAttribution() {
 
 // ── 单笔归因 (质检详情内直达, 不必进两层抽屉) ──
 const qcAttributing = ref(false)
+// ── 人工定根因 · 质检详情就地确认 (uncertain 案例的闭环出口) ──
+const qcJudgedLayer = ref("")
+const qcJudgedTable = ref("")
+const qcConfirming = ref(false)
+
+async function doQcConfirm() {
+  if (!qcDetail.value?.badcase_id) return
+  // uncertain 不可被"确认"为根因 — 人工确认的意义就是给出确定层
+  if (!qcJudgedLayer.value || qcJudgedLayer.value === "uncertain") {
+    ElMessage.warning("请先选择根因层 (uncertain 不能作为确认值, 人工确认就是来定层的)")
+    return
+  }
+  qcConfirming.value = true
+  try {
+    const changed = qcJudgedLayer.value !== qcDetail.value.root_cause_layer
+    await resolveBadcase(qcDetail.value.badcase_id, {
+      fix_status: "fixing",
+      human_confirmed_layer: qcJudgedLayer.value,
+      fix_table: qcJudgedTable.value || undefined,
+      note: `人工定根因${changed ? ` (改判 ${layerLabel(qcDetail.value.root_cause_layer) || "uncertain"} → ${layerLabel(qcJudgedLayer.value)})` : ""}`,
+    })
+    ElMessage.success(`根因已确认: ${layerLabel(qcJudgedLayer.value)} — 进入修复跟踪`)
+    await loadQc()
+    const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
+    if (row) qcDetail.value = row
+  } catch {
+    /* handled */
+  } finally {
+    qcConfirming.value = false
+  }
+}
+
 async function doQcAttribute() {
   if (!qcDetail.value?.badcase_id) return
   qcAttributing.value = true
@@ -644,6 +686,9 @@ async function doQcAttribute() {
 async function openQcDetail(row: QcSessionRow) {
   qcDetail.value = row
   qcDetailVisible.value = true
+  // 人工定根因初始值: 裁判明确层可改判, uncertain 强制人工选择 (不预填)
+  qcJudgedLayer.value = row.root_cause_layer && row.root_cause_layer !== "uncertain" ? row.root_cause_layer : ""
+  qcJudgedTable.value = row.fix_table || ""
   qcReplay.value = null
   qcReplayLoading.value = true
   panoActiveNames.value = ["pano"]
@@ -964,7 +1009,7 @@ function openNext() {
 
 function openDetail(row: Badcase) {
   detail.value = row
-  judgedLayer.value = row.human_confirmed_layer || row.root_cause_layer || "uncertain"
+  judgedLayer.value = row.human_confirmed_layer || (row.root_cause_layer !== "uncertain" ? row.root_cause_layer : "") || ""
   judgedTable.value = row.fix_table || ""
   detailVisible.value = true
   loadContext(row)
@@ -1182,6 +1227,11 @@ async function pollRecheck(newSid: string) {
 
 async function confirmResolve() {
   if (!detail.value) return
+  // uncertain 不可被确认为根因 — 人工确认的意义就是给出确定层
+  if (!judgedLayer.value || judgedLayer.value === "uncertain") {
+    ElMessage.warning("请先在上方「根因归因」区选择根因层 (uncertain 不能作为确认值)")
+    return
+  }
   acting.value = true
   try {
     await resolveBadcase(detail.value.id, {
