@@ -227,46 +227,58 @@ async def scan_session(
             logger.debug("qa_scan 判定写入 Redis 失败 (不阻断): session=%s", session_id)
 
     if verdict["verdict"] == "fail":
-        # 代表性问题轮: 第一个 problem 指向的轮次 (客户侧文本), 无轮次信息取首轮客户输入
+        # 一通会话可能多方面问题: 按 problem 轮次去重逐轮开案 (每案独立根因与
+        # 处置状态机; 同题 30 天去重天然防重复). 上限 3 案防长会话爆破,
+        # 其余 problems 全量挂在每案的 signal_detail 里可追溯.
+        from lumio.services.common.badcase_store import capture_badcase
+
         first_customer = next((t["content"] for t in turns if t.get("speaker") == "customer"), turns[0]["content"])
-        problem_turn = next((p.get("turn") for p in verdict["problems"] if p.get("turn")), None)
-        user_input = first_customer
-        bot_output = None
-        if problem_turn and 1 <= int(problem_turn) <= len(turns):
-            idx = int(problem_turn) - 1
-            user_input = turns[idx]["content"] if turns[idx].get("speaker") == "customer" else user_input
-            # 问题轮的客服回复 (同轮或下一轮)
+        problem_turns: list[int] = []
+        for p in verdict["problems"]:
+            t = p.get("turn")
+            try:
+                t = int(t) if t is not None else None
+            except (TypeError, ValueError):
+                t = None
+            if t and 1 <= t <= len(turns) and t not in problem_turns:
+                problem_turns.append(t)
+        if not problem_turns:
+            problem_turns = [1]  # 无轮次信息 → 首轮兜底 (与历史行为一致)
+        badcase_ids: list[str] = []
+        for turn_no in problem_turns[:3]:
+            idx = turn_no - 1
+            user_input = turns[idx]["content"] if turns[idx].get("speaker") == "customer" else first_customer
             bot_output = next(
                 (turns[j]["content"] for j in (idx, idx + 1) if j < len(turns) and turns[j].get("speaker") == "bot"),
                 None,
             )
-        from lumio.services.common.badcase_store import capture_badcase
-
-        bc = await capture_badcase(
-            session_factory,
-            trace_id=session_id,
-            session_id=session_id,
-            customer_id=None,
-            signal_source=SIGNAL_SOURCE,
-            user_input=(user_input or "")[:500],
-            bot_output=(bot_output or "")[:2000],
-            signal_detail={
-                "verdict": "fail",
-                "problems": verdict["problems"],
-                "summary": verdict["summary"],
-                "judge_model": model,
-                "source": SIGNAL_SOURCE,
-            },
-            snapshot={
-                "transcript": transcript[:1800],
-                "turns_meta": [
-                    {"speaker": t["speaker"], "intent": t.get("intent"), "src": t.get("response_source")}
-                    for t in turns[:20]
-                ],
-            },
-            session_time=session_time,
-        )
-        badcase_id = str(bc.id)
+            bc = await capture_badcase(
+                session_factory,
+                trace_id=session_id,
+                session_id=session_id,
+                customer_id=None,
+                signal_source=SIGNAL_SOURCE,
+                user_input=(user_input or "")[:500],
+                bot_output=(bot_output or "")[:2000],
+                signal_detail={
+                    "verdict": "fail",
+                    "problems": verdict["problems"],
+                    "problem_turn": turn_no,
+                    "summary": verdict["summary"],
+                    "judge_model": model,
+                    "source": SIGNAL_SOURCE,
+                },
+                snapshot={
+                    "transcript": transcript[:1800],
+                    "turns_meta": [
+                        {"speaker": t2["speaker"], "intent": t2.get("intent"), "src": t2.get("response_source")}
+                        for t2 in turns[:20]
+                    ],
+                },
+                session_time=session_time,
+            )
+            badcase_ids.append(str(bc.id))
+        badcase_id = badcase_ids[0]
     else:
         badcase_id = None
         first_customer = next((t["content"] for t in turns if t.get("speaker") == "customer"), "")
