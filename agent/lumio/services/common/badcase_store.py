@@ -639,6 +639,11 @@ async def update_fix_status(
 
     from lumio.shared.exceptions import LumioError
 
+    # uncertain 不能被"确认"为根因: 人工确认的意义就是给出确定层 —
+    # 曾有交互把默认值 uncertain 郑重落库, 归因闸门形同虚设
+    if human_confirmed_layer == "uncertain":
+        raise LumioError(code=2001, message="确认根因不能是 uncertain — 请选择具体根因层")
+
     async with session_factory() as session:
         row = await session.get(Badcase, uuid_utils.UUID(badcase_id))
         if row is None:
