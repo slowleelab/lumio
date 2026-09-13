@@ -80,7 +80,7 @@
       <div class="stat-card clickable" @click="gotoCategory('pending_review')">
         <span class="label">待复核</span>
         <span class="num warn">{{ stats?.pending_review ?? "-" }}</span>
-        <span class="hint">待人工判定会话 (问题已发现, 等人确认)</span>
+        <span class="hint">待复核会话 (问题已发现, 等人确认根因)</span>
       </div>
     </div>
 
@@ -355,7 +355,7 @@ const LAYER_LABELS: Record<string, string> = {
   layer_5: "⑤ RAG 检索",
   layer_6: "⑥ 回复生成",
   layer_7: "⑦ 风控合规",
-  uncertain: "待人工判定",
+  uncertain: "待确认根因",
 }
 const SIGNAL_LABELS: Record<string, string> = {
   negative_feedback: "负面反馈",

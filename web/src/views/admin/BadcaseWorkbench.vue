@@ -324,7 +324,7 @@
         <div class="drawer-title">
           <el-tag :type="verdictType(qcDetail?.verdict || '')" effect="dark">{{ verdictLabel(qcDetail?.verdict || "") || "未质检" }}</el-tag>
           <span class="session-id">{{ qcDetail?.session_id }}</span>
-          <el-tag v-if="qcDetail?.category === 'pending_review'" size="small" type="warning">待人工判定</el-tag>
+          <el-tag v-if="qcDetail?.category === 'pending_review'" size="small" type="warning">待复核</el-tag>
         </div>
       </template>
       <div v-if="qcDetail" class="qc-detail" v-loading="qcReplayLoading">
@@ -894,7 +894,7 @@ const LAYER_LABELS: Record<string, string> = {
   layer_5: "⑤ RAG 检索",
   layer_6: "⑥ 回复生成",
   layer_7: "⑦ 风控合规",
-  uncertain: "待人工判定",
+  uncertain: "待确认根因",
 }
 const SIGNAL_LABELS: Record<string, string> = {
   negative_feedback: "负面反馈",
