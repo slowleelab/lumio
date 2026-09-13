@@ -2,7 +2,39 @@
   <div class="badcase-page">
     <div class="page-header">
       <h2>智能质检</h2>
+      <div class="header-actions">
+        <el-tooltip placement="left" effect="light">
+          <template #content>
+            <div class="judge-tip">
+              <b>GLM-5.3-Flash 裁判 · 批量归因</b><br />
+              对全部「未归因」坏例逐条跑 LLM 裁判 (n=3 多数票),<br />
+              每条约 20-40 秒后台执行, 完成后自动刷新。<br />
+              采集落库后不会自动归因 —— 由你在此触发。
+            </div>
+          </template>
+          <el-button size="small" type="primary" plain :loading="batch.running" @click="doBatchAttribution">
+            {{ batch.running ? `GLM 裁判中 ${batch.done}/${batch.total}` : "GLM 裁判 · 批量归因待归因项" }}
+          </el-button>
+        </el-tooltip>
+      </div>
     </div>
+
+    <!-- 批量归因进度条 -->
+    <el-progress
+      v-if="batch.running"
+      :percentage="batchPct"
+      :stroke-width="10"
+      striped
+      striped-flow
+      style="margin-top: 10px"
+    >
+      <template #default>
+        <span class="batch-progress-text">
+          GLM 裁判批量归因中 {{ batch.done }}/{{ batch.total }}
+          <template v-if="batch.failed"> (失败 {{ batch.failed }})</template>
+        </span>
+      </template>
+    </el-progress>
 
     <div class="filters">
       <el-select v-model="qcFilters.category" placeholder="分类" clearable size="small" style="width: 130px" @change="reloadQc">
@@ -409,7 +441,11 @@
         <div class="qc-actions">
           <div class="qc-actions-main">
             <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
-            <span v-else-if="qcDetail.verdict === 'pass'" class="muted action-hint">质检合格 · 无问题案例, 无需整改</span>
+            <el-button
+              v-if="qcDetail.badcase_id && !qcDetail.root_cause_layer"
+              plain :loading="qcAttributing" @click="doQcAttribute"
+            >GLM 裁判归因 (单笔)</el-button>
+            <span v-else-if="!qcDetail.badcase_id && qcDetail.verdict === 'pass'" class="muted action-hint">质检合格 · 无问题案例, 无需整改</span>
           </div>
           <div class="qc-actions-judge">
             <span class="muted action-hint">判定操作</span>
@@ -442,6 +478,8 @@ import { Search } from "@element-plus/icons-vue"
 import {
   attributeBadcase,
   resolveBadcase,
+  startBatchAttribution,
+  getBatchAttributionStatus,
   expandGoldenSet,
   getBadcase,
   listQcSessions,
@@ -531,6 +569,67 @@ const qcDetail = ref<QcSessionRow | null>(null)
 const qcReplay = ref<ReplayResponse | null>(null)
 const qcReplayLoading = ref(false)
 const qcRescanning = ref(false)
+
+// ── GLM 批量归因 (后台任务轮询; 页头触发, 范围跟随当前关键字筛选) ──
+const batch = ref({
+  running: false,
+  total: 0,
+  done: 0,
+  failed: 0,
+})
+let batchTimer: ReturnType<typeof setInterval> | null = null
+
+const batchPct = computed(() => (batch.value.total > 0 ? Math.round((batch.value.done / batch.value.total) * 100) : 0))
+
+async function pollBatch() {
+  try {
+    const st = await getBatchAttributionStatus()
+    batch.value = { running: st.running, total: st.total, done: st.done, failed: st.failed }
+    if (!st.running) {
+      if (batchTimer) {
+        clearInterval(batchTimer)
+        batchTimer = null
+      }
+      if (st.total > 0) {
+        ElMessage.success(`批量归因完成: 成功 ${st.done} / 失败 ${st.failed} / 共 ${st.total}`)
+        await loadQc()
+      }
+    }
+  } catch {
+    /* handled */
+  }
+}
+
+async function doBatchAttribution() {
+  const scope: { keyword?: string } = {}
+  if (qcFilters.value.keyword) scope.keyword = qcFilters.value.keyword
+  const scopeText = Object.keys(scope).length ? " (按当前搜索范围)" : ""
+  try {
+    await startBatchAttribution(200, scope)
+    ElMessage.success(`GLM 裁判批量归因已启动${scopeText}, 每条约 20-40 秒`)
+    if (!batchTimer) batchTimer = setInterval(pollBatch, 4000)
+  } catch {
+    /* handled */
+  }
+}
+
+// ── 单笔归因 (质检详情内直达, 不必进两层抽屉) ──
+const qcAttributing = ref(false)
+async function doQcAttribute() {
+  if (!qcDetail.value?.badcase_id) return
+  qcAttributing.value = true
+  try {
+    const r = (await attributeBadcase(qcDetail.value.badcase_id)) as { root_cause_layer?: string }
+    ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
+    await loadQc()
+    const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
+    if (row) qcDetail.value = row
+  } catch {
+    /* handled */
+  } finally {
+    qcAttributing.value = false
+  }
+}
 
 async function openQcDetail(row: QcSessionRow) {
   qcDetail.value = row
@@ -1199,10 +1298,12 @@ onMounted(() => {
     qcFilters.value.category = q
   }
   loadQc()
+  pollBatch() // 恢复可能进行中的批量归因进度
 })
 onUnmounted(() => {
   if (replayTimer) clearInterval(replayTimer)
   if (recheckTimer) clearInterval(recheckTimer)
+  if (batchTimer) clearInterval(batchTimer)
 })
 </script>
 
@@ -1218,6 +1319,7 @@ onUnmounted(() => {
   margin-top: 8px;
   .tab-hint { font-size: var(--fs-xs, 11px); color: var(--color-text-placeholder); margin-left: 4px; }
 }
+.batch-progress-text { font-size: var(--fs-sm); color: var(--color-text-secondary); }
 .problem-tag { margin-right: 4px; margin-bottom: 2px; cursor: default; }
 .qa-verdict {
   display: flex;
