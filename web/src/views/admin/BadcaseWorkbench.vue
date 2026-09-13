@@ -294,7 +294,7 @@
         <div class="section-title">处理操作 <span class="muted section-hint">(按状态机流转: 待处置 → 修复中 → 已灰度 → 已上线 → 已验证; 终态不可逆)</span></div>
         <div class="action-grid">
           <!-- 主推进: 按状态机只亮当前态的合法转移 (与后端 _FIX_TRANSITIONS 同构) -->
-          <el-button v-if="!detail.root_cause_layer" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因</el-button>
+          <el-button v-if="!detail.root_cause_layer || detail.root_cause_layer === 'uncertain'" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因{{ detail.root_cause_layer === "uncertain" ? " (重试)" : "" }}</el-button>
           <el-button v-if="detail.fix_status === 'pending' && detail.root_cause_layer" size="small" type="success" :loading="acting" @click="confirmResolve">
             确认根因 → 修复中{{ detail.root_cause_layer === "uncertain" ? " (待选根因)" : "" }}
           </el-button>
@@ -444,9 +444,12 @@
           <div class="qc-actions-main">
             <el-button v-if="qcDetail.badcase_id" type="warning" plain @click="openBadcaseById(qcDetail.badcase_id!)">整改闭环</el-button>
             <el-button
-              v-if="qcDetail.badcase_id && !qcDetail.root_cause_layer"
+              v-if="qcDetail.badcase_id && (!qcDetail.root_cause_layer || qcDetail.root_cause_layer === 'uncertain')"
               plain :loading="qcAttributing" @click="doQcAttribute"
-            >GLM 裁判归因 (单笔)</el-button>
+            >GLM 裁判归因{{ qcDetail.root_cause_layer === "uncertain" ? " (重试)" : " (单笔)" }}</el-button>
+            <span v-else-if="!qcDetail.badcase_id && qcDetail.verdict === 'fail'" class="muted action-hint" title="同一问题句 30 天内只开一案, 重复出现累加出现次数 — 防同题刷屏">
+              判定不合格但未单独开案 — 同题已并入既有案例组, 在处置列表按问题句搜索主案例
+            </span>
             <span v-else-if="!qcDetail.badcase_id && qcDetail.verdict === 'pass'" class="muted action-hint">质检合格 · 无问题案例, 无需整改</span>
           </div>
           <div class="qc-actions-judge">
