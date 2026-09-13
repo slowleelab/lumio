@@ -348,13 +348,13 @@ function gotoScan() {
 }
 
 const LAYER_LABELS: Record<string, string> = {
-  layer_1: "① 预处理",
-  layer_2: "② 会话管理",
-  layer_3: "③ 意图识别",
-  layer_4: "④ 路由决策",
-  layer_5: "⑤ RAG 检索",
-  layer_6: "⑥ 回复生成",
-  layer_7: "⑦ 风控合规",
+  layer_1: "预处理",
+  layer_2: "会话管理",
+  layer_3: "意图识别",
+  layer_4: "路由决策",
+  layer_5: "RAG 检索",
+  layer_6: "回复生成",
+  layer_7: "风控合规",
   uncertain: "待确认根因",
 }
 const SIGNAL_LABELS: Record<string, string> = {

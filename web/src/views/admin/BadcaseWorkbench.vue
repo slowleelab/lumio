@@ -291,25 +291,26 @@
         </el-collapse>
         <div v-if="!detail.snapshot || !Object.keys(detail.snapshot).length" class="muted">(采集时未携带快照)</div>
 
-        <div class="section-title">处理操作 <span class="muted section-hint">(流转需填备注, 供事后追溯)</span></div>
+        <div class="section-title">处理操作 <span class="muted section-hint">(按状态机流转: 待处置 → 修复中 → 已灰度 → 已上线 → 已验证; 终态不可逆)</span></div>
         <div class="action-grid">
-          <!-- 主推进: 按当前状态只亮下一步 -->
-          <el-button v-if="!detail.root_cause_layer" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">① GLM 裁判归因</el-button>
-          <el-button v-if="detail.needs_human_review" size="small" type="success" :loading="acting" @click="confirmResolve">
-            ② 确认归因并进入修复
+          <!-- 主推进: 按状态机只亮当前态的合法转移 (与后端 _FIX_TRANSITIONS 同构) -->
+          <el-button v-if="!detail.root_cause_layer" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因</el-button>
+          <el-button v-if="detail.fix_status === 'pending' && detail.root_cause_layer" size="small" type="success" :loading="acting" @click="confirmResolve">
+            确认根因 → 修复中{{ detail.root_cause_layer === "uncertain" ? " (待选根因)" : "" }}
           </el-button>
-          <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">③ 修复完成 · 转灰度</el-button>
-          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">④ 灰度验证通过 · 正式上线</el-button>
-          <!-- 验证闭环: 重放原会话 (当前代码重新回答) → 按新判定自动流转 verified/reopened -->
+          <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">修复完成 → 已灰度</el-button>
+          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">灰度通过 → 已上线</el-button>
+          <!-- 验证闭环: 重放原会话 (当前代码重新回答) → 按新判定自动流转 已验证/已重开 -->
           <el-button
             v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
             size="small" type="primary" plain :loading="recheckState.running" @click="recheckFromBadcase"
-          >{{ recheckState.running ? `复检重放中 ${recheckState.done}/${recheckState.total || "…"}` : `${detail.fix_status === "deployed" ? "⑤" : "灰度"}复检原会话 (重放)` }}</el-button>
-          <el-button v-if="detail.fix_status === 'reopened'" size="small" type="warning" :loading="acting" @click="transition('fixing')">↩ 复检未过 · 重新修复</el-button>
+          >{{ recheckState.running ? `复检重放中 ${recheckState.done}/${recheckState.total || "…"}` : `复检原会话 (重放${detail.fix_status === "deployed" ? "" : "·灰度"})` }}</el-button>
+          <el-button v-if="detail.fix_status === 'reopened'" size="small" type="warning" :loading="acting" @click="transition('fixing')">重新修复 → 修复中</el-button>
           <!-- 次要操作 -->
           <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
           <el-button size="small" @click="gotoAudit(detail)">会话审计</el-button>
-          <el-button size="small" type="danger" plain :loading="acting" @click="rejectCase">驳回此例</el-button>
+          <el-button v-if="detail.fix_status !== 'verified' && detail.fix_status !== 'rejected'" size="small" type="danger" plain :loading="acting" @click="rejectCase">驳回 (误采集)</el-button>
+          <span v-else class="muted action-hint">终态 · 不可流转</span>
         </div>
 
         <template v-if="detail.fix_note">
@@ -892,13 +893,13 @@ async function openBadcaseById(badcaseId: string) {
 }
 
 const LAYER_LABELS: Record<string, string> = {
-  layer_1: "① 预处理",
-  layer_2: "② 会话管理",
-  layer_3: "③ 意图识别",
-  layer_4: "④ 路由决策",
-  layer_5: "⑤ RAG 检索",
-  layer_6: "⑥ 回复生成",
-  layer_7: "⑦ 风控合规",
+  layer_1: "预处理",
+  layer_2: "会话管理",
+  layer_3: "意图识别",
+  layer_4: "路由决策",
+  layer_5: "RAG 检索",
+  layer_6: "回复生成",
+  layer_7: "风控合规",
   uncertain: "待确认根因",
 }
 const SIGNAL_LABELS: Record<string, string> = {
@@ -1206,17 +1207,17 @@ async function rejectCase() {
 
 // ── 批量操作 ──
 async function batchConfirm() {
-  // uncertain 是"GLM 没把握、等人定根因"——必须单笔人工选根因, 批量确认会把
-  // "不确定"郑重确认为根因 (曾真实发生); 只批量确认 GLM 已给出明确根因的
+  // 状态机口径: 待处置 + GLM 已给出明确根因 → 可批量确认进修复;
+  // uncertain 是"等人定根因"——必须单笔进详情人工选层, 批量会把"不确定"确认为根因
   const rows = selected.value.filter(
-    (r) => r.root_cause_layer && r.root_cause_layer !== "uncertain" && r.needs_human_review,
+    (r) => r.fix_status === "pending" && r.root_cause_layer && r.root_cause_layer !== "uncertain",
   )
   const skipped = selected.value.length - rows.length
   if (!rows.length) {
     ElMessage.warning(
       skipped
-        ? `选中 ${skipped} 条均为待确认根因/已确认 — uncertain 案例需单笔进详情选根因`
-        : "选中项中没有可确认的 (需已归因且待复核)",
+        ? `选中 ${skipped} 条为待归因/待确认根因/非待处置 — uncertain 案例需单笔进详情选根因`
+        : "选中项中没有可确认的 (需待处置且已有明确根因)",
     )
     return
   }
