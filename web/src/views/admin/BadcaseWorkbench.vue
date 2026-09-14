@@ -2,39 +2,8 @@
   <div class="badcase-page">
     <div class="page-header">
       <h2>智能质检</h2>
-      <div class="header-actions">
-        <el-tooltip placement="left" effect="light">
-          <template #content>
-            <div class="judge-tip">
-              <b>GLM-5.3-Flash 裁判 · 批量归因</b><br />
-              对全部「未归因」坏例逐条跑 LLM 裁判 (n=3 多数票),<br />
-              每条约 20-40 秒后台执行, 完成后自动刷新。<br />
-              采集落库后不会自动归因 —— 由你在此触发。
-            </div>
-          </template>
-          <el-button size="small" type="primary" plain :loading="batch.running" @click="doBatchAttribution">
-            {{ batch.running ? `GLM 裁判中 ${batch.done}/${batch.total}` : "GLM 裁判 · 批量归因待归因项" }}
-          </el-button>
-        </el-tooltip>
-      </div>
     </div>
 
-    <!-- 批量归因进度条 -->
-    <el-progress
-      v-if="batch.running"
-      :percentage="batchPct"
-      :stroke-width="10"
-      striped
-      striped-flow
-      style="margin-top: 10px"
-    >
-      <template #default>
-        <span class="batch-progress-text">
-          GLM 裁判批量归因中 {{ batch.done }}/{{ batch.total }}
-          <template v-if="batch.failed"> (失败 {{ batch.failed }})</template>
-        </span>
-      </template>
-    </el-progress>
 
     <div class="filters">
       <el-select v-model="qcFilters.category" placeholder="判定" clearable size="small" style="width: 110px" @change="reloadQc">
@@ -42,15 +11,6 @@
         <el-option label="提醒级" value="warn" />
         <el-option label="不合格" value="fail" />
         <el-option label="未质检" value="unscanned" />
-      </el-select>
-      <el-select v-model="qcFilters.disposition" placeholder="处置" clearable size="small" style="width: 110px" @change="reloadQc">
-        <el-option label="待处置" value="pending" />
-        <el-option label="修复中" value="fixing" />
-        <el-option label="已灰度" value="canary" />
-        <el-option label="已上线" value="deployed" />
-        <el-option label="已验证" value="verified" />
-        <el-option label="已重开" value="reopened" />
-        <el-option label="已驳回" value="rejected" />
       </el-select>
       <el-input
         v-model="qcFilters.keyword"
@@ -63,12 +23,8 @@
         @clear="reloadQc"
       />
       <el-button size="small" @click="reloadQc">查询</el-button>
-      <el-button v-if="qcFilters.category || qcFilters.disposition || qcFilters.keyword" size="small" link @click="clearQcFilters">清除筛选</el-button>
+      <el-button v-if="qcFilters.category || qcFilters.keyword" size="small" link @click="clearQcFilters">清除筛选</el-button>
       <div class="filter-spacer"></div>
-      <template v-if="selected.length">
-        <el-button size="small" type="success" plain @click="batchConfirm">批量确认 ({{ selected.length }})</el-button>
-        <el-button size="small" type="warning" plain @click="batchTransition('fixing')">批量转修复中</el-button>
-      </template>
     </div>
 
     <el-table
@@ -80,7 +36,6 @@
       @selection-change="onSelection"
       @row-click="openQcDetail"
     >
-      <el-table-column type="selection" width="38" :selectable="(row: QcSessionRow) => !!row.badcase_id" />
       <el-table-column label="会话时间" width="150">
         <template #default="{ row }">
           <span :title="sessionTimeTitle(row)">
@@ -131,25 +86,6 @@
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="根因层" width="128">
-        <template #default="{ row }">
-          <el-tag v-if="row.human_confirmed_layer" size="small" type="success">{{ layerLabel(row.human_confirmed_layer) }}</el-tag>
-          <el-tag v-else-if="row.root_cause_layer" size="small" :type="row.root_cause_layer === 'uncertain' ? 'warning' : 'primary'">
-            {{ layerLabel(row.root_cause_layer) }}
-          </el-tag>
-          <span v-else-if="row.badcase_id" class="muted">未归因</span>
-          <span v-else class="muted">-</span>
-          <el-tooltip v-if="(row.case_count ?? 0) > 1" :content="`该会话有 ${row.case_count} 个未销项案例 (多方面问题各自闭环), 详情中逐案处理`" placement="top">
-            <el-tag size="small" type="info" effect="plain">+{{ (row.case_count ?? 1) - 1 }} 案</el-tag>
-          </el-tooltip>
-        </template>
-      </el-table-column>
-      <el-table-column label="修复状态" width="82">
-        <template #default="{ row }">
-          <el-tag v-if="row.fix_status" size="small" :type="fixStatusType(row.fix_status)">{{ fixStatusLabel(row.fix_status) }}</el-tag>
-          <span v-else class="muted">-</span>
-        </template>
-      </el-table-column>
       <el-table-column label="操作" width="70" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
@@ -171,157 +107,6 @@
       @size-change="reloadQc"
     />
 
-    <!-- 详情抽屉 -->
-    <el-drawer v-model="detailVisible" size="58%" destroy-on-close>
-      <template #header>
-        <div class="drawer-title">
-          <el-tag :type="fixStatusType(detail?.fix_status || '')" effect="dark">{{ fixStatusLabel(detail?.fix_status || "") }}</el-tag>
-          <el-tag size="small" :type="signalType(detail?.signal_source || '')">{{ signalLabel(detail?.signal_source || "") }}</el-tag>
-          <span class="muted" style="font-size: 12px">出现 {{ detail?.occurrences ?? 1 }} 次</span>
-          <el-button size="small" link :disabled="!nextIdx" @click="openNext">下一条 ›</el-button>
-        </div>
-      </template>
-      <div v-if="detail" class="detail-body">
-        <!-- 整改进度步骤条: 处置状态机一眼可见 -->
-        <el-steps :active="fixStepActive" align-center size="small" finish-status="success" class="fix-steps">
-          <el-step title="归因" :description="detail.root_cause_layer ? layerLabel(detail.root_cause_layer) : '待裁判'" />
-          <el-step title="人工确认" :description="detail.needs_human_review ? '待复核' : detail.root_cause_layer ? '已确认' : '-'" />
-          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已上线', reopened: '复检未过', rejected: '已驳回' }[detail.fix_status] || '-'" />
-          <el-step title="验证" :description="{ verified: '复检通过 · 已销项', deployed: '可复检', canary: '灰度可复检' }[detail.fix_status] || '待上线'" />
-        </el-steps>
-        <el-alert v-if="detail.fix_status === 'rejected'" type="info" :closable="false" class="reject-alert" :title="`已驳回 — ${detail.fix_note || ''}`" />
-        <el-descriptions :column="3" border size="small">
-          <el-descriptions-item label="信号源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
-          <el-descriptions-item label="出现次数">{{ detail.occurrences ?? 1 }} 次</el-descriptions-item>
-          <el-descriptions-item label="采集时间">{{ fmtTime(detail.created_at) }}</el-descriptions-item>
-          <el-descriptions-item label="会话时间">
-            <span :title="`会话最后一轮对话时间; 采集时间是信号落库/巡检时刻`">{{ fmtTime(detail.session_time) }}</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="会话">
-            <el-link type="primary" :underline="false" @click="gotoAudit(detail)">{{ detail.session_id?.slice(0, 24) }}…</el-link>
-          </el-descriptions-item>
-          <el-descriptions-item label="裁判模型">{{ detail.attribution_model || "-" }}</el-descriptions-item>
-          <el-descriptions-item label="修复状态">
-            <el-tag size="small" :type="fixStatusType(detail.fix_status)">{{ fixStatusLabel(detail.fix_status) }}</el-tag>
-          </el-descriptions-item>
-        </el-descriptions>
-
-        <div class="section-title">对话现场</div>
-        <div v-if="contextLoading" class="muted context-loading">加载会话上下文…</div>
-        <template v-else>
-          <div v-for="(m, i) in contextMessages" :key="i" class="ctx-row" :class="m.speaker === 'customer' ? 'ctx-user' : 'ctx-bot'">
-            <span class="ctx-speaker">{{ m.speaker === "customer" ? "客户" : "Bot" }}</span>
-            <span class="ctx-content">{{ m.content }}</span>
-          </div>
-          <div v-if="!contextMessages.length" class="muted">会话历史已过期 (仅存现场轮)</div>
-        </template>
-        <div class="ctx-row ctx-user highlight">
-          <span class="ctx-speaker">客户</span>
-          <span class="ctx-content">{{ detail.user_input }}</span>
-        </div>
-        <div class="ctx-row ctx-bot highlight">
-          <span class="ctx-speaker">Bot</span>
-          <span class="ctx-content">{{ detail.bot_output || "-" }}</span>
-        </div>
-
-        <template v-if="detail.root_cause_layer">
-          <div class="section-title">根因归因 <span class="muted section-hint">(裁判结论 · 可人工改判后确认)</span></div>
-          <div class="attrib-row">
-            <el-select v-model="judgedLayer" size="small" style="width: 150px" :placeholder="detail.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'">
-              <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
-            </el-select>
-            <el-select v-model="judgedTable" size="small" style="width: 170px" placeholder="修复分流表">
-              <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key">
-                <el-tooltip :content="FIX_TABLE_TIPS[key] || ''" placement="right" :disabled="!FIX_TABLE_TIPS[key]">
-                  <span>{{ label }}</span>
-                </el-tooltip>
-              </el-option>
-            </el-select>
-            <span class="muted attrib-meta">
-              {{ categoryLabel(detail.root_cause_category) }} · 置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
-            </span>
-          </div>
-          <div class="evidence">{{ detail.attribution_evidence }}</div>
-          <!-- 修复指引: 分流表 → 去哪里改什么 -->
-          <el-alert v-if="fixGuide" type="success" :closable="false" class="fix-guide">
-            <template #title>
-              修复指引 · {{ FIX_TABLE_LABELS[judgedTable || detail.fix_table || ""] || "分流表" }}:
-              {{ fixGuide.text }}
-              <el-link v-if="fixGuide.to" type="primary" :underline="false" style="margin-left: 6px" @click="router.push(fixGuide.to!)">前往处理 ›</el-link>
-            </template>
-          </el-alert>
-        </template>
-        <div v-else class="section-title muted">尚未归因 — 点击下方「GLM 裁判归因」开始 (约 20-40 秒)</div>
-
-        <!-- 质检判定 (qa_scan 采集的案例: 裁判指出的具体问题项) -->
-        <template v-if="qaVerdict">
-          <div class="section-title">
-            质检判定
-            <span class="muted section-hint">(全量质检巡检 · 与人工坐席质检同口径)</span>
-          </div>
-          <div class="qa-verdict">
-            <el-tag :type="verdictType(qaVerdict)" size="small">{{ verdictLabel(qaVerdict) }}</el-tag>
-            <span v-if="qaSummary" class="qa-summary">{{ qaSummary }}</span>
-          </div>
-          <div v-for="(p, i) in qaProblems" :key="i" class="qa-problem">
-            <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
-            <span class="qa-reason"><template v-if="p.turn">第 {{ p.turn }} 轮 · </template>{{ p.reason || "-" }}</span>
-          </div>
-        </template>
-
-        <div class="section-title">
-          采集现场快照
-          <span class="muted section-hint">(按问答链路分层展示; 原始数据可折叠查看)</span>
-        </div>
-        <el-descriptions v-if="snapRows.length" :column="2" border size="small">
-          <el-descriptions-item v-for="r in snapRows" :key="r.label" :label="r.label">{{ r.value }}</el-descriptions-item>
-        </el-descriptions>
-        <div v-if="snapTurnsMeta.length" class="turns-meta">
-          <div class="turns-meta-title">逐轮元数据 (对话走向: 每轮意图与回复来源)</div>
-          <div v-for="(t, i) in snapTurnsMeta" :key="i" class="turn-meta-row">
-            <span class="turn-idx">{{ i + 1 }}</span>
-            <span class="turn-speaker" :class="{ 'is-customer': t.speaker === 'customer' }">{{ t.speaker === "customer" ? "客户" : "Bot" }}</span>
-            <span class="turn-intent">意图: {{ t.intent || "-" }}</span>
-            <span class="turn-src">来源: {{ t.src || "-" }}</span>
-          </div>
-        </div>
-        <pre v-if="snapTranscript" class="snapshot transcript">{{ snapTranscript }}</pre>
-        <el-collapse v-if="detail.snapshot && Object.keys(detail.snapshot).length" class="raw-snap">
-          <el-collapse-item name="raw">
-            <template #title><span class="muted">查看原始快照数据 (调试用)</span></template>
-            <pre class="snapshot">{{ snapshotPretty }}</pre>
-          </el-collapse-item>
-        </el-collapse>
-        <div v-if="!detail.snapshot || !Object.keys(detail.snapshot).length" class="muted">(采集时未携带快照)</div>
-
-        <div class="section-title">处理操作 <span class="muted section-hint">(按状态机流转: 待处置 → 修复中 → 已灰度 → 已上线 → 已验证; 终态不可逆)</span></div>
-        <div class="action-grid">
-          <!-- 主推进: 按状态机只亮当前态的合法转移 (与后端 _FIX_TRANSITIONS 同构) -->
-          <el-button v-if="!detail.root_cause_layer || detail.root_cause_layer === 'uncertain'" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因{{ detail.root_cause_layer === "uncertain" ? " (重试)" : "" }}</el-button>
-          <el-button v-if="detail.fix_status === 'pending' && detail.root_cause_layer" size="small" type="success" :loading="acting" @click="confirmResolve">
-            确认根因 → 修复中{{ detail.root_cause_layer === "uncertain" ? " (待选根因)" : "" }}
-          </el-button>
-          <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">修复完成 → 已灰度</el-button>
-          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">灰度通过 → 已上线</el-button>
-          <!-- 验证闭环: 重放原会话 (当前代码重新回答) → 按新判定自动流转 已验证/已重开 -->
-          <el-button
-            v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
-            size="small" type="primary" plain :loading="recheckState.running" @click="recheckFromBadcase"
-          >{{ recheckState.running ? `复检重放中 ${recheckState.done}/${recheckState.total || "…"}` : `复检原会话 (重放${detail.fix_status === "deployed" ? "" : "·灰度"})` }}</el-button>
-          <el-button v-if="detail.fix_status === 'reopened'" size="small" type="warning" :loading="acting" @click="transition('fixing')">重新修复 → 修复中</el-button>
-          <!-- 次要操作 -->
-          <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
-          <el-button size="small" @click="gotoAudit(detail)">会话审计</el-button>
-          <el-button v-if="detail.fix_status !== 'verified' && detail.fix_status !== 'rejected'" size="small" type="danger" plain :loading="acting" @click="rejectCase">驳回 (误采集)</el-button>
-          <span v-else class="muted action-hint">终态 · 不可流转</span>
-        </div>
-
-        <template v-if="detail.fix_note">
-          <div class="section-title">最近处理记录</div>
-          <div class="fix-note">{{ detail.fix_note }} <span class="muted" v-if="detail.resolved_at">· {{ fmtTime(detail.resolved_at) }}</span></div>
-        </template>
-      </div>
-    </el-drawer>
 
     <!-- ══ 质检详情抽屉 · 工作台三段式: 结论 Hero → 证据 Tabs → 吸底行动区 ══ -->
     <el-drawer v-model="qcDetailVisible" size="58%" destroy-on-close class="qc-drawer">
@@ -349,7 +134,7 @@
         <!-- ── 证据: 三个视图共享同一空间, 切换替代滚动 ── -->
         <el-tabs v-model="qcEvidenceTab" class="qc-evidence">
           <el-tab-pane name="problems">
-            <template #label>问题定位<el-badge v-if="qcDetail.problems?.length" :value="qcDetail.problems.length" class="qc-tab-badge" /></template>
+            <template #label>质检发现<el-badge v-if="qcDetail.problems?.length" :value="qcDetail.problems.length" class="qc-tab-badge" /></template>
             <template v-if="qcDetail.problems?.length">
               <div v-for="(p, i) in qcDetail.problems" :key="i" class="qc-problem">
                 <div class="qc-problem-head">
@@ -434,29 +219,15 @@
       <!-- ── 吸底工具行: 本抽屉只核查会话质量; 案例是独立处置对象, 入口收敛为一行摘要 ── -->
       <template #footer>
         <div v-if="qcDetail" class="qc-actionbar">
-          <div class="qc-cases-digest" @click="qcCasesExpanded = !qcCasesExpanded">
-            <template v-if="qcCases.length">
-              <span class="qc-cases-digest-main">问题案例 {{ qcCases.length }} 案</span>
-              <span class="muted">
-                {{ qcCaseDigest }}
-              </span>
-              <el-icon class="qc-cases-arrow" :class="{ open: qcCasesExpanded }"><ArrowRight /></el-icon>
+          <div class="qc-cases-digest">
+            <template v-if="(qcDetail.case_count ?? 0) > 0">
+              <span class="qc-cases-digest-main">问题已立案 {{ qcDetail.case_count }} 项</span>
+              <el-link type="primary" :underline="false" @click="router.push({ path: '/admin/cases', query: { keyword: qcDetail.session_id } })">去案例工作台 ›</el-link>
             </template>
             <template v-else-if="qcDetail.verdict === 'fail'">
-              <span class="muted">判定不合格但未单独开案 — 同题已并入既有案例组 (30 天一案)</span>
+              <span class="muted">判定不合格但未单独开案 — 同题已并入既有案例组 (30 天一案), 可在案例工作台按问题句搜索</span>
             </template>
             <template v-else><span class="muted">质检合格 · 无问题案例</span></template>
-          </div>
-          <div v-if="qcCasesExpanded" class="qc-cases-body">
-            <div v-for="c in qcCases" :key="c.id" class="qc-case-row" :class="{ 'qc-case-current': c.id === qcDetail.badcase_id }">
-              <span class="qc-case-input" :title="c.user_input">{{ (c.user_input || "").slice(0, 26) }}</span>
-              <el-tag v-if="c.human_confirmed_layer" size="small" type="success">{{ layerLabel(c.human_confirmed_layer) }}</el-tag>
-              <el-tag v-else-if="c.root_cause_layer === 'uncertain'" size="small" type="warning">待确认根因</el-tag>
-              <el-tag v-else-if="c.root_cause_layer" size="small" type="primary">{{ layerLabel(c.root_cause_layer) }}</el-tag>
-              <el-tag v-else size="small" type="info">未归因</el-tag>
-              <el-tag v-if="c.fix_status" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
-              <el-button size="small" link type="primary" @click="openBadcaseById(c.id)">处理 ›</el-button>
-            </div>
           </div>
 
           <div class="qc-actionbar-tools">
@@ -494,20 +265,12 @@ import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { ArrowRight, Search } from "@element-plus/icons-vue"
 import {
-  attributeBadcase,
-  listBadcases,
-  resolveBadcase,
-  startBatchAttribution,
-  getBatchAttributionStatus,
-  expandGoldenSet,
-  getBadcase,
   listQcSessions,
   rescanQualitySession,
   replayQualitySession,
   getReplayStatus,
   humanVerdictQualitySession,
   type QcSessionRow,
-  type Badcase,
   type QualityProblem,
 } from "@/api/closedLoop"
 import { getConversationReplay, type ReplayResponse } from "@/api/console"
@@ -523,7 +286,7 @@ const qcTotal = ref(0)
 const qcPage = ref(1)
 const qcPageSize = ref(50)
 const qcLoading = ref(false)
-const qcFilters = ref<{ category: string; disposition: string; keyword: string }>({ category: "", disposition: "", keyword: "" })
+const qcFilters = ref<{ category: string; keyword: string }>({ category: "", keyword: "" })
 const selected = ref<QcSessionRow[]>([])
 
 async function loadQc() {
@@ -531,7 +294,6 @@ async function loadQc() {
   try {
     const res = await listQcSessions({
       category: qcFilters.value.category || undefined,
-      disposition: qcFilters.value.disposition || undefined,
       keyword: qcFilters.value.keyword || undefined,
       limit: qcPageSize.value,
       offset: (qcPage.value - 1) * qcPageSize.value,
@@ -551,7 +313,7 @@ function reloadQc() {
 }
 
 function clearQcFilters() {
-  qcFilters.value = { category: "", disposition: "", keyword: "" }
+  qcFilters.value = { category: "", keyword: "" }
   reloadQc()
 }
 
@@ -579,10 +341,6 @@ function problemLabel(t?: string) {
   return t ? (PROBLEM_LABELS[t] ?? t) : "-"
 }
 
-function gotoAuditSession(sessionId: string) {
-  router.push({ path: "/admin/audit", query: { session_id: sessionId } })
-}
-
 // 质检记录行点击: fail 且已采入闭环 → 打开对应问题案例; 否则跳会话回放
 const qcDetailVisible = ref(false)
 const qcDetail = ref<QcSessionRow | null>(null)
@@ -590,84 +348,10 @@ const qcReplay = ref<ReplayResponse | null>(null)
 const qcReplayLoading = ref(false)
 const qcRescanning = ref(false)
 
-// ── GLM 批量归因 (后台任务轮询; 页头触发, 范围跟随当前关键字筛选) ──
-const batch = ref({
-  running: false,
-  total: 0,
-  done: 0,
-  failed: 0,
-})
-let batchTimer: ReturnType<typeof setInterval> | null = null
-
-const batchPct = computed(() => (batch.value.total > 0 ? Math.round((batch.value.done / batch.value.total) * 100) : 0))
-
-async function pollBatch() {
-  try {
-    const st = await getBatchAttributionStatus()
-    batch.value = { running: st.running, total: st.total, done: st.done, failed: st.failed }
-    if (!st.running) {
-      if (batchTimer) {
-        clearInterval(batchTimer)
-        batchTimer = null
-      }
-      if (st.total > 0) {
-        ElMessage.success(`批量归因完成: 成功 ${st.done} / 失败 ${st.failed} / 共 ${st.total}`)
-        await loadQc()
-      }
-    }
-  } catch {
-    /* handled */
-  }
-}
-
-async function doBatchAttribution() {
-  const scope: { keyword?: string } = {}
-  if (qcFilters.value.keyword) scope.keyword = qcFilters.value.keyword
-  const scopeText = Object.keys(scope).length ? " (按当前搜索范围)" : ""
-  try {
-    await startBatchAttribution(200, scope)
-    ElMessage.success(`GLM 裁判批量归因已启动${scopeText}, 每条约 20-40 秒`)
-    if (!batchTimer) batchTimer = setInterval(pollBatch, 4000)
-  } catch {
-    /* handled */
-  }
-}
-
-// ── 质检详情 · 案例摘要行 (本抽屉只核查会话质量, 处置操作在案例抽屉) ──
-const qcCases = ref<Badcase[]>([])
-const qcCasesExpanded = ref(false)
-const qcCaseDigest = computed(() => {
-  const parts: string[] = []
-  const unattributed = qcCases.value.filter((c) => !c.root_cause_layer).length
-  const uncertain = qcCases.value.filter((c) => c.root_cause_layer === "uncertain").length
-  const pending = qcCases.value.filter((c) => c.fix_status === "pending").length - unattributed - uncertain
-  const byStatus = new Map<string, number>()
-  for (const c of qcCases.value) {
-    if (c.fix_status && c.fix_status !== "pending") byStatus.set(c.fix_status, (byStatus.get(c.fix_status) ?? 0) + 1)
-  }
-  if (unattributed) parts.push(`${unattributed} 未归因`)
-  if (uncertain) parts.push(`${uncertain} 待确认根因`)
-  if (pending > 0) parts.push(`${pending} 待确认`)
-  for (const [st, n] of byStatus) parts.push(`${n} ${fixStatusLabel(st)}`)
-  return parts.join(" · ") || "全部待处置"
-})
-
-async function refreshQcCases(sessionId: string) {
-  try {
-    const r = await listBadcases({ session_id: sessionId, limit: 20 })
-    qcCases.value = r.badcases ?? []
-  } catch {
-    /* handled */
-  }
-}
-
 async function openQcDetail(row: QcSessionRow) {
   qcDetail.value = row
   qcDetailVisible.value = true
   // 一通会话可能多方面问题 → 多案例: 拉全量供逐案处置
-  qcCases.value = []
-  qcCasesExpanded.value = false
-  await refreshQcCases(row.session_id)
   qcReplay.value = null
   qcReplayLoading.value = true
   qcEvidenceTab.value = "problems"
@@ -913,400 +597,6 @@ async function doRescan() {
   }
 }
 
-async function openBadcaseById(badcaseId: string) {
-  try {
-    const bc = await getBadcase(badcaseId)
-    if (bc) openDetail(bc)
-  } catch {
-    /* handled */
-  }
-}
-
-const LAYER_LABELS: Record<string, string> = {
-  layer_1: "预处理",
-  layer_2: "会话管理",
-  layer_3: "意图识别",
-  layer_4: "路由决策",
-  layer_5: "RAG 检索",
-  layer_6: "回复生成",
-  layer_7: "风控合规",
-  uncertain: "待确认根因",
-}
-const SIGNAL_LABELS: Record<string, string> = {
-  negative_feedback: "负面反馈",
-  transfer: "转人工",
-  agent_revoke: "人工撤回",
-  behavior_anomaly: "行为异常",
-  compliance_alert: "合规告警",
-  qa_scan: "质检巡检",
-}
-const CATEGORY_LABELS: Record<string, string> = {
-  semantic: "语义误判",
-  knowledge: "知识缺口",
-  process: "流程缺陷",
-  coverage: "覆盖不足",
-  uncertain: "待定",
-}
-const FIX_TABLE_LABELS: Record<string, string> = {
-  A_knowledge: "A · 知识库",
-  B_intent: "B · 意图库",
-  C_rule: "C · 规则",
-  D_model: "D · 模型",
-  none: "无需修复",
-}
-
-// ── 列表 ──
-function onSelection(rows: QcSessionRow[]) {
-  // 批量操作作用于问题案例: 行携带 badcase_id 才可选 (模板 :selectable 已限)
-  selected.value = rows.filter((r) => r.badcase_id)
-}
-function fixTableFor(_row: QcSessionRow): string | undefined {
-  return undefined // 统一行不携带分流表; 后端 resolve 按根因层自动落表
-}
-
-
-// ── 详情抽屉 ──
-const detailVisible = ref(false)
-const detail = ref<Badcase | null>(null)
-const judgedLayer = ref("")
-const judgedTable = ref("")
-const acting = ref(false)
-const contextMessages = ref<{ speaker: string; content: string }[]>([])
-const contextLoading = ref(false)
-
-const nextIdx = computed(() => {
-  if (!detail.value) return null
-  const i = qcRows.value.findIndex((b) => b.badcase_id === detail.value!.id)
-  return i >= 0 && i < qcRows.value.length - 1 ? i + 1 : null
-})
-
-function openNext() {
-  const row = qcRows.value[nextIdx.value!]
-  if (row?.badcase_id) openBadcaseById(row.badcase_id)
-}
-
-function openDetail(row: Badcase) {
-  detail.value = row
-  judgedLayer.value = row.human_confirmed_layer || (row.root_cause_layer !== "uncertain" ? row.root_cause_layer : "") || ""
-  judgedTable.value = row.fix_table || ""
-  detailVisible.value = true
-  loadContext(row)
-}
-
-async function loadContext(row: Badcase) {
-  contextMessages.value = []
-  contextLoading.value = true
-  try {
-    // 管理端会话回放接口 (此前误调客户侧 /sessions/*: admin token + 已归档会话下 404)
-    const { getConversationReplay } = await import("@/api/console")
-    const r = await getConversationReplay(row.session_id)
-    const all: { speaker: string; content: string }[] = (r.turns ?? []).map((t) => ({
-      speaker: t.speaker,
-      content: t.content,
-    }))
-    // 只显示现场轮之前的上文 (最后两条是本坏例现场, 模板里高亮单独渲染)
-    contextMessages.value = all.slice(0, -2).slice(-4)
-  } catch {
-    contextMessages.value = [] // 会话已归档/过期时静默降级, 仅显示现场轮
-  } finally {
-    contextLoading.value = false
-  }
-}
-
-const snapshotPretty = computed(() => {
-  const snap = detail.value?.snapshot
-  return snap && Object.keys(snap).length ? JSON.stringify(snap, null, 2) : "(采集时未携带快照)"
-})
-
-// ── 快照中文分层对照: 采集时的链路状态字段 → 人话 ──
-const SNAP_FIELD_LABELS: Record<string, string> = {
-  intent: "命中意图",
-  confidence: "意图置信度",
-  traffic_class: "流量分类",
-  response_source: "回复来源",
-  rag_hit: "RAG 检索",
-  context_len: "上下文轮数",
-  guard_reason: "护栏动作",
-  stage_detail: "阶段明细",
-}
-function snapFieldValue(key: string, v: unknown): string {
-  if (key === "confidence") return typeof v === "number" ? `${Math.round(v * 100)}%` : String(v ?? "-")
-  if (key === "rag_hit") return v ? "已命中知识库/工具" : "未命中"
-  if (v == null || v === "") return "-"
-  return typeof v === "object" ? JSON.stringify(v) : String(v)
-}
-const snapRows = computed(() => {
-  const snap = detail.value?.snapshot
-  if (!snap) return []
-  const rows: { label: string; value: string }[] = []
-  for (const [key, label] of Object.entries(SNAP_FIELD_LABELS)) {
-    if (key in snap) rows.push({ label, value: snapFieldValue(key, snap[key]) })
-  }
-  // 未收录的标量字段也照常显示 (兜底, 防止新增字段被吞)
-  for (const [key, v] of Object.entries(snap)) {
-    if (key in SNAP_FIELD_LABELS || key === "transcript" || key === "turns_meta") continue
-    if (typeof v !== "object") rows.push({ label: key, value: snapFieldValue(key, v) })
-  }
-  return rows
-})
-const snapTurnsMeta = computed(() => {
-  const meta = detail.value?.snapshot?.turns_meta
-  return Array.isArray(meta) ? (meta as { speaker: string; intent?: string; src?: string }[]) : []
-})
-const snapTranscript = computed(() => {
-  const t = detail.value?.snapshot?.transcript
-  return typeof t === "string" && t.trim() ? t : ""
-})
-
-// ── 质检判定 (qa_scan 采集的案例: signal_detail 里裁判结论) ──
-const qaDetail = computed(() => detail.value?.signal_detail as { verdict?: string; summary?: string; problems?: QualityProblem[] } | null)
-const qaVerdict = computed(() => qaDetail.value?.verdict ?? "")
-const qaSummary = computed(() => qaDetail.value?.summary ?? "")
-const qaProblems = computed<QualityProblem[]>(() => qaDetail.value?.problems ?? [])
-
-async function refreshAfterAction(msg: string) {
-  ElMessage.success(msg)
-  detailVisible.value = false
-  await loadQc()
-}
-
-async function runAttribution(row: Badcase) {
-  acting.value = true
-  try {
-    const r = (await attributeBadcase(row.id)) as { root_cause_layer?: string; needs_human_review?: boolean }
-    if (r.root_cause_layer === "uncertain") {
-      ElMessage.warning("归因完成: 裁判证据不足 — 常见于问题轮无决策链中间产物, 请人工定根因", { duration: 7000 })
-    } else {
-      ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
-    }
-    await loadQc()
-    if (detailVisible.value && detail.value?.id === row.id) {
-      const fresh = await getBadcase(row.id)
-      if (fresh) openDetail(fresh)
-    }
-  } catch {
-    /* handled */
-  } finally {
-    acting.value = false
-  }
-}
-
-// 整改进度步骤条: 0 归因 → 1 确认 → 2 修复(含灰度) → 3 验证
-const fixStepActive = computed(() => {
-  const d = detail.value
-  if (!d) return 0
-  if (d.fix_status === "verified") return 4
-  if (d.fix_status === "deployed" || d.fix_status === "canary") return 3
-  if (d.fix_status === "canary") return 3
-  if (d.fix_status === "fixing") return 2
-  if (d.root_cause_layer && !d.needs_human_review) return 2
-  if (d.root_cause_layer) return 1
-  return 0
-})
-
-// 分流表说明 (下拉 tooltip) 与修复指引 (去哪里改什么)
-const FIX_TABLE_TIPS: Record<string, string> = {
-  A_knowledge: "知识缺口/检索不命中 → 补知识内容",
-  B_intent: "意图/语义误判 → 意图库与种子语料",
-  C_rule: "规则/路由/会话配置 → 规则与映射表",
-  D_model: "生成幻觉/Prompt 失效 → 提示词与模型",
-  none: "无需改表 (流程/工程问题)",
-}
-const FIX_TABLE_GUIDES: Record<string, { text: string; to?: string }> = {
-  A_knowledge: { text: "到 FAQ 管理补标准问答对, 或在文档管理补充知识文档并重新摄入", to: "/admin/faq" },
-  B_intent: { text: "到意图库管理页维护规则词/种子语料, 重跑评测闸门后激活", to: "/admin/intent-library" },
-  C_rule: { text: "核对意图注册表与流量分类映射 (归并表), 走代码评审", to: "/admin/intent-library" },
-  D_model: { text: "调整回复生成系统提示词与出站闸门话术, 走代码评审", to: "" },
-  none: { text: "流程或工程问题, 在代码/配置侧定位处理", to: "" },
-}
-const fixGuide = computed(() => {
-  const key = judgedTable.value || detail.value?.fix_table || ""
-  return FIX_TABLE_GUIDES[key] ?? null
-})
-
-// 流转带备注 (供 fix_note 追溯)
-async function transition(status: string) {
-  if (!detail.value) return
-  let note = ""
-  try {
-    const r = await ElMessageBox.prompt("流转备注 (可选, 默认状态名):", `流转 → ${fixStatusLabel(status)}`, {
-      inputPlaceholder: "如: 已补 FAQ 词条 / 种子语料已重训",
-      inputValue: "",
-    })
-    note = (r.value || "").trim()
-  } catch {
-    return /* 取消 */
-  }
-  acting.value = true
-  try {
-    await resolveBadcase(detail.value.id, {
-      fix_status: status,
-      note: note ? `${fixStatusLabel(status)} · ${note}` : `状态流转 → ${fixStatusLabel(status)}`,
-    })
-    await refreshAfterAction(`已${fixStatusLabel(status)}`)
-  } catch {
-    /* handled */
-  } finally {
-    acting.value = false
-  }
-}
-
-// 复检 (从整改闭环侧验证修复效果): 重放 = 当前代码重新回答原会话全部问题。
-// rescan 只是对原对话历史重新打分 — bot 回答是历史固定的, 验证不了修复本身。
-// 重放完成 (status=done 时自动质检已落库) → 按新会话判定自动流转:
-// pass/warn → verified (验证通过, 销项); fail → reopened (打回重修)。
-const recheckState = ref({ running: false, done: 0, total: 0 })
-let recheckTimer: ReturnType<typeof setInterval> | null = null
-
-async function recheckFromBadcase() {
-  if (!detail.value?.session_id) return
-  recheckState.value = { running: true, done: 0, total: 0 }
-  try {
-    const r = await replayQualitySession(detail.value.session_id)
-    recheckState.value.total = r.total_rounds
-    if (!recheckTimer) recheckTimer = setInterval(() => void pollRecheck(r.new_session_id), 2000)
-  } catch {
-    ElMessage.error("复检 (重放) 启动失败")
-    recheckState.value.running = false
-  }
-}
-
-async function pollRecheck(newSid: string) {
-  try {
-    const st = await getReplayStatus(newSid)
-    recheckState.value.done = st.done
-    if (st.status === "running") return
-    if (recheckTimer) {
-      clearInterval(recheckTimer)
-      recheckTimer = null
-    }
-    recheckState.value.running = false
-    if (st.status !== "done" || st.error) {
-      ElMessage.warning(`复检未完成: ${st.error || "重放中断"} — 案例状态未变, 可稍后重试`)
-      return
-    }
-    const res = await listQcSessions({ keyword: newSid, limit: 1 })
-    const verdict = res.sessions?.[0]?.verdict || ""
-    if (!verdict) {
-      ElMessage.warning("复检重放完成但新会话尚未出质检判定, 稍后可查看新会话手动流转")
-      return
-    }
-    const ok = verdict === "pass" || verdict === "warn"
-    await resolveBadcase(detail.value!.id, {
-      fix_status: ok ? "verified" : "reopened",
-      note: `复检重放 ${newSid}: ${verdictLabel(verdict)} — ${ok ? "验证通过, 销项" : "未通过, 打回重修"}`,
-    })
-    ElMessage[ok ? "success" : "warning"](`复检 ${verdictLabel(verdict)} — 已自动${ok ? "销项 (已验证)" : "打回 (已重开)"}`)
-    await refreshAfterAction(ok ? "复检通过, 案例已验证" : "复检未通过, 案例已重开")
-  } catch {
-    /* handled */
-  }
-}
-
-async function confirmResolve() {
-  if (!detail.value) return
-  // uncertain 不可被确认为根因 — 人工确认的意义就是给出确定层
-  if (!judgedLayer.value || judgedLayer.value === "uncertain") {
-    ElMessage.warning("请先在上方「根因归因」区选择根因层 (uncertain 不能作为确认值)")
-    return
-  }
-  acting.value = true
-  try {
-    await resolveBadcase(detail.value.id, {
-      fix_status: "fixing",
-      fix_table: judgedTable.value || detail.value.fix_table || undefined,
-      human_confirmed_layer: judgedLayer.value,
-      note: `人工确认${judgedLayer.value !== detail.value.root_cause_layer ? " (改判)" : ""}`,
-    })
-    await refreshAfterAction("归因已确认，进入修复跟踪")
-  } catch {
-    /* handled */
-  } finally {
-    acting.value = false
-  }
-}
-
-async function rejectCase() {
-  if (!detail.value) return
-  try {
-    const { value } = await ElMessageBox.prompt("驳回原因 (必填):", "驳回坏例", { inputPlaceholder: "如: 误采集 / 重复提交" })
-    if (!value.trim()) {
-      ElMessage.warning("驳回需填原因")
-      return
-    }
-    acting.value = true
-    await resolveBadcase(detail.value.id, { fix_status: "rejected", note: `驳回: ${value}` })
-    await refreshAfterAction("已驳回")
-  } catch {
-    return
-  } finally {
-    acting.value = false
-  }
-}
-
-// ── 批量操作 ──
-async function batchConfirm() {
-  // 状态机口径: 待处置 + GLM 已给出明确根因 → 可批量确认进修复;
-  // uncertain 是"等人定根因"——必须单笔进详情人工选层, 批量会把"不确定"确认为根因
-  const rows = selected.value.filter(
-    (r) => r.fix_status === "pending" && r.root_cause_layer && r.root_cause_layer !== "uncertain",
-  )
-  const skipped = selected.value.length - rows.length
-  if (!rows.length) {
-    ElMessage.warning(
-      skipped
-        ? `选中 ${skipped} 条为待归因/待确认根因/非待处置 — uncertain 案例需单笔进详情选根因`
-        : "选中项中没有可确认的 (需待处置且已有明确根因)",
-    )
-    return
-  }
-  try {
-    await ElMessageBox.confirm(`将 ${rows.length} 条按机器归因结果批量确认进入修复？`, "批量确认", { type: "warning" })
-  } catch {
-    return
-  }
-  let ok = 0
-  for (const r of rows) {
-    try {
-      await resolveBadcase(r.badcase_id!, { fix_status: "fixing", fix_table: fixTableFor(r), human_confirmed_layer: r.root_cause_layer!, note: "批量确认" })
-      ok++
-    } catch {
-      /* skip */
-    }
-  }
-  ElMessage.success(`批量确认完成: ${ok}/${rows.length}`)
-  await loadQc()
-}
-
-async function batchTransition(status: string) {
-  const rows = selected.value
-  if (!rows.length) return
-  let ok = 0
-  for (const r of rows) {
-    try {
-      await resolveBadcase(r.badcase_id!, { fix_status: status, note: "批量流转" })
-      ok++
-    } catch {
-      /* skip */
-    }
-  }
-  ElMessage.success(`批量流转完成: ${ok}/${rows.length}`)
-  await loadQc()
-}
-
-async function addToGolden(row: Badcase) {
-  try {
-    const r = await expandGoldenSet([row.user_input])
-    ElMessage.success(`金标扩充完成: 生成 ${r.variants.length} 条变体`)
-  } catch {
-    /* handled */
-  }
-}
-
-function gotoAudit(row: Badcase) {
-  gotoAuditSession(row.session_id)
-}
-
 // ── 展示工具 ──
 function signalType(s: string): string {
   const m: Record<string, string> = {
@@ -1348,22 +638,13 @@ function fmtTime(iso?: string | null) {
 onMounted(() => {
   // 报表卡片跳转带入筛选: 判定域 query.category (兼容旧值 pending_review → 处置待处置) + 处置域 query.disposition
   const q = route.query.category as string | undefined
-  if (q === "pending_review") {
-    qcFilters.value.disposition = "pending"
-  } else if (q && ["pass", "warn", "fail", "unscanned"].includes(q)) {
+  if (q && ["pass", "warn", "fail", "unscanned"].includes(q)) {
     qcFilters.value.category = q
   }
-  const d = route.query.disposition as string | undefined
-  if (d && ["pending", "fixing", "canary", "deployed", "verified", "reopened", "rejected"].includes(d)) {
-    qcFilters.value.disposition = d
-  }
   loadQc()
-  pollBatch() // 恢复可能进行中的批量归因进度
 })
 onUnmounted(() => {
   if (replayTimer) clearInterval(replayTimer)
-  if (recheckTimer) clearInterval(recheckTimer)
-  if (batchTimer) clearInterval(batchTimer)
 })
 </script>
 

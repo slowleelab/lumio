@@ -19,6 +19,10 @@
           <el-icon><DataAnalysis /></el-icon>
           <template #title>智能质检</template>
         </el-menu-item>
+        <el-menu-item index="/admin/cases">
+          <el-icon><Tickets /></el-icon>
+          <template #title>案例工作台</template>
+        </el-menu-item>
         <el-menu-item index="/admin/intent-library">
           <el-icon><Notebook /></el-icon>
           <template #title>意图库管理</template>
@@ -91,6 +95,7 @@ import {
   TrendCharts,
   PieChart,
   DataAnalysis,
+  Tickets,
   Notebook,
   VideoPlay,
   Back,

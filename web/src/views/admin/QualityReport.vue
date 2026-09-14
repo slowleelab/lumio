@@ -77,7 +77,7 @@
         <span class="num danger">{{ coverage?.by_verdict?.fail ?? "-" }}</span>
         <span class="hint">另有提醒级 {{ coverage?.by_verdict?.warn ?? 0 }} (轻问题, 不合格另计)</span>
       </div>
-      <div class="stat-card clickable" @click="gotoCategory('pending', 'disposition')">
+      <div class="stat-card clickable" @click="router.push({ path: '/admin/cases', query: { fix_status: 'pending' } })">
         <span class="label">待处置</span>
         <span class="num warn">{{ stats?.pending_review ?? "-" }}</span>
         <span class="hint">问题案例待归因/待确认根因 (根因 uncertain 需单笔人工确认)</span>
