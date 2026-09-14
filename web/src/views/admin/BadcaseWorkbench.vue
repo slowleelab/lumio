@@ -431,48 +431,30 @@
         </el-tabs>
       </div>
 
-      <!-- ── 吸底行动区: 案例处置 + 工具行, 滚动不丢失 ── -->
+      <!-- ── 吸底工具行: 本抽屉只核查会话质量; 案例是独立处置对象, 入口收敛为一行摘要 ── -->
       <template #footer>
         <div v-if="qcDetail" class="qc-actionbar">
-          <div class="qc-cases-head">
-            问题案例
-            <span class="muted section-hint">
-              {{ qcCases.length ? `${qcCases.length} 案 · 各自闭环` : qcDetail.verdict === "fail" ? "同题已并入既有案例组" : "无案例" }}
-            </span>
+          <div class="qc-cases-digest" @click="qcCasesExpanded = !qcCasesExpanded">
+            <template v-if="qcCases.length">
+              <span class="qc-cases-digest-main">问题案例 {{ qcCases.length }} 案</span>
+              <span class="muted">
+                {{ qcCaseDigest }}
+              </span>
+              <el-icon class="qc-cases-arrow" :class="{ open: qcCasesExpanded }"><ArrowRight /></el-icon>
+            </template>
+            <template v-else-if="qcDetail.verdict === 'fail'">
+              <span class="muted">判定不合格但未单独开案 — 同题已并入既有案例组 (30 天一案)</span>
+            </template>
+            <template v-else><span class="muted">质检合格 · 无问题案例</span></template>
           </div>
-          <div class="qc-cases-body">
-            <div v-if="!qcCases.length" class="muted case-empty">
-              <template v-if="qcDetail.verdict === 'fail'">判定不合格但未单独开案 — 在处置列表按问题句搜索主案例</template>
-              <template v-else>该会话无问题案例</template>
-            </div>
+          <div v-if="qcCasesExpanded" class="qc-cases-body">
             <div v-for="c in qcCases" :key="c.id" class="qc-case-row" :class="{ 'qc-case-current': c.id === qcDetail.badcase_id }">
               <span class="qc-case-input" :title="c.user_input">{{ (c.user_input || "").slice(0, 26) }}</span>
               <el-tag v-if="c.human_confirmed_layer" size="small" type="success">{{ layerLabel(c.human_confirmed_layer) }}</el-tag>
-              <el-tag v-else-if="c.root_cause_layer && c.root_cause_layer !== 'uncertain' && c.fix_status !== 'pending'" size="small" type="primary">
-                {{ layerLabel(c.root_cause_layer) }}
-              </el-tag>
-              <el-select
-                v-else-if="c.fix_status === 'pending' && c.root_cause_layer"
-                :model-value="caseDraft(c.id).layer" size="small" style="width: 118px"
-                :placeholder="c.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'"
-                @update:model-value="caseDraft(c.id).layer = $event"
-              >
-                <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
-              </el-select>
               <el-tag v-else-if="c.root_cause_layer === 'uncertain'" size="small" type="warning">待确认根因</el-tag>
+              <el-tag v-else-if="c.root_cause_layer" size="small" type="primary">{{ layerLabel(c.root_cause_layer) }}</el-tag>
               <el-tag v-else size="small" type="info">未归因</el-tag>
-
-              <el-button
-                v-if="c.fix_status === 'pending' && c.root_cause_layer"
-                size="small" type="success" plain :loading="qcCaseActing === c.id" @click="confirmCase(c)"
-              >确认 → 修复中</el-button>
-              <el-button
-                v-if="!c.root_cause_layer || (c.root_cause_layer === 'uncertain' && c.fix_status === 'pending')"
-                size="small" :type="c.root_cause_layer ? 'primary' : 'warning'" :text="!!c.root_cause_layer" :plain="!c.root_cause_layer"
-                :loading="qcCaseActing === c.id" @click="attributeCase(c)"
-              >{{ c.root_cause_layer ? "重试归因" : "GLM 归因" }}</el-button>
-
-              <el-tag v-if="c.fix_status && c.fix_status !== 'pending'" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
+              <el-tag v-if="c.fix_status" size="small" :type="fixStatusType(c.fix_status)">{{ fixStatusLabel(c.fix_status) }}</el-tag>
               <el-button size="small" link type="primary" @click="openBadcaseById(c.id)">处理 ›</el-button>
             </div>
           </div>
@@ -510,7 +492,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
-import { Search } from "@element-plus/icons-vue"
+import { ArrowRight, Search } from "@element-plus/icons-vue"
 import {
   attributeBadcase,
   listBadcases,
@@ -651,73 +633,31 @@ async function doBatchAttribution() {
   }
 }
 
-// ── 质检详情 · 问题案例逐案处置 (操作内联在案行, 不再堆顶部工具栏) ──
+// ── 质检详情 · 案例摘要行 (本抽屉只核查会话质量, 处置操作在案例抽屉) ──
 const qcCases = ref<Badcase[]>([])
-const qcCaseActing = ref<string | null>(null) // 正在操作的案 id (行内 loading)
-// 案行根因选择草稿: 裁判明确层预填可改判, uncertain 强制人工选择
-const caseDrafts = reactive<Record<string, { layer: string }>>({})
-
-function caseDraft(id: string): { layer: string } {
-  if (!caseDrafts[id]) caseDrafts[id] = { layer: "" }
-  return caseDrafts[id]
-}
+const qcCasesExpanded = ref(false)
+const qcCaseDigest = computed(() => {
+  const parts: string[] = []
+  const unattributed = qcCases.value.filter((c) => !c.root_cause_layer).length
+  const uncertain = qcCases.value.filter((c) => c.root_cause_layer === "uncertain").length
+  const pending = qcCases.value.filter((c) => c.fix_status === "pending").length - unattributed - uncertain
+  const byStatus = new Map<string, number>()
+  for (const c of qcCases.value) {
+    if (c.fix_status && c.fix_status !== "pending") byStatus.set(c.fix_status, (byStatus.get(c.fix_status) ?? 0) + 1)
+  }
+  if (unattributed) parts.push(`${unattributed} 未归因`)
+  if (uncertain) parts.push(`${uncertain} 待确认根因`)
+  if (pending > 0) parts.push(`${pending} 待确认`)
+  for (const [st, n] of byStatus) parts.push(`${n} ${fixStatusLabel(st)}`)
+  return parts.join(" · ") || "全部待处置"
+})
 
 async function refreshQcCases(sessionId: string) {
   try {
     const r = await listBadcases({ session_id: sessionId, limit: 20 })
     qcCases.value = r.badcases ?? []
-    for (const c of qcCases.value) {
-      caseDraft(c.id).layer = c.root_cause_layer && c.root_cause_layer !== "uncertain" ? c.root_cause_layer : ""
-    }
   } catch {
     /* handled */
-  }
-}
-
-async function confirmCase(c: Badcase) {
-  const layer = caseDraft(c.id)?.layer
-  // uncertain 不可被"确认"为根因 — 人工确认的意义就是给出确定层
-  if (!layer || layer === "uncertain") {
-    ElMessage.warning("请先选择根因层 (uncertain 不能作为确认值)")
-    return
-  }
-  qcCaseActing.value = c.id
-  try {
-    const changed = layer !== c.root_cause_layer
-    await resolveBadcase(c.id, {
-      fix_status: "fixing",
-      human_confirmed_layer: layer,
-      note: `人工定根因${changed ? ` (改判 ${layerLabel(c.root_cause_layer) || "uncertain"} → ${layerLabel(layer)})` : ""}`,
-    })
-    ElMessage.success(`根因已确认: ${layerLabel(layer)} — 进入修复跟踪`)
-    await loadQc()
-    await refreshQcCases(c.session_id)
-    const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
-    if (row) qcDetail.value = row
-  } catch {
-    /* handled */
-  } finally {
-    qcCaseActing.value = null
-  }
-}
-
-async function attributeCase(c: Badcase) {
-  qcCaseActing.value = c.id
-  try {
-    const r = (await attributeBadcase(c.id)) as { root_cause_layer?: string }
-    if (r.root_cause_layer === "uncertain") {
-      ElMessage.warning("归因完成: 裁判证据不足 — 常见于问题轮无决策链中间产物 (如转人工静默), 请人工定根因", { duration: 7000 })
-    } else {
-      ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
-    }
-    await loadQc()
-    await refreshQcCases(c.session_id)
-    const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
-    if (row) qcDetail.value = row
-  } catch {
-    /* handled */
-  } finally {
-    qcCaseActing.value = null
   }
 }
 
@@ -726,7 +666,7 @@ async function openQcDetail(row: QcSessionRow) {
   qcDetailVisible.value = true
   // 一通会话可能多方面问题 → 多案例: 拉全量供逐案处置
   qcCases.value = []
-  Object.keys(caseDrafts).forEach((k) => delete caseDrafts[k])
+  qcCasesExpanded.value = false
   await refreshQcCases(row.session_id)
   qcReplay.value = null
   qcReplayLoading.value = true
@@ -1609,18 +1549,26 @@ onUnmounted(() => {
   line-height: 1.6;
   color: var(--color-text-primary);
 }
-/* 吸底行动区: 案例处置永远在手边 */
+/* 吸底工具区: 案例摘要一行 (可展开只读明细), 处置操作在案例抽屉 */
 .qc-actionbar {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
 }
-.qc-cases-head {
-  font-weight: 600;
-  font-size: var(--fs-sm);
+.qc-cases-digest {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: var(--space-2);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+}
+.qc-cases-digest-main { font-weight: 600; }
+.qc-cases-arrow {
+  margin-left: auto;
+  transition: transform 0.2s;
+  &.open { transform: rotate(90deg); }
 }
 .qc-cases-body {
   max-height: 168px;
