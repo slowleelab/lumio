@@ -101,15 +101,13 @@
       </el-table-column>
       <el-table-column label="操作" width="150" align="center">
         <template #default="{ row }">
-          <!-- 行内主推进: 只亮当前态的合法转移 (与抽屉/后端转移表同构), 深操作进详情 -->
-          <el-button
-            v-if="!row.root_cause_layer || (row.root_cause_layer === 'uncertain' && row.fix_status === 'pending')"
-            size="small" type="warning" text :loading="rowActing === row.id" @click="attributeRow(row)"
-          >{{ row.root_cause_layer ? "重试归因" : "归因" }}</el-button>
-          <el-button
-            v-if="row.fix_status === 'pending' && row.root_cause_layer && row.root_cause_layer !== 'uncertain'"
-            size="small" type="success" text :loading="rowActing === row.id" @click="confirmRow(row)"
-          >确认根因</el-button>
+          <!-- 行内只放"申报类"推进 (无需再看证据): 转灰度/上线/重放验证/重新修复.
+               判断类动作归位: 归因=页头批量/详情单案 (后台任务), 确认根因=必须进详情
+               看过现场再确认 (人工把关不容盲确认) -->
+          <span v-if="row.fix_status === 'pending' && !row.root_cause_layer" class="muted" style="font-size: 12px">待归因</span>
+          <el-tooltip v-if="row.fix_status === 'pending' && row.root_cause_layer" content="人工确认须先查看对话现场与根因证据 — 进详情确认 (批量信任裁判根因用页头工具)" placement="top">
+            <span class="muted" style="font-size: 12px">待确认</span>
+          </el-tooltip>
           <el-button v-if="row.fix_status === 'fixing'" size="small" type="warning" text :loading="rowActing === row.id" @click="transitionRow(row, 'canary')">转灰度</el-button>
           <el-button v-if="row.fix_status === 'canary'" size="small" type="success" text :loading="rowActing === row.id" @click="transitionRow(row, 'deployed')">上线</el-button>
           <el-button v-if="row.fix_status === 'deployed'" size="small" type="primary" text :loading="rowActing === row.id" @click="recheckRow(row)">重放验证</el-button>
@@ -670,16 +668,6 @@ async function withRow(row: Badcase, fn: () => Promise<void>) {
   }
 }
 
-async function confirmRow(row: Badcase) {
-  await withRow(row, async () => {
-    await resolveBadcase(row.id, {
-      fix_status: "fixing",
-      human_confirmed_layer: row.root_cause_layer!,
-      note: `人工定根因 (行内确认: 裁判根因 ${layerLabel(row.root_cause_layer)})`,
-    })
-    ElMessage.success(`根因已确认: ${layerLabel(row.root_cause_layer)} — 进入修复跟踪`)
-  })
-}
 
 async function transitionRow(row: Badcase, status: string) {
   await withRow(row, async () => {
@@ -688,16 +676,6 @@ async function transitionRow(row: Badcase, status: string) {
   })
 }
 
-async function attributeRow(row: Badcase) {
-  await withRow(row, async () => {
-    const r = (await attributeBadcase(row.id)) as { root_cause_layer?: string }
-    if (r.root_cause_layer === "uncertain") {
-      ElMessage.warning("归因完成: 裁判证据不足 — 请进详情人工定根因", { duration: 6000 })
-    } else {
-      ElMessage.success(`归因完成: ${layerLabel(r.root_cause_layer) || "-"}`)
-    }
-  })
-}
 
 async function recheckRow(row: Badcase) {
   // 重放验证: 临时切换 detail 指向该行, 复用抽屉的重放+自动流转链路
