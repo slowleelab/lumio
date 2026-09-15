@@ -74,7 +74,7 @@
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="信号" width="86" align="center">
+      <el-table-column label="来源" width="86" align="center">
         <template #default="{ row }">
           <el-tag v-if="row.signal_source" size="small" :type="signalType(row.signal_source)">{{ signalLabel(row.signal_source) }}</el-tag>
         </template>
@@ -122,12 +122,12 @@
         <el-steps :active="fixStepActive" align-center size="small" finish-status="success" class="fix-steps">
           <el-step title="归因" :description="detail.root_cause_layer ? layerLabel(detail.root_cause_layer) : '待裁判'" />
           <el-step title="人工确认" :description="detail.needs_human_review ? '待复核' : detail.root_cause_layer ? '已确认' : '-'" />
-          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已上线', reopened: '复检未过', rejected: '已驳回' }[detail.fix_status] || '-'" />
-          <el-step title="验证" :description="{ verified: '复检通过 · 已销项', deployed: '可复检', canary: '灰度可复检' }[detail.fix_status] || '待上线'" />
+          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已上线', reopened: '重放验证未过', rejected: '已驳回' }[detail.fix_status] || '-'" />
+          <el-step title="验证" :description="{ verified: '重放验证通过 · 已销项', deployed: '可重放验证', canary: '灰度可重放验证' }[detail.fix_status] || '待上线'" />
         </el-steps>
         <el-alert v-if="detail.fix_status === 'rejected'" type="info" :closable="false" class="reject-alert" :title="`已驳回 — ${detail.fix_note || ''}`" />
         <el-descriptions :column="3" border size="small">
-          <el-descriptions-item label="信号源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
+          <el-descriptions-item label="来源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
           <el-descriptions-item label="出现次数">{{ detail.occurrences ?? 1 }} 次</el-descriptions-item>
           <el-descriptions-item label="采集时间">{{ fmtTime(detail.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="会话时间">
@@ -166,7 +166,7 @@
             <el-select v-model="judgedLayer" size="small" style="width: 150px" :placeholder="detail.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'">
               <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
             </el-select>
-            <el-select v-model="judgedTable" size="small" style="width: 170px" placeholder="修复分流表">
+            <el-select v-model="judgedTable" size="small" style="width: 170px" placeholder="修复指引">
               <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key">
                 <el-tooltip :content="FIX_TABLE_TIPS[key] || ''" placement="right" :disabled="!FIX_TABLE_TIPS[key]">
                   <span>{{ label }}</span>
@@ -193,7 +193,7 @@
         <template v-if="qaVerdict">
           <div class="section-title">
             质检判定
-            <span class="muted section-hint">(全量质检巡检 · 与人工坐席质检同口径)</span>
+            <span class="muted section-hint">(全量质检判定 · 与人工坐席质检同口径)</span>
           </div>
           <div class="qa-verdict">
             <el-tag :type="verdictType(qaVerdict)" size="small">{{ verdictLabel(qaVerdict) }}</el-tag>
@@ -243,7 +243,7 @@
           <el-button
             v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
             size="small" type="primary" plain :loading="recheckState.running" @click="recheckFromBadcase"
-          >{{ recheckState.running ? `复检重放中 ${recheckState.done}/${recheckState.total || "…"}` : `复检原会话 (重放${detail.fix_status === "deployed" ? "" : "·灰度"})` }}</el-button>
+          >{{ recheckState.running ? `重放验证中 ${recheckState.done}/${recheckState.total || "…"}` : `重放验证 (当前代码重新回答${detail.fix_status === "deployed" ? "" : " · 灰度"})` }}</el-button>
           <el-button v-if="detail.fix_status === 'reopened'" size="small" type="warning" :loading="acting" @click="transition('fixing')">重新修复 → 修复中</el-button>
           <!-- 次要操作 -->
           <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
@@ -304,10 +304,10 @@ const LAYER_LABELS: Record<string, string> = {
 const SIGNAL_LABELS: Record<string, string> = {
   negative_feedback: "负面反馈",
   transfer: "转人工",
-  agent_revoke: "人工撤回",
+  agent_revoke: "坐席撤回",
   behavior_anomaly: "行为异常",
   compliance_alert: "合规告警",
-  qa_scan: "质检巡检",
+  qa_scan: "质检不合格",
 }
 
 function distOf(dist: Record<string, number> | undefined, labels: Record<string, string>) {
@@ -622,7 +622,7 @@ async function transition(status: string) {
   }
 }
 
-// 复检 (从整改闭环侧验证修复效果): 重放 = 当前代码重新回答原会话全部问题。
+// 重放验证 (整改闭环侧验证修复效果): 用当前代码重新回答原会话全部问题。
 // rescan 只是对原对话历史重新打分 — bot 回答是历史固定的, 验证不了修复本身。
 // 重放完成 (status=done 时自动质检已落库) → 按新会话判定自动流转:
 
@@ -637,7 +637,7 @@ async function recheckFromBadcase() {
     recheckState.value.total = r.total_rounds
     if (!recheckTimer) recheckTimer = setInterval(() => void pollRecheck(r.new_session_id), 2000)
   } catch {
-    ElMessage.error("复检 (重放) 启动失败")
+    ElMessage.error("重放验证启动失败")
     recheckState.value.running = false
   }
 }
@@ -653,22 +653,22 @@ async function pollRecheck(newSid: string) {
     }
     recheckState.value.running = false
     if (st.status !== "done" || st.error) {
-      ElMessage.warning(`复检未完成: ${st.error || "重放中断"} — 案例状态未变, 可稍后重试`)
+      ElMessage.warning(`重放验证未完成: ${st.error || "重放中断"} — 案例状态未变, 可稍后重试`)
       return
     }
     const res = await listQcSessions({ keyword: newSid, limit: 1 })
     const verdict = res.sessions?.[0]?.verdict || ""
     if (!verdict) {
-      ElMessage.warning("复检重放完成但新会话尚未出质检判定, 稍后可查看新会话手动流转")
+      ElMessage.warning("重放验证完成但新会话尚未出质检判定, 稍后可查看新会话手动流转")
       return
     }
     const ok = verdict === "pass" || verdict === "warn"
     await resolveBadcase(detail.value!.id, {
       fix_status: ok ? "verified" : "reopened",
-      note: `复检重放 ${newSid}: ${verdictLabel(verdict)} — ${ok ? "验证通过, 销项" : "未通过, 打回重修"}`,
+      note: `重放验证 ${newSid}: ${verdictLabel(verdict)} — ${ok ? "验证通过, 销项" : "未通过, 打回重修"}`,
     })
-    ElMessage[ok ? "success" : "warning"](`复检 ${verdictLabel(verdict)} — 已自动${ok ? "销项 (已验证)" : "打回 (已重开)"}`)
-    await refreshAfterAction(ok ? "复检通过, 案例已验证" : "复检未通过, 案例已重开")
+    ElMessage[ok ? "success" : "warning"](`重放验证 ${verdictLabel(verdict)} — 已自动${ok ? "销项 (已验证)" : "打回 (已重开)"}`)
+    await refreshAfterAction(ok ? "重放验证通过, 案例已验证" : "重放验证未通过, 案例已重开")
   } catch {
     /* handled */
   }
