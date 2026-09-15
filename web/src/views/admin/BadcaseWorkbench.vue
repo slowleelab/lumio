@@ -598,6 +598,43 @@ async function doRescan() {
 }
 
 // ── 展示工具 ──
+const LAYER_LABELS: Record<string, string> = {
+  layer_1: "预处理",
+  layer_2: "会话管理",
+  layer_3: "意图识别",
+  layer_4: "路由决策",
+  layer_5: "RAG 检索",
+  layer_6: "回复生成",
+  layer_7: "风控合规",
+  uncertain: "待确认根因",
+}
+const SIGNAL_LABELS: Record<string, string> = {
+  negative_feedback: "负面反馈",
+  transfer: "转人工",
+  agent_revoke: "人工撤回",
+  behavior_anomaly: "行为异常",
+  compliance_alert: "合规告警",
+  qa_scan: "质检巡检",
+}
+
+function distOf(dist: Record<string, number> | undefined, labels: Record<string, string>) {
+  const entries = Object.entries(dist ?? {}).map(([key, count]) => ({ key, count, label: labels[key] ?? key }))
+  const total = entries.reduce((s, e) => s + e.count, 0) || 1
+  const max = Math.max(1, ...entries.map((e) => e.count))
+  return entries
+    .sort((a, b) => b.count - a.count)
+    .map((e) => ({
+      ...e,
+      width: `${Math.max(4, Math.round((e.count / max) * 100))}%`,
+      pct: `${Math.round((e.count / total) * 100)}%`,
+    }))
+}
+const layerDist = computed(() => distOf(stats.value?.layer_dist, LAYER_LABELS))
+const signalDist = computed(() => distOf(stats.value?.signal_dist, SIGNAL_LABELS))
+
+// 修复闭环漏斗: 采集 → 待复核 → 已确认 → 已上线
+
+
 function signalType(s: string): string {
   const m: Record<string, string> = {
     negative_feedback: "danger",
