@@ -547,9 +547,18 @@ async def quality_human_verdict_endpoint(
     session_id = str((body or {}).get("session_id") or "").strip()
     verdict = str((body or {}).get("verdict") or "").strip()
     note = (body or {}).get("note")
+    problems = (body or {}).get("problems")
     if not session_id:
         raise LumioError(code=2001, message="session_id 必填")
-    rec = await record_human_verdict(db, session_id, verdict, note if isinstance(note, str) else None)
+    if problems is not None and not isinstance(problems, list):
+        raise LumioError(code=2001, message="problems 须为列表")
+    rec = await record_human_verdict(
+        db,
+        session_id,
+        verdict,
+        note if isinstance(note, str) else None,
+        [dict(p) for p in problems if isinstance(p, dict)][:8] if problems is not None else None,
+    )
     # 判定改合格但案例还挂着 → 提示驳回 (两域独立, 不自动联动只提醒)
     open_badcase = False
     if verdict == "pass":

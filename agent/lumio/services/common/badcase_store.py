@@ -447,11 +447,14 @@ async def record_human_verdict(
     session_id: str,
     verdict: str,
     note: str | None = None,
+    problems: list[dict[str, Any]] | None = None,
 ) -> QualityRecord:
     """人工判定落库: 追加一条 judge_model=人工判定 的质检记录 (append-only 审计口径)。
 
     会话维度列表按 scanned_at 取最新 → 人工判定即成为当前判定, 原AI判定保留可追溯。
     session_time / turns / badcase_id 沿用最新一条 AI 记录, 保持列表锚点与整改闭环关联。
+    problems: 人工编辑后的问题标注列表 (逐轮内联打标的编辑场景) —
+    缺省为空 (纯改判); 提供时覆盖 (原 AI 标注保留在 AI 记录中可追溯)。
     """
     if verdict not in ("pass", "warn", "fail"):
         raise LumioError(code=2001, message=f"verdict 非法: {verdict}")
@@ -470,7 +473,7 @@ async def record_human_verdict(
     rec = QualityRecord(
         session_id=session_id,
         verdict=verdict,
-        problems=[],
+        problems=problems or [],
         summary=(note or "").strip()[:255] or None,
         judge_model="人工判定",
         turns=latest.turns if latest else None,
