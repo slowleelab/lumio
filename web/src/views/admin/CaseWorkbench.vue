@@ -99,21 +99,21 @@
       <el-table-column label="会话时间" width="150">
         <template #default="{ row }">{{ fmtTime(row.session_time || row.created_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="168" align="center">
+      <el-table-column label="操作" width="150" align="center">
         <template #default="{ row }">
           <!-- 行内主推进: 只亮当前态的合法转移 (与抽屉/后端转移表同构), 深操作进详情 -->
           <el-button
             v-if="!row.root_cause_layer || (row.root_cause_layer === 'uncertain' && row.fix_status === 'pending')"
-            size="small" link type="warning" :loading="rowActing === row.id" @click="attributeRow(row)"
+            size="small" type="warning" text :loading="rowActing === row.id" @click="attributeRow(row)"
           >{{ row.root_cause_layer ? "重试归因" : "归因" }}</el-button>
           <el-button
             v-if="row.fix_status === 'pending' && row.root_cause_layer && row.root_cause_layer !== 'uncertain'"
-            size="small" link type="success" :loading="rowActing === row.id" @click="confirmRow(row)"
-          >确认→修复</el-button>
-          <el-button v-if="row.fix_status === 'fixing'" size="small" link type="warning" :loading="rowActing === row.id" @click="transitionRow(row, 'canary')">完成→灰度</el-button>
-          <el-button v-if="row.fix_status === 'canary'" size="small" link type="success" :loading="rowActing === row.id" @click="transitionRow(row, 'deployed')">上线</el-button>
-          <el-button v-if="row.fix_status === 'deployed'" size="small" link type="primary" :loading="rowActing === row.id" @click="recheckRow(row)">重放验证</el-button>
-          <el-button v-if="row.fix_status === 'reopened'" size="small" link type="warning" :loading="rowActing === row.id" @click="transitionRow(row, 'fixing')">重新修复</el-button>
+            size="small" type="success" text :loading="rowActing === row.id" @click="confirmRow(row)"
+          >确认根因</el-button>
+          <el-button v-if="row.fix_status === 'fixing'" size="small" type="warning" text :loading="rowActing === row.id" @click="transitionRow(row, 'canary')">转灰度</el-button>
+          <el-button v-if="row.fix_status === 'canary'" size="small" type="success" text :loading="rowActing === row.id" @click="transitionRow(row, 'deployed')">上线</el-button>
+          <el-button v-if="row.fix_status === 'deployed'" size="small" type="primary" text :loading="rowActing === row.id" @click="recheckRow(row)">重放验证</el-button>
+          <el-button v-if="row.fix_status === 'reopened'" size="small" type="warning" text :loading="rowActing === row.id" @click="transitionRow(row, 'fixing')">重新修复</el-button>
           <span v-if="row.fix_status === 'verified' || row.fix_status === 'rejected'" class="muted" style="font-size: 12px">终态</span>
           <el-button size="small" link type="primary" @click="openDetail(row)">详情</el-button>
         </template>
@@ -492,9 +492,15 @@ async function doBatchAttribution() {
 }
 
 
+const nextIdx = computed(() => {
+  if (!detail.value) return null
+  const i = caseRows.value.findIndex((b) => b.id === detail.value!.id)
+  return i >= 0 && i < caseRows.value.length - 1 ? i + 1 : null
+})
+
 function openNext() {
   const row = caseRows.value[nextIdx.value!]
-  if (row?.badcase_id) openBadcaseById(row.badcase_id)
+  if (row) openDetail(row)
 }
 
 function openDetail(row: Badcase) {
@@ -602,6 +608,16 @@ async function runAttribution(row: Badcase) {
     acting.value = false
   }
 }
+
+const detailVisible = ref(false)
+const detail = ref<Badcase | null>(null)
+const judgedLayer = ref("")
+const judgedTable = ref("")
+const acting = ref(false)
+const contextMessages = ref<{ speaker: string; content: string }[]>([])
+const contextLoading = ref(false)
+
+
 
 const fixStepActive = computed(() => {
   const d = detail.value
@@ -902,6 +918,14 @@ function layerLabel(s?: string | null) {
 function categoryLabel(s?: string | null) {
   return s ? (CATEGORY_LABELS[s] ?? s) : ""
 }
+const CATEGORY_LABELS: Record<string, string> = {
+  semantic: "语义理解偏差",
+  knowledge: "知识缺失",
+  process: "流程设计问题",
+  coverage: "覆盖不足",
+  uncertain: "待定",
+}
+
 function fixStatusLabel(s: string) {
   const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "已灰度", deployed: "已上线", verified: "已验证", reopened: "已重开", rejected: "已驳回" }
   return m[s] ?? s
