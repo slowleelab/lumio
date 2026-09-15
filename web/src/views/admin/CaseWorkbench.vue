@@ -56,7 +56,7 @@
       </template>
     </div>
 
-    <el-table :data="caseRows" v-loading="casesLoading" stripe size="small" style="margin-top: 12px" @selection-change="onSelection">
+    <el-table :data="caseRows" v-loading="casesLoading" stripe size="small" style="margin-top: 12px" class="cases-table" @row-click="openDetail" @selection-change="onSelection">
       <el-table-column type="selection" width="40" :selectable="(row: Badcase) => row.fix_status === 'pending' && !!row.root_cause_layer && row.root_cause_layer !== 'uncertain'" />
       <el-table-column label="问题句" min-width="220">
         <template #default="{ row }">
@@ -99,7 +99,7 @@
       <el-table-column label="会话时间" width="150">
         <template #default="{ row }">{{ fmtTime(row.session_time || row.created_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="150" align="center">
+      <el-table-column label="操作" width="110" align="center">
         <template #default="{ row }">
           <!-- 行内只放"申报类"推进 (无需再看证据): 转灰度/上线/重放验证/重新修复.
                判断类动作归位: 归因=页头批量/详情单案 (后台任务), 确认根因=必须进详情
@@ -108,12 +108,11 @@
           <el-tooltip v-if="row.fix_status === 'pending' && row.root_cause_layer" content="人工确认须先查看对话现场与根因证据 — 进详情确认 (批量信任裁判根因用页头工具)" placement="top">
             <span class="muted" style="font-size: 12px">待确认</span>
           </el-tooltip>
-          <el-button v-if="row.fix_status === 'fixing'" size="small" type="warning" text :loading="rowActing === row.id" @click="transitionRow(row, 'canary')">转灰度</el-button>
-          <el-button v-if="row.fix_status === 'canary'" size="small" type="success" text :loading="rowActing === row.id" @click="transitionRow(row, 'deployed')">上线</el-button>
-          <el-button v-if="row.fix_status === 'deployed'" size="small" type="primary" text :loading="rowActing === row.id" @click="recheckRow(row)">重放验证</el-button>
-          <el-button v-if="row.fix_status === 'reopened'" size="small" type="warning" text :loading="rowActing === row.id" @click="transitionRow(row, 'fixing')">重新修复</el-button>
-          <span v-if="row.fix_status === 'verified' || row.fix_status === 'rejected'" class="muted" style="font-size: 12px">终态</span>
-          <el-button size="small" link type="primary" @click="openDetail(row)">详情</el-button>
+          <el-button v-if="row.fix_status === 'fixing'" size="small" type="warning" text :loading="rowActing === row.id" @click.stop="transitionRow(row, 'canary')">转灰度</el-button>
+          <el-button v-if="row.fix_status === 'canary'" size="small" type="success" text :loading="rowActing === row.id" @click.stop="transitionRow(row, 'deployed')">上线</el-button>
+          <el-button v-if="row.fix_status === 'deployed'" size="small" type="primary" text :loading="rowActing === row.id" @click.stop="recheckRow(row)">重放验证</el-button>
+          <el-button v-if="row.fix_status === 'reopened'" size="small" type="warning" text :loading="rowActing === row.id" @click.stop="transitionRow(row, 'fixing')">重新修复</el-button>
+          <span v-if="row.fix_status === 'verified' || row.fix_status === 'rejected'" class="muted" style="font-size: 12px">终态 · 点击行查看</span>
         </template>
       </el-table-column>
     </el-table>
@@ -942,6 +941,10 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+.cases-table {
+  :deep(.el-table__row) { cursor: pointer; }
+}
+
 .page-header {
   display: flex;
   align-items: center;
