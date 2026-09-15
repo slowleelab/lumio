@@ -146,7 +146,7 @@
       </el-col>
       <el-col :span="12">
         <el-card shadow="never">
-          <template #header><span>信号来源分布 <span class="muted">问题案例从哪些渠道被发现</span></span></template>
+          <template #header><span>问题来源分布 <span class="muted">问题案例从哪些事件被发现</span></span></template>
           <div class="dist-bars">
             <div v-for="d in signalDist" :key="d.key" class="dist-row" :title="`${d.label}: ${d.count} (${d.pct})`">
               <span class="dist-label">{{ d.label }}</span>
@@ -360,10 +360,10 @@ const LAYER_LABELS: Record<string, string> = {
 const SIGNAL_LABELS: Record<string, string> = {
   negative_feedback: "负面反馈",
   transfer: "转人工",
-  agent_revoke: "人工撤回",
+  agent_revoke: "坐席撤回",
   behavior_anomaly: "行为异常",
   compliance_alert: "合规告警",
-  qa_scan: "质检巡检",
+  qa_scan: "质检不合格",
 }
 
 function distOf(dist: Record<string, number> | undefined, labels: Record<string, string>) {

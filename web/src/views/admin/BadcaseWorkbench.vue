@@ -80,7 +80,7 @@
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="信号" width="92">
+      <el-table-column label="来源" width="92">
         <template #default="{ row }">
           <el-tag v-if="row.signal_source" size="small" :type="signalType(row.signal_source)">{{ signalLabel(row.signal_source) }}</el-tag>
           <span v-else class="muted">-</span>
@@ -243,8 +243,8 @@
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
-            <el-tooltip content="重跑 AI 裁判 (覆盖最新判定)" placement="top">
-              <el-button size="small" :loading="qcRescanning" @click="doRescan">AI 复检</el-button>
+            <el-tooltip content="对原对话重跑 AI 裁判, 覆盖为最新判定 (与重放验证不同: 不重新生成回复)" placement="top">
+              <el-button size="small" :loading="qcRescanning" @click="doRescan">重新质检</el-button>
             </el-tooltip>
             <span class="qc-tools-sep"></span>
             <el-tooltip content="原客户消息按序重发当前链路 — 修复前后对比验证" placement="top">
@@ -586,12 +586,12 @@ async function doRescan() {
         summary: r.summary ?? qcDetail.value.summary,
       }
       await loadQc()
-      ElMessage.success(`复检完成: ${verdictLabel(r.verdict ?? "")}`)
+      ElMessage.success(`重新质检完成: ${verdictLabel(r.verdict ?? "")}`)
     } else {
-      ElMessage.info(r.status === "skipped" ? "对话不足 2 轮, 跳过" : "复检完成")
+      ElMessage.info(r.status === "skipped" ? "对话不足 2 轮, 跳过" : "重新质检完成")
     }
   } catch {
-    ElMessage.error("复检失败")
+    ElMessage.error("重新质检失败")
   } finally {
     qcRescanning.value = false
   }
@@ -611,10 +611,10 @@ const LAYER_LABELS: Record<string, string> = {
 const SIGNAL_LABELS: Record<string, string> = {
   negative_feedback: "负面反馈",
   transfer: "转人工",
-  agent_revoke: "人工撤回",
+  agent_revoke: "坐席撤回",
   behavior_anomaly: "行为异常",
   compliance_alert: "合规告警",
-  qa_scan: "质检巡检",
+  qa_scan: "质检不合格",
 }
 
 function distOf(dist: Record<string, number> | undefined, labels: Record<string, string>) {
