@@ -227,6 +227,51 @@ async def scan_session(
             logger.debug("qa_scan 判定写入 Redis 失败 (不阻断): session=%s", session_id)
 
     if verdict["verdict"] == "fail":
+        # 案例业务分类: 取该会话决策链最新意图 (intent_classify 留痕;
+        # dialogue_log.intent 历史未填充不可用). 追问场景以会话主意图近似,
+        # 业务粒度 (咨询/账务/挂失…) 足够
+        try:
+            # 逐轮意图序列: 决策链按 turn_start 分组, 每组取 intent_classify 的意图 —
+            # 多主题会话 (权益→账单混问) 每案按自己问题轮定类, 而非会话众数
+            from lumio.shared.orm_models import DecisionLog
+
+            async with session_factory() as sdb:
+                _events = (
+                    await sdb.execute(
+                        select(DecisionLog.action, DecisionLog.evidence_json)
+                        .where(DecisionLog.session_id == session_id)
+                        .order_by(DecisionLog.created_at)
+                    )
+                ).all()
+            _turn_intents: list[str | None] = []  # 每客户轮一个槽位 (无分类轮为 None)
+            _bare: list[str] = []  # 无 turn_start 的老链 (该动作后加): 裸意图兜底
+            for _act, _ev in _events:
+                if _act == "turn_start":
+                    _turn_intents.append(None)
+                elif _act == "intent_classify" and isinstance(_ev, dict) and _ev.get("intent"):
+                    if _turn_intents:
+                        _turn_intents[-1] = str(_ev["intent"])[:64]
+                    else:
+                        _bare.append(str(_ev["intent"])[:64])
+
+            def _classify(turn_no: int | None) -> str | None:
+                # 问题轮对位 (problem turn 是日志行号 → 客户轮序); 对不上或该轮无意图
+                # 时退会话兜底口径: 排除兜底意图(知识问答/闲聊)的众数
+                _generic = {"faq", "knowledge_qa", "chitchat", "nb_chitchat", "nb_noise"}
+                if turn_no and 1 <= turn_no <= len(_turn_intents):
+                    _row = _turn_intents[turn_no - 1]
+                    if _row and _row not in _generic:
+                        return _row
+                from collections import Counter
+
+                _pool = _turn_intents + _bare
+                _biz = [t for t in _pool if t and t not in _generic]
+                _pick = Counter(_biz or [t for t in _pool if t]).most_common(1)
+                return _pick[0][0] if _pick else None
+        except Exception:
+            _turn_intents = []
+            _classify = lambda turn_no: None  # noqa: E731
+            logger.debug("案例业务分类取意图失败 (不阻断): session=%s", session_id)
         # 一通会话可能多方面问题: 按 problem 轮次去重逐轮开案 (每案独立根因与
         # 处置状态机; 同题 30 天去重天然防重复). 上限 3 案防长会话爆破,
         # 其余 problems 全量挂在每案的 signal_detail 里可追溯.
@@ -258,6 +303,7 @@ async def scan_session(
                 session_id=session_id,
                 customer_id=None,
                 signal_source=SIGNAL_SOURCE,
+                intent_label=_classify(turn_no),
                 user_input=(user_input or "")[:500],
                 bot_output=(bot_output or "")[:2000],
                 signal_detail={

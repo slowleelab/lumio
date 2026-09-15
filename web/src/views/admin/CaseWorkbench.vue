@@ -32,8 +32,11 @@
       <el-select v-model="caseFilters.fix_status" placeholder="处置状态" clearable size="small" style="width: 120px" @change="reloadCases">
         <el-option v-for="(label, key) in fixStatusLabelMap" :key="key" :label="label" :value="key" />
       </el-select>
-      <el-select v-model="caseFilters.root_cause_layer" placeholder="根因层" clearable size="small" style="width: 120px" @change="reloadCases">
+      <el-select v-model="caseFilters.root_cause_layer" placeholder="根因层" clearable size="small" style="width: 112px" @change="reloadCases">
         <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" />
+      </el-select>
+      <el-select v-model="caseFilters.intent_label" placeholder="业务" clearable size="small" style="width: 112px" @change="reloadCases">
+        <el-option v-for="opt in intentOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
       </el-select>
       <el-input
         v-model="caseFilters.keyword"
@@ -46,7 +49,7 @@
         @clear="reloadCases"
       />
       <el-button size="small" @click="reloadCases">查询</el-button>
-      <el-button v-if="caseFilters.fix_status || caseFilters.root_cause_layer || caseFilters.keyword" size="small" link @click="clearFilters">清除筛选</el-button>
+      <el-button v-if="caseFilters.fix_status || caseFilters.root_cause_layer || caseFilters.intent_label || caseFilters.keyword" size="small" link @click="clearFilters">清除筛选</el-button>
       <div class="filter-spacer"></div>
       <template v-if="selected.length">
         <el-button size="small" type="success" plain @click="batchConfirm">批量确认 ({{ selected.length }})</el-button>
@@ -58,6 +61,12 @@
       <el-table-column label="问题句" min-width="220">
         <template #default="{ row }">
           <span :title="row.user_input">{{ (row.user_input || "").slice(0, 40) }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="业务" width="96" align="center">
+        <template #default="{ row }">
+          <span v-if="row.intent_label" size="small">{{ intentZh(row.intent_label) }}</span>
+          <span v-else class="muted">-</span>
         </template>
       </el-table-column>
       <el-table-column label="根因" width="110" align="center">
@@ -304,7 +313,7 @@ const caseTotal = ref(0)
 const casePage = ref(1)
 const casePageSize = ref(50)
 const casesLoading = ref(false)
-const caseFilters = ref<{ fix_status: string; root_cause_layer: string; keyword: string }>({ fix_status: "", root_cause_layer: "", keyword: "" })
+const caseFilters = ref<{ fix_status: string; root_cause_layer: string; intent_label: string; keyword: string }>({ fix_status: "", root_cause_layer: "", intent_label: "", keyword: "" })
 const LAYER_LABELS: Record<string, string> = {
   layer_1: "预处理",
   layer_2: "会话管理",
@@ -352,6 +361,21 @@ const FIX_TABLE_LABELS: Record<string, string> = {
 
 // ── 列表 ──
 
+const INTENT_ZH: Record<string, string> = {
+  bill_query: "账单查询", account_bill_query: "账单查询", transaction_query: "交易明细查询",
+  txn_query: "交易明细查询", limit_query: "额度查询", installment_inquiry: "分期咨询",
+  reward_query: "积分相关", faq: "知识问答", knowledge_qa: "知识问答", faq_product: "产品咨询",
+  chitchat: "闲聊", nb_chitchat: "闲聊", nb_noise: "无效输入", complaint: "投诉",
+  transfer_agent: "要求转人工", card_loss: "卡片挂失", card_loss_report: "卡片挂失",
+}
+const intentZh = (v: string) => INTENT_ZH[v] ?? v
+// 选项取自当前页数据去重 (全量枚举太长, 队列里出现什么给什么)
+const intentOptions = computed(() => {
+  const seen = new Map<string, string>()
+  for (const c of caseRows.value) if (c.intent_label) seen.set(c.intent_label, intentZh(c.intent_label))
+  return [...seen.entries()].map(([value, label]) => ({ value, label })).sort((a, b2) => a.label.localeCompare(b2.label))
+})
+
 const selected = ref<Badcase[]>([])
 
 function onSelection(rows: Badcase[]) {
@@ -378,6 +402,7 @@ async function loadCases() {
     const res = await listBadcases({
       fix_status: caseFilters.value.fix_status || undefined,
       root_cause_layer: caseFilters.value.root_cause_layer || undefined,
+      intent_label: caseFilters.value.intent_label || undefined,
       keyword: caseFilters.value.keyword || undefined,
       limit: casePageSize.value,
       offset: (casePage.value - 1) * casePageSize.value,
@@ -397,7 +422,7 @@ function reloadCases() {
 }
 
 function clearFilters() {
-  caseFilters.value = { fix_status: "", root_cause_layer: "", keyword: "" }
+  caseFilters.value = { fix_status: "", root_cause_layer: "", intent_label: "", keyword: "" }
   reloadCases()
 }
 
@@ -901,6 +926,8 @@ onMounted(() => {
   if (fs && fixStatusLabelMap[fs]) caseFilters.value.fix_status = fs
   const rl = route.query.root_cause_layer as string | undefined
   if (rl) caseFilters.value.root_cause_layer = rl
+  const il = route.query.intent_label as string | undefined
+  if (il) caseFilters.value.intent_label = il
   const kw = (route.query.keyword || route.query.session_id) as string | undefined
   if (kw) caseFilters.value.keyword = kw
   loadCases()
