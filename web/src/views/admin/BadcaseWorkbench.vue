@@ -133,32 +133,8 @@
 
         <!-- ── 证据: 三个视图共享同一空间, 切换替代滚动 ── -->
         <el-tabs v-model="qcEvidenceTab" class="qc-evidence">
-          <el-tab-pane name="problems">
-            <template #label>质检发现<el-badge v-if="qcDetail.problems?.length" :value="qcDetail.problems.length" class="qc-tab-badge" /></template>
-            <template v-if="qcDetail.problems?.length">
-              <div v-for="(p, i) in qcDetail.problems" :key="i" class="qc-problem">
-                <div class="qc-problem-head">
-                  <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
-                  <span v-if="p.turn" class="muted">第 {{ rowRound(p.turn) || p.turn }} 轮对话 · 日志第 {{ p.turn }} 行</span>
-                </div>
-                <div class="qc-problem-reason">{{ p.reason || "(未说明原因)" }}</div>
-                <template v-if="problemTurnDialog(p.turn)">
-                  <div class="scene-bubble customer">{{ problemTurnDialog(p.turn)!.customer }}</div>
-                  <div class="scene-bubble bot">
-                    {{ problemTurnDialog(p.turn)!.bot }}
-                    <el-tag v-if="problemTurnDialog(p.turn)!.source" size="small" type="info" class="scene-src">{{ problemTurnDialog(p.turn)!.source }}</el-tag>
-                  </div>
-                  <div v-if="qcTurnChains[rowRound(p.turn!) - 1]" class="qc-turn-chain">
-                    该轮链路: {{ qcTurnChains[rowRound(p.turn!) - 1].steps.join(" → ") }}
-                  </div>
-                </template>
-                <div v-else-if="p.turn && qcReplay" class="muted" style="font-size: 12px">第 {{ rowRound(p.turn) || p.turn }} 轮对话内容超出回放范围</div>
-              </div>
-            </template>
-            <div v-else class="muted qc-evi-empty">无问题项 ({{ verdictLabel(qcDetail.verdict || "") || "未质检" }})</div>
-          </el-tab-pane>
-
-          <el-tab-pane :label="`会话回放 (${qcPanorama.length})`" name="replay">
+          
+          <el-tab-pane :label="`会话核查 (${qcPanorama.length} 轮)`" name="replay">
             <template v-if="qcPanorama.length">
               <div v-for="r in qcPanorama" :key="r.round" class="pano-round" :class="{ 'pano-problem': r.problem }">
                 <span class="pano-round-no">{{ r.round }}</span>
@@ -167,6 +143,24 @@
                   <div class="pano-bot">
                     {{ r.bot }}
                     <el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag>
+                  </div>
+                  <!-- 问题标注内联在对应回答下 (证据与发现同一现场); 支持人工编辑描述 -->
+                  <div v-for="(p, pi) in r.problems" :key="pi" class="qc-inline-problem">
+                    <div class="qc-inline-head">
+                      <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
+                      <span class="muted">第 {{ r.round }} 轮对话 · 日志第 {{ p.turn }} 行</span>
+                      <el-button size="small" link type="primary" @click="startEditProblem(p)">编辑</el-button>
+                    </div>
+                    <template v-if="editingProblemIdx !== (qcDetail.problems ?? []).indexOf(p)">
+                      <div class="qc-inline-reason">{{ p.reason || "(未说明原因)" }}</div>
+                    </template>
+                    <template v-else>
+                      <el-input v-model="problemDraft" type="textarea" :rows="2" size="small" placeholder="修订问题描述 (保存后追加人工判定记录, 原 AI 标注保留可追溯)" />
+                      <div class="qc-inline-actions">
+                        <el-button size="small" type="primary" :loading="annotating" @click="saveProblemEdit()">保存</el-button>
+                        <el-button size="small" @click="editingProblemIdx = -1">取消</el-button>
+                      </div>
+                    </template>
                   </div>
                 </div>
               </div>
@@ -354,7 +348,7 @@ async function openQcDetail(row: QcSessionRow) {
   // 一通会话可能多方面问题 → 多案例: 拉全量供逐案处置
   qcReplay.value = null
   qcReplayLoading.value = true
-  qcEvidenceTab.value = "problems"
+  qcEvidenceTab.value = "replay"
   replayState.value = { running: false, newSessionId: null, total: 0, done: 0, finishedAt: null, current: "" }
   replayNewReplay.value = null
   try {
@@ -424,18 +418,28 @@ const ACTION_STEP: Record<string, string> = {
 // 会话全景: 客户轮 → 客服回复配对
 const qcPanorama = computed(() => {
   const ts = qcReplay.value?.turns ?? []
-  const rounds: { round: number; customer: string; bot: string; source: string | null; problem: boolean }[] = []
+  const rounds: {
+    round: number
+    customer: string
+    bot: string
+    source: string | null
+    problem: boolean
+    problems: QualityProblem[]
+  }[] = []
   let round = 0
   for (const t of ts) {
     if (t.speaker === "customer") {
       round += 1
       const bot = ts[ts.indexOf(t) + 1]
+      // 该轮的问题标注 (裁判发现内联到对应回答下, 代码审查 inline-comment 范式)
+      const roundProblems = (qcDetail.value?.problems ?? []).filter((p) => p.turn != null && rowRound(p.turn) === round)
       rounds.push({
         round,
         customer: t.content,
         bot: bot?.speaker === "bot" ? bot.content : "",
         source: bot?.response_source ?? null,
-        problem: (qcDetail.value?.problems ?? []).some((p) => p.turn != null && rowRound(p.turn) === round),
+        problem: roundProblems.length > 0,
+        problems: roundProblems,
       })
     }
   }
@@ -443,7 +447,7 @@ const qcPanorama = computed(() => {
 })
 
 // 证据视图: tabs 共享空间 (问题定位默认), 重放启动后自动切对比
-const qcEvidenceTab = ref("problems")
+const qcEvidenceTab = ref("replay")
 
 // 重放执行: 原客户消息按序重发 → 轮询完成 → 结束会话触发质检 → 前后对比
 const replayState = ref<{
@@ -536,6 +540,38 @@ async function doReplay() {
 }
 
 // 人工判定: 追加 judge_model=人工判定 的质检记录, 状态列转为「人工质检」
+// ── 问题标注内联编辑: 修订描述 → 追加人工判定记录 (append-only, 原 AI 标注可追溯) ──
+const editingProblemIdx = ref(-1) // 在 qcDetail.problems 中的精确索引 (引用对位, 轮次重算在多问题时会错位)
+const problemDraft = ref("")
+const annotating = ref(false)
+
+function startEditProblem(p: QualityProblem) {
+  editingProblemIdx.value = (qcDetail.value?.problems ?? []).indexOf(p)
+  problemDraft.value = p.reason || ""
+}
+
+async function saveProblemEdit() {
+  if (!qcDetail.value) return
+  annotating.value = true
+  try {
+    // 深拷贝当前标注列表, 仅改编辑中那条的描述
+    const next = (qcDetail.value.problems ?? []).map((p) => ({ ...p }))
+    if (editingProblemIdx.value >= 0 && editingProblemIdx.value < next.length) {
+      next[editingProblemIdx.value].reason = problemDraft.value.trim()
+    }
+    await humanVerdictQualitySession(qcDetail.value.session_id, qcDetail.value.verdict === "pass" ? "pass" : "fail", undefined, next)
+    ElMessage.success("标注已修订 — 追加人工判定记录 (原 AI 标注保留可追溯)")
+    editingProblemIdx.value = -1
+    await loadQc()
+    const row = qcRows.value.find((x) => x.session_id === qcDetail.value?.session_id)
+    if (row) qcDetail.value = row
+  } catch {
+    /* handled */
+  } finally {
+    annotating.value = false
+  }
+}
+
 const humanJudging = ref<"pass" | "fail" | null>(null)
 async function doHumanVerdict(v: "pass" | "fail") {
   if (!qcDetail.value) return
@@ -914,6 +950,32 @@ onUnmounted(() => {
 }
 .qc-tools-sep { flex: 1; }
 .action-hint { font-size: var(--fs-xs, 12px); }
+/* 问题标注内联卡 (证据与发现同一现场) */
+.qc-inline-problem {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--el-color-error, #f56c6c);
+  background: var(--el-color-error-light-9, #fef0f0);
+  border-radius: 6px;
+}
+.qc-inline-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.qc-inline-reason {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+}
+.qc-inline-actions {
+  margin-top: 6px;
+  display: flex;
+  gap: var(--space-2);
+}
+
 /* 问题轮现场还原 */
 .scene-bubble {
   max-width: 92%;

@@ -259,8 +259,9 @@ export function humanVerdictQualitySession(
   sessionId: string,
   verdict: "pass" | "fail",
   note?: string,
+  problems?: QualityProblem[],
 ): Promise<{ status: string; session_id: string; verdict: string; judge_model: string; open_badcase?: boolean }> {
-  return client.post("/admin/closed-loop/quality/human-verdict", { session_id: sessionId, verdict, note })
+  return client.post("/admin/closed-loop/quality/human-verdict", { session_id: sessionId, verdict, note, problems })
 }
 
 export function listQualityRecords(params?: {
