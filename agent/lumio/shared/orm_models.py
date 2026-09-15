@@ -1193,6 +1193,10 @@ class Badcase(Base):
     bot_output: Mapped[str | None] = mapped_column(Text, nullable=True)
     snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # 问题轮意图 (业务分类维度): 采集时从对话轮的意图识别结果落库 —
+    # 案例队列按业务类分拣展示 (咨询/账务/挂失/闲聊…), 与根因(技术层)正交
+    intent_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     root_cause_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
     root_cause_category: Mapped[str | None] = mapped_column(String(16), nullable=True)
     attribution_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)

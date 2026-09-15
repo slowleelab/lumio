@@ -51,6 +51,7 @@ export interface ClosedLoopHealth {
 export function listBadcases(params?: {
   session_id?: string
   signal_source?: string
+  intent_label?: string
   root_cause_layer?: string
   fix_status?: string
   fix_table?: string

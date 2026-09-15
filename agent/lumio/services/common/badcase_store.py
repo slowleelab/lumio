@@ -35,6 +35,7 @@ async def capture_badcase(
     snapshot: dict[str, Any] | None = None,
     fix_status: str = "pending",
     session_time: datetime | None = None,
+    intent_label: str | None = None,
 ) -> Badcase:
     """信号采集: 五路信号 → badcase 落库。
 
@@ -95,6 +96,7 @@ async def capture_badcase(
             needs_human_review=True,
             fix_status=fix_status,
             session_time=session_time,
+            intent_label=intent_label,
         )
         session.add(bc)
         await session.commit()
@@ -112,6 +114,7 @@ async def list_badcases(
     fix_status: str | None = None,
     fix_table: str | None = None,
     needs_review: bool | None = None,
+    intent_label: str | None = None,
     keyword: str | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -120,6 +123,8 @@ async def list_badcases(
     conds = []
     if session_id:
         conds.append(Badcase.session_id == session_id)
+    if intent_label:
+        conds.append(Badcase.intent_label == intent_label)
     if signal_source:
         conds.append(Badcase.signal_source == signal_source)
     if root_cause_layer:
@@ -171,6 +176,7 @@ def _to_dict(b: Badcase) -> dict[str, Any]:
         "customer_id": b.customer_id,
         "channel": b.channel,
         "signal_source": b.signal_source,
+        "intent_label": b.intent_label,
         "signal_detail": b.signal_detail,
         "user_input": b.user_input,
         "bot_output": (b.bot_output or "")[:200],
