@@ -53,26 +53,31 @@ def _local_prompt_defs() -> dict[str, dict[str, Any]]:
         "knowledge_system": {
             "category": "generation",
             "description": "知识问答链 — 咨询类问题的回复生成（基于知识库检索作答，约束简洁与澄清规范）",
+            "scene": "客户咨询信用卡知识（权益、年费、费用、政策等），意图分入知识域时",
             "content": prompts_mod.KNOWLEDGE_SYSTEM_PROMPT,
         },
         "business_system": {
             "category": "generation",
             "description": "业务办理链 — 办理类请求的回复生成（缺参数时逐项追问，敏感操作交系统确认）",
+            "scene": "客户办理业务（查账单、查额度、办分期、挂失等），意图命中工具链时",
             "content": prompts_mod.BUSINESS_SYSTEM_PROMPT,
         },
         "complaint_system": {
             "category": "generation",
             "description": "投诉安抚链 — 投诉场景的回复生成（先共情再处理，严重投诉转人工）",
+            "scene": "客户表达不满、投诉或情绪明显负面时",
             "content": prompts_mod.COMPLAINT_SYSTEM_PROMPT,
         },
         "fallback_system": {
             "category": "generation",
             "description": "兜底闲聊链 — 无意义输入/离题闲聊的回复生成（接住话题并引导回业务）",
+            "scene": "意图不明、无意义输入或离题闲聊时的兜底",
             "content": prompts_mod.FALLBACK_SYSTEM_PROMPT,
         },
         "summarize_system": {
             "category": "generation",
             "description": "多轮对话压缩摘要 — 长会话滚动总结，供后续轮次作上下文",
+            "scene": "会话超过轮次上限时后台滚动压缩历史，客户无感知",
             "content": prompts_mod._SUMMARIZE_SYSTEM_PROMPT,
         },
     }

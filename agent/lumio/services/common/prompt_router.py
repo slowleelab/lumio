@@ -51,6 +51,7 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
         "safety_redlines": {
             "category": "safety",
             "description": "身份与安全红线 — 自动拼接在所有对话链之后，合规底线，不可后台修改",
+            "scene": "所有对话链路每轮自动拼接生效，覆盖全部生成场景",
             "content": _SAFETY_REDLINES,
         }
     }
@@ -61,6 +62,7 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
         items["qa_judge"] = {
             "category": "judge",
             "description": "全量质检裁判 — 判定会话合格/提醒/不合格的审查口径，改动会使历史判定不可比",
+            "scene": "每日全量质检巡检，逐会话给出判定结论",
             "content": QA_RUBRIC_PROMPT,
         }
     except Exception:
@@ -71,6 +73,7 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
         items["attribution_judge"] = {
             "category": "judge",
             "description": "坏例归因裁判 — 七层根因的判定口径",
+            "scene": "案例工作台点击「归因判定」时，分析坏例的根因层",
             "content": _JUDGE_SYSTEM_PROMPT,
         }
     except Exception:
@@ -81,27 +84,44 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
         items["classify_base"] = {
             "category": "classify",
             "description": "意图分类基线 — 决定客户每句话被分到哪个意图（意图库新增的意图会自动追加）",
+            "scene": "每条客户消息进来的第一站，分类结果决定走哪条链路",
             "content": _CLASSIFY_SYSTEM_PROMPT,
         }
         items["input_arbitrate"] = {
             "category": "classify",
             "description": "输入仲裁 — 判定客户回复是噪声、补槽位还是新需求",
+            "scene": "客户回复短句（如“是的”、卡号）时，判定其性质",
             "content": _ARBITRATE_SYSTEM_PROMPT,
         }
     except Exception:
         pass
-    # 话术类常量 (P1 锁定, P2 评估开放)
+    # 话术类常量 (P1 锁定, P2 评估开放): (slug, 描述, 运用场景, 常量名)
     _script_specs = [
-        ("greeting", "会话开场问候语", "GREETING_RESPONSE"),
-        ("farewell", "会话结束告别语", "FAREWELL_RESPONSE"),
-        ("crisis", "危机干预话术 — 客户表露自伤意图时的安抚与转人工（合规锁定）", "CRISIS_RESPONSE"),
-        ("chitchat_redirect", "闲聊引导 — 接住离题话题并引回业务", "CHITCHAT_REDIRECT_RESPONSE"),
-        ("confirm_followup", '反问确认跟进 — 客户答"是的"之后给出能力引导', "CONFIRM_FOLLOWUP_RESPONSE"),
+        ("greeting", "会话开场问候语", "客户发送第一条消息时", "GREETING_RESPONSE"),
+        ("farewell", "会话结束告别语", "客户告别、会话结束时", "FAREWELL_RESPONSE"),
+        (
+            "crisis",
+            "危机干预话术 — 客户表露自伤意图时的安抚与转人工（合规锁定）",
+            "客户表露自伤或轻生意图时，最高优先级触发",
+            "CRISIS_RESPONSE",
+        ),
+        (
+            "chitchat_redirect",
+            "闲聊引导 — 接住离题话题并引回业务",
+            "客户闲聊被识别为闲聊意图时",
+            "CHITCHAT_REDIRECT_RESPONSE",
+        ),
+        (
+            "confirm_followup",
+            '反问确认跟进 — 客户答"是的"之后给出能力引导',
+            "机器人上轮自由反问后，客户回答“是的/好的”时",
+            "CONFIRM_FOLLOWUP_RESPONSE",
+        ),
     ]
-    for slug, desc, const in _script_specs:
+    for slug, desc, scene, const in _script_specs:
         val = getattr(_prompts, const, None)
         if isinstance(val, str):
-            items[slug] = {"category": "script", "description": desc, "content": val}
+            items[slug] = {"category": "script", "description": desc, "scene": scene, "content": val}
     return items
 
 
@@ -149,8 +169,10 @@ async def list_prompts(user: AdminOnlyUser) -> dict:
     from lumio.shared.orm_models import PromptTemplate, PromptVersion
 
     items: list[dict] = []
-    # 中文描述以代码内定义为唯一真源 (DB 行的 description 是 seed 时刻快照, 会过期)
-    local_desc = {n: d["description"] for n, d in _local_prompt_defs().items()}
+    # 中文描述/运用场景以代码内定义为唯一真源 (DB 行的 description 是 seed 时刻快照, 会过期)
+    local_defs = _local_prompt_defs()
+    local_desc = {n: d["description"] for n, d in local_defs.items()}
+    local_scene = {n: d.get("scene", "") for n, d in local_defs.items()}
     async with get_async_session_factory()() as session:
         tmpls = (
             (await session.execute(select(PromptTemplate).order_by(PromptTemplate.category, PromptTemplate.name)))
@@ -173,6 +195,7 @@ async def list_prompts(user: AdminOnlyUser) -> dict:
                     "name": t.name,
                     "category": t.category,
                     "description": local_desc.get(t.name, t.description),
+                    "scene": local_scene.get(t.name, ""),
                     "editable": True,
                     "source": "db",
                     "active_version": ver.version if ver else 0,
@@ -189,6 +212,7 @@ async def list_prompts(user: AdminOnlyUser) -> dict:
                 "name": slug,
                 "category": d["category"],
                 "description": d["description"],
+                "scene": d.get("scene", ""),
                 "editable": False,
                 "source": "code",
                 "active_version": 0,
@@ -207,6 +231,7 @@ async def list_prompts(user: AdminOnlyUser) -> dict:
                     "name": slug,
                     "category": d["category"],
                     "description": d["description"],
+                    "scene": d.get("scene", ""),
                     "editable": True,
                     "source": "db",
                     "active_version": 1,
@@ -247,6 +272,7 @@ async def prompt_detail(name: str, user: AdminOnlyUser) -> dict:
                 "name": name,
                 "category": d["category"],
                 "description": d["description"],
+                "scene": d.get("scene", ""),
                 "editable": True,
                 "source": "db",
                 "active_version": 1,
@@ -269,6 +295,7 @@ async def prompt_detail(name: str, user: AdminOnlyUser) -> dict:
             "name": name,
             "category": t.category,
             "description": _local_prompt_defs().get(name, {}).get("description", t.description),
+            "scene": _local_prompt_defs().get(name, {}).get("scene", ""),
             "editable": True,
             "source": "db",
             "active_version": active.version if active else 0,
