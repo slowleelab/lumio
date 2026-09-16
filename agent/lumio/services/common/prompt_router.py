@@ -50,7 +50,7 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
     items: dict[str, dict[str, str]] = {
         "safety_redlines": {
             "category": "safety",
-            "description": "身份与安全红线 (拼接进全部对话链 system prompt, 合规红线不可后台修改)",
+            "description": "身份与安全红线 — 自动拼接在所有对话链之后，合规底线，不可后台修改",
             "content": _SAFETY_REDLINES,
         }
     }
@@ -60,7 +60,7 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
 
         items["qa_judge"] = {
             "category": "judge",
-            "description": "质检巡检裁判 (判定口径, 变更会使历史判定不可比)",
+            "description": "全量质检裁判 — 判定会话合格/提醒/不合格的审查口径，改动会使历史判定不可比",
             "content": QA_RUBRIC_PROMPT,
         }
     except Exception:
@@ -70,7 +70,7 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
 
         items["attribution_judge"] = {
             "category": "judge",
-            "description": "坏例归因裁判 (7 层根因判定口径)",
+            "description": "坏例归因裁判 — 七层根因的判定口径",
             "content": _JUDGE_SYSTEM_PROMPT,
         }
     except Exception:
@@ -80,28 +80,28 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
 
         items["classify_base"] = {
             "category": "classify",
-            "description": "L3 意图分类基线 prompt (意图注册表增量会动态追加)",
+            "description": "意图分类基线 — 决定客户每句话被分到哪个意图（意图库新增的意图会自动追加）",
             "content": _CLASSIFY_SYSTEM_PROMPT,
         }
         items["input_arbitrate"] = {
             "category": "classify",
-            "description": "输入仲裁 prompt (噪声/槽位回执/新意图判定)",
+            "description": "输入仲裁 — 判定客户回复是噪声、补槽位还是新需求",
             "content": _ARBITRATE_SYSTEM_PROMPT,
         }
     except Exception:
         pass
     # 话术类常量 (P1 锁定, P2 评估开放)
     _script_specs = [
-        ("greeting", "问候语", "GREETING_RESPONSE"),
-        ("farewell", "告别语", "FAREWELL_RESPONSE"),
-        ("crisis", "危机干预话术 (合规)", "CRISIS_RESPONSE"),
-        ("chitchat_redirect", "闲聊引导话术", "CHITCHAT_REDIRECT_RESPONSE"),
-        ("confirm_followup", "反问确认跟进话术", "CONFIRM_FOLLOWUP_RESPONSE"),
+        ("greeting", "会话开场问候语", "GREETING_RESPONSE"),
+        ("farewell", "会话结束告别语", "FAREWELL_RESPONSE"),
+        ("crisis", "危机干预话术 — 客户表露自伤意图时的安抚与转人工（合规锁定）", "CRISIS_RESPONSE"),
+        ("chitchat_redirect", "闲聊引导 — 接住离题话题并引回业务", "CHITCHAT_REDIRECT_RESPONSE"),
+        ("confirm_followup", '反问确认跟进 — 客户答"是的"之后给出能力引导', "CONFIRM_FOLLOWUP_RESPONSE"),
     ]
     for slug, desc, const in _script_specs:
         val = getattr(_prompts, const, None)
         if isinstance(val, str):
-            items[slug] = {"category": "script", "description": f"{desc} (固定话术)", "content": val}
+            items[slug] = {"category": "script", "description": desc, "content": val}
     return items
 
 
@@ -149,6 +149,8 @@ async def list_prompts(user: AdminOnlyUser) -> dict:
     from lumio.shared.orm_models import PromptTemplate, PromptVersion
 
     items: list[dict] = []
+    # 中文描述以代码内定义为唯一真源 (DB 行的 description 是 seed 时刻快照, 会过期)
+    local_desc = {n: d["description"] for n, d in _local_prompt_defs().items()}
     async with get_async_session_factory()() as session:
         tmpls = (
             (await session.execute(select(PromptTemplate).order_by(PromptTemplate.category, PromptTemplate.name)))
@@ -170,7 +172,7 @@ async def list_prompts(user: AdminOnlyUser) -> dict:
                 {
                     "name": t.name,
                     "category": t.category,
-                    "description": t.description,
+                    "description": local_desc.get(t.name, t.description),
                     "editable": True,
                     "source": "db",
                     "active_version": ver.version if ver else 0,
@@ -266,7 +268,7 @@ async def prompt_detail(name: str, user: AdminOnlyUser) -> dict:
         return {
             "name": name,
             "category": t.category,
-            "description": t.description,
+            "description": _local_prompt_defs().get(name, {}).get("description", t.description),
             "editable": True,
             "source": "db",
             "active_version": active.version if active else 0,

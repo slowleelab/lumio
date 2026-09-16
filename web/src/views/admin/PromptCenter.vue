@@ -18,10 +18,14 @@
     </el-alert>
 
     <el-table v-loading="loading" :data="filtered" size="small" class="prompt-table" @row-click="openDetail">
-      <el-table-column label="提示词" min-width="260">
+      <el-table-column label="提示词" min-width="170">
         <template #default="{ row }">
           <div class="prompt-name">{{ row.name }}</div>
-          <div class="muted prompt-desc">{{ row.description }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column label="描述" min-width="320">
+        <template #default="{ row }">
+          <div class="prompt-desc">{{ row.description }}</div>
         </template>
       </el-table-column>
       <el-table-column label="类别" width="110">
@@ -372,7 +376,7 @@ onMounted(load)
 
 .prompt-desc {
   font-size: 12px;
-  margin-top: 2px;
+  line-height: 1.5;
 }
 
 .drawer-meta {
