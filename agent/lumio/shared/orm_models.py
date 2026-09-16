@@ -1277,3 +1277,73 @@ class QualityRecord(Base):
         Index("ix_quality_record_session_time", "session_time"),
         Index("ix_quality_record_scanned", "scanned_at"),
     )
+
+
+# ── 提示词资产管理 (PromptOps: DB 为运营源, 代码常量为兜底) ──
+
+
+class PromptTemplate(Base):
+    """提示词模板 (逻辑提示词, 一个 name 一个生命周期)
+
+    内容变更 = 新建 PromptVersion (append-only) + active_version_id 指针切换,
+    回滚即指针回拨。editable=False 为工程锁定类 (裁判口径/分类基线), 后台只读。
+    """
+
+    __tablename__ = "prompt_template"
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    category: Mapped[str] = mapped_column(String(16), nullable=False)  # generation/script/assist
+    description: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    # 变量契约: 模板中允许出现的占位符名 (generation 类为空 = 禁止任何占位符)
+    variables: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    active_version_id: Mapped[uuid_utils.UUID | None] = mapped_column(Uuid(native_uuid=False), nullable=True)
+    # 最近发布关联的坏例案例 (D·模型 修复溯源)
+    source_case_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=datetime.now,
+        server_default=text("now()"),
+        onupdate=datetime.now,
+    )
+
+
+class PromptVersion(Base):
+    """提示词版本 (append-only, 内容一经发布不可变)
+
+    status: draft(草稿) → published(生效, 同 template 同时仅一个) → archived(被新版本替换)
+    """
+
+    __tablename__ = "prompt_version"
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    template_id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False), ForeignKey("prompt_template.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)  # per-template 自增序号
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    changelog: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    # 灰度百分比 (P2 启用按 customer_id 稳定哈希分流; P1 仅存档)
+    rollout_pct: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
+    source_case_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        Index("uq_prompt_version_seq", "template_id", "version", unique=True),
+    )

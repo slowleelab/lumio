@@ -1,245 +1,260 @@
-"""B0: Prompt 注册中心 — Nacos 热加载 + Redis 缓存 + A/B 版本管理
+"""Prompt 注册中心 (PromptOps) — DB 为运营源, 三层降级, 版本指针切换
 
-3 大能力:
-1. 版本管理: 每个 prompt 有 version 字段, 启动时打印当前生效版本
-2. 热加载: 从 Nacos 配置中心拉取, Redis 缓存 60s, 改动不重启
-3. A/B 测试: get_prompt(name, customer_id) → 按 hash 选版本
+能力:
+1. 版本管理: prompt_version append-only; template.active_version_id 指针切换, 回滚=拨回指针
+2. 热加载: PG → Redis 缓存 → 进程缓存 (各 60s TTL), 发布即失效, 改动不重启
+3. lazy seed: 首次访问 DB 无记录时, 用本地代码常量自动建 template + v1 (published), 幂等
 
-降级策略:
-- Nacos 不可用 → Redis 缓存 → 本地 prompts.py 常量 (兜底)
-- 三层都不可用 → 启动失败 (硬错误, 不允许无 prompt 上线)
+降级链 (resolve):
+  进程缓存 → Redis → PG (含 seed) → 本地常量兜底
+  四层全考虑: DB 挂了服务照常对话 — 本地常量永不删除, "永不上线空提示词".
 
-后续可加:
-- Prompt diff (对比两个版本差异)
-- Prompt 回滚 (一键切回上一版本)
-- Prompt A/B 效果分析 (实验组 vs 对照组 CSAT)
+工程锁定类 (裁判口径/分类基线/安全红线) 不入 DB, 由 prompt_router 从代码常量只读展示.
+
+关键: Prompt 内容不含 session_id/时间戳等动态信息 (否则无法命中 KV cache);
+变量通过渲染层注入, generation 类模板禁止任何占位符 (variables 契约为空).
 """
 
 from __future__ import annotations
 
-import functools
-import hashlib
+import json
 import time
+from dataclasses import dataclass
 from typing import Any
 
-from lumio.shared.config import PromptSettings, get_settings
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from lumio.shared.config import get_settings
 from lumio.shared.logger import get_logger
 
 logger = get_logger(__name__)
 
-
-# ── 关键: Prompt 内容不能含 session_id / 时间戳等动态信息 ──
-# 否则无法命中 KV cache. 变量通过 render(template, context) 注入.
+_REDIS_KEY = "lumio:prompt:v2:{name}"
 
 
-class PromptVersion:
-    """Prompt 版本对象."""
+@dataclass
+class ResolvedPrompt:
+    """解析结果: 内容 + 版本溯源 (版本进决策链, 坏例可归因到具体提示词版本)"""
 
-    def __init__(
-        self,
-        name: str,
-        version: str,
-        content: str,
-        changelog: str = "",
-        rollout_pct: float = 100.0,
-        created_at: float | None = None,
-    ) -> None:
-        self.name = name
-        self.version = version
-        self.content = content
-        self.changelog = changelog
-        self.rollout_pct = max(0.0, min(100.0, rollout_pct))
-        self.created_at = created_at or time.time()
-
-    def __repr__(self) -> str:
-        return f"PromptVersion(name={self.name}, version={self.version}, rollout={self.rollout_pct}%)"
+    name: str
+    version: int  # DB 版本序号; 本地兜底为 0
+    content: str
+    source: str  # db | redis | local
 
 
-# ── 本地兜底 prompt 库 (Nacos / Redis 都不可用时使用) ──
-# 复用 prompts.py 硬编码常量
-_LOCAL_PROMPTS: dict[str, PromptVersion] = {}
+# ── 本地基线定义 (seed 源 + 四层兜底; 内容与 prompts/__init__.py 常量同源) ──
 
 
-def _init_local_prompts() -> None:
-    """初始化本地兜底 prompt 库 (从 prompts.py 导入)."""
-    from lumio.services.bot.prompts import (
-        BUSINESS_SYSTEM_PROMPT,
-        FALLBACK_SYSTEM_PROMPT,
-        KNOWLEDGE_SYSTEM_PROMPT,
-    )
+def _local_prompt_defs() -> dict[str, dict[str, Any]]:
+    from lumio.services.bot import prompts as prompts_mod
 
-    _LOCAL_PROMPTS.clear()
-    _LOCAL_PROMPTS.update(
-        {
-            "knowledge_agent": PromptVersion(
-                name="knowledge_agent",
-                version="local-v1",
-                content=KNOWLEDGE_SYSTEM_PROMPT,
-                changelog="本地兜底版本 (Nacos 不可用时使用)",
-            ),
-            "business_agent": PromptVersion(
-                name="business_agent",
-                version="local-v1",
-                content=BUSINESS_SYSTEM_PROMPT,
-                changelog="本地兜底版本",
-            ),
-            "fallback_agent": PromptVersion(
-                name="fallback_agent",
-                version="local-v1",
-                content=FALLBACK_SYSTEM_PROMPT,
-                changelog="本地兜底版本",
-            ),
-        }
-    )
+    return {
+        "knowledge_system": {
+            "category": "generation",
+            "description": "知识问答链 system prompt (基于检索回答/简洁/澄清规范)",
+            "content": prompts_mod.KNOWLEDGE_SYSTEM_PROMPT,
+        },
+        "business_system": {
+            "category": "generation",
+            "description": "业务办理链 system prompt (缺参追问/敏感确认/降级)",
+            "content": prompts_mod.BUSINESS_SYSTEM_PROMPT,
+        },
+        "complaint_system": {
+            "category": "generation",
+            "description": "投诉安抚链 system prompt (先共情后处理)",
+            "content": prompts_mod.COMPLAINT_SYSTEM_PROMPT,
+        },
+        "fallback_system": {
+            "category": "generation",
+            "description": "兜底闲聊域 system prompt (能力锚引导/离题接话)",
+            "content": prompts_mod.FALLBACK_SYSTEM_PROMPT,
+        },
+        "summarize_system": {
+            "category": "generation",
+            "description": "多轮对话压缩摘要 prompt (上下文工程用)",
+            "content": prompts_mod._SUMMARIZE_SYSTEM_PROMPT,
+        },
+    }
 
 
 class PromptRegistry:
-    """Prompt 注册中心 (单例)."""
+    """Prompt 注册中心 (进程内单例; Redis/PG 懒连接, 不可用时逐层降级)"""
 
-    def __init__(self, settings: PromptSettings | None = None) -> None:
-        self._settings = settings or get_settings().prompt
-        self._cache: dict[str, PromptVersion] = {}
-        self._cache_loaded_at: dict[str, float] = {}
-        self._redis_client: Any = None  # 延迟初始化
-        self._nacos_client: Any = None
-        _init_local_prompts()
-        if self._settings.log_active_version:
-            logger.info("PromptRegistry 启动, 当前生效版本: %s", self._get_active_versions())
+    def __init__(self) -> None:
+        self._settings = get_settings().prompt
+        self._proc_cache: dict[str, tuple[ResolvedPrompt, float]] = {}
+        self._redis: Any = None  # None=未尝试, False=不可用
 
-    def _get_active_versions(self) -> dict[str, str]:
-        return {name: pv.version for name, pv in self._cache.items()} or {
-            name: pv.version for name, pv in _LOCAL_PROMPTS.items()
-        }
+    # ── 对外主入口 ──
 
-    def _get_redis(self) -> Any:
-        """延迟初始化 Redis 客户端."""
-        if self._redis_client is None:
+    async def resolve(self, name: str) -> ResolvedPrompt:
+        ttl = self._settings.cache_ttl_seconds or 60
+        cached = self._proc_cache.get(name)
+        if cached and time.time() - cached[1] < ttl:
+            return cached[0]
+
+        rp = await self._from_redis(name) or await self._from_db(name)
+        if rp is None:
+            rp = self._local(name)
+        else:
+            self._proc_cache[name] = (rp, time.time())
+        if rp.source == "local":
+            # 兜底路径不缓存 (DB 恢复后下一轮即切回), 但避免刷日志
+            logger.debug("prompt 走本地兜底: name=%s", name)
+        return rp
+
+    async def invalidate(self, name: str | None = None) -> None:
+        """发布/回滚后调用: 清进程缓存 + 删 Redis key (60s 内全实例收敛)"""
+        names = [name] if name else list(self._proc_cache)
+        for n in names:
+            self._proc_cache.pop(n, None)
+        redis = await self._get_redis()
+        if redis:
+            with_keys = [_REDIS_KEY.format(name=n) for n in names]
+            try:
+                await redis.delete(*with_keys)
+            except Exception as exc:
+                logger.warning("prompt 缓存失效失败 (将靠 TTL 收敛): err=%s", exc)
+
+    # ── 三层取数 ──
+
+    async def _get_redis(self) -> Any:
+        if self._redis is None:
             try:
                 from lumio.services.common.redis_client import get_redis_client
 
-                self._redis_client = get_redis_client()
+                self._redis = get_redis_client()
             except Exception as exc:
                 logger.debug("Redis 客户端不可用: %s", exc)
-                self._redis_client = False  # 标记不可用
-        return self._redis_client if self._redis_client else None
+                self._redis = False
+        return self._redis or None
 
-    def get_prompt(self, name: str, customer_id: str | None = None) -> str:
-        """获取 prompt 内容 (A/B 版本感知).
-
-        优先级: Nacos → Redis 缓存 → 本地兜底
-        A/B 路由: rollout_pct < 100 时, 按 customer_id hash 决定是否启用新版本
-        """
-        # 1. 尝试从缓存 (Redis 或内存) 获取
-        version = self._get_from_cache(name)
-        if version is None:
-            version = self._load_from_nacos(name)
-            if version is None:
-                # 2. 兜底到本地
-                version = _LOCAL_PROMPTS.get(name)
-                if version is None:
-                    logger.error("Prompt 不存在且无本地兜底: name=%s", name)
-                    return f"[PROMPT_MISSING:{name}]"
-
-        # A/B 路由: rollout_pct < 100 时按 hash 分流
-        if version.rollout_pct < 100.0 and customer_id and not self._is_in_rollout(customer_id, version.rollout_pct):
-            # 切回主版本
-            main_version = self._get_main_version(name)
-            if main_version:
-                version = main_version
-
-        return version.content
-
-    def _get_from_cache(self, name: str) -> PromptVersion | None:
-        """从 Redis 缓存或内存获取."""
-        now = time.time()
-        cached_at = self._cache_loaded_at.get(name, 0)
-        if now - cached_at < self._settings.cache_ttl_seconds and name in self._cache:
-            return self._cache[name]
-
-        # 尝试 Redis
-        redis = self._get_redis()
-        if redis:
-            try:
-                import json
-
-                data = redis.get(f"lumio:prompt:{name}")
-                if data:
-                    payload = json.loads(data)
-                    pv = PromptVersion(
-                        name=name,
-                        version=payload["version"],
-                        content=payload["content"],
-                        changelog=payload.get("changelog", ""),
-                        rollout_pct=payload.get("rollout_pct", 100.0),
-                        created_at=payload.get("created_at"),
-                    )
-                    self._cache[name] = pv
-                    self._cache_loaded_at[name] = now
-                    return pv
-            except Exception as exc:
-                logger.debug("Redis 缓存读取失败: name=%s err=%s", name, exc)
-
-        return None
-
-    def _load_from_nacos(self, name: str) -> PromptVersion | None:
-        """从 Nacos 拉取 (失败时返回 None)."""
+    async def _from_redis(self, name: str) -> ResolvedPrompt | None:
+        redis = await self._get_redis()
+        if not redis:
+            return None
         try:
-            # 实际集成 nacos-sdk 时启用
-            # from nacos import NacosClient
-            # client = NacosClient(self._settings.nacos_server_addr)
-            # data = client.get_config(f"lumio.prompts.{name}")
-            # return self._parse_nacos_data(name, data)
-            logger.debug("Nacos 客户端未启用, 跳过 (name=%s)", name)
-            return None
+            raw = await redis.get(_REDIS_KEY.format(name=name))
+            if not raw:
+                return None
+            payload = json.loads(raw)
+            return ResolvedPrompt(name=name, version=int(payload["v"]), content=payload["c"], source="redis")
         except Exception as exc:
-            logger.warning("Nacos 拉取失败: name=%s err=%s", name, exc)
+            logger.debug("Redis prompt 读取失败: name=%s err=%s", name, exc)
             return None
 
-    def _get_main_version(self, name: str) -> PromptVersion | None:
-        """获取主版本 (100% rollout)."""
-        main = self._cache.get(f"{name}:main")
-        if main:
-            return main
-        return _LOCAL_PROMPTS.get(name)
+    async def _from_db(self, name: str) -> ResolvedPrompt | None:
+        """PG 取活跃版本; 无记录时 lazy seed (本地常量建 v1)。任何异常返回 None 走兜底"""
+        try:
+            from lumio.services.common.database import get_async_session_factory
+            from lumio.shared.orm_models import PromptTemplate, PromptVersion
+
+            factory = get_async_session_factory()
+            async with factory() as session:
+                result = await session.execute(
+                    select(PromptVersion)
+                    .join(PromptTemplate, PromptTemplate.active_version_id == PromptVersion.id)
+                    .where(PromptTemplate.name == name)
+                )
+                row = result.scalar_one_or_none()
+                if row is not None:
+                    rp = ResolvedPrompt(name=name, version=row.version, content=row.content, source="db")
+                    await self._cache_to_redis(name, rp)
+                    return rp
+                # lazy seed (并发下唯一键冲突 → 对方已建, 重读)
+                seeded = await self._seed(session, name)
+                if seeded is not None:
+                    await self._cache_to_redis(name, seeded)
+                return seeded
+        except Exception as exc:
+            logger.warning("prompt DB 读取失败, 走兜底: name=%s err=%s", name, exc)
+            return None
+
+    async def _seed(self, session: Any, name: str) -> ResolvedPrompt | None:
+        from lumio.shared.orm_models import PromptTemplate, PromptVersion, _uuid_v7
+
+        defs = _local_prompt_defs()
+        d = defs.get(name)
+        if d is None:
+            logger.error("prompt 未注册且无本地兜底: name=%s", name)
+            return None
+        # 列默认值在 flush 时才生成, 显式预生成 ID 以便互相引用 (template.active_version_id ↔ version.template_id)
+        tmpl = PromptTemplate(
+            id=_uuid_v7(),
+            name=name,
+            category=d["category"],
+            description=d["description"],
+            variables=[],
+        )
+        ver = PromptVersion(
+            id=_uuid_v7(),
+            template_id=tmpl.id,
+            version=1,
+            content=d["content"],
+            changelog="内置基线 (代码常量 lazy seed)",
+            created_by="system",
+            status="published",
+        )
+        tmpl.active_version_id = ver.id
+        session.add(tmpl)
+        session.add(ver)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()  # 并发 seed: 对方已建
+            from sqlalchemy import select as _sel
+
+            row = (
+                await session.execute(
+                    _sel(PromptVersion)
+                    .join(PromptTemplate, PromptTemplate.active_version_id == PromptVersion.id)
+                    .where(PromptTemplate.name == name)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                logger.warning("prompt seed 撞唯一键且重读为空: name=%s", name)
+                return None
+            return ResolvedPrompt(name=name, version=row.version, content=row.content, source="db")
+        logger.info("prompt lazy seed 完成: name=%s v1", name)
+        return ResolvedPrompt(name=name, version=1, content=d["content"], source="db")
+
+    async def _cache_to_redis(self, name: str, rp: ResolvedPrompt) -> None:
+        redis = await self._get_redis()
+        if not redis:
+            return
+        try:
+            ttl = self._settings.cache_ttl_seconds or 60
+            await redis.set(
+                _REDIS_KEY.format(name=name), json.dumps({"v": rp.version, "c": rp.content}), ex=ttl
+            )
+        except Exception as exc:
+            logger.debug("Redis prompt 写入失败: name=%s err=%s", name, exc)
 
     @staticmethod
-    def _is_in_rollout(customer_id: str, rollout_pct: float) -> bool:
-        """按 customer_id hash 决定是否在新版本 (粘性分桶)."""
-        if not customer_id:
-            return True
-        h = int(hashlib.sha256(customer_id.encode()).hexdigest(), 16) % 100
-        return h < rollout_pct
-
-    def get_metadata(self, name: str) -> dict[str, Any] | None:
-        """获取 prompt 元数据 (version, changelog 等) 用于调试."""
-        v = self._cache.get(name) or _LOCAL_PROMPTS.get(name)
-        if v:
-            return {
-                "name": v.name,
-                "version": v.version,
-                "rollout_pct": v.rollout_pct,
-                "changelog": v.changelog,
-                "created_at": v.created_at,
-            }
-        return None
-
-    def invalidate_cache(self, name: str | None = None) -> None:
-        """清除缓存 (灰度时手动调用)."""
-        if name:
-            self._cache.pop(name, None)
-            self._cache_loaded_at.pop(name, None)
-        else:
-            self._cache.clear()
-            self._cache_loaded_at.clear()
+    def _local(name: str) -> ResolvedPrompt:
+        d = _local_prompt_defs().get(name)
+        content = d["content"] if d else ""
+        if not d:
+            logger.error("prompt 未注册且无本地兜底: name=%s", name)
+        return ResolvedPrompt(name=name, version=0, content=content, source="local")
 
 
-# 全局单例 — 用 functools.cache 替代手写 if-check, 线程安全 + 防 race
-@functools.cache
+_registry: PromptRegistry | None = None
+
+
 def get_prompt_registry() -> PromptRegistry:
-    """获取全局 PromptRegistry (线程安全, 仅初始化 1 次)."""
-    return PromptRegistry()
+    global _registry
+    if _registry is None:
+        _registry = PromptRegistry()
+    return _registry
 
 
-def get_prompt(name: str, customer_id: str | None = None) -> str:
-    """便捷函数: 获取 prompt 内容."""
-    return get_prompt_registry().get_prompt(name, customer_id)
+async def get_prompt(name: str) -> str:
+    """便捷入口: 取 prompt 内容 (调用方不需版本信息时用)"""
+    return (await get_prompt_info(name)).content
+
+
+async def get_prompt_info(name: str) -> ResolvedPrompt:
+    """便捷入口: 取内容 + 版本 (需进决策链 evidence 时用)"""
+    return await get_prompt_registry().resolve(name)

@@ -192,6 +192,26 @@ class SessionCorruptedError(LumioError):
     message = "会话状态损坏"
 
 
+class PromptValidationError(LumioError):
+    """2011: 提示词草稿校验失败 (长度/变量契约/空内容)"""
+
+    code = 2011
+    message = "提示词内容不合规"
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(code=self.code, message=message or self.message, status_code=422)
+
+
+class PromptLockedError(LumioError):
+    """3011: 工程锁定类提示词 (裁判口径/分类基线) 拒绝后台修改"""
+
+    code = 3011
+    message = "该提示词为工程锁定类, 变更需走代码评审"
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(code=self.code, message=message or self.message, status_code=403)
+
+
 class BusinessError(LumioError):
     """3010: 通用业务规则错误 (如 per-customer 会话上限)"""
 

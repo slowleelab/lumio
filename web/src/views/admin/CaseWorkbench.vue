@@ -645,7 +645,7 @@ const FIX_TABLE_GUIDES: Record<string, { text: string; to?: string }> = {
   A_knowledge: { text: "到 FAQ 管理补标准问答对, 或在文档管理补充知识文档并重新摄入", to: "/admin/faq" },
   B_intent: { text: "到意图库管理页维护规则词/种子语料, 重跑评测闸门后激活", to: "/admin/intent-library" },
   C_rule: { text: "核对意图注册表与流量分类映射 (归并表), 走代码评审", to: "/admin/intent-library" },
-  D_model: { text: "调整回复生成系统提示词与出站闸门话术, 走代码评审", to: "" },
+  D_model: { text: "到提示词中心调整对应链路的 system prompt (草稿→发布, 可回滚), 灰度/上线状态即版本发布节奏", to: "/admin/prompts" },
   none: { text: "流程或工程问题, 在代码/配置侧定位处理", to: "" },
 }
 const fixGuide = computed(() => {
