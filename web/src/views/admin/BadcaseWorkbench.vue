@@ -140,9 +140,14 @@
                 <span class="pano-round-no">{{ r.round }}</span>
                 <div class="pano-text">
                   <div class="pano-customer">{{ r.customer }}</div>
-                  <div class="pano-bot">
+                  <div v-if="r.bot" class="pano-bot">
                     {{ r.bot }}
                     <el-tag v-if="r.source" size="small" type="info" class="scene-src">{{ r.source }}</el-tag>
+                  </div>
+                  <!-- 无 bot 行的轮次: 数据缺失非 UI 截断 — 明示成因, 避免误读为丢内容 -->
+                  <div v-else class="pano-bot pano-bot-missing">
+                    <el-tag size="small" type="warning" effect="plain">本轮机器人无回复记录</el-tag>
+                    <span class="muted">客户消息已落库但无应答 — 常见成因: 会话已转人工（消息转告坐席）/ 处理中断</span>
                   </div>
                   <!-- 问题标注内联在对应回答下 (证据与发现同一现场); 支持人工编辑描述 -->
                   <div v-for="(p, pi) in r.problems" :key="pi" class="qc-inline-problem">
@@ -1029,6 +1034,12 @@ onUnmounted(() => {
 }
 .pano-customer { font-size: 13px; }
 .pano-bot { margin-top: 2px; font-size: 12px; color: var(--color-text-secondary); }
+.pano-bot-missing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
 /* 整改闭环抽屉优化 */
 .fix-steps { margin-bottom: 16px; }
 .reject-alert { margin-bottom: 12px; }
