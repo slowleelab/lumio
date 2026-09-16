@@ -236,8 +236,8 @@
           <div v-for="(t, i) in snapTurnsMeta" :key="i" class="turn-meta-row">
             <span class="turn-idx">{{ i + 1 }}</span>
             <span class="turn-speaker" :class="{ 'is-customer': t.speaker === 'customer' }">{{ t.speaker === "customer" ? "客户" : "Bot" }}</span>
-            <span class="turn-intent">意图: {{ t.intent || "-" }}</span>
-            <span class="turn-src">来源: {{ t.src || "-" }}</span>
+            <span v-if="t.speaker === 'customer'" class="turn-intent">意图: {{ t.intent || "-" }}</span>
+            <span v-else class="turn-src">来源: {{ t.src || "-" }}</span>
           </div>
         </div>
         <pre v-if="snapTranscript" class="snapshot transcript">{{ snapTranscript }}</pre>
@@ -565,7 +565,14 @@ const snapRows = computed(() => {
 })
 const snapTurnsMeta = computed(() => {
   const meta = detail.value?.snapshot?.turns_meta
-  return Array.isArray(meta) ? (meta as { speaker: string; intent?: string; src?: string }[]) : []
+  if (!Array.isArray(meta)) return []
+  const rows = meta as { speaker: string; intent?: string; src?: string }[]
+  // dialogue_log 的 intent 落在 bot 行, 但意图是客户话语的分类结果 — 展示时归位到紧邻的客户行
+  return rows.map((r, i) => {
+    if (r.speaker !== "customer" || r.intent) return r
+    const bot = rows[i + 1]
+    return bot && bot.speaker !== "customer" && bot.intent ? { ...r, intent: bot.intent } : r
+  })
 })
 const snapTranscript = computed(() => {
   const t = detail.value?.snapshot?.transcript
