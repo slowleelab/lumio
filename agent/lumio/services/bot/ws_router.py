@@ -199,11 +199,11 @@ async def _process_streaming(
 
     FIX-9: 接入会话历史 — 从 Redis 加载最近对话, 断线重连后上下文延续.
     """
-    from lumio.services.bot.prompts import KNOWLEDGE_SYSTEM_PROMPT
+    from lumio.services.bot.prompt_registry import get_prompt
     from lumio.services.bot.streaming import get_streaming_client
 
     messages: list[dict] = [
-        {"role": "system", "content": KNOWLEDGE_SYSTEM_PROMPT},
+        {"role": "system", "content": await get_prompt("knowledge_system")},
     ]
 
     # 加载最近历史 (含当前输入), 拼成 user/assistant 交替消息

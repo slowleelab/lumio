@@ -14,6 +14,7 @@ import CaseWorkbench from "@/views/admin/CaseWorkbench.vue"
 import QualityReport from "@/views/admin/QualityReport.vue"
 import IntentLibrary from "@/views/admin/IntentLibrary.vue"
 import DialogueSimulator from "@/views/admin/DialogueSimulator.vue"
+import PromptCenter from "@/views/admin/PromptCenter.vue"
 
 const router = createRouter({
   history: createWebHistory(),
@@ -36,6 +37,7 @@ const router = createRouter({
         { path: "cases", name: "admin-cases", component: CaseWorkbench },
         { path: "quality-report", name: "admin-quality-report", component: QualityReport },
         { path: "intent-library", name: "admin-intent-library", component: IntentLibrary },
+        { path: "prompts", name: "admin-prompts", component: PromptCenter },
         { path: "simulator", name: "admin-simulator", component: DialogueSimulator },
       ],
     },

@@ -27,6 +27,10 @@
           <el-icon><Notebook /></el-icon>
           <template #title>意图库管理</template>
         </el-menu-item>
+        <el-menu-item index="/admin/prompts">
+          <el-icon><EditPen /></el-icon>
+          <template #title>提示词中心</template>
+        </el-menu-item>
         <el-menu-item index="/admin/simulator">
           <el-icon><VideoPlay /></el-icon>
           <template #title>对话模拟</template>
@@ -97,6 +101,7 @@ import {
   DataAnalysis,
   Tickets,
   Notebook,
+  EditPen,
   VideoPlay,
   Back,
 } from "@element-plus/icons-vue"

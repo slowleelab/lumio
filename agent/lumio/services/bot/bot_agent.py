@@ -20,19 +20,16 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from lumio.services.bot.input_gate import InputGate
+from lumio.services.bot.prompt_registry import get_prompt, get_prompt_info
 from lumio.services.bot.prompts import (
-    _SUMMARIZE_SYSTEM_PROMPT,
-    BUSINESS_SYSTEM_PROMPT,
     BUSINESS_TRANSFER_TEMPLATE,
     CHITCHAT_REDIRECT_RESPONSE,
     CLARIFY_RESPONSE,
     CLARIFY_RESPONSES,
     CONFIRM_FOLLOWUP_RESPONSE,
     CRISIS_RESPONSE,
-    FALLBACK_SYSTEM_PROMPT,
     FAREWELL_RESPONSE,
     GREETING_RESPONSE,
-    KNOWLEDGE_SYSTEM_PROMPT,
     SENSITIVE_REPLY_BRIDGE_RESPONSE,
 )
 from lumio.services.bot.slot_tracker import _ENTITY_TO_SLOT, SlotTracker
@@ -1636,11 +1633,14 @@ class LumioAgent:
         except Exception:
             logger.debug("few-shot 选择失败, 跳过: session=%s", session_id)
 
+        # PromptOps: system prompt 走注册中心 (DB 版本 → Redis → 本地兜底), 版本进决策链溯源
+        kp = await get_prompt_info("knowledge_system")
+
         # A0: 分层消息构建 (替代原 f-string 拼接)
         from lumio.services.bot.kv_cache import build_layered_messages, estimate_cache_metrics
 
         messages = build_layered_messages(
-            domain_prompt=KNOWLEDGE_SYSTEM_PROMPT,
+            domain_prompt=kp.content,
             user_input=user_input,
             customer_context=session_memory,
             session_memory="",  # 已合并到 customer_context
@@ -1689,7 +1689,7 @@ class LumioAgent:
         # 最大化前缀缓存命中; 失败时由 generate_with_fallback 走既有降级链.
         _t_llm = time.monotonic()
         result = await self._degradation_mgr.generate_with_fallback(
-            system_prompt=KNOWLEDGE_SYSTEM_PROMPT,
+            system_prompt=kp.content,
             user_input=user_input,
             context=context,
             intent_label=intent.primary_intent,
@@ -1713,6 +1713,7 @@ class LumioAgent:
                     "source": getattr(result, "source", ""),
                     "rag_used": bool(context),
                     "citations": citation_titles[:5],
+                    "prompt": f"knowledge_system:v{kp.version}({kp.source})",
                 },
                 latency_ms=_llm_ms,
                 turn_id="",  # 继承本轮 turn_id (contextvar)
@@ -1932,9 +1933,10 @@ class LumioAgent:
 
         # 结构化会话记忆注入 system prompt
         session_memory = await self._build_session_memory(session_id)
-        system_prompt = BUSINESS_SYSTEM_PROMPT
+        bp = await get_prompt_info("business_system")
+        system_prompt = bp.content
         if session_memory:
-            system_prompt = f"{BUSINESS_SYSTEM_PROMPT}\n\n## 会话记忆\n{session_memory}"
+            system_prompt = f"{bp.content}\n\n## 会话记忆\n{session_memory}"
         # 槽位状态注入(与 knowledge 路径同一真相源, 引导 Bot 知道自己已收集/还缺哪些信息)
         slot_prompt = await self._load_slot_prompt(session_id, intent.primary_intent, entities or [], user_input)
         if slot_prompt:
@@ -2003,7 +2005,12 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"business 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", ""), "domain": "business", "rag_used": bool(context)},
+                evidence={
+                    "source": getattr(result, "source", ""),
+                    "domain": "business",
+                    "rag_used": bool(context),
+                    "prompt": f"business_system:v{bp.version}({bp.source})",
+                },
                 latency_ms=_llm_ms,
                 turn_id="",  # 继承本轮 turn_id (contextvar)
             )
@@ -2060,9 +2067,10 @@ class LumioAgent:
         tool_names = select_tools_for_intent(intent.primary_intent, intent.primary_confidence, get_settings().mcp)
 
         session_memory = await self._build_session_memory(session_id)
-        system_prompt = BUSINESS_SYSTEM_PROMPT
+        bp = await get_prompt_info("business_system")
+        system_prompt = bp.content
         if session_memory:
-            system_prompt = f"{BUSINESS_SYSTEM_PROMPT}\n\n## 会话记忆\n{session_memory}"
+            system_prompt = f"{bp.content}\n\n## 会话记忆\n{session_memory}"
 
         try:
             tool_result = await self._tool_executor.run_conversation(  # type: ignore[union-attr]
@@ -2250,9 +2258,10 @@ class LumioAgent:
                 )
             try:
                 session_memory = await self._build_session_memory(session_id)
-                system_prompt = BUSINESS_SYSTEM_PROMPT
+                bp = await get_prompt_info("business_system")
+                system_prompt = bp.content
                 if session_memory:
-                    system_prompt = f"{BUSINESS_SYSTEM_PROMPT}\n\n## 会话记忆\n{session_memory}"
+                    system_prompt = f"{bp.content}\n\n## 会话记忆\n{session_memory}"
                 history = await self._load_history(session_id)
                 tool_result = await self._tool_executor.execute_confirmed_action(  # type: ignore[union-attr]
                     pending=pending,
@@ -2674,9 +2683,10 @@ class LumioAgent:
                 intent.primary_confidence,
             )
 
-        system_prompt = FALLBACK_SYSTEM_PROMPT
+        fp = await get_prompt_info("fallback_system")
+        system_prompt = fp.content
         if session_memory:
-            system_prompt = f"{FALLBACK_SYSTEM_PROMPT}\n\n## 会话记忆\n{session_memory}"
+            system_prompt = f"{fp.content}\n\n## 会话记忆\n{session_memory}"
         # 槽位状态注入(若上轮在等必填信息, 本句可能是在回话)
         slot_prompt = await self._load_slot_prompt(session_id, intent.primary_intent, entities or [], user_input)
         if slot_prompt:
@@ -2697,7 +2707,11 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"fallback 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", ""), "domain": "chitchat"},
+                evidence={
+                    "source": getattr(result, "source", ""),
+                    "domain": "chitchat",
+                    "prompt": f"fallback_system:v{fp.version}({fp.source})",
+                },
                 latency_ms=_llm_ms,
                 turn_id="",  # 继承本轮 turn_id (contextvar)
             )
@@ -3253,7 +3267,7 @@ class LumioAgent:
 
             existing_summary = state.conversation_summary if split_idx > 0 else ""
 
-            summary_prompt = _SUMMARIZE_SYSTEM_PROMPT
+            summary_prompt = await get_prompt("summarize_system")
             user_content = (
                 f"已有摘要：\n{existing_summary}\n\n新增对话：\n{conversation}"
                 if existing_summary

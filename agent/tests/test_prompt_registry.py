@@ -1,54 +1,176 @@
-"""Prompt 注册中心单元测试 (prompt_registry.py)"""
+"""PromptOps 测试: 注册中心三层降级/lazy seed/草稿校验 + 提示词内容回归
+
+内容回归测试守护的是内置基线 (代码常量, 即 seed 源与四层兜底) — 后台发布的新版本
+永远不能低于这条地板线; 每条断言都源自真实会话复盘 (工号编造/系统故障话术/死胡同反问).
+"""
 
 from __future__ import annotations
 
-import json
-import time
+import pytest
 
-from lumio.services.bot.prompt_registry import (
-    _LOCAL_PROMPTS,
-    PromptRegistry,
-    PromptVersion,
-    get_prompt,
-    get_prompt_registry,
-)
+from lumio.services.bot import prompt_registry as pr
+from lumio.services.bot.prompt_registry import PromptRegistry, ResolvedPrompt
 from lumio.services.bot.prompts import (
     BUSINESS_SYSTEM_PROMPT,
     COMPLAINT_SYSTEM_PROMPT,
     FALLBACK_SYSTEM_PROMPT,
     KNOWLEDGE_SYSTEM_PROMPT,
 )
+from lumio.shared.exceptions import PromptValidationError
+
+# ── 注册中心: 三层降级 / lazy seed / 缓存失效 ──
 
 
-def test_prompt_version_rollout_clamp():
-    """rollout_pct 限制在 0~100"""
-    assert PromptVersion("n", "v", "c", rollout_pct=150.0).rollout_pct == 100.0
-    assert PromptVersion("n", "v", "c", rollout_pct=-10.0).rollout_pct == 0.0
-    assert PromptVersion("n", "v", "c").rollout_pct == 100.0
-    assert "rollout=100.0%" in repr(PromptVersion("n", "v", "c"))
+class FakeRedis:
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+
+    async def get(self, k: str):
+        return self.data.get(k)
+
+    async def set(self, k: str, v: str, ex: int = 0):
+        self.data[k] = v
+
+    async def delete(self, *keys: str):
+        for k in keys:
+            self.data.pop(k, None)
 
 
-def test_local_prompts_initialized():
-    """本地兜底库含 3 个 prompt (实例化后初始化)"""
-    PromptRegistry()  # 触发 _init_local_prompts
-    assert set(_LOCAL_PROMPTS) == {"knowledge_agent", "business_agent", "fallback_agent"}
-    for pv in _LOCAL_PROMPTS.values():
-        assert pv.content  # 内容非空
+class FakeResult:
+    def __init__(self, val):
+        self._v = val
+
+    def scalar_one_or_none(self):
+        return self._v
 
 
-def test_get_prompt_local_fallback():
-    """无 Nacos/Redis 时兜底本地 prompt"""
-    reg = PromptRegistry()
-    content = reg.get_prompt("knowledge_agent")
-    assert content == _LOCAL_PROMPTS["knowledge_agent"].content
+class FakeRow:
+    """DB 活跃版本行 (registry 只读 version/content)"""
+
+    def __init__(self, version: int, content: str):
+        self.version = version
+        self.content = content
 
 
-def test_get_prompt_missing():
-    """不存在的 prompt 返回占位符"""
-    reg = PromptRegistry()
-    assert reg.get_prompt("no_such_prompt") == "[PROMPT_MISSING:no_such_prompt]"
+class FakeSession:
+    def __init__(self, first_result):
+        self.results = [first_result]
+        self.added: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        pass
+
+    async def execute(self, q):
+        return FakeResult(self.results.pop(0) if self.results else None)
 
 
+def _broken_factory(*a, **kw):
+    raise RuntimeError("db down")
+
+
+@pytest.fixture()
+def reg():
+    """独立 registry 实例: redis 关闭, DB 默认挂 (单测内 monkeypatch)"""
+    r = PromptRegistry()
+    r._redis = False
+    return r
+
+
+async def test_local_fallback_when_db_down(monkeypatch, reg):
+    """DB 挂 → 本地常量兜底, version=0, 内容与代码常量逐字节一致"""
+    monkeypatch.setattr("lumio.services.common.database.get_async_session_factory", _broken_factory)
+    rp = await reg.resolve("knowledge_system")
+    assert rp.source == "local"
+    assert rp.version == 0
+    assert rp.content == KNOWLEDGE_SYSTEM_PROMPT
+
+
+async def test_resolve_from_db_then_proc_cache(monkeypatch, reg):
+    """DB 命中 source=db; TTL 内二次取走进程缓存 (DB 挂也不受影响)"""
+    session = FakeSession(FakeRow(3, "DB版本内容"))
+    monkeypatch.setattr("lumio.services.common.database.get_async_session_factory", lambda: (lambda: session))
+    rp = await reg.resolve("knowledge_system")
+    assert (rp.source, rp.version, rp.content) == ("db", 3, "DB版本内容")
+    monkeypatch.setattr("lumio.services.common.database.get_async_session_factory", _broken_factory)
+    assert (await reg.resolve("knowledge_system")).version == 3
+
+
+async def test_lazy_seed_builds_v1(monkeypatch, reg):
+    """DB 无记录 → 本地常量建 template+v1(published), 指针指向 v1"""
+    session = FakeSession(None)
+    monkeypatch.setattr("lumio.services.common.database.get_async_session_factory", lambda: (lambda: session))
+    rp = await reg.resolve("fallback_system")
+    assert (rp.source, rp.version) == ("db", 1)
+    tmpl, ver = session.added[0], session.added[1]
+    assert tmpl.active_version_id == ver.id
+    assert ver.status == "published"
+    assert ver.content == FALLBACK_SYSTEM_PROMPT
+
+
+async def test_redis_tier(monkeypatch):
+    """进程缓存空 → Redis 命中 (source=redis)"""
+    r = PromptRegistry()
+    redis = FakeRedis()
+    redis.data["lumio:prompt:v2:business_system"] = '{"v": 7, "c": "redis内容"}'
+    monkeypatch.setattr("lumio.services.common.redis_client.get_redis_client", lambda: redis)
+    monkeypatch.setattr("lumio.services.common.database.get_async_session_factory", _broken_factory)
+    rp = await r.resolve("business_system")
+    assert (rp.source, rp.version, rp.content) == ("redis", 7, "redis内容")
+
+
+async def test_invalidate_clears_both_tiers(monkeypatch, reg):
+    redis = FakeRedis()
+    redis.data["lumio:prompt:v2:knowledge_system"] = '{"v": 2, "c": "x"}'
+    monkeypatch.setattr("lumio.services.common.redis_client.get_redis_client", lambda: redis)
+    reg._redis = None  # 重连拿 fake
+    reg._proc_cache["knowledge_system"] = (ResolvedPrompt("knowledge_system", 2, "x", "redis"), 0.0)
+    await reg.invalidate("knowledge_system")
+    assert "knowledge_system" not in reg._proc_cache
+    assert "lumio:prompt:v2:knowledge_system" not in redis.data
+
+
+async def test_unknown_name_local_empty(monkeypatch, reg):
+    """未注册名字: 空内容返回 (调用方有上层降级链, 不崩溃)"""
+    monkeypatch.setattr("lumio.services.common.database.get_async_session_factory", _broken_factory)
+    rp = await reg.resolve("no_such_prompt")
+    assert (rp.source, rp.content) == ("local", "")
+
+
+def test_validate_content_rules():
+    """草稿校验: 空/超长/未声明占位符拒绝; 声明过放行"""
+    from lumio.services.common.prompt_router import _validate_content
+
+    with pytest.raises(PromptValidationError):
+        _validate_content("   ", [])
+    with pytest.raises(PromptValidationError):
+        _validate_content("x" * 12001, [])
+    with pytest.raises(PromptValidationError):
+        _validate_content("请提供 {card_no} 后四位", [])  # generation 类禁止占位符
+    _validate_content("文本 {reason}", ["reason"])
+    _validate_content("普通文本", [])
+
+
+def test_local_defs_cover_generation_prompts():
+    """本地基线覆盖四条链 + 摘要 (seed 源完整性)"""
+    assert set(pr._local_prompt_defs()) == {
+        "knowledge_system",
+        "business_system",
+        "complaint_system",
+        "fallback_system",
+        "summarize_system",
+    }
+
+
+# ── 提示词内容回归 (内置基线地板线, 均源自真实会话复盘) ──
 # 回归: 客户随便发句无意义输入, 兜底话术不得谎称"系统故障" (见 S6 诊断)
 def test_fallback_prompt_does_not_claim_system_outage():
     """兜底系统提示词不得诱导模型说系统故障/服务不可用, 应引导客户换说法"""
@@ -84,114 +206,6 @@ def test_prompts_safety_redlines():
         assert "不承诺任何收益" in p, "必须不承诺收益"
 
 
-def test_get_prompt_from_redis_cache(monkeypatch):
-    """Redis 缓存命中优先于本地"""
-    reg = PromptRegistry()
-
-    class _FakeRedisSync:
-        def __init__(self, data: dict) -> None:
-            self.data = data
-
-        def get(self, key: str):
-            return self.data.get(key)
-
-    payload = json.dumps({"version": "2.0", "content": "新版 prompt 内容", "rollout_pct": 100.0})
-    reg._redis_client = _FakeRedisSync({"lumio:prompt:knowledge_agent": payload})
-    content = reg.get_prompt("knowledge_agent")
-    assert content == "新版 prompt 内容"
-    assert reg._cache["knowledge_agent"].version == "2.0"
-
-
-def test_get_prompt_rollout_switch_back():
-    """rollout_pct < 100 且未命中 → 切回主版本"""
-    reg = PromptRegistry()
-    now = time.time()
-    reg._cache["knowledge_agent"] = PromptVersion(
-        name="knowledge_agent",
-        version="canary-2.0",
-        content="灰度内容",
-        rollout_pct=1.0,  # 1% 灰度
-    )
-    reg._cache_loaded_at["knowledge_agent"] = now
-    # 用 hash 不在 1% 内的 customer_id
-    content = reg.get_prompt("knowledge_agent", customer_id="customer-x")
-    assert content == _LOCAL_PROMPTS["knowledge_agent"].content  # 主版本
-
-
-def test_get_prompt_rollout_hit():
-    """rollout_pct < 100 且命中灰度 → 灰度内容"""
-    reg = PromptRegistry()
-    now = time.time()
-    reg._cache["knowledge_agent"] = PromptVersion(
-        name="knowledge_agent",
-        version="canary-2.0",
-        content="灰度内容",
-        rollout_pct=100.0,
-    )
-    reg._cache_loaded_at["knowledge_agent"] = now
-    assert reg.get_prompt("knowledge_agent", customer_id="c") == "灰度内容"
-
-
-def test_is_in_rollout_sticky():
-    """粘性分桶: 同一 customer 结果稳定"""
-    assert PromptRegistry._is_in_rollout("", 50.0) is True  # 空 customer 全量
-    r1 = PromptRegistry._is_in_rollout("cust-1", 50.0)
-    r2 = PromptRegistry._is_in_rollout("cust-1", 50.0)
-    assert r1 == r2
-
-
-def test_get_metadata():
-    """元数据查询"""
-    reg = PromptRegistry()
-    meta = reg.get_metadata("knowledge_agent")
-    assert meta["version"] == "local-v1"
-    assert "changelog" in meta
-    assert reg.get_metadata("no_such") is None
-
-
-def test_get_metadata_from_cache():
-    """缓存版本元数据优先"""
-    reg = PromptRegistry()
-    reg._cache["business_agent"] = PromptVersion(name="business_agent", version="v9", content="c", changelog="改")
-    assert reg.get_metadata("business_agent")["version"] == "v9"
-
-
-def test_invalidate_cache():
-    """缓存清除: 单名与全量"""
-    reg = PromptRegistry()
-    reg._cache["a"] = PromptVersion("a", "v1", "c")
-    reg._cache["b"] = PromptVersion("b", "v1", "c")
-    reg._cache_loaded_at["a"] = time.time()
-
-    reg.invalidate_cache("a")
-    assert "a" not in reg._cache
-    assert "b" in reg._cache
-
-    reg.invalidate_cache()
-    assert reg._cache == {}
-
-
-def test_redis_error_soft():
-    """Redis 读取异常 → 回退本地"""
-    reg = PromptRegistry()
-
-    class _BoomRedis:
-        def get(self, key: str):
-            raise RuntimeError("redis down")
-
-    reg._redis_client = _BoomRedis()
-    content = reg.get_prompt("knowledge_agent")
-    assert content == _LOCAL_PROMPTS["knowledge_agent"].content
-
-
-def test_registry_singleton_and_helper():
-    """单例 + 便捷函数"""
-    r1 = get_prompt_registry()
-    r2 = get_prompt_registry()
-    assert r1 is r2
-    assert get_prompt("fallback_agent") == _LOCAL_PROMPTS["fallback_agent"].content
-
-
 def test_fallback_prompt_has_capability_anchor_for_chitchat():
     """理想形态 (会话 b561cd04): 闲聊/离题时承认帮不上 + 列出能力锚, 禁裸 yes/no 反问."""
     assert "超出业务范围" in FALLBACK_SYSTEM_PROMPT
@@ -224,7 +238,6 @@ def test_business_prompt_confirmation_and_no_yesno():
 
 def test_safety_redlines_forbid_full_pan():
     """P1a: 安全红线必须禁止索取完整卡号/复述凭证 (所有提示词生效)"""
-    from lumio.services.bot.prompts import COMPLAINT_SYSTEM_PROMPT, FALLBACK_SYSTEM_PROMPT, KNOWLEDGE_SYSTEM_PROMPT
 
     for p in (KNOWLEDGE_SYSTEM_PROMPT, BUSINESS_SYSTEM_PROMPT, COMPLAINT_SYSTEM_PROMPT, FALLBACK_SYSTEM_PROMPT):
         assert "完整卡号" in p, "红线必须禁止索要完整卡号"

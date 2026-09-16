@@ -98,6 +98,11 @@ def create_bot_app(lifespan: Callable | None = None) -> FastAPI:
 
     app.include_router(simulator_router, prefix="/api")
 
+    # 提示词管理路由 (PromptOps: 版本/发布/回滚, 修复分流表 D·模型落地页)
+    from lumio.services.common.prompt_router import router as prompt_router
+
+    app.include_router(prompt_router, prefix="/api")
+
     # 审计日志中间件
     from lumio.shared.audit_middleware import register_audit_middleware
 

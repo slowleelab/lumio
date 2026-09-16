@@ -45,9 +45,7 @@ async def test_faq_crud_lifecycle(admin_client: httpx.AsyncClient) -> None:
     assert r2.status_code == 200 and r2.json()["question"].startswith("覆盖率测试问答")
 
     # 更新答案
-    r3 = await admin_client.put(
-        f"/api/kb/faq/{faq_id}", json={"answer": f"更新后的答案 {tag}。"}
-    )
+    r3 = await admin_client.put(f"/api/kb/faq/{faq_id}", json={"answer": f"更新后的答案 {tag}。"})
     assert r3.status_code == 200
 
     # 提交 → 审批通过 → 发布 (审批端点均需 FaqApprovalRequest body)
@@ -59,7 +57,10 @@ async def test_faq_crud_lifecycle(admin_client: httpx.AsyncClient) -> None:
     # 列表过滤: 只看已发布, 能按问句前缀查到本条
     r4 = await admin_client.get("/api/kb/faq", params={"approval_status": "PUBLISHED", "limit": 200})
     assert r4.status_code == 200
-    assert any(str(f.get("question", "")).startswith("覆盖率测试问答") and tag in str(f.get("question", "")) for f in r4.json()["faqs"])
+    assert any(
+        str(f.get("question", "")).startswith("覆盖率测试问答") and tag in str(f.get("question", ""))
+        for f in r4.json()["faqs"]
+    )
 
     # 归档 → 不再出现在发布列表; restore 可回草稿
     assert (await admin_client.post(f"/api/kb/faq/{faq_id}/archive", json=_c)).status_code == 200
@@ -70,9 +71,7 @@ async def test_faq_crud_lifecycle(admin_client: httpx.AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_faq_update_missing_raises(admin_client: httpx.AsyncClient) -> None:
-    r = await admin_client.put(
-        f"/api/kb/faq/{uuid.uuid4()}", json={"answer": "x"}
-    )
+    r = await admin_client.put(f"/api/kb/faq/{uuid.uuid4()}", json={"answer": "x"})
     assert 400 <= r.status_code < 500
 
 
