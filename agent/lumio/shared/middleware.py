@@ -17,6 +17,7 @@ from lumio.shared.exceptions import (
     BusinessError,
     InvalidTransitionError,
     LumioError,
+    PromptLockedError,
     ServiceOverloadedError,
     SessionNotFoundError,
 )
@@ -29,6 +30,7 @@ _HTTP_STATUS_OVERRIDES: dict[int, int] = {
     InvalidTransitionError.code: 409,
     BusinessError.code: 409,  # 业务规则不允许 (会话上限等)
     ServiceOverloadedError.code: 503,  # 服务过载/依赖不可用 → 503
+    PromptLockedError.code: 403,  # 工程锁定类提示词拒改 → 无权限语义
     1001: 401,  # AuthenticationError
     1003: 403,  # AuthorizationError
 }
