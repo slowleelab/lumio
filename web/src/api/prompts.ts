@@ -8,6 +8,7 @@ export interface PromptItem {
   name: string
   category: string
   description: string
+  scene?: string
   editable: boolean
   source: "db" | "code"
   active_version: number

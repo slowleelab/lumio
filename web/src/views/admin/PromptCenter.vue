@@ -28,7 +28,12 @@
           <div class="prompt-desc">{{ row.description }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="类别" width="110">
+      <el-table-column label="运用场景" min-width="240">
+        <template #default="{ row }">
+          <div class="prompt-scene">{{ row.scene || "-" }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column label="类别" width="100">
         <template #default="{ row }">
           <el-tag size="small" :type="categoryType(row.category)" effect="plain">{{ categoryLabel(row.category) }}</el-tag>
         </template>
@@ -67,6 +72,10 @@
           <el-tag v-if="detail.editable" size="small" type="success" effect="plain">在线可管理</el-tag>
           <el-tag v-else size="small" type="info" effect="plain">工程锁定 · 只读</el-tag>
           <span class="muted">{{ detail.description }}</span>
+        </div>
+        <div v-if="detail.scene" class="drawer-meta scene-line">
+          <span class="scene-label">运用场景</span>
+          <span class="muted">{{ detail.scene }}</span>
         </div>
 
         <!-- 工程锁定: 只读内容 -->
@@ -379,12 +388,28 @@ onMounted(load)
   line-height: 1.5;
 }
 
+.prompt-scene {
+  font-size: 12px;
+  color: var(--color-text-muted, #909399);
+  line-height: 1.5;
+}
+
 .drawer-meta {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: 14px;
   flex-wrap: wrap;
+}
+
+.scene-line {
+  margin-bottom: 6px;
+}
+
+.scene-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-color-primary);
 }
 
 .section-title {
