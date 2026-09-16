@@ -18,7 +18,6 @@ from lumio.services.bot.prompts import (
 )
 from lumio.shared.exceptions import PromptValidationError
 
-
 # ── 注册中心: 三层降级 / lazy seed / 缓存失效 ──
 
 
