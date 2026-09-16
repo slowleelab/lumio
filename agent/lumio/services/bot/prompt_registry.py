@@ -52,27 +52,27 @@ def _local_prompt_defs() -> dict[str, dict[str, Any]]:
     return {
         "knowledge_system": {
             "category": "generation",
-            "description": "知识问答链 system prompt (基于检索回答/简洁/澄清规范)",
+            "description": "知识问答链 — 咨询类问题的回复生成（基于知识库检索作答，约束简洁与澄清规范）",
             "content": prompts_mod.KNOWLEDGE_SYSTEM_PROMPT,
         },
         "business_system": {
             "category": "generation",
-            "description": "业务办理链 system prompt (缺参追问/敏感确认/降级)",
+            "description": "业务办理链 — 办理类请求的回复生成（缺参数时逐项追问，敏感操作交系统确认）",
             "content": prompts_mod.BUSINESS_SYSTEM_PROMPT,
         },
         "complaint_system": {
             "category": "generation",
-            "description": "投诉安抚链 system prompt (先共情后处理)",
+            "description": "投诉安抚链 — 投诉场景的回复生成（先共情再处理，严重投诉转人工）",
             "content": prompts_mod.COMPLAINT_SYSTEM_PROMPT,
         },
         "fallback_system": {
             "category": "generation",
-            "description": "兜底闲聊域 system prompt (能力锚引导/离题接话)",
+            "description": "兜底闲聊链 — 无意义输入/离题闲聊的回复生成（接住话题并引导回业务）",
             "content": prompts_mod.FALLBACK_SYSTEM_PROMPT,
         },
         "summarize_system": {
             "category": "generation",
-            "description": "多轮对话压缩摘要 prompt (上下文工程用)",
+            "description": "多轮对话压缩摘要 — 长会话滚动总结，供后续轮次作上下文",
             "content": prompts_mod._SUMMARIZE_SYSTEM_PROMPT,
         },
     }
