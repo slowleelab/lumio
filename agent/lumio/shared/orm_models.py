@@ -1344,6 +1344,4 @@ class PromptVersion(Base):
         TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
     )
 
-    __table_args__ = (
-        Index("uq_prompt_version_seq", "template_id", "version", unique=True),
-    )
+    __table_args__ = (Index("uq_prompt_version_seq", "template_id", "version", unique=True),)

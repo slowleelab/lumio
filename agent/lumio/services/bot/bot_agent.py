@@ -2005,7 +2005,12 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"business 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", ""), "domain": "business", "rag_used": bool(context), "prompt": f"business_system:v{bp.version}({bp.source})"},
+                evidence={
+                    "source": getattr(result, "source", ""),
+                    "domain": "business",
+                    "rag_used": bool(context),
+                    "prompt": f"business_system:v{bp.version}({bp.source})",
+                },
                 latency_ms=_llm_ms,
                 turn_id="",  # 继承本轮 turn_id (contextvar)
             )
@@ -2702,7 +2707,11 @@ class LumioAgent:
                 agent_name="bot_agent",
                 action=DecisionAction.LLM_GENERATE,
                 reasoning=f"fallback 生成, 来源={getattr(result, 'source', '')}",
-                evidence={"source": getattr(result, "source", ""), "domain": "chitchat", "prompt": f"fallback_system:v{fp.version}({fp.source})"},
+                evidence={
+                    "source": getattr(result, "source", ""),
+                    "domain": "chitchat",
+                    "prompt": f"fallback_system:v{fp.version}({fp.source})",
+                },
                 latency_ms=_llm_ms,
                 turn_id="",  # 继承本轮 turn_id (contextvar)
             )

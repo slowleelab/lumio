@@ -44,7 +44,13 @@ async def test_followup_context_gated_by_pending_reply() -> None:
     history = [{"speaker": "customer", "content": "帮我查账单"}, {"speaker": "bot", "content": "请提供卡号"}]
 
     # 正常追问轮: 有上下文
-    agent._session_manager = _SM({"last_tool_result": {"tool": "t", "summary": "还款日 2026-07-25"}, "awaiting_slots": {}, "pending_action": None})
+    agent._session_manager = _SM(
+        {
+            "last_tool_result": {"tool": "t", "summary": "还款日 2026-07-25"},
+            "awaiting_slots": {},
+            "pending_action": None,
+        }
+    )
     ctx = await agent._build_followup_context("s1", history)
     assert ctx is not None and "上一轮系统动作" in ctx
 

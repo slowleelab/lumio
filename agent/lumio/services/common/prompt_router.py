@@ -108,9 +108,7 @@ def _locked_prompt_defs() -> dict[str, dict[str, str]]:
 async def _load_template(session: Any, name: str) -> Any:
     from lumio.shared.orm_models import PromptTemplate
 
-    return (
-        await session.execute(select(PromptTemplate).where(PromptTemplate.name == name))
-    ).scalar_one_or_none()
+    return (await session.execute(select(PromptTemplate).where(PromptTemplate.name == name))).scalar_one_or_none()
 
 
 def _validate_content(content: str, variables: list | None) -> None:
@@ -152,7 +150,11 @@ async def list_prompts(user: AdminOnlyUser) -> dict:
 
     items: list[dict] = []
     async with get_async_session_factory()() as session:
-        tmpls = (await session.execute(select(PromptTemplate).order_by(PromptTemplate.category, PromptTemplate.name))).scalars().all()
+        tmpls = (
+            (await session.execute(select(PromptTemplate).order_by(PromptTemplate.category, PromptTemplate.name)))
+            .scalars()
+            .all()
+        )
         for t in tmpls:
             ver = None
             if t.active_version_id:
@@ -250,12 +252,16 @@ async def prompt_detail(name: str, user: AdminOnlyUser) -> dict:
                 "versions": [],
             }
         versions = (
-            await session.execute(
-                select(PromptVersion)
-                .where(PromptVersion.template_id == t.id)
-                .order_by(PromptVersion.version.desc())
+            (
+                await session.execute(
+                    select(PromptVersion)
+                    .where(PromptVersion.template_id == t.id)
+                    .order_by(PromptVersion.version.desc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         active = next((v for v in versions if v.id == t.active_version_id), None)
         return {
             "name": name,
@@ -303,8 +309,13 @@ async def create_draft(name: str, body: DraftBody, user: AdminOnlyUser) -> dict:
                 id=_uuid_v7(), name=name, category=d["category"], description=d["description"], variables=[]
             )
             v1 = PromptVersion(
-                id=_uuid_v7(), template_id=t.id, version=1, content=d["content"],
-                changelog="内置基线 (代码常量 lazy seed)", created_by="system", status="published",
+                id=_uuid_v7(),
+                template_id=t.id,
+                version=1,
+                content=d["content"],
+                changelog="内置基线 (代码常量 lazy seed)",
+                created_by="system",
+                status="published",
             )
             t.active_version_id = v1.id
             session.add(t)
@@ -353,12 +364,14 @@ async def publish_version(name: str, version_id: UUID, user: AdminOnlyUser) -> d
             raise LumioError(message="该版本已是当前生效版本", code=3010, status_code=409)
         # 同一 template 同时仅一个 published
         olds = (
-            await session.execute(
-                select(PromptVersion).where(
-                    PromptVersion.template_id == t.id, PromptVersion.status == "published"
+            (
+                await session.execute(
+                    select(PromptVersion).where(PromptVersion.template_id == t.id, PromptVersion.status == "published")
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for o in olds:
             o.status = "archived"
         ver.status = "published"

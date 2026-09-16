@@ -225,9 +225,7 @@ class PromptRegistry:
             return
         try:
             ttl = self._settings.cache_ttl_seconds or 60
-            await redis.set(
-                _REDIS_KEY.format(name=name), json.dumps({"v": rp.version, "c": rp.content}), ex=ttl
-            )
+            await redis.set(_REDIS_KEY.format(name=name), json.dumps({"v": rp.version, "c": rp.content}), ex=ttl)
         except Exception as exc:
             logger.debug("Redis prompt 写入失败: name=%s err=%s", name, exc)
 
