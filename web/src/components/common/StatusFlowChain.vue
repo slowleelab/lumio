@@ -263,7 +263,7 @@ const showBranches = computed(() => !terminal.value || props.current === "reject
 }
 
 .flow-edge.active .edge-line {
-  background: repeating-linear-gradient(90deg, var(--el-color-primary-light-5) 0 6px, transparent 6px 10px);
+  background: linear-gradient(90deg, var(--el-color-primary-light-7), var(--el-color-primary-light-4));
 }
 
 .flow-edge.idle .edge-line,
@@ -277,10 +277,10 @@ const showBranches = computed(() => !terminal.value || props.current === "reject
   padding: 3px 10px;
   font-size: 11px;
   border-radius: 999px;
-  border: 1px solid var(--el-color-primary);
-  color: var(--el-color-primary);
-  background: var(--el-color-primary-light-9);
-  cursor: pointer;
+  border: 1px solid var(--el-border-color);
+  color: var(--color-text-muted, #c0c4cc);
+  background: transparent;
+  cursor: default;
   white-space: nowrap;
   transition: all 0.18s;
   display: inline-flex;
@@ -288,11 +288,22 @@ const showBranches = computed(() => !terminal.value || props.current === "reject
   gap: 4px;
 }
 
-.flow-edge.active .edge-action:hover:not(:disabled) {
-  background: var(--el-color-primary);
+/* 当前可执行动作 = 实底主按钮 (全链唯一强视觉焦点, 一眼可见哪里点) */
+.flow-edge.active .edge-action {
+  padding: 5px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  border: none;
   color: #fff;
+  background: var(--el-color-primary);
+  cursor: pointer;
+  box-shadow: 0 2px 8px var(--el-color-primary-light-5);
+}
+
+.flow-edge.active .edge-action:hover:not(:disabled) {
+  background: var(--el-color-primary-light-3);
   transform: translateY(-1px);
-  box-shadow: 0 2px 6px var(--el-color-primary-light-7);
+  box-shadow: 0 4px 10px var(--el-color-primary-light-5);
 }
 
 .flow-edge.active .edge-action:disabled {
