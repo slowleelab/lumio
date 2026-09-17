@@ -217,6 +217,12 @@ def test_rubric_mentions_all_dimensions() -> None:
     assert "JSON" in QA_RUBRIC_PROMPT
 
 
+def test_rubric_forbids_invalid_clarify() -> None:
+    """无效澄清硬条款 (会话 8d988206 复盘): 清晰业务问句被澄清话术打发必须判 fail, 防条款被误删"""
+    assert "不得以 \"客户表述含糊\" 为由豁免" in QA_RUBRIC_PROMPT
+    assert "倒推" in QA_RUBRIC_PROMPT
+
+
 # ── 覆率加固: 巡检装载/单会话分支/后台任务/裁判构造/存量回填 ──
 
 
