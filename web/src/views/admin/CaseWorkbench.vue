@@ -137,13 +137,15 @@
         </div>
       </template>
       <div v-if="detail" class="detail-body">
-        <!-- 整改进度步骤条: 处置状态机一眼可见 -->
-        <el-steps :active="fixStepActive" align-center size="small" finish-status="success" class="fix-steps">
-          <el-step title="归因" :description="detail.root_cause_layer ? layerLabel(detail.root_cause_layer) : '待裁判'" />
-          <el-step title="人工确认" :description="detail.needs_human_review ? '待复核' : detail.root_cause_layer ? '已确认' : '-'" />
-          <el-step title="修复" :description="{ fixing: '修复中', canary: '已灰度', deployed: '已上线', reopened: '重放验证未过', rejected: '已驳回' }[detail.fix_status] || '-'" />
-          <el-step title="验证" :description="{ verified: '重放验证通过 · 已销项', deployed: '可重放验证', canary: '灰度可重放验证' }[detail.fix_status] || '待上线'" />
-        </el-steps>
+        <!-- 处置状态机节点链: 流程经过哪些节点一目了然, 点击下一节点即流转 -->
+        <StatusFlowChain
+          :current="detail.fix_status"
+          :blocked="!detail.root_cause_layer || detail.root_cause_layer === 'uncertain'"
+          :loading="acting"
+          :reject-note="detail.fix_note || ''"
+          class="fix-steps"
+          @advance="onChainAdvance"
+        />
         <el-alert v-if="detail.fix_status === 'rejected'" type="info" :closable="false" class="reject-alert" :title="`已驳回 — ${detail.fix_note || ''}`" />
         <el-descriptions :column="3" border size="small">
           <el-descriptions-item label="来源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
@@ -249,26 +251,18 @@
         </el-collapse>
         <div v-if="!detail.snapshot || !Object.keys(detail.snapshot).length" class="muted">(采集时未携带快照)</div>
 
-        <div class="section-title">处理操作 <span class="muted section-hint">(按状态机流转: 待处置 → 修复中 → 已灰度 → 已上线 → 已验证; 终态不可逆)</span></div>
+        <div class="section-title">处理操作 <span class="muted section-hint">(主推进在上方节点链 — 点击下一节点流转; 此处保留复合动作与工具)</span></div>
         <div class="action-grid">
-          <!-- 主推进: 按状态机只亮当前态的合法转移 (与后端 _FIX_TRANSITIONS 同构) -->
+          <!-- 归因是流转前置 (pending→fixing 需明确根因), 不是状态流转, 保留为显式动作 -->
           <el-button v-if="!detail.root_cause_layer || detail.root_cause_layer === 'uncertain'" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因{{ detail.root_cause_layer === "uncertain" ? " (重试)" : "" }}</el-button>
-          <el-button v-if="detail.fix_status === 'pending' && detail.root_cause_layer" size="small" type="success" :loading="acting" @click="confirmResolve">
-            确认根因 → 修复中{{ detail.root_cause_layer === "uncertain" ? " (待选根因)" : "" }}
-          </el-button>
-          <el-button v-if="detail.fix_status === 'fixing'" size="small" type="warning" :loading="acting" @click="transition('canary')">修复完成 → 已灰度</el-button>
-          <el-button v-if="detail.fix_status === 'canary'" size="small" type="success" :loading="acting" @click="transition('deployed')">灰度通过 → 已上线</el-button>
           <!-- 验证闭环: 重放原会话 (当前代码重新回答) → 按新判定自动流转 已验证/已重开 -->
           <el-button
             v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
             size="small" type="primary" plain :loading="recheckState.running" @click="recheckFromBadcase"
           >{{ recheckState.running ? `重放验证中 ${recheckState.done}/${recheckState.total || "…"}` : `重放验证 (当前代码重新回答${detail.fix_status === "deployed" ? "" : " · 灰度"})` }}</el-button>
-          <el-button v-if="detail.fix_status === 'reopened'" size="small" type="warning" :loading="acting" @click="transition('fixing')">重新修复 → 修复中</el-button>
           <!-- 次要操作 -->
           <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
           <el-button size="small" @click="gotoAudit(detail)">会话审计</el-button>
-          <el-button v-if="detail.fix_status !== 'verified' && detail.fix_status !== 'rejected'" size="small" type="danger" plain :loading="acting" @click="rejectCase">驳回 (误采集)</el-button>
-          <span v-else class="muted action-hint">终态 · 不可流转</span>
         </div>
 
         <template v-if="detail.fix_note">
@@ -285,6 +279,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
+import StatusFlowChain from "@/components/common/StatusFlowChain.vue"
 import {
   attributeBadcase,
   resolveBadcase,
@@ -798,6 +793,14 @@ async function confirmResolve() {
   } finally {
     acting.value = false
   }
+}
+
+// 节点链流转分发: 点击下一节点 → 复用既有动作 (确认根因/状态转移/驳回), 语义与原按钮一致
+async function onChainAdvance(to: string) {
+  if (!detail.value) return
+  if (to === "rejected") return rejectCase()
+  if (to === "fixing" && detail.value.fix_status === "pending") return confirmResolve()
+  return transition(to)
 }
 
 async function rejectCase() {
