@@ -1345,3 +1345,39 @@ class PromptVersion(Base):
     )
 
     __table_args__ = (Index("uq_prompt_version_seq", "template_id", "version", unique=True),)
+
+
+class FixPattern(Base):
+    """问题治理方案 (修复分流表之上的共性聚合层)
+
+    问题组本身不落库 — 由 badcase 按 (intent_label, root_cause_layer) 实时聚合,
+    新案例自动入组、治理完成后复发自动重开; 本表只挂治理方案 (按 group_key upsert)。
+    展示状态全部派生: 无方案 / 方案已定 / 修复中(组内有 fixing+) / 已治理(组内无 open)。
+    """
+
+    __tablename__ = "fix_pattern"
+
+    id: Mapped[uuid_utils.UUID] = mapped_column(
+        Uuid(native_uuid=False),
+        primary_key=True,
+        default=_uuid_v7,
+    )
+    # f"{intent_label or '_'}::{root_cause_layer}" — 与聚合查询同构
+    group_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    intent_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    root_cause_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    fix_table: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    plan_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    plan_owner: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=datetime.now, server_default=text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=datetime.now,
+        server_default=text("now()"),
+        onupdate=datetime.now,
+    )

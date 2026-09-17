@@ -23,6 +23,10 @@
           <el-icon><Tickets /></el-icon>
           <template #title>案例工作台</template>
         </el-menu-item>
+        <el-menu-item index="/admin/patterns">
+          <el-icon><Aim /></el-icon>
+          <template #title>问题治理</template>
+        </el-menu-item>
         <el-menu-item index="/admin/intent-library">
           <el-icon><Notebook /></el-icon>
           <template #title>意图库管理</template>
@@ -100,6 +104,7 @@ import {
   PieChart,
   DataAnalysis,
   Tickets,
+  Aim,
   Notebook,
   EditPen,
   VideoPlay,
