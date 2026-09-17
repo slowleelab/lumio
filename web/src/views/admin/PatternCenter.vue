@@ -108,6 +108,7 @@
             :counts="batchCounts"
             :loading="acting"
             :allow-reject="false"
+            batch-mode
             @advance="(to: string) => runBatch(to)"
           />
 

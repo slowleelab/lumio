@@ -795,10 +795,11 @@ async function confirmResolve() {
   }
 }
 
-// 节点链流转分发: 点击下一节点 → 复用既有动作 (确认根因/状态转移/驳回), 语义与原按钮一致
+// 节点链流转分发: 每段流转对应明确动作 — verified 必须走重放验证闭环 (自动判定流转), 不允许直接改写状态
 async function onChainAdvance(to: string) {
   if (!detail.value) return
   if (to === "rejected") return rejectCase()
+  if (to === "verified") return recheckFromBadcase()
   if (to === "fixing" && detail.value.fix_status === "pending") return confirmResolve()
   return transition(to)
 }
