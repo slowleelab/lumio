@@ -39,14 +39,32 @@ def classifier_with_vector(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_l2_vector_hit_between_rule_and_llm(classifier_with_vector, monkeypatch) -> None:
-    """规则未命中 → L2 向量命中 → 直接返回, 不调 L3 LLM"""
+    """规则未命中 → L2 向量命中且与快路径同域 (精确叶子) → 直接返回, 不调 L3 LLM"""
     clf, vec = classifier_with_vector
-    result, _, _, source = await clf.classify("我的额度是多少")
+    # 同域场景: 快路径 FAQ(knowledge 域), 向量也判 knowledge → 取快路径叶子
+    vec.search = AsyncMock(return_value=_vm(intent="consulting", score=0.85))
+    result, _, _, source = await clf.classify("白金卡有什么权益")
     vec.search.assert_awaited_once()
-    # L2 判定五域 query → 域代表叶子 account_bill_query; 定义句式强制咨询域
-    assert result.primary_intent in (IntentLabel.ACCOUNT_BILL_QUERY, IntentLabel.FAQ)
+    assert result.primary_intent == IntentLabel.FAQ
     assert result.primary_confidence == pytest.approx(0.85, abs=1e-3)
     assert source == "vector"
+
+
+@pytest.mark.asyncio
+async def test_l2_domain_representative_caps_to_llm(classifier_with_vector) -> None:
+    """域代表兜底不算强识别 (会话 8d988206 复盘): 快路径业务意图与向量域不一致
+    (limit_query@query域 vs 向量强制咨询域) → 取域代表时置信封顶到采纳阈下,
+    强制落 L3 终判 — 余弦相似度不冒充分类置信豁免 LLM"""
+    clf, vec = classifier_with_vector
+    # 复现生产形态: 快路径 limit_query@0.2 (query 域), 向量命中被"怎么办"句式强制到
+    # consulting 域 → 异域 → 域代表分支 (曾经的假高置信直返豁免 L3)
+
+    clf._rule.classify.return_value = IntentResult(primary_intent=IntentLabel.LIMIT_QUERY, primary_confidence=0.2)
+    vec.search = AsyncMock(return_value=_vm(intent="query", score=0.85))
+    result, _, _, source = await clf.classify("我想转账但限额怎么办")
+    vec.search.assert_awaited_once()
+    clf._llm.classify.assert_awaited_once()  # L3 被触发
+    assert result.primary_confidence < 0.85  # 高相似度不再透传为高置信
 
 
 @pytest.mark.asyncio
