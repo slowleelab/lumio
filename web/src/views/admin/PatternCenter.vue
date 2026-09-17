@@ -101,19 +101,15 @@
 
           <div class="section-title">
             批量执行
-            <span class="muted section-hint">(逐例走状态机守门, 单例失败不阻断; 确认根因随方案批量落人工确认)</span>
+            <span class="muted section-hint">(节点带各状态案例数, 点击下一节点批量流转; 逐例走状态机守门, 单例失败不阻断)</span>
           </div>
-          <div class="batch-row">
-            <el-button size="small" type="success" :loading="acting" :disabled="!canBatch('fixing')" @click="runBatch('fixing')">
-              批量确认根因 → 修复中 ({{ pendingCount }})
-            </el-button>
-            <el-button size="small" type="warning" :loading="acting" :disabled="!canBatch('canary')" @click="runBatch('canary')">
-              批量转灰度 ({{ fixingCount }})
-            </el-button>
-            <el-button size="small" :loading="acting" :disabled="!canBatch('deployed')" @click="runBatch('deployed')">
-              批量上线 ({{ canaryCount }})
-            </el-button>
-          </div>
+          <StatusFlowChain
+            :current="batchChainCurrent"
+            :counts="batchCounts"
+            :loading="acting"
+            :allow-reject="false"
+            @advance="(to: string) => runBatch(to)"
+          />
 
           <div class="section-title">组内案例 <span class="muted section-hint">({{ detail.cases.length }} 例, 按会话时间倒序)</span></div>
           <el-table :data="detail.cases" size="small" class="case-table" max-height="420">
@@ -153,6 +149,7 @@
 import { computed, onMounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
+import StatusFlowChain from "@/components/common/StatusFlowChain.vue"
 import {
   batchTransition,
   getPatternDetail,
@@ -236,17 +233,20 @@ function fmtTime(t: string | null) {
 }
 
 const fixGuideTo = computed(() => FIX_GUIDE_TO[planTable.value || detail.value?.fix_table || ""] ?? null)
-const pendingCount = computed(() => detail.value?.cases.filter((c) => c.fix_status === "pending" || c.fix_status === "reopened").length ?? 0)
-const fixingCount = computed(() => detail.value?.cases.filter((c) => c.fix_status === "fixing").length ?? 0)
-const canaryCount = computed(() => detail.value?.cases.filter((c) => c.fix_status === "canary").length ?? 0)
 
-function canBatch(target: string) {
-  if (target === "fixing") return pendingCount.value > 0
-  if (target === "canary") return fixingCount.value > 0
-  if (target === "deployed") return canaryCount.value > 0
-  return false
-}
-
+// 批量节点链: 组内案例状态分布 → 计数徽标; 当前位置取组内"最靠前"状态 (批量从它推进)
+const batchCounts = computed<Record<string, number>>(() => {
+  const c: Record<string, number> = {}
+  for (const k of ["pending", "fixing", "canary", "deployed", "verified"])
+    c[k] = detail.value?.cases.filter((x) => x.fix_status === k).length ?? 0
+  return c
+})
+const batchChainCurrent = computed<string>(() => {
+  const c = batchCounts.value
+  if ((c.fixing ?? 0) > 0 && (c.pending ?? 0) === 0) return c.canary ? "fixing" : "fixing"
+  if ((c.canary ?? 0) > 0 && (c.fixing ?? 0) === 0 && (c.pending ?? 0) === 0) return "canary"
+  return "pending"
+})
 async function load() {
   loading.value = true
   try {
@@ -303,7 +303,7 @@ async function savePlan() {
 async function runBatch(target: string) {
   if (!detail.value) return
   const verb = { fixing: "确认根因并转入修复中", canary: "批量转灰度", deployed: "批量上线" }[target] ?? target
-  const n = target === "fixing" ? pendingCount.value : target === "canary" ? fixingCount.value : canaryCount.value
+  const n = batchCounts.value[target === "fixing" ? "pending" : target === "canary" ? "fixing" : "canary"] ?? 0
   await ElMessageBox.confirm(
     target === "fixing"
       ? `将组内 ${n} 个待处置案例的根因批量确认为「${layerLabel(detail.value.root_cause_layer)}」并转入修复中。方案落定即人工把关, 确认执行?`
