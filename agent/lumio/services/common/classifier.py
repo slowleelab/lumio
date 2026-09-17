@@ -1156,14 +1156,25 @@ class IntentClassifier:
                     if v_domain is None:
                         raise ValueError(f"L2 返回未知域: {vm.intent}")
                     v_domain = domain_of_with_text(v_domain, text)  # 定义句式强制咨询域
+                    v_leaf_is_representative = False
                     if domain_of(fast_result.primary_intent) == v_domain:
                         v_leaf = fast_result.primary_intent
                     else:
                         v_leaf = domain_representative(v_domain)
-                    logger.info("L2 向量域命中: %s@%.3f → 叶子 %s", v_domain.value, vm.score, v_leaf.value)
+                        v_leaf_is_representative = True
+                    # 域代表兜底不算强识别 (会话 8d988206 复盘): "我想转账但限额怎么办"
+                    # 语料无转账意图 → 向量近邻落 faq 域, 取域代表 faq@0.84 假"高置信"
+                    # 豁免了 L3 LLM; 余弦相似度 ≠ 分类置信, 且域代表粒度已塌缩。
+                    # 置信封顶到该意图采纳阈之下, 强制落 L3 让 LLM 终判; 精确叶子不受影响。
+                    # 已知边界: 同域精确叶子分支 (快路径叶子与向量域一致) 仍按相似度直返 —
+                    # 域级双信号同向 (BERT 叶子 + 向量域确认), 可信度高于域代表兜底。
+                    v_conf = round(min(vm.score, 0.99), 4)
+                    if v_leaf_is_representative:
+                        v_conf = min(v_conf, round(_fast_accept_threshold(v_leaf, self._threshold) - 0.05, 4))
+                    logger.info("L2 向量域命中: %s@%.3f → 叶子 %s@%.3f", v_domain.value, vm.score, v_leaf.value, v_conf)
                     fast_result = IntentResult(
                         primary_intent=v_leaf,
-                        primary_confidence=round(min(vm.score, 0.99), 4),
+                        primary_confidence=v_conf,
                         alternatives=fast_result.alternatives,
                         alternative_scores=fast_result.alternative_scores,
                         energy=fast_result.energy,
