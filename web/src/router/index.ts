@@ -15,6 +15,7 @@ import QualityReport from "@/views/admin/QualityReport.vue"
 import IntentLibrary from "@/views/admin/IntentLibrary.vue"
 import DialogueSimulator from "@/views/admin/DialogueSimulator.vue"
 import PromptCenter from "@/views/admin/PromptCenter.vue"
+import PatternCenter from "@/views/admin/PatternCenter.vue"
 
 const router = createRouter({
   history: createWebHistory(),
@@ -35,6 +36,7 @@ const router = createRouter({
         { path: "rag-metrics", name: "admin-rag-metrics", component: RagMetrics },
         { path: "badcase", name: "admin-badcase", component: BadcaseWorkbench },
         { path: "cases", name: "admin-cases", component: CaseWorkbench },
+        { path: "patterns", name: "admin-patterns", component: PatternCenter },
         { path: "quality-report", name: "admin-quality-report", component: QualityReport },
         { path: "intent-library", name: "admin-intent-library", component: IntentLibrary },
         { path: "prompts", name: "admin-prompts", component: PromptCenter },
