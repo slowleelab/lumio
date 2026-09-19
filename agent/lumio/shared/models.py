@@ -711,6 +711,9 @@ class RetrieveRequest(BaseModel):
     rerank: bool = True
     search_type: Literal["hybrid", "bm25_only", "vector_only"] = "hybrid"
     rrf_k: int | None = None  # 覆盖 RRF k 参数；None 时使用配置默认值
+    # 查询工程 (查询表达适配): 同义词 OR 注入 BM25, alt 多路词法并查 — 只作用词法路
+    synonym_terms: list[str] = Field(default_factory=list)
+    alt_queries: list[str] = Field(default_factory=list)
 
     # 银行合规: 权限 + 时间过滤
     user_role: str | None = None  # 调用者角色，用于权限过滤

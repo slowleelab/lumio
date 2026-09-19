@@ -32,6 +32,7 @@ from lumio.services.bot.prompts import (
     GREETING_RESPONSE,
     SENSITIVE_REPLY_BRIDGE_RESPONSE,
 )
+from lumio.services.bot.query_engine import build_retrieval_queries
 from lumio.services.bot.slot_tracker import _ENTITY_TO_SLOT, SlotTracker
 from lumio.services.bot.tool_executor import ConfirmDecision, ToolCallingExecutor, detect_confirmation
 from lumio.services.bot.tool_selection import select_tools_for_intent
@@ -1548,14 +1549,22 @@ class LumioAgent:
         # (敏感诉求不得被字面相似词条劫持), 敏感重路由轮跳过 (防二次绕开状态机)。
         # 追问轮检索用上下文改写句 (rewritten_query): 接话原句 ("那还款日是哪一天")
         # 的向量/BM25 会命中无关文档, 自包含改写句才检得准 (对话理解升级)。
-        retrieval_query = (getattr(intent, "rewritten_query", None) or "").strip() or user_input
+        # 查询工程三层 (零 LLM 成本): ① 归一(口语转书面/错序/黑话→书面语) ② 同义
+        # OR 扩展(补词汇鸿沟, 仅 BM25) ③ 多路词法(原句/归一句并查 RRF 融合);
+        # 改写句(接话翻译)优先于归一句作主查询 — 自包含 > 书面化。
+        _qe = build_retrieval_queries(user_input, getattr(intent, "rewritten_query", None))
+        retrieval_query = _qe["main"]
         if not _sensitive_rerouted and not _has_emergency_marker(user_input):
             faq_hit = await self._try_faq_direct(session_id, retrieval_query)
             if faq_hit is not None:
                 return faq_hit
         _rag_t0 = time.monotonic()
         context = await self._retrieve(
-            retrieval_query, intent=intent.primary_intent, confidence=intent.primary_confidence
+            retrieval_query,
+            intent=intent.primary_intent,
+            confidence=intent.primary_confidence,
+            synonym_terms=_qe["synonym_terms"],
+            alt_queries=_qe["alt_queries"],
         )
         if extra_context:
             context = f"{extra_context}\n\n{context}" if context else extra_context
@@ -1570,6 +1579,10 @@ class LumioAgent:
                     "hit": bool(context),
                     "context_len": len(context or ""),
                     "query": retrieval_query[:60],
+                    "query_engine": {
+                        "synonyms": (_qe["synonym_terms"] or [])[:4],
+                        "alts": (_qe["alt_queries"] or [])[:2],
+                    },
                     "citations": (self._last_citation_docids or [])[:5],
                 },
                 turn_id="",  # 继承本轮 turn_id (contextvar)
@@ -2934,10 +2947,19 @@ class LumioAgent:
             logger.warning("FAQ 通道匹配失败, 继续文档检索: %s", faq_err)
             return None
 
-    async def _retrieve(self, query: str, *, intent: IntentLabel | None = None, confidence: float = 0.0) -> str:
+    async def _retrieve(
+        self,
+        query: str,
+        *,
+        intent: IntentLabel | None = None,
+        confidence: float = 0.0,
+        synonym_terms: list[str] | None = None,
+        alt_queries: list[str] | None = None,
+    ) -> str:
         """RAG 检索 (P0-3 上下文工程: 接线 reranker + 相关性阈值 + 首尾重排 + RAG 预算截算)
 
         intent/confidence 提供时做意图感知检索词增强 (高置信交易/风险意图拼规范词)。
+        synonym_terms/alt_queries: 查询工程产物 (同义 OR + 多路词法), 只作用 BM25。
         """
         if intent is not None and confidence >= 0.7:
             terms = _INTENT_RETRIEVAL_TERMS.get(intent)
@@ -2971,7 +2993,13 @@ class LumioAgent:
             )
 
             resp: RetrieveResponse = await do_retrieve(
-                request=RetrieveRequest(query=query, top_k=settings.rag.top_k, rerank=True),
+                request=RetrieveRequest(
+                    query=query,
+                    top_k=settings.rag.top_k,
+                    rerank=True,
+                    synonym_terms=synonym_terms or [],
+                    alt_queries=alt_queries or [],
+                ),
                 es_client=self._es_client,
                 milvus_collection=self._milvus_collection,
                 embedding_provider=embedding_provider,

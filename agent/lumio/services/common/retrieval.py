@@ -243,14 +243,20 @@ async def search_bm25(
     query: str,
     top_k: int = 5,
     filters: dict | None = None,
+    synonym_terms: list[str] | None = None,
+    alt_queries: list[str] | None = None,
 ) -> tuple[list[RetrievedChunk], float | None]:
-    """BM25 全文检索（Elasticsearch + IK 分词）
+    """BM25 全文检索（Elasticsearch + IK 分词, 查询工程感知）
 
     Args:
         es_client: ES 异步客户端（None 时返回空列表，触发降级）
-        query: 查询文本
+        query: 查询文本 (归一主查询)
         top_k: 返回结果数
         filters: 过滤条件
+        synonym_terms: 同义扩展词 — 以 should(OR) 注入, 命中任一 synonym 也计分;
+            不改主查询语义, 只补词汇鸿沟 (词法路对表达最敏感)
+        alt_queries: 多查询展开 — 额外词法路 (should), 主查询 must 权重不变;
+            各路命中在同一 BM25 评分池天然融合
 
     Returns:
         (chunks, best_score) 元组:
@@ -265,14 +271,21 @@ async def search_bm25(
     settings = get_settings()
     index_name = f"{settings.elasticsearch.index_prefix}_kb_chunks"
 
-    # 构建 ES 查询体
+    # 构建 ES 查询体 (查询工程: 主查询 must + 同义词/多路 should OR)
     match_query = {"match": {"content": {"query": query, "analyzer": "ik_smart"}}}
     filter_clauses = build_es_filters(filters or {})
+    should: list[dict[str, Any]] = []
+    for term in synonym_terms or []:
+        should.append({"match": {"content": {"query": term, "analyzer": "ik_smart"}}})
+    for aq in alt_queries or []:
+        should.append({"match": {"content": {"query": aq, "analyzer": "ik_smart"}}})
 
-    if filter_clauses:
-        body: dict[str, Any] = {"query": {"bool": {"must": [match_query], "filter": filter_clauses}}}
-    else:
-        body = {"query": match_query}
+    bool_query: dict[str, Any] = {"must": [match_query]}
+    if should:
+        bool_query["should"] = should
+        bool_query["minimum_should_match"] = 0  # OR 软扩展: 不命中同义词不影响主查询
+    bool_query["filter"] = filter_clauses
+    body = {"query": {"bool": bool_query}}
 
     try:
         resp = await es_client.search(index=index_name, body=body, size=top_k)
@@ -610,7 +623,16 @@ async def retrieve(
 
     if request.search_type == "hybrid":
         # 并行: ES BM25 ∥ (embed -> Milvus vector)
-        bm25_task = asyncio.create_task(search_bm25(es_client, request.query, expanded_k, compliance_filters))
+        bm25_task = asyncio.create_task(
+            search_bm25(
+                es_client,
+                request.query,
+                expanded_k,
+                compliance_filters,
+                synonym_terms=request.synonym_terms,
+                alt_queries=request.alt_queries,
+            )
+        )
 
         if embedding_provider and milvus_collection:
             # 初始化为 None: embed_query 抛异常时 except 分支会引用, 避免 NameError
@@ -644,7 +666,14 @@ async def retrieve(
             fused = []
 
     elif request.search_type == "bm25_only":
-        bm25_results, bm25_best_score = await search_bm25(es_client, request.query, expanded_k, compliance_filters)
+        bm25_results, bm25_best_score = await search_bm25(
+            es_client,
+            request.query,
+            expanded_k,
+            compliance_filters,
+            synonym_terms=request.synonym_terms,
+            alt_queries=request.alt_queries,
+        )
         fused = bm25_results
 
     elif request.search_type == "vector_only":
