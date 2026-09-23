@@ -175,6 +175,53 @@ class TestQueryChain:
         assert out.tool_args.get("card_no")
 
     @pytest.mark.asyncio
+    async def test_degraded_summary_not_cached(self) -> None:
+        """降级产物不缓存 (E2E e2e-comp-2 复盘): LLM 熔断期 ContentDegrader 模板
+        文案被缓存, 服务恢复后 cache_hit 直接回错误话术"""
+        schema = {"properties": {"period": {"type": "string"}}, "required": ["period"]}
+        mcp = _mock_mcp(schema)
+        mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "账单金额 8650 元"})
+        deg = MagicMock()
+        deg.generate_with_fallback = AsyncMock(
+            return_value=MagicMock(content="抱歉，暂时无法查询您的账单信息。", source="template")
+        )
+        redis = MagicMock()
+        redis.get = AsyncMock(return_value=None)
+        redis.set = AsyncMock()
+        chain = QueryChain(mcp_client=mcp, redis_client=redis, degradation_mgr=deg)
+        out = await chain.run(
+            intent_label="account_bill_query",
+            user_input="查账单",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        # 降级文案作为回复返回 (不阻断), 但绝不写入缓存
+        assert "暂时无法查询" in out.content
+        redis.set.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_llm_summary_cached(self) -> None:
+        """正常 LLM 摘要照常缓存"""
+        schema = {"properties": {"period": {"type": "string"}}, "required": ["period"]}
+        mcp = _mock_mcp(schema)
+        mcp.call_tool = AsyncMock(return_value={"is_error": False, "content": "账单金额 8650 元"})
+        deg = MagicMock()
+        deg.generate_with_fallback = AsyncMock(return_value=MagicMock(content="您本期账单 8650 元", source="llm"))
+        redis = MagicMock()
+        redis.get = AsyncMock(return_value=None)
+        redis.set = AsyncMock()
+        chain = QueryChain(mcp_client=mcp, redis_client=redis, degradation_mgr=deg)
+        await chain.run(
+            intent_label="account_bill_query",
+            user_input="查账单",
+            tool_names=["query_card_bill"],
+            slot_values={"period": "2026-08"},
+            customer_id="c1",
+        )
+        redis.set.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_cache_hit_skips_tool(self) -> None:
         schema = {"properties": {"period": {"type": "string"}}, "required": ["period"]}
         mcp = _mock_mcp(schema)

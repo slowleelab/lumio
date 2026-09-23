@@ -199,9 +199,11 @@ class QueryChain:
         logger.info("查询链路直连调用: tool=%s 耗时=%.0fms 缓存=miss", tool_name, mcp_ms)
 
         t1 = time.monotonic()
-        content = await self._summarize(user_input, tool_name, raw, history)
+        content, cacheable = await self._summarize(user_input, tool_name, raw, history)
         summarize_ms = (time.monotonic() - t1) * 1000
-        if content:
+        # 降级产物不缓存 (E2E e2e-comp-2 复盘): LLM 熔断期 ContentDegrader 模板文案
+        # ("暂时无法查询…") 被当有效数据缓存, 服务恢复后 cache_hit 直接回错误话术。
+        if content and cacheable:
             await self._cache_set(key, content)
         return QueryChainResult(
             content=content,
@@ -215,10 +217,14 @@ class QueryChain:
 
     async def _summarize(
         self, user_input: str, tool_name: str, raw_result: str, history: list[dict[str, str]] | None
-    ) -> str:
-        """单次 LLM 摘要（非工具循环）— LLM 不可用回落工具原文"""
+    ) -> tuple[str, bool]:
+        """单次 LLM 摘要（非工具循环）— LLM 不可用回落工具原文。
+
+        返回 (content, cacheable): cacheable=False 表示产物来自降级链
+        (ContentDegrader 模板) 而非真实生成 — 不得写入工具结果缓存。
+        """
         if self._degradation is None:
-            return raw_result
+            return raw_result, True
         context = f"[工具 {tool_name} 查询结果]\n{raw_result}"
         try:
             result = await self._degradation.generate_with_fallback(
@@ -230,7 +236,9 @@ class QueryChain:
                 context=context,
                 history=history,
             )
-            return str(result.content)
+            src = str(getattr(result, "source", "llm"))
+            degraded = src in ("template", "fallback")
+            return str(result.content), not degraded
         except Exception as exc:
             logger.warning("查询链路摘要生成失败, 回落工具原文: %s", exc)
-            return raw_result
+            return raw_result, True
