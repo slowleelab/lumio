@@ -576,6 +576,8 @@ class LumioAgent:
                         evidence={
                             "source": result.get("response_source"),
                             "intent": intent_result.primary_intent.value,
+                            # 复合级联标记: source=knowledge 时区分"取数+知识联合生成"与纯知识链
+                            "cascade": result.get("cascade"),
                             "total_ms": round(total_ms, 1),
                         },
                         latency_ms=total_ms,
@@ -1352,7 +1354,7 @@ class LumioAgent:
         extra = qc.get("retrieval_context") or ""
         if not extra:
             return None
-        return await self._handle_knowledge(
+        result = await self._handle_knowledge(
             session_id,
             user_input,
             intent_result,
@@ -1361,6 +1363,9 @@ class LumioAgent:
             sentiment,
             extra_context=extra,
         )
+        if isinstance(result, dict):
+            result["cascade"] = "composite"  # 决策链可溯源: 该回复经取数+知识级联
+        return result
 
     async def _handle_knowledge(
         self,
