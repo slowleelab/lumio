@@ -9,6 +9,11 @@
         <span v-if="g.totalMs != null" class="turn-total">全程 {{ g.totalMs >= 1000 ? (g.totalMs / 1000).toFixed(1) + 's' : Math.round(g.totalMs) + 'ms' }}</span>
         <span class="turn-steps">{{ g.decisions.length }} 步</span>
       </div>
+      <!-- 本轮客户输入醒目位: 看决策链不用翻回会话核查对照"客户当时说了什么" -->
+      <div v-if="g.input" class="turn-input">
+        <span class="turn-input-label">客户输入</span>
+        <span class="turn-input-text">{{ g.input }}</span>
+      </div>
       <el-timeline>
         <el-timeline-item
           v-for="d in g.decisions"
@@ -92,7 +97,14 @@ function agentLabel(name: string) {
 // 一轮的 N 步拆成 N 个假轮次 — 合并为一个「历史记录 · 未分轮」组如实展示。
 const turnGroups = computed(() => {
   const decisions = props.decisions ?? []
-  type Group = { turnId: string; decisions: ReplayDecision[]; totalMs: number | null; legacy: boolean; newIndex: number }
+  type Group = {
+    turnId: string
+    decisions: ReplayDecision[]
+    totalMs: number | null
+    legacy: boolean
+    newIndex: number
+    input: string
+  }
   const byTurn = new Map<string, ReplayDecision[]>()
   for (const d of decisions) {
     const key = d.turn_id || "-"
@@ -104,7 +116,8 @@ const turnGroups = computed(() => {
   for (const [turnId, ds] of byTurn) {
     if (ds.some((x) => x.action === "turn_start")) {
       const done = ds.find((x) => x.action === "chain_complete" && typeof x.latency_ms === "number")
-      fresh.push({ turnId, decisions: ds, totalMs: done ? done.latency_ms : null, legacy: false, newIndex: 0 })
+      const input = String(ds.find((x) => x.action === "turn_start")?.evidence?.input_preview || "")
+      fresh.push({ turnId, decisions: ds, totalMs: done ? done.latency_ms : null, legacy: false, newIndex: 0, input })
     } else {
       legacy.push(...ds)
     }
