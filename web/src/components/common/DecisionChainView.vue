@@ -1,48 +1,46 @@
 <template>
   <div class="decision-chain-view">
-    <div v-for="g in turnGroups" :key="g.turnId" class="turn-group">
-      <div class="turn-group-head">
+    <!-- 每轮一行: 左列 (轮次+客户输入+总耗时) + 右列 (步骤横向流, 悬停看细节) -->
+    <div v-for="g in turnGroups" :key="g.turnId" class="chain-row">
+      <div class="row-head">
         <span class="turn-badge" :class="{ 'turn-badge-legacy': g.legacy }">
-          {{ g.legacy ? "历史记录 · 未分轮" : `第 ${g.newIndex} 轮` }}
+          {{ g.legacy ? "历史·未分轮" : `第 ${g.newIndex} 轮` }}
         </span>
-        <span class="turn-time">{{ formatTime(g.decisions[0].created_at) }}</span>
-        <span v-if="g.totalMs != null" class="turn-total">全程 {{ g.totalMs >= 1000 ? (g.totalMs / 1000).toFixed(1) + 's' : Math.round(g.totalMs) + 'ms' }}</span>
-        <span class="turn-steps">{{ g.decisions.length }} 步</span>
+        <span class="row-input" :title="g.input || formatTime(g.decisions[0].created_at)">
+          {{ g.input || formatTime(g.decisions[0].created_at) }}
+        </span>
+        <span v-if="g.totalMs != null" class="row-total">
+          {{ g.totalMs >= 1000 ? (g.totalMs / 1000).toFixed(1) + "s" : Math.round(g.totalMs) + "ms" }}
+        </span>
       </div>
-      <!-- 本轮客户输入醒目位: 看决策链不用翻回会话核查对照"客户当时说了什么" -->
-      <div v-if="g.input" class="turn-input">{{ g.input }}</div>
-      <el-timeline>
-        <el-timeline-item
-          v-for="d in g.decisions"
-          :key="d.decision_id"
-          :type="decisionMeta(d.action).dot"
-          :color="decisionMeta(d.action).color"
-          placement="top"
-        >
-          <div class="decision-card">
-            <div class="decision-head">
-              <el-tag size="small" :type="decisionMeta(d.action).tag" effect="light">
-                {{ decisionMeta(d.action).label }}
-              </el-tag>
-              <span v-if="d.latency_ms != null && d.latency_ms > 0" class="meta-num">{{ Math.round(d.latency_ms) }}ms</span>
-              <span class="decision-agent">{{ agentLabel(d.agent_name) }}</span>
+      <div class="row-steps">
+        <template v-for="(d, i) in g.decisions" :key="d.decision_id">
+          <span v-if="i" class="step-sep">›</span>
+          <el-popover placement="top" trigger="hover" :width="420" popper-class="chain-step-pop">
+            <template #reference>
+              <span class="step-chip" :class="'chip-' + decisionMeta(d.action).tag">
+                {{ decisionMeta(d.action).label
+                }}<em v-if="d.latency_ms != null && d.latency_ms > 0">{{
+                  d.latency_ms >= 1000 ? (d.latency_ms / 1000).toFixed(1) + "s" : Math.round(d.latency_ms) + "ms"
+                }}</em>
+              </span>
+            </template>
+            <div class="pop-title">
+              <el-tag size="small" :type="decisionMeta(d.action).tag" effect="light">{{ decisionMeta(d.action).label }}</el-tag>
+              <span class="pop-agent">{{ agentLabel(d.agent_name) }}</span>
             </div>
-            <div class="decision-explain">{{ decisionExplain(d) }}</div>
-            <div class="decision-reason">技术记录：{{ d.reasoning }}</div>
-            <div v-if="evidenceSummary(d.evidence).length" class="decision-kv">
+            <div class="pop-explain">{{ decisionExplain(d) }}</div>
+            <div class="pop-reason">技术记录：{{ d.reasoning }}</div>
+            <div v-if="evidenceSummary(d.evidence).length" class="pop-kvs">
               <span v-for="kv in evidenceSummary(d.evidence)" :key="kv.k" class="kv-item">
                 <span class="kv-k">{{ kv.k }}</span>
                 <span class="kv-v" :class="{ 'kv-bad': kv.bad }">{{ kv.v }}</span>
               </span>
             </div>
-            <el-collapse v-if="d.evidence && Object.keys(d.evidence).length" class="decision-raw">
-              <el-collapse-item :title="`原始数据 (${Object.keys(d.evidence).length} 字段)`">
-                <pre class="decision-evidence">{{ JSON.stringify(d.evidence, null, 2) }}</pre>
-              </el-collapse-item>
-            </el-collapse>
-          </div>
-        </el-timeline-item>
-      </el-timeline>
+            <pre v-if="d.evidence && Object.keys(d.evidence).length" class="pop-raw">{{ JSON.stringify(d.evidence, null, 2) }}</pre>
+          </el-popover>
+        </template>
+      </div>
     </div>
     <el-empty v-if="!decisions.length" description="无决策记录" />
   </div>
@@ -336,114 +334,161 @@ function formatTime(s: string | null) {
 </script>
 
 <style scoped lang="scss">
-.turn-group {
-  margin-bottom: var(--space-4);
-  padding: var(--space-3);
+.chain-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  margin-bottom: 8px;
   background: var(--color-bg-page);
-  border-radius: var(--radius-md);
 }
-.turn-group-head {
+.row-head {
+  flex-shrink: 0;
+  width: 268px;
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-2);
+  gap: 8px;
+  min-width: 0;
 }
 .turn-badge {
+  flex-shrink: 0;
   padding: 1px 8px;
   font-size: var(--fs-xs, 12px);
+  border-radius: 999px;
+  background: var(--el-color-primary-light-8);
+  color: var(--el-color-primary);
   font-weight: 600;
-  color: var(--color-primary);
-  background: var(--color-primary-light-9, rgba(64, 158, 255, 0.1));
-  border-radius: 10px;
 }
 .turn-badge-legacy {
-  color: var(--color-text-secondary);
-  background: var(--color-fill, rgba(0, 0, 0, 0.06));
+  background: var(--el-fill-color);
+  color: var(--color-text-muted);
 }
-.turn-time {
-  font-size: var(--fs-xs, 12px);
-  color: var(--color-text-secondary);
+.row-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-primary, #303133);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-left: 3px solid var(--el-color-primary);
+  padding-left: 8px;
+  line-height: 1.5;
 }
-.turn-total {
-  font-size: var(--fs-xs, 12px);
-  color: var(--color-success, #67c23a);
+.row-total {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--color-text-muted);
 }
-.turn-steps {
-  margin-left: auto;
-  font-size: var(--fs-xs, 12px);
-  color: var(--color-text-secondary);
-}
-.decision-card {
-  padding: var(--space-2);
-  background: var(--color-bg-page);
-  border-radius: var(--radius-md);
-}
-.decision-head {
+.row-steps {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-}
-.decision-agent {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  margin-left: auto;
-}
-.decision-explain {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--el-text-color-primary);
-  margin-top: 6px;
-  line-height: 1.6;
-}
-.decision-reason {
-  margin-top: var(--space-1);
-  font-size: var(--fs-sm);
-  color: var(--color-text-primary);
-}
-.decision-kv {
-  display: flex;
   flex-wrap: wrap;
-  gap: 6px 14px;
-  margin-top: 6px;
+  gap: 3px 0;
 }
-.kv-item {
-  font-size: 12px;
+.step-sep {
+  color: var(--el-border-color);
+  margin: 0 4px;
+  font-size: 11px;
+}
+.step-chip {
   display: inline-flex;
-  gap: 4px;
   align-items: baseline;
-}
-.kv-k {
-  color: var(--el-text-color-secondary);
-}
-.kv-v {
-  font-weight: 600;
-  color: var(--el-text-color-primary);
-}
-.kv-bad {
-  color: var(--el-color-danger);
-}
-.decision-raw :deep(.el-collapse-item__header) {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  height: 28px;
-  line-height: 28px;
-  background: transparent;
-  border: none;
-}
-.decision-raw :deep(.el-collapse-item__wrap) {
-  background: transparent;
-}
-.decision-evidence {
-  margin: var(--space-2) 0 0;
-  padding: var(--space-2);
-  background: var(--color-bg-page, #f5f7fa);
-  border-radius: var(--radius-sm);
-  font-size: var(--fs-xs, 12px);
-  max-height: 200px;
-  overflow: auto;
-}
-.meta-num {
-  font-size: var(--fs-xs, 12px);
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  border-radius: 6px;
+  border: 1px solid var(--el-border-color);
+  background: var(--el-fill-color-blank);
   color: var(--color-text-secondary);
+  cursor: default;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.step-chip:hover {
+  border-color: var(--el-color-primary);
+  color: var(--el-color-primary);
+}
+.step-chip em {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+.chip-primary {
+  border-color: var(--el-color-primary-light-5);
+  color: var(--el-color-primary);
+}
+.chip-success {
+  border-color: var(--el-color-success-light-5);
+  color: var(--el-color-success);
+}
+.chip-warning {
+  border-color: var(--el-color-warning-light-5);
+  color: var(--el-color-warning);
+}
+.chip-danger {
+  border-color: var(--el-color-danger-light-5);
+  color: var(--el-color-danger);
+  background: var(--el-color-danger-light-9);
+}
+</style>
+
+<style lang="scss">
+/* popper 挂 body, 需全局样式 */
+.chain-step-pop {
+  .pop-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .pop-agent {
+    font-size: 11px;
+    color: var(--color-text-muted);
+  }
+  .pop-explain {
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--color-text-primary, #303133);
+  }
+  .pop-reason {
+    font-size: 11.5px;
+    color: var(--color-text-muted);
+    margin-top: 4px;
+  }
+  .pop-kvs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    margin-top: 6px;
+  }
+  .kv-item {
+    font-size: 11px;
+  }
+  .kv-k {
+    color: var(--color-text-muted);
+    margin-right: 3px;
+  }
+  .kv-v {
+    font-weight: 600;
+  }
+  .kv-bad {
+    color: var(--el-color-danger);
+  }
+  .pop-raw {
+    max-height: 180px;
+    overflow: auto;
+    background: var(--color-bg-page);
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 10.5px;
+    line-height: 1.5;
+    margin: 8px 0 0;
+  }
 }
 </style>

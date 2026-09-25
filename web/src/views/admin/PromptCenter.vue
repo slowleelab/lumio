@@ -65,7 +65,7 @@
     </el-table>
 
     <!-- 详情抽屉 -->
-    <el-drawer v-model="detailVisible" size="62%" :title="detail?.name ?? ''" class="prompt-drawer">
+    <el-dialog v-model="detailVisible" width="76%" top="5vh" :title="detail?.name ?? ''" class="prompt-center-dialog" :close-on-click-modal="false">
       <template v-if="detail">
         <div class="drawer-meta">
           <el-tag size="small" :type="categoryType(detail.category)" effect="plain">{{ categoryLabel(detail.category) }}</el-tag>
@@ -141,7 +141,7 @@
           </el-alert>
         </template>
       </template>
-    </el-drawer>
+    </el-dialog>
   </div>
 </template>
 
@@ -508,5 +508,10 @@ onMounted(load)
 
 .muted {
   color: var(--color-text-muted, #909399);
+}
+.prompt-center-dialog :deep(.el-dialog__body) {
+  height: 76vh;
+  overflow: auto;
+  padding-top: 12px;
 }
 </style>
