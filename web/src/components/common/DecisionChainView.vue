@@ -10,10 +10,7 @@
         <span class="turn-steps">{{ g.decisions.length }} 步</span>
       </div>
       <!-- 本轮客户输入醒目位: 看决策链不用翻回会话核查对照"客户当时说了什么" -->
-      <div v-if="g.input" class="turn-input">
-        <span class="turn-input-label">客户输入</span>
-        <span class="turn-input-text">{{ g.input }}</span>
-      </div>
+      <div v-if="g.input" class="turn-input">{{ g.input }}</div>
       <el-timeline>
         <el-timeline-item
           v-for="d in g.decisions"
