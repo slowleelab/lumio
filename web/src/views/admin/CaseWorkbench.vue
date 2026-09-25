@@ -127,7 +127,7 @@
       @size-change="reloadCases"
     />
 
-    <el-drawer v-model="detailVisible" size="58%" destroy-on-close>
+    <el-dialog v-model="detailVisible" width="88%" top="3vh" destroy-on-close class="case-center-dialog" :close-on-click-modal="false">
       <template #header>
         <div class="drawer-title">
           <el-tag :type="fixStatusType(detail?.fix_status || '')" effect="dark">{{ fixStatusLabel(detail?.fix_status || "") }}</el-tag>
@@ -270,7 +270,7 @@
           <div class="fix-note">{{ detail.fix_note }} <span class="muted" v-if="detail.resolved_at">· {{ fmtTime(detail.resolved_at) }}</span></div>
         </template>
       </div>
-    </el-drawer>
+    </el-dialog>
   </div>
 </template>
 
@@ -1281,6 +1281,11 @@ onUnmounted(() => {
   margin-top: 8px;
   font-size: 12px;
   color: var(--color-text-secondary);
+}
+.case-center-dialog :deep(.el-dialog__body) {
+  height: 78vh;
+  overflow: auto;
+  padding-top: 12px;
 }
 </style>
 

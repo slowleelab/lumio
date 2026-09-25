@@ -109,7 +109,7 @@
 
 
     <!-- ══ 质检详情抽屉 · 工作台三段式: 结论 Hero → 证据 Tabs → 吸底行动区 ══ -->
-    <el-drawer v-model="qcDetailVisible" size="58%" destroy-on-close class="qc-drawer">
+    <el-dialog v-model="qcDetailVisible" width="88%" top="3vh" destroy-on-close class="qc-center-dialog" :close-on-click-modal="false">
       <template #header>
         <div class="drawer-title">
           <span class="session-id">{{ qcDetail?.session_id }}</span>
@@ -254,7 +254,7 @@
           </div>
         </div>
       </template>
-    </el-drawer>
+    </el-dialog>
   </div>
 </template>
 
@@ -1085,5 +1085,10 @@ onUnmounted(() => {
   margin-top: 8px;
   font-size: 12px;
   color: var(--color-text-secondary);
+}
+.qc-center-dialog :deep(.el-dialog__body) {
+  height: 78vh;
+  overflow: auto;
+  padding-top: 12px;
 }
 </style>
