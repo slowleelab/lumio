@@ -131,7 +131,7 @@
             </el-tab-pane>
 
             <el-tab-pane :label="`决策链 (${replay.decisions.length})`" name="decisions">
-              <DecisionChainView :decisions="replay.decisions" />
+              <DecisionChainView :decisions="replay.decisions" :turns="replay.turns" />
             </el-tab-pane>
 
             <el-tab-pane :label="`处理记录 (${replay.messages.length})`" name="messages">
