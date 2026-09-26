@@ -39,21 +39,44 @@ ROOT_CAUSE_LAYERS = (*tuple(f"layer_{i}" for i in range(1, 8)), "uncertain")
 # ── 修复分流表 (方案 §5.1 四张) ──
 FIX_TABLES = ("A_knowledge", "B_intent", "C_rule", "D_model", "none")
 
-# 根因层 → 默认分流表 (方案 §5.1; 人工可覆盖)
-_LAYER_TO_FIX_TABLE = {
-    "layer_3": "B_intent",  # 语义/意图误判
-    "layer_5": "A_knowledge",  # 检索不命中/知识缺口
-    "layer_6": "D_model",  # 生成幻觉/Prompt 失效
-    "layer_7": "C_rule",  # 合规拦截漏配
-    "layer_4": "C_rule",  # 路由属性
-    "layer_2": "C_rule",  # 会话/槽位
-    "layer_1": "C_rule",  # 预处理
+# 根因层 → 允许的修复分流表 (首位 = 推荐默认; 方案 §5.1)
+# 设计: A/B/D 各承接一个专属层 (知识/意图/生成), C·规则是工程配置族
+# (预处理/会话/路由/合规) 的公共收容桶; 交叉次选项是现实中的替代修复路径 —
+#   layer_3 意图误判 → 高频明确表述可加 L1 规则词 (C)
+#   layer_5 检索不命中 → query 归一/同义词缺口改 lexicon 词表 (C)
+#   layer_6 生成失效 → 上下文缺正确知识时补文档内容 (A)
+# 允许集外组合无业务含义 (如 合规漏配 × 补意图语料), 归因器输出与人工
+# 改判均受此约束 (update_fix_status 守门); uncertain 未定层不带修复路由
+_LAYER_ALLOWED_FIX_TABLES: dict[str, tuple[str, ...]] = {
+    "layer_1": ("C_rule",),
+    "layer_2": ("C_rule",),
+    "layer_3": ("B_intent", "C_rule"),
+    "layer_4": ("C_rule",),
+    "layer_5": ("A_knowledge", "C_rule"),
+    "layer_6": ("D_model", "A_knowledge"),
+    "layer_7": ("C_rule",),
 }
+
+# 根因层 → 默认分流表 (= 允许集首位; 人工可在允许集内覆盖)
+_LAYER_TO_FIX_TABLE = {layer: tables[0] for layer, tables in _LAYER_ALLOWED_FIX_TABLES.items()}
 
 
 def fix_table_for_layer(layer: str | None) -> str:
     """根因层 → 默认分流表"""
     return _LAYER_TO_FIX_TABLE.get(layer or "", "none")
+
+
+def allowed_fix_tables(layer: str | None) -> tuple[str, ...]:
+    """根因层 → 允许的修复分流表 (uncertain/未知层为空元组 = 无修复路由)"""
+    return _LAYER_ALLOWED_FIX_TABLES.get(layer or "", ())
+
+
+def is_valid_layer_table(layer: str | None, fix_table: str | None) -> bool:
+    """层×表组合是否合法: 'none' (无需修复) 任意层可持有; 未定层不约束表"""
+    if not fix_table or fix_table == "none":
+        return True
+    allowed = allowed_fix_tables(layer)
+    return not allowed or fix_table in allowed
 
 
 # ── 粗筛去重 key (方案 §4.1: 向量相似 > 0.95 合并, 文本哈希前缀粗分组) ──
@@ -138,7 +161,8 @@ def _parse_judge_json(raw: str) -> dict[str, Any] | None:
             text = text[4:]
     try:
         start, end = text.index("{"), text.rindex("}") + 1
-        return json.loads(text[start:end])
+        parsed: dict[str, Any] = json.loads(text[start:end])
+        return parsed
     except (ValueError, json.JSONDecodeError):
         return None
 
@@ -233,7 +257,8 @@ class BadcaseJudge:
 
         needs_review = majority_ratio < 1.0 or conf < self._min_conf or layer == "uncertain"
         fix_table = same_vote.get("suggested_fix_table", "")
-        if fix_table not in FIX_TABLES:
+        # 允许集约束: 层×表组合不合法 (含 uncertain 带表、枚举外值) 一律回落默认路由
+        if fix_table not in allowed_fix_tables(layer):
             fix_table = fix_table_for_layer(layer)
 
         return AttributionResult(

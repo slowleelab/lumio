@@ -187,16 +187,26 @@
             <el-select v-model="judgedLayer" size="small" style="width: 150px" :placeholder="detail.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'">
               <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
             </el-select>
-            <el-select v-model="judgedTable" size="small" style="width: 170px" placeholder="修复指引">
-              <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key">
-                <el-tooltip :content="FIX_TABLE_TIPS[key] || ''" placement="right" :disabled="!FIX_TABLE_TIPS[key]">
-                  <span>{{ label }}</span>
+            <el-select
+              v-model="judgedTable"
+              size="small"
+              style="width: 170px"
+              :disabled="!tableOptions.length"
+              :placeholder="tableOptions.length ? '修复分流表' : '先选根因层'"
+            >
+              <el-option v-for="opt in tableOptions" :key="opt.key" :label="opt.label" :value="opt.key">
+                <el-tooltip :content="FIX_TABLE_TIPS[opt.key] || ''" placement="right" :disabled="!FIX_TABLE_TIPS[opt.key]">
+                  <span>
+                    {{ opt.label }}
+                    <span v-if="opt.recommended" class="rec-mark">推荐</span>
+                  </span>
                 </el-tooltip>
               </el-option>
             </el-select>
             <span class="muted attrib-meta">
               {{ categoryLabel(detail.root_cause_category) }} · 置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
             </span>
+            <span v-if="deviated" class="deviate-hint">偏离默认推荐 ({{ FIX_TABLE_LABELS[defaultTable] }})</span>
           </div>
           <div class="evidence">{{ detail.attribution_evidence }}</div>
           <!-- 修复指引: 分流表 → 去哪里改什么 -->
@@ -275,7 +285,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
@@ -497,7 +507,7 @@ function openNext() {
 function openDetail(row: Badcase) {
   detail.value = row
   judgedLayer.value = row.human_confirmed_layer || (row.root_cause_layer !== "uncertain" ? row.root_cause_layer : "") || ""
-  judgedTable.value = row.fix_table || ""
+  judgedTable.value = judgedLayer.value ? row.fix_table || "" : "" // 层未定不带孤儿表值
   detailVisible.value = true
   loadContext(row)
 }
@@ -614,6 +624,36 @@ const judgedTable = ref("")
 const acting = ref(false)
 const contextMessages = ref<{ speaker: string; content: string }[]>([])
 const contextLoading = ref(false)
+
+// 层 → 允许的修复表 (首位 = 推荐默认; 与后端 badcase_loop._LAYER_ALLOWED_FIX_TABLES 同构, 后端守门兜底)
+const LAYER_ALLOWED_TABLES: Record<string, string[]> = {
+  layer_1: ["C_rule"],
+  layer_2: ["C_rule"],
+  layer_3: ["B_intent", "C_rule"],
+  layer_4: ["C_rule"],
+  layer_5: ["A_knowledge", "C_rule"],
+  layer_6: ["D_model", "A_knowledge"],
+  layer_7: ["C_rule"],
+}
+const tableOptions = computed(() =>
+  (LAYER_ALLOWED_TABLES[judgedLayer.value] || []).map((key, i) => ({
+    key,
+    label: FIX_TABLE_LABELS[key] ?? key,
+    recommended: i === 0,
+  })),
+)
+const defaultTable = computed(() => (LAYER_ALLOWED_TABLES[judgedLayer.value] || [])[0] || "")
+const deviated = computed(() => {
+  if (!defaultTable.value || !judgedTable.value || judgedTable.value === "none") return false
+  return judgedTable.value !== defaultTable.value
+})
+watch(judgedLayer, (layer) => {
+  // 切层联动: 原表不在新层允许集 (含存量非法组合) → 归正为推荐默认
+  const allowed = LAYER_ALLOWED_TABLES[layer] || []
+  if (allowed.length && (!judgedTable.value || !allowed.includes(judgedTable.value))) {
+    judgedTable.value = allowed[0]
+  }
+})
 
 
 
@@ -777,6 +817,12 @@ async function confirmResolve() {
   // uncertain 不可被确认为根因 — 人工确认的意义就是给出确定层
   if (!judgedLayer.value || judgedLayer.value === "uncertain") {
     ElMessage.warning("请先在上方「根因归因」区选择根因层 (uncertain 不能作为确认值)")
+    return
+  }
+  // 层×表组合保险 (联动已限选, 此处兜底防手滑)
+  const allowedTables = LAYER_ALLOWED_TABLES[judgedLayer.value] || []
+  if (allowedTables.length && judgedTable.value && !allowedTables.includes(judgedTable.value) && judgedTable.value !== "none") {
+    ElMessage.warning(`根因层「${LAYER_LABELS[judgedLayer.value]}」不允许修复表 ${FIX_TABLE_LABELS[judgedTable.value] ?? judgedTable.value}`)
     return
   }
   acting.value = true
@@ -1057,6 +1103,19 @@ onUnmounted(() => {
 .context-loading { font-size: var(--fs-sm); padding: 6px 0; }
 .attrib-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
 .attrib-meta { font-size: var(--fs-sm); }
+.rec-mark {
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  border-radius: 3px;
+}
+.deviate-hint {
+  font-size: var(--fs-sm);
+  color: var(--el-color-warning);
+}
 .evidence, .snapshot {
   background: var(--color-bg-page, #f5f7fa);
   padding: 10px;

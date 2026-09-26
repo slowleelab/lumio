@@ -679,9 +679,36 @@ async def update_fix_status(
                 code=3001,
                 message=f"非法状态转移: {current} → {fix_status} (终态不可流转, 重开走重新采集开新行)",
             )
+        # 层×表组合守门: 诊断 (根因层) 与处方 (修复分流表) 不是任意组合 —
+        # 允许集外的配对无业务含义, 前端联动限选, 此处后端兜底
+        from lumio.services.common.badcase_loop import allowed_fix_tables, fix_table_for_layer
+
+        effective_layer = human_confirmed_layer or row.root_cause_layer or ""
+        effective_table = fix_table or row.fix_table or ""
+        layer_allowed = allowed_fix_tables(effective_layer)
+        if (
+            fix_status != "rejected"  # 驳回 = 无需修复, 存量非法组合允许直接出清
+            and layer_allowed
+            and effective_table
+            and effective_table not in layer_allowed
+            and effective_table != "none"
+        ):
+            raise LumioError(
+                code=3001,
+                message=(
+                    f"非法组合: 根因层 {effective_layer} 不允许修复表 {effective_table} "
+                    f"(允许: {'/'.join(layer_allowed)})"
+                ),
+            )
         row.fix_status = fix_status
         if fix_table:
             row.fix_table = fix_table
+        elif human_confirmed_layer and not row.fix_table:
+            # 确认根因时行上无表 → 自动落推荐默认 (批量确认链路依赖此兜底)
+            row.fix_table = fix_table_for_layer(human_confirmed_layer)
+        if fix_status == "rejected":
+            # 驳回 = 判定无需修复, 不携带修复路由
+            row.fix_table = "none"
         if human_confirmed_layer:
             row.human_confirmed_layer = human_confirmed_layer
             row.root_cause_layer = human_confirmed_layer

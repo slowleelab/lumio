@@ -7,14 +7,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from lumio.services.common.badcase_loop import (
+    _LAYER_TO_FIX_TABLE,
     BadcaseJudge,
+    allowed_fix_tables,
     dedup_key,
     filter_variants,
     fix_table_for_layer,
+    is_valid_layer_table,
     rule_augment,
 )
-from lumio.services.common.badcase_store import capture_badcase, update_fix_status
-from lumio.shared.orm_models import Badcase
+from lumio.services.common.badcase_store import capture_badcase
 
 
 def _sf():
@@ -82,147 +84,6 @@ async def test_capture_persists_and_dedup_key() -> None:
     assert bc.dedup_group_id == dedup_key("我要挂失信用卡")
     assert bc.fix_status == "pending"
 
-    @pytest.mark.asyncio
-    async def test_update_fix_status(self) -> None:
-        """状态流转持久化 (合法转移: pending → fixing)"""
-        from unittest.mock import AsyncMock, MagicMock
-
-        from uuid_utils import uuid7
-
-        bc = Badcase(
-            id=uuid7(),
-            trace_id="t",
-            session_id="s",
-            signal_source="transfer",
-            user_input="x",
-            fix_status="pending",
-        )
-        session = MagicMock()
-        session.get = AsyncMock(return_value=bc)
-        session.commit = AsyncMock()
-
-        class F:
-            def __call__(self):
-                return session
-
-        ok = await update_fix_status(F(), str(bc.id), fix_status="fixing", note="done")
-        assert ok is True
-        assert bc.fix_status == "fixing"
-
-    async def test_update_fix_status_rejects_skip_transition(self) -> None:
-        """状态机守门: pending 直跳 verified / 终态复活 均拒绝 (后端校验, 不靠前端按钮)"""
-        from unittest.mock import AsyncMock, MagicMock
-
-        import pytest
-        from uuid_utils import uuid7
-
-        from lumio.shared.exceptions import LumioError
-
-        def _mk(status: str) -> tuple[Badcase, type]:
-            bc = Badcase(
-                id=uuid7(),
-                trace_id="t",
-                session_id="s",
-                signal_source="transfer",
-                user_input="x",
-                fix_status=status,
-            )
-            session = MagicMock()
-            session.get = AsyncMock(return_value=bc)
-            session.commit = AsyncMock()
-
-            class F:
-                def __call__(self):
-                    return session
-
-            return bc, F
-
-        # pending → verified 跳态
-        bc, f = _mk("pending")
-        with pytest.raises(LumioError):
-            await update_fix_status(f(), str(bc.id), fix_status="verified")
-        # verified 终态复活
-        bc, f = _mk("verified")
-        with pytest.raises(LumioError):
-            await update_fix_status(f(), str(bc.id), fix_status="fixing")
-        # rejected 终态复活
-        bc, f = _mk("rejected")
-        with pytest.raises(LumioError):
-            await update_fix_status(f(), str(bc.id), fix_status="pending")
-        # 合法: reopened → fixing
-        bc, f = _mk("reopened")
-        ok = await update_fix_status(f(), str(bc.id), fix_status="fixing")
-        assert ok is True and bc.fix_status == "fixing"
-
-    async def test_update_fix_status_confirm_layer_resolves_uncertain(self) -> None:
-        """确认根因即消解 uncertain: root_cause_layer 覆写为确认值, needs_review 翻转"""
-        from unittest.mock import AsyncMock, MagicMock
-
-        from uuid_utils import uuid7
-
-        bc = Badcase(
-            id=uuid7(),
-            trace_id="t",
-            session_id="s",
-            signal_source="transfer",
-            user_input="x",
-            fix_status="pending",
-            root_cause_layer="uncertain",
-            needs_human_review=True,
-        )
-        session = MagicMock()
-        session.get = AsyncMock(return_value=bc)
-        session.commit = AsyncMock()
-
-        class F:
-            def __call__(self):
-                return session
-
-        ok = await update_fix_status(
-            F(), str(bc.id), fix_status="fixing", human_confirmed_layer="layer_6", note="人工定根因"
-        )
-        assert ok is True
-        assert bc.root_cause_layer == "layer_6"  # uncertain 消解为确认值
-        assert bc.needs_human_review is False
-        assert bc.human_confirmed_layer == "layer_6"
-
-    async def test_update_fix_status_verified_sets_resolved_at(self) -> None:
-        """复检通过销项 (verified) 记 resolved_at; 打回 (reopened) 不记; deployed 上线也不记 (终态才记)"""
-        from unittest.mock import AsyncMock, MagicMock
-
-        from uuid_utils import uuid7
-
-        bc = Badcase(
-            id=uuid7(),
-            trace_id="t",
-            session_id="s",
-            signal_source="transfer",
-            user_input="x",
-            fix_status="deployed",
-        )
-        session = MagicMock()
-        session.get = AsyncMock(return_value=bc)
-        session.commit = AsyncMock()
-
-        class F:
-            def __call__(self):
-                return session
-
-        ok = await update_fix_status(F(), str(bc.id), fix_status="reopened", note="复检 fail")
-        assert ok is True
-        assert bc.fix_status == "reopened"
-        assert bc.resolved_at is None
-
-        # reopened → fixing (重新修复) → canary → deployed → verified 走合法链
-        for st in ("fixing", "canary", "deployed"):
-            ok = await update_fix_status(F(), str(bc.id), fix_status=st)
-            assert ok is True
-            assert bc.resolved_at is None  # deployed 不是终点, 不记 resolved_at
-        ok = await update_fix_status(F(), str(bc.id), fix_status="verified", note="复检 pass")
-        assert ok is True
-        assert bc.fix_status == "verified"
-        assert bc.resolved_at is not None
-
 
 # ── 模块 A 归因闸门 ──
 
@@ -233,8 +94,14 @@ def _judge() -> BadcaseJudge:
     return BadcaseJudge(llm, model="test-judge", min_confidence=0.7, samples=3)
 
 
-def _vote(layer="layer_5", cat="knowledge", conf=0.9):
-    return {"root_cause_layer": layer, "root_cause_category": cat, "evidence": "e", "confidence": conf}
+def _vote(layer="layer_5", cat="knowledge", conf=0.9, fix_table=""):
+    return {
+        "root_cause_layer": layer,
+        "root_cause_category": cat,
+        "evidence": "e",
+        "confidence": conf,
+        "suggested_fix_table": fix_table,
+    }
 
 
 class TestAttribution:
@@ -278,6 +145,67 @@ class TestAttribution:
         j._llm.chat_json = AsyncMock(side_effect=RuntimeError("down"))
         r = await j.attribute({"trace_id": "t"})
         assert r is None
+
+    @pytest.mark.asyncio
+    async def test_uncertain_with_table_falls_to_none(self) -> None:
+        """uncertain 未定层不带修复路由: 裁判带了表也归 none"""
+        j = _judge()
+        j._llm.chat_json = AsyncMock(
+            side_effect=[_vote("uncertain", "uncertain", 0.8, fix_table="B_intent") for _ in range(3)]
+        )
+        r = await j.attribute({"trace_id": "t"})
+        assert r.root_cause_layer == "uncertain"
+        assert r.fix_table == "none"
+
+    @pytest.mark.asyncio
+    async def test_cross_layer_table_falls_to_default(self) -> None:
+        """层×表跨层非法 (layer_5 带 B) → 回落本层默认 A"""
+        j = _judge()
+        j._llm.chat_json = AsyncMock(side_effect=[_vote("layer_5", fix_table="B_intent") for _ in range(3)])
+        r = await j.attribute({"trace_id": "t"})
+        assert r.root_cause_layer == "layer_5"
+        assert r.fix_table == "A_knowledge"
+
+    @pytest.mark.asyncio
+    async def test_allowed_table_kept(self) -> None:
+        """层内允许的表 (layer_6 带 A) → 保留裁判输出"""
+        j = _judge()
+        j._llm.chat_json = AsyncMock(
+            side_effect=[_vote("layer_6", "process", fix_table="A_knowledge") for _ in range(3)]
+        )
+        r = await j.attribute({"trace_id": "t"})
+        assert r.fix_table == "A_knowledge"
+
+
+class TestLayerTableConstraint:
+    """层×表组合允许集 (诊断与处方不是任意组合; 前端联动限选, 后端守门)"""
+
+    def test_every_layer_has_allowed_set(self) -> None:
+        for i in range(1, 8):
+            layer = f"layer_{i}"
+            assert allowed_fix_tables(layer), f"{layer} 缺允许集"
+            assert fix_table_for_layer(layer) == allowed_fix_tables(layer)[0]  # 默认 = 首位
+
+    def test_uncertain_has_no_route(self) -> None:
+        assert allowed_fix_tables("uncertain") == ()
+        assert allowed_fix_tables(None) == ()
+        assert allowed_fix_tables("layer_99") == ()
+        assert fix_table_for_layer("uncertain") == "none"
+
+    def test_is_valid_layer_table(self) -> None:
+        assert is_valid_layer_table("layer_3", "B_intent") is True
+        assert is_valid_layer_table("layer_3", "C_rule") is True  # 次优路径在允许集内
+        assert is_valid_layer_table("layer_3", "A_knowledge") is False
+        assert is_valid_layer_table("layer_7", "D_model") is False
+        assert is_valid_layer_table("layer_5", "none") is True  # 无需修复任意层可持有
+        assert is_valid_layer_table("layer_5", "") is True
+        assert is_valid_layer_table("uncertain", "B_intent") is True  # 未定层不约束 (守门只对有效层生效)
+        assert is_valid_layer_table("layer_6", "A_knowledge") is True  # 生成层补知识是替代路径
+
+    def test_default_table_mapping_consistent(self) -> None:
+        """_LAYER_TO_FIX_TABLE 从允许集派生, 不允许出现允许集外的默认值"""
+        for layer, table in _LAYER_TO_FIX_TABLE.items():
+            assert table in allowed_fix_tables(layer)
 
 
 # ── 模块 B 规则模板 + 过滤 ──
