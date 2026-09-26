@@ -174,7 +174,7 @@
           </el-tab-pane>
 
           <el-tab-pane :label="`决策链 (${qcReplay?.decisions.length ?? 0})`" name="chain">
-            <DecisionChainView v-if="qcReplay?.decisions.length" :decisions="qcReplay.decisions" />
+            <DecisionChainView v-if="qcReplay?.decisions.length" :decisions="qcReplay.decisions" :turns="qcReplay.turns" />
             <div v-else class="muted qc-evi-empty">无决策记录</div>
           </el-tab-pane>
 
