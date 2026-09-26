@@ -28,7 +28,6 @@
               </template>
               <div class="pop-title">
                 <el-tag size="small" :type="decisionMeta(d.action).tag" effect="light">{{ decisionMeta(d.action).label }}</el-tag>
-                <span class="pop-agent">{{ agentLabel(d.agent_name) }}</span>
               </div>
               <div class="pop-explain">{{ decisionExplain(d) }}</div>
               <div class="pop-reason">技术记录：{{ d.reasoning }}</div>
@@ -112,16 +111,8 @@ const ACTION_META: Record<string, { label: string; tag: string; dot: string; col
   mis_kill_candidate: { label: "误杀排查", tag: "warning", dot: "warning" },
   topic_track: { label: "诉求跟踪", tag: "info", dot: "" },
 }
-const AGENT_LABELS: Record<string, string> = {
-  bot_agent: "编排大脑",
-  query_chain: "查询链路",
-  tool_executor: "工具执行器",
-}
 function decisionMeta(action: string) {
   return ACTION_META[action] ?? { label: action, tag: "info", dot: "" }
-}
-function agentLabel(name: string) {
-  return AGENT_LABELS[name] ?? name
 }
 // ── 决策链按轮分组: 同一 turn_id 的决策归为一轮 (turn_id 由消息出队时绑定贯穿) ──
 // 存量兼容: 修复前的决策每条独立 uuid4 (无 turn_start 特征), 按轮分组会把
@@ -601,10 +592,6 @@ function formatTime(s: string | null) {
     align-items: center;
     gap: 8px;
     margin-bottom: 6px;
-  }
-  .pop-agent {
-    font-size: 11px;
-    color: var(--color-text-muted);
   }
   .pop-explain {
     font-size: 12.5px;
