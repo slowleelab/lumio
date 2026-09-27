@@ -652,6 +652,7 @@ async def update_fix_status(
     fix_table: str | None = None,
     note: str | None = None,
     human_confirmed_layer: str | None = None,
+    secondary_layers: list[str] | None = None,
 ) -> bool:
     """人工裁决/状态流转 (方案 §7.4 错误案例库结构化字段)
 
@@ -659,6 +660,8 @@ async def update_fix_status(
     - human_confirmed_layer 传入即"确认根因": root_cause_layer 覆写为确认值
       (uncertain 消解), needs_human_review 同步翻转 — "待人工确认"由
       root_cause_layer=uncertain 派生, 不再是独立平行布尔
+    - secondary_layers 人工复核多因: 次要因素层 (≤2, 不可含主层);
+      传入即覆写 (空列表 = 清空), None = 不动
     - resolved_at 只在终态 (verified/rejected) 记录 — deployed 不是终点
     """
     import uuid_utils
@@ -683,7 +686,7 @@ async def update_fix_status(
             )
         # 层×表组合守门: 诊断 (根因层) 与处方 (修复分流表) 不是任意组合 —
         # 允许集外的配对无业务含义, 前端联动限选, 此处后端兜底
-        from lumio.services.common.badcase_loop import allowed_fix_tables, fix_table_for_layer
+        from lumio.services.common.badcase_loop import ROOT_CAUSE_LAYERS, allowed_fix_tables, fix_table_for_layer
 
         effective_layer = human_confirmed_layer or row.root_cause_layer or ""
         effective_table = fix_table or row.fix_table or ""
@@ -702,6 +705,14 @@ async def update_fix_status(
                     f"(允许: {'/'.join(layer_allowed)})"
                 ),
             )
+        # 人工多因守门: 次要因素必须是合法层、不含主层、至多 2 个
+        if secondary_layers is not None:
+            bad_secondary = [x for x in secondary_layers if x not in ROOT_CAUSE_LAYERS or x == effective_layer]
+            if bad_secondary or len(secondary_layers) > 2:
+                raise LumioError(
+                    code=3001,
+                    message=f"非法次要因素: {secondary_layers} (须为合法层、不含主根因层、至多 2 个)",
+                )
         row.fix_status = fix_status
         if fix_table:
             row.fix_table = fix_table
@@ -715,6 +726,8 @@ async def update_fix_status(
             row.human_confirmed_layer = human_confirmed_layer
             row.root_cause_layer = human_confirmed_layer
             row.needs_human_review = False
+        if secondary_layers is not None:
+            row.secondary_layers = secondary_layers or None
         if note:
             row.fix_note = note
         if fix_status in ("verified", "rejected"):

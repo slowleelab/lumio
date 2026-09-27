@@ -350,6 +350,51 @@ class TestLayerTableGate:
         ok = await update_fix_status(f(), str(bc.id), fix_status="fixing")
         assert ok is True and bc.fix_status == "fixing"
 
+    async def test_manual_secondary_layers_persisted(self) -> None:
+        """人工多因: 确认根因同时提交次要因素 → 落库"""
+        bc, f = self._mk(layer="uncertain")
+        ok = await update_fix_status(
+            f(),
+            str(bc.id),
+            fix_status="fixing",
+            human_confirmed_layer="layer_3",
+            secondary_layers=["layer_5", "layer_6"],
+        )
+        assert ok is True
+        assert bc.secondary_layers == ["layer_5", "layer_6"]
+
+    async def test_manual_secondary_with_primary_rejected(self) -> None:
+        """次要因素含主根因层 → 拦截"""
+        bc, f = self._mk(layer="uncertain")
+        with pytest.raises(LumioError):
+            await update_fix_status(
+                f(),
+                str(bc.id),
+                fix_status="fixing",
+                human_confirmed_layer="layer_3",
+                secondary_layers=["layer_3", "layer_5"],
+            )
+
+    async def test_manual_secondary_over_limit_rejected(self) -> None:
+        """次要因素超过 2 个 → 拦截"""
+        bc, f = self._mk(layer="uncertain")
+        with pytest.raises(LumioError):
+            await update_fix_status(
+                f(),
+                str(bc.id),
+                fix_status="fixing",
+                human_confirmed_layer="layer_3",
+                secondary_layers=["layer_4", "layer_5", "layer_6"],
+            )
+
+    async def test_manual_secondary_clear_passes(self) -> None:
+        """空列表 = 显式清空次要因素"""
+        bc, f = self._mk(layer="layer_3", fix_table="B_intent", status="fixing")
+        bc.secondary_layers = ["layer_5"]
+        ok = await update_fix_status(f(), str(bc.id), fix_status="canary", secondary_layers=[])
+        assert ok is True
+        assert bc.secondary_layers is None
+
 
 # ── 模块 B 规则模板 + 过滤 ──
 
