@@ -206,18 +206,25 @@
             <span class="muted attrib-meta">
               {{ categoryLabel(detail.root_cause_category) }} · 置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
             </span>
-            <template v-if="(detail.secondary_layers ?? []).length">
-              <span class="muted attrib-meta">次要因素:</span>
-              <el-tag
-                v-for="sl in detail.secondary_layers"
-                :key="sl"
-                size="small"
-                effect="plain"
-                type="warning"
-                class="secondary-tag"
-              >{{ LAYER_LABELS[sl] ?? sl }}</el-tag>
-            </template>
             <span v-if="deviated" class="deviate-hint">偏离默认推荐 ({{ FIX_TABLE_LABELS[defaultTable] }})</span>
+          </div>
+          <div class="secondary-row">
+            <span class="muted attrib-meta">次要因素</span>
+            <el-select
+              v-model="judgedSecondary"
+              multiple
+              collapse-tags
+              collapse-tags-tooltip
+              :multiple-limit="2"
+              size="small"
+              style="width: 240px"
+              :disabled="!judgedLayer || judgedLayer === 'uncertain'"
+              :placeholder="judgedLayer ? '多因: 可多选 (至多 2 个)' : '先选根因层'"
+              class="secondary-select"
+            >
+              <el-option v-for="opt in secondaryOptions" :key="opt.key" :label="opt.label" :value="opt.key" />
+            </el-select>
+            <span class="muted attrib-meta secondary-hint">(归因可能是多方面的 — 主因驱动修复路由, 次要因素供修复决策参考)</span>
           </div>
           <div class="evidence">{{ detail.attribution_evidence }}</div>
           <!-- 修复指引: 分流表 → 去哪里改什么 -->
@@ -519,6 +526,7 @@ function openDetail(row: Badcase) {
   detail.value = row
   judgedLayer.value = row.human_confirmed_layer || (row.root_cause_layer !== "uncertain" ? row.root_cause_layer : "") || ""
   judgedTable.value = judgedLayer.value ? row.fix_table || "" : "" // 层未定不带孤儿表值
+  judgedSecondary.value = (row.secondary_layers ?? []).filter((x) => x !== judgedLayer.value)
   detailVisible.value = true
   loadContext(row)
 }
@@ -663,6 +671,20 @@ watch(judgedLayer, (layer) => {
   const allowed = LAYER_ALLOWED_TABLES[layer] || []
   if (allowed.length && (!judgedTable.value || !allowed.includes(judgedTable.value))) {
     judgedTable.value = allowed[0]
+  }
+})
+
+// 人工多因: 次要因素层 (至多 2, 不含主根因层) — 主因驱动修复路由, 次要供修复决策参考
+const judgedSecondary = ref<string[]>([])
+const secondaryOptions = computed(() =>
+  Object.entries(LAYER_LABELS)
+    .filter(([key]) => key !== judgedLayer.value && key !== "uncertain")
+    .map(([key, label]) => ({ key, label })),
+)
+watch(judgedLayer, (layer) => {
+  // 切层后次要因素里不能残留主层
+  if (judgedSecondary.value.includes(layer)) {
+    judgedSecondary.value = judgedSecondary.value.filter((x) => x !== layer)
   }
 })
 
@@ -842,6 +864,7 @@ async function confirmResolve() {
       fix_status: "fixing",
       fix_table: judgedTable.value || detail.value.fix_table || undefined,
       human_confirmed_layer: judgedLayer.value,
+      secondary_layers: judgedSecondary.value,
       note: `人工确认${judgedLayer.value !== detail.value.root_cause_layer ? " (改判)" : ""}`,
     })
     await refreshAfterAction("归因已确认，进入修复跟踪")
@@ -1127,8 +1150,21 @@ onUnmounted(() => {
   font-size: var(--fs-sm);
   color: var(--el-color-warning);
 }
-.secondary-tag {
-  font-weight: 400;
+.secondary-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.secondary-select {
+  :deep(.el-tag) {
+    background: var(--el-color-warning-light-9);
+    border-color: var(--el-color-warning-light-7);
+    color: var(--el-color-warning);
+  }
+}
+.secondary-hint {
+  font-size: var(--fs-sm);
 }
 .evidence, .snapshot {
   background: var(--color-bg-page, #f5f7fa);

@@ -74,7 +74,7 @@ export function attributeBadcase(badcaseId: string): Promise<Record<string, unkn
 
 export function resolveBadcase(
   badcaseId: string,
-  body: { fix_status: string; fix_table?: string; note?: string; human_confirmed_layer?: string },
+  body: { fix_status: string; fix_table?: string; note?: string; human_confirmed_layer?: string; secondary_layers?: string[] },
 ): Promise<{ status: string }> {
   return client.post(`/admin/closed-loop/badcases/${badcaseId}/resolve`, body)
 }
