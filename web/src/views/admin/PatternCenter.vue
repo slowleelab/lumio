@@ -54,7 +54,7 @@
               <el-tag v-else size="small" type="warning" effect="plain">修复中</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="最近发生" width="90" align="center">
+          <el-table-column label="最近发生" width="76" align="center">
             <template #default="{ row }">{{ fmtTime(row.last_seen) }}</template>
           </el-table-column>
         </el-table>
@@ -393,9 +393,16 @@ onMounted(load)
 
 .pattern-layout {
   display: grid;
-  grid-template-columns: 420px 1fr;
+  /* 左栏需容纳列表全部列 (问题组 180 + 案例/待处置 112 + 方案 86 + 时间 76 ≈ 470px) */
+  grid-template-columns: 486px 1fr;
   gap: 14px;
   align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .pattern-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 .group-panel :deep(.el-table__row) {
