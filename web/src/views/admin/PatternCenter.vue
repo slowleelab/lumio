@@ -83,8 +83,13 @@
             <span class="muted section-hint">(方案落定 = 治理人确认组内共性根因, 是批量执行的把关前置)</span>
           </div>
           <div class="plan-row">
-            <el-select v-model="planTable" size="small" style="width: 140px" placeholder="修复分流表">
-              <el-option v-for="(label, key) in FIX_TABLE_LABELS" :key="key" :label="label" :value="key" />
+            <el-select v-model="planTable" size="small" style="width: 150px" placeholder="修复分流表">
+              <el-option v-for="opt in planTableOptions" :key="opt.key" :label="opt.label" :value="opt.key">
+                <span>
+                  {{ opt.label }}
+                  <span v-if="opt.recommended" class="rec-mark">推荐</span>
+                </span>
+              </el-option>
             </el-select>
             <el-input v-model="planOwner" placeholder="负责人" size="small" style="width: 130px" />
             <el-button size="small" @click="planText = detail.plan_template || ''">按分流表生成建议</el-button>
@@ -188,6 +193,24 @@ const FIX_TABLE_LABELS: Record<string, string> = {
   D_model: "D · 模型",
   none: "无需修复",
 }
+// 层 → 允许的修复表 (首位 = 推荐默认; 与后端 badcase_loop._LAYER_ALLOWED_FIX_TABLES 同构, 后端守门兜底)
+const LAYER_ALLOWED_TABLES: Record<string, string[]> = {
+  layer_1: ["C_rule"],
+  layer_2: ["C_rule"],
+  layer_3: ["B_intent", "C_rule"],
+  layer_4: ["C_rule"],
+  layer_5: ["A_knowledge", "C_rule"],
+  layer_6: ["D_model", "A_knowledge"],
+  layer_7: ["C_rule"],
+}
+// 组根因层固定 (group_key 组成部分), 表选项锁定本层允许集
+const planTableOptions = computed(() =>
+  (LAYER_ALLOWED_TABLES[detail.value?.root_cause_layer || ""] || []).map((key, i) => ({
+    key,
+    label: FIX_TABLE_LABELS[key] ?? key,
+    recommended: i === 0,
+  })),
+)
 const FIX_GUIDE_TO: Record<string, string> = {
   A_knowledge: "/admin/faq",
   B_intent: "/admin/intent-library",
@@ -266,7 +289,8 @@ async function openGroup(row: PatternGroup) {
     detail.value = data
     planText.value = data.plan_text
     planOwner.value = data.plan_owner
-    planTable.value = data.fix_table ?? ""
+    const allowed = LAYER_ALLOWED_TABLES[data.root_cause_layer] || []
+    planTable.value = allowed.includes(data.fix_table ?? "") ? data.fix_table ?? "" : allowed[0] || "" // 存量非法归正推荐
   } finally {
     detailLoading.value = false
   }
@@ -283,6 +307,12 @@ async function savePlan() {
   if (!detail.value) return
   if (!planText.value.trim()) {
     ElMessage.warning("方案内容不能为空")
+    return
+  }
+  // 组层×表组合保险 (下拉已锁定允许集, 此处兜底)
+  const allowed = LAYER_ALLOWED_TABLES[detail.value.root_cause_layer] || []
+  if (allowed.length && (!planTable.value || !allowed.includes(planTable.value))) {
+    ElMessage.warning(`根因层「${layerLabel(detail.value.root_cause_layer)}」的修复表请从允许集内选择`)
     return
   }
   acting.value = true
@@ -451,5 +481,15 @@ onMounted(load)
 
 .muted {
   color: var(--color-text-muted, #909399);
+}
+
+.rec-mark {
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  border-radius: 3px;
 }
 </style>

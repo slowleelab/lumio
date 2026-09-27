@@ -121,6 +121,46 @@ async def test_detail_and_plan_upsert(pattern_db) -> None:
         )
 
 
+async def test_plan_illegal_layer_table_rejected(pattern_db) -> None:
+    """组层×表组合守门: layer_3 组不允许 A_knowledge 方案, layer_6 组允许 D/A 两表"""
+    sf, created = pattern_db
+    await _mk_case(sf, created, "pat-t7", "pat_test_gate", "layer_3", "守门现场")
+    await _mk_case(sf, created, "pat-t8", "pat_test_gate6", "layer_6", "守门现场6")
+    key3 = ps.group_key_for("pat_test_gate", "layer_3")
+    key6 = ps.group_key_for("pat_test_gate6", "layer_6")
+
+    with pytest.raises(LumioError) as ei:
+        await save_plan_endpoint(
+            key3,
+            PlanPayload(
+                intent_label="pat_test_gate",
+                root_cause_layer="layer_3",
+                fix_table="A_knowledge",
+                plan_text="越界方案",
+                plan_owner="x",
+            ),
+            _ADMIN,
+            _fake_request(sf),
+        )
+    assert ei.value.code == 3001
+
+    # 允许集内次优路径 (layer_6 → A_knowledge) 通过
+    await save_plan_endpoint(
+        key6,
+        PlanPayload(
+            intent_label="pat_test_gate6",
+            root_cause_layer="layer_6",
+            fix_table="A_knowledge",
+            plan_text="补知识承托生成",
+            plan_owner="x",
+        ),
+        _ADMIN,
+        _fake_request(sf),
+    )
+    d = await get_pattern_endpoint(key6, _ADMIN, _fake_request(sf))
+    assert d["fix_table"] == "A_knowledge"
+
+
 async def test_batch_confirm_and_advance(pattern_db) -> None:
     sf, created = pattern_db
     cid = await _mk_case(sf, created, "pat-t6", "pat_test_loss", "layer_3", "挂失意图误判")
