@@ -158,7 +158,10 @@ _JUDGE_SYSTEM_PROMPT = """你是银行信用卡智能客服的质量分析专家
 1. 只依据给定的中间产物判断，不得推测未给出的信息
 2. 证据不足以确定时 root_cause_defect 填 "uncertain"，不要强行归因
 3. 输出严格的 JSON，不要输出任何 JSON 之外的文字
-4. 判定锚点（中间产物满足以下模式时直接定缺陷，证据字段优先于直觉）：
+4. evidence 用业务语言写给质检运营看（如"意图识别把问账单理解成了闲聊，
+   回复中编造了具体金额"），不要出现 layer_3 之类技术编号、intent_score
+   之类字段名或英文枚举值
+5. 判定锚点（中间产物满足以下模式时直接定缺陷，证据字段优先于直觉）：
    - intent 与用户输入语义明显不符 → intent_misread
    - intent 基本对但置信很低 / 被当闲聊处理, 客户其实在问业务 → intent_uncovered
    - rag_hit=false 且该问题需要知识作答（非纯操作/转人工诉求）→ knowledge_missing
@@ -166,7 +169,7 @@ _JUDGE_SYSTEM_PROMPT = """你是银行信用卡智能客服的质量分析专家
    - rag_hit=true、意图也对, 但回复与输入主题无关或含编造数字 → reply_quality
    - 意图识别正确, 但回复以"无法查询/请去官方渠道"拒绝（该类诉求本有工具链可查）→ fallback_poor
    - 回复含不合规承诺、敏感信息泄露或编造办理话术 → compliance_risk
-5. 伴随缺陷：主缺陷之外，若中间产物显示还存在其他独立缺陷（非同一问题的传导），
+6. 伴随缺陷：主缺陷之外，若中间产物显示还存在其他独立缺陷（非同一问题的传导），
    填入 contributing_defects（至多 2 个，不与主缺陷相同；无则为空数组）。
    示例：主缺陷是意图理解错，同时 rag_hit=false 表明知识库也无兜底内容
    → root_cause_defect="intent_misread", contributing_defects=["knowledge_missing"]

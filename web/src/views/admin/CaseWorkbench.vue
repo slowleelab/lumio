@@ -231,7 +231,7 @@
               </el-option>
             </el-select>
           </div>
-          <div class="evidence">{{ detail.attribution_evidence }}</div>
+          <div class="evidence">{{ evidenceZh(detail.attribution_evidence) }}</div>
           <!-- 修复指引: 分流表 → 去哪里改什么 -->
           <el-alert v-if="fixGuide" type="success" :closable="false" class="fix-guide">
             <template #title>
@@ -1043,6 +1043,25 @@ const CATEGORY_LABELS: Record<string, string> = {
   process: "流程设计问题",
   coverage: "覆盖不足",
   uncertain: "待定",
+}
+
+// 归因依据可读化: 裁判 evidence 里的技术标识 (layer_X / 缺陷枚举 / 字段名)
+// 渲染为业务语言 — 存量与新数据统一覆盖, 不动库
+const LAYER_ZH_FULL: Record<string, string> = {
+  layer_1: "预处理", layer_2: "会话管理", layer_3: "意图识别", layer_4: "路由决策",
+  layer_5: "知识检索", layer_6: "回复生成", layer_7: "风控合规",
+}
+function evidenceZh(text?: string | null): string {
+  if (!text) return ""
+  let out = text
+  // layer_6 生成… → [回复生成] 生成… (保留编号可追溯)
+  for (const [key, label] of Object.entries(LAYER_ZH_FULL)) {
+    out = out.replaceAll(key, `${label}(${key})`)
+  }
+  for (const [key, label] of Object.entries(DEFECT_LABELS)) {
+    out = out.replaceAll(key, label)
+  }
+  return out
 }
 
 function fixStatusLabel(s: string) {
