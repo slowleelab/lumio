@@ -263,6 +263,8 @@ async def resolve_badcase(
     sf = getattr(request.app.state, "db_session_factory", None)
     if not sf:
         raise LumioError(code=5001, message="数据库未就绪")
+    raw_secondary = body.get("secondary_layers")
+    secondary = [str(x) for x in raw_secondary] if isinstance(raw_secondary, list) else None
     ok = await update_fix_status(
         sf,
         badcase_id,
@@ -270,6 +272,8 @@ async def resolve_badcase(
         fix_table=body.get("fix_table"),
         note=body.get("note"),
         human_confirmed_layer=body.get("human_confirmed_layer"),
+        human_confirmed_defect=body.get("human_confirmed_defect"),
+        secondary_layers=secondary,
     )
     if not ok:
         raise LumioError(code=2001, message=f"Badcase 不存在: {badcase_id}")

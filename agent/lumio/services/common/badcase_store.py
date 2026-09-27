@@ -652,23 +652,26 @@ async def update_fix_status(
     fix_table: str | None = None,
     note: str | None = None,
     human_confirmed_layer: str | None = None,
+    human_confirmed_defect: str | None = None,
+    secondary_layers: list[str] | None = None,
 ) -> bool:
     """人工裁决/状态流转 (方案 §7.4 错误案例库结构化字段)
 
     - 转移合法性按 _FIX_TRANSITIONS 校验, 非法转移抛 LumioError(3001)
-    - human_confirmed_layer 传入即"确认根因": root_cause_layer 覆写为确认值
-      (uncertain 消解), needs_human_review 同步翻转 — "待人工确认"由
-      root_cause_layer=uncertain 派生, 不再是独立平行布尔
+    - human_confirmed_defect 传入即"确认主缺陷": 责任层/修复表由缺陷派生
+      (root_cause_layer 同步覆写, needs_human_review 翻转); human_confirmed_layer
+      为旧接口兼容 (仅层, 不带缺陷语义)
+    - secondary_layers 伴随缺陷 (≤2, 不与主缺陷相同); 传入即覆写 (空 = 清空)
     - resolved_at 只在终态 (verified/rejected) 记录 — deployed 不是终点
     """
     import uuid_utils
 
     from lumio.shared.exceptions import LumioError
 
-    # uncertain 不能被"确认"为根因: 人工确认的意义就是给出确定层 —
+    # uncertain 不能被"确认": 人工确认的意义就是给出确定缺陷/层 —
     # 曾有交互把默认值 uncertain 郑重落库, 归因闸门形同虚设
-    if human_confirmed_layer == "uncertain":
-        raise LumioError(code=2001, message="确认根因不能是 uncertain — 请选择具体根因层")
+    if human_confirmed_layer == "uncertain" or human_confirmed_defect == "uncertain":
+        raise LumioError(code=2001, message="确认根因不能是 uncertain — 请选择具体缺陷")
 
     async with session_factory() as session:
         row = await session.get(Badcase, uuid_utils.UUID(badcase_id))
@@ -681,11 +684,22 @@ async def update_fix_status(
                 code=3001,
                 message=f"非法状态转移: {current} → {fix_status} (终态不可流转, 重开走重新采集开新行)",
             )
-        # 层×表组合守门: 诊断 (根因层) 与处方 (修复分流表) 不是任意组合 —
-        # 允许集外的配对无业务含义, 前端联动限选, 此处后端兜底
-        from lumio.services.common.badcase_loop import allowed_fix_tables, fix_table_for_layer
+        # 层×表组合守门: 诊断与处方不是任意组合 — 允许集外的配对无业务含义,
+        # 前端联动限选, 此处后端兜底
+        from lumio.services.common.badcase_loop import (
+            DEFECT_TYPES,
+            allowed_fix_tables,
+            defect_to_fix_table,
+            defect_to_layer,
+            fix_table_for_layer,
+        )
 
-        effective_layer = human_confirmed_layer or row.root_cause_layer or ""
+        # 缺陷确认: 技术投影全部派生 (单一事实源)
+        if human_confirmed_defect is not None and human_confirmed_defect not in DEFECT_TYPES:
+            raise LumioError(code=2001, message=f"未知缺陷类型: {human_confirmed_defect}")
+        confirmed_layer = defect_to_layer(human_confirmed_defect) if human_confirmed_defect else human_confirmed_layer
+
+        effective_layer = confirmed_layer or row.root_cause_layer or ""
         effective_table = fix_table or row.fix_table or ""
         layer_allowed = allowed_fix_tables(effective_layer)
         if (
@@ -702,19 +716,43 @@ async def update_fix_status(
                     f"(允许: {'/'.join(layer_allowed)})"
                 ),
             )
+        # 伴随缺陷守门: 合法缺陷枚举、不与主缺陷相同、至多 2 个
+        if secondary_layers is not None:
+            primary = human_confirmed_defect or ""
+            bad = [x for x in secondary_layers if x not in DEFECT_TYPES or x == primary]
+            if bad or len(secondary_layers) > 2:
+                raise LumioError(
+                    code=3001,
+                    message=f"非法伴随缺陷: {secondary_layers} (须为合法缺陷、不与主缺陷相同、至多 2 个)",
+                )
         row.fix_status = fix_status
-        if fix_table:
-            row.fix_table = fix_table
-        elif human_confirmed_layer and not row.fix_table:
-            # 确认根因时行上无表 → 自动落推荐默认 (批量确认链路依赖此兜底)
-            row.fix_table = fix_table_for_layer(human_confirmed_layer)
+        if human_confirmed_defect:
+            # 确认主缺陷: 层/表/性质全部派生落库 (显式传 fix_table 时尊重人工选择)
+            row.root_cause_category = human_confirmed_defect
+            derived_layer = defect_to_layer(human_confirmed_defect)
+            row.human_confirmed_layer = derived_layer
+            row.root_cause_layer = derived_layer
+            if fix_table:
+                row.fix_table = fix_table
+            else:
+                row.fix_table = defect_to_fix_table(human_confirmed_defect)
+        else:
+            if confirmed_layer:
+                # 旧接口 (仅层确认): 层直接覆写 (批量确认链路)
+                row.human_confirmed_layer = confirmed_layer
+                row.root_cause_layer = confirmed_layer
+            if fix_table:
+                row.fix_table = fix_table
+            elif confirmed_layer and not row.fix_table:
+                # 确认根因时行上无表 → 自动落推荐默认 (批量确认链路依赖此兜底)
+                row.fix_table = fix_table_for_layer(confirmed_layer)
         if fix_status == "rejected":
             # 驳回 = 判定无需修复, 不携带修复路由
             row.fix_table = "none"
-        if human_confirmed_layer:
-            row.human_confirmed_layer = human_confirmed_layer
-            row.root_cause_layer = human_confirmed_layer
+        if human_confirmed_defect or confirmed_layer:
             row.needs_human_review = False
+        if secondary_layers is not None:
+            row.secondary_layers = secondary_layers or None
         if note:
             row.fix_note = note
         if fix_status in ("verified", "rejected"):

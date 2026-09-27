@@ -183,17 +183,44 @@
 
         <template v-if="detail.root_cause_layer">
           <div class="section-title">根因归因 <span class="muted section-hint">(裁判结论 · 可人工改判后确认)</span></div>
+          <!-- 缺陷驱动: 用户只面对"主要缺陷 + 伴随缺陷"两个业务选择, 责任层/修复表/性质全部自动派生 -->
           <div class="attrib-row">
-            <el-select v-model="judgedLayer" size="small" style="width: 150px" :placeholder="detail.root_cause_layer === 'uncertain' ? '选择根因层' : '根因 (可改判)'">
-              <el-option v-for="(label, key) in LAYER_LABELS" :key="key" :label="label" :value="key" :disabled="key === 'uncertain'" />
+            <span class="attrib-field">主要缺陷</span>
+            <el-select v-model="judgedDefect" size="small" style="width: 170px" placeholder="选择主要缺陷">
+              <el-option v-for="(label, key) in DEFECT_LABELS" :key="key" :label="label" :value="key" />
             </el-select>
+            <span class="muted attrib-meta">
+              置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
+            </span>
+            <span v-if="judgedDefect && judgedDefect !== 'uncertain'" class="derived-tags">
+              <el-tag size="small" effect="plain" type="info">{{ LAYER_LABELS[judgedLayer] ?? judgedLayer }} 层</el-tag>
+              <el-tag size="small" effect="plain" :type="deviated ? 'warning' : 'success'">
+                {{ FIX_TABLE_LABELS[judgedTable] ?? judgedTable }}
+              </el-tag>
+            </span>
+          </div>
+          <div class="secondary-row">
+            <span class="attrib-field">伴随缺陷</span>
             <el-select
-              v-model="judgedTable"
+              v-model="judgedSecondary"
+              multiple
+              collapse-tags
+              collapse-tags-tooltip
+              :multiple-limit="2"
               size="small"
-              style="width: 170px"
-              :disabled="!tableOptions.length"
-              :placeholder="tableOptions.length ? '修复分流表' : '先选根因层'"
+              style="width: 260px"
+              :disabled="!judgedDefect || judgedDefect === 'uncertain'"
+              placeholder="多因: 可多选 (至多 2 个)"
+              class="secondary-select"
             >
+              <el-option v-for="opt in secondaryOptions" :key="opt.key" :label="opt.label" :value="opt.key" />
+            </el-select>
+            <span v-if="deviated" class="deviate-hint">修复表偏离该缺陷默认 ({{ FIX_TABLE_LABELS[defaultTable] }})</span>
+            <span v-else class="muted attrib-meta secondary-hint">(层/修复表由缺陷自动带出, 修复表可在下方微调)</span>
+          </div>
+          <div class="table-row" v-if="judgedDefect && judgedDefect !== 'uncertain'">
+            <span class="attrib-field">修复方式</span>
+            <el-select v-model="judgedTable" size="small" style="width: 170px" :disabled="!tableOptions.length">
               <el-option v-for="opt in tableOptions" :key="opt.key" :label="opt.label" :value="opt.key">
                 <el-tooltip :content="FIX_TABLE_TIPS[opt.key] || ''" placement="right" :disabled="!FIX_TABLE_TIPS[opt.key]">
                   <span>
@@ -203,21 +230,6 @@
                 </el-tooltip>
               </el-option>
             </el-select>
-            <span class="muted attrib-meta">
-              {{ categoryLabel(detail.root_cause_category) }} · 置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
-            </span>
-            <template v-if="(detail.secondary_layers ?? []).length">
-              <span class="muted attrib-meta">次要因素:</span>
-              <el-tag
-                v-for="sl in detail.secondary_layers"
-                :key="sl"
-                size="small"
-                effect="plain"
-                type="warning"
-                class="secondary-tag"
-              >{{ LAYER_LABELS[sl] ?? sl }}</el-tag>
-            </template>
-            <span v-if="deviated" class="deviate-hint">偏离默认推荐 ({{ FIX_TABLE_LABELS[defaultTable] }})</span>
           </div>
           <div class="evidence">{{ detail.attribution_evidence }}</div>
           <!-- 修复指引: 分流表 → 去哪里改什么 -->
@@ -517,10 +529,23 @@ function openNext() {
 
 function openDetail(row: Badcase) {
   detail.value = row
-  judgedLayer.value = row.human_confirmed_layer || (row.root_cause_layer !== "uncertain" ? row.root_cause_layer : "") || ""
-  judgedTable.value = judgedLayer.value ? row.fix_table || "" : "" // 层未定不带孤儿表值
+  // 主缺陷优先取缺陷枚举; 存量粗分类映射最近缺陷; 层兜底归一 (旧数据只判了层)
+  judgedDefect.value = normalizeDefect(row.root_cause_category) || reverseLayerDefect(row.root_cause_layer)
+  const allowed = LAYER_ALLOWED_TABLES[DEFECT_TO_LAYER[judgedDefect.value] || ""] || []
+  judgedTable.value = allowed.includes(row.fix_table ?? "") ? row.fix_table ?? "" : DEFECT_TO_TABLE[judgedDefect.value] || ""
+  // 伴随缺陷: 只保留缺陷枚举值 (旧 layer_x 值语义已弃, 人工重选)
+  judgedSecondary.value = (row.secondary_layers ?? []).filter((x) => x in DEFECT_LABELS && x !== judgedDefect.value)
   detailVisible.value = true
   loadContext(row)
+}
+
+// 层 → 主导缺陷 (仅存量兜底: 旧数据只有层无缺陷时反推一个默认主缺陷)
+function reverseLayerDefect(layer?: string | null): string {
+  const m: Record<string, string> = {
+    layer_3: "intent_misread", layer_5: "knowledge_missing", layer_6: "reply_quality",
+    layer_4: "rule_flaw", layer_7: "compliance_risk", layer_1: "rule_flaw", layer_2: "rule_flaw",
+  }
+  return m[layer ?? ""] ?? ""
 }
 
 async function loadContext(row: Badcase) {
@@ -630,11 +655,48 @@ async function runAttribution(row: Badcase) {
 
 const detailVisible = ref(false)
 const detail = ref<Badcase | null>(null)
-const judgedLayer = ref("")
+const judgedDefect = ref("") // 主缺陷 (归因主维度: 业务语言, 层/表全部由它派生)
 const judgedTable = ref("")
 const acting = ref(false)
 const contextMessages = ref<{ speaker: string; content: string }[]>([])
 const contextLoading = ref(false)
+
+// 缺陷类型 (与后端 badcase_loop.DEFECT_TYPES 同构; 领域专家视角: 质检运营
+// 面对"业务缺陷"而非系统分层 — 层/性质/修复表是缺陷的技术投影, 自动带出)
+const DEFECT_LABELS: Record<string, string> = {
+  knowledge_missing: "知识缺失",
+  knowledge_outdated: "知识过时",
+  intent_misread: "意图理解错",
+  intent_uncovered: "说法未覆盖",
+  rule_flaw: "流程/规则缺陷",
+  reply_quality: "回复质量差",
+  fallback_poor: "兜底不当",
+  compliance_risk: "合规风险",
+}
+const DEFECT_TO_LAYER: Record<string, string> = {
+  knowledge_missing: "layer_5", knowledge_outdated: "layer_5",
+  intent_misread: "layer_3", intent_uncovered: "layer_3",
+  rule_flaw: "layer_4", reply_quality: "layer_6",
+  fallback_poor: "layer_4", compliance_risk: "layer_7",
+}
+const DEFECT_TO_TABLE: Record<string, string> = {
+  knowledge_missing: "A_knowledge", knowledge_outdated: "A_knowledge",
+  intent_misread: "B_intent", intent_uncovered: "B_intent",
+  rule_flaw: "C_rule", reply_quality: "D_model",
+  fallback_poor: "C_rule", compliance_risk: "C_rule",
+}
+// 旧粗分类 → 最近缺陷 (存量案例归因升级前 category 值的展示/确认兼容)
+const LEGACY_CATEGORY_TO_DEFECT: Record<string, string> = {
+  semantic: "intent_misread", knowledge: "knowledge_missing",
+  coverage: "intent_uncovered", process: "rule_flaw",
+}
+function normalizeDefect(v?: string | null): string {
+  if (v && v in DEFECT_LABELS) return v
+  return LEGACY_CATEGORY_TO_DEFECT[v ?? ""] ?? ""
+}
+
+// 主缺陷 → 责任层 (只读派生, 不再是用户下拉)
+const judgedLayer = computed(() => DEFECT_TO_LAYER[judgedDefect.value] || "")
 
 // 层 → 允许的修复表 (首位 = 推荐默认; 与后端 badcase_loop._LAYER_ALLOWED_FIX_TABLES 同构, 后端守门兜底)
 const LAYER_ALLOWED_TABLES: Record<string, string[]> = {
@@ -658,11 +720,23 @@ const deviated = computed(() => {
   if (!defaultTable.value || !judgedTable.value || judgedTable.value === "none") return false
   return judgedTable.value !== defaultTable.value
 })
-watch(judgedLayer, (layer) => {
-  // 切层联动: 原表不在新层允许集 (含存量非法组合) → 归正为推荐默认
-  const allowed = LAYER_ALLOWED_TABLES[layer] || []
+// 伴随缺陷 (多因, 至多 2, 不与主缺陷相同) — 主要缺陷驱动修复路由与问题组聚合
+const judgedSecondary = ref<string[]>([])
+const secondaryOptions = computed(() =>
+  Object.entries(DEFECT_LABELS)
+    .filter(([key]) => key !== judgedDefect.value)
+    .map(([key, label]) => ({ key, label })),
+)
+
+watch(judgedDefect, (defect) => {
+  // 切缺陷: 修复表重置为该缺陷默认 (原表不在新层允许集时归正); 伴随缺陷排除主缺陷
+  const derived = DEFECT_TO_TABLE[defect] || ""
+  const allowed = LAYER_ALLOWED_TABLES[DEFECT_TO_LAYER[defect] || ""] || []
   if (allowed.length && (!judgedTable.value || !allowed.includes(judgedTable.value))) {
-    judgedTable.value = allowed[0]
+    judgedTable.value = derived || allowed[0]
+  }
+  if (judgedSecondary.value.includes(defect)) {
+    judgedSecondary.value = judgedSecondary.value.filter((x) => x !== defect)
   }
 })
 
@@ -825,24 +899,25 @@ async function pollRecheck(newSid: string) {
 
 async function confirmResolve() {
   if (!detail.value) return
-  // uncertain 不可被确认为根因 — 人工确认的意义就是给出确定层
-  if (!judgedLayer.value || judgedLayer.value === "uncertain") {
-    ElMessage.warning("请先在上方「根因归因」区选择根因层 (uncertain 不能作为确认值)")
+  // 主缺陷必选 — 人工确认的意义就是给出确定缺陷 (层/表由它派生)
+  if (!judgedDefect.value) {
+    ElMessage.warning("请先在上方「根因归因」区选择主要缺陷")
     return
   }
-  // 层×表组合保险 (联动已限选, 此处兜底防手滑)
+  // 层×表组合保险 (派生已限选, 此处兜底防手滑)
   const allowedTables = LAYER_ALLOWED_TABLES[judgedLayer.value] || []
   if (allowedTables.length && judgedTable.value && !allowedTables.includes(judgedTable.value) && judgedTable.value !== "none") {
-    ElMessage.warning(`根因层「${LAYER_LABELS[judgedLayer.value]}」不允许修复表 ${FIX_TABLE_LABELS[judgedTable.value] ?? judgedTable.value}`)
+    ElMessage.warning(`缺陷「${DEFECT_LABELS[judgedDefect.value]}」(责任层 ${LAYER_LABELS[judgedLayer.value]}) 不允许修复表 ${FIX_TABLE_LABELS[judgedTable.value] ?? judgedTable.value}`)
     return
   }
   acting.value = true
   try {
     await resolveBadcase(detail.value.id, {
       fix_status: "fixing",
-      fix_table: judgedTable.value || detail.value.fix_table || undefined,
-      human_confirmed_layer: judgedLayer.value,
-      note: `人工确认${judgedLayer.value !== detail.value.root_cause_layer ? " (改判)" : ""}`,
+      fix_table: judgedTable.value || DEFECT_TO_TABLE[judgedDefect.value] || undefined,
+      human_confirmed_defect: judgedDefect.value,
+      secondary_layers: judgedSecondary.value,
+      note: `人工确认${normalizeDefect(detail.value.root_cause_category) !== judgedDefect.value ? " (改判)" : ""}`,
     })
     await refreshAfterAction("归因已确认，进入修复跟踪")
   } catch {
@@ -1127,8 +1202,38 @@ onUnmounted(() => {
   font-size: var(--fs-sm);
   color: var(--el-color-warning);
 }
-.secondary-tag {
-  font-weight: 400;
+.secondary-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.attrib-field {
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-secondary);
+  width: 56px;
+}
+.derived-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.table-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.secondary-select {
+  :deep(.el-tag) {
+    background: var(--el-color-warning-light-9);
+    border-color: var(--el-color-warning-light-7);
+    color: var(--el-color-warning);
+  }
+}
+.secondary-hint {
+  font-size: var(--fs-sm);
 }
 .evidence, .snapshot {
   background: var(--color-bg-page, #f5f7fa);

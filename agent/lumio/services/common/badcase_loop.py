@@ -39,6 +39,59 @@ ROOT_CAUSE_LAYERS = (*tuple(f"layer_{i}" for i in range(1, 8)), "uncertain")
 # ── 修复分流表 (方案 §5.1 四张) ──
 FIX_TABLES = ("A_knowledge", "B_intent", "C_rule", "D_model", "none")
 
+# ── 缺陷类型 (归因主维度; 领域专家视角: 质检运营面对"业务缺陷"而非系统分层) ──
+# 层/性质/修复表全部由缺陷派生 (单一事实源): 归因器与人工只选缺陷,
+# 技术投影 (layer/category/fix_table) 不再是并列的用户维度。
+DEFECT_TYPES: dict[str, dict[str, str]] = {
+    "knowledge_missing": {"label": "知识缺失", "layer": "layer_5", "category": "knowledge", "fix_table": "A_knowledge"},
+    "knowledge_outdated": {
+        "label": "知识过时",
+        "layer": "layer_5",
+        "category": "knowledge",
+        "fix_table": "A_knowledge",
+    },
+    "intent_misread": {"label": "意图理解错", "layer": "layer_3", "category": "semantic", "fix_table": "B_intent"},
+    "intent_uncovered": {"label": "说法未覆盖", "layer": "layer_3", "category": "coverage", "fix_table": "B_intent"},
+    "rule_flaw": {"label": "流程/规则缺陷", "layer": "layer_4", "category": "process", "fix_table": "C_rule"},
+    "reply_quality": {"label": "回复质量差", "layer": "layer_6", "category": "process", "fix_table": "D_model"},
+    "fallback_poor": {"label": "兜底不当", "layer": "layer_4", "category": "process", "fix_table": "C_rule"},
+    "compliance_risk": {"label": "合规风险", "layer": "layer_7", "category": "process", "fix_table": "C_rule"},
+}
+
+
+def defect_to_layer(defect: str | None) -> str:
+    """缺陷 → 责任层 (派生; 未知名/uncertain 归 uncertain)"""
+    d = DEFECT_TYPES.get(defect or "")
+    return d["layer"] if d else "uncertain"
+
+
+def defect_to_category(defect: str | None) -> str:
+    d = DEFECT_TYPES.get(defect or "")
+    return d["category"] if d else "uncertain"
+
+
+def defect_to_fix_table(defect: str | None) -> str:
+    d = DEFECT_TYPES.get(defect or "")
+    return d["fix_table"] if d else "none"
+
+
+# 旧粗分类 (semantic/knowledge/process/coverage) → 最近缺陷 (展示兼容:
+# 存量案例归因升级前的 category 值, 人工确认时作为主缺陷默认值带出)
+_LEGACY_CATEGORY_TO_DEFECT: dict[str, str] = {
+    "semantic": "intent_misread",
+    "knowledge": "knowledge_missing",
+    "coverage": "intent_uncovered",
+    "process": "rule_flaw",
+}
+
+
+def normalize_defect(value: str | None) -> str:
+    """任意存量值 → 缺陷枚举 (旧粗分类取最近缺陷, 未知名归 uncertain)"""
+    if value in DEFECT_TYPES:
+        return value  # type: ignore[return-value]
+    return _LEGACY_CATEGORY_TO_DEFECT.get(value or "", "uncertain")
+
+
 # 根因层 → 允许的修复分流表 (首位 = 推荐默认; 方案 §5.1)
 # 设计: A/B/D 各承接一个专属层 (知识/意图/生成), C·规则是工程配置族
 # (预处理/会话/路由/合规) 的公共收容桶; 交叉次选项是现实中的替代修复路径 —
@@ -90,32 +143,33 @@ def dedup_key(user_input: str) -> str:
 
 # ── 模块 A: LLM-as-Judge 自动归因 ──
 
-_JUDGE_SYSTEM_PROMPT = """你是银行智能客服系统的故障根因分析专家。系统采用八层架构：
-①预处理 → ②会话管理 → ③意图识别(三级漏斗) → ④路由决策
-→ ⑤RAG检索 → ⑥回复生成 → ⑦风控合规 → ⑧监控闭环
-你的任务：根据给定的 Badcase 上下文（用户输入 + 各层中间产物），
-判断这个 Badcase 的根因出在哪一层，并给出依据。
+_JUDGE_SYSTEM_PROMPT = """你是银行信用卡智能客服的质量分析专家。给你一个服务坏例
+（客户输入 + 机器人回复 + 各环节中间产物），判断属于哪类业务缺陷。
+缺陷类型（只能从中选择一个作为主缺陷）：
+- knowledge_missing 知识缺失: 该问题需要知识作答, 但知识库没有相关内容
+- knowledge_outdated 知识过时: 检索到了内容但已过时/不准确, 导致答错
+- intent_misread 意图理解错: 客户意思被理解错（问账单判成闲聊/faq 等）
+- intent_uncovered 说法未覆盖: 意思理解了或置信很低, 但这类说法/场景没被意图库收录
+- rule_flaw 流程/规则缺陷: 意图对了, 但编排/槽位/路由规则设计不当导致没办成事
+- reply_quality 回复质量差: 检索内容是对的, 但生成的话术跑题/生硬/编造数字
+- fallback_poor 兜底不当: 该查的诉求被"无法查询/请去官方渠道"打发、该转人工没转
+- compliance_risk 合规风险: 回复含不合规承诺、索要敏感信息或编造办理结果
 判定纪律：
-1. 找"第一处输出偏离"的层——后续层的错误往往是上游错误的传导，归因只归到源头
-2. 只依据给定的中间产物判断，不得推测未给出的信息
-3. 如果证据不足以确定根因，root_cause_layer 填 "uncertain"，不要强行归因
-4. 输出严格的 JSON，不要输出任何 JSON 之外的文字
-5. 判定锚点（中间产物满足以下模式时直接定层，证据字段优先于直觉）：
-   - intent 与用户输入语义明显不符（问账单判成 faq、问挂失判成闲聊等）→ layer_3
-   - rag_hit=false 且该问题需要知识作答（非纯操作/转人工诉求）→ layer_5
-   - rag_hit=true 但回复与输入主题无关或含编造数字 → layer_6
-   - 意图识别正确，但回复以"无法查询/请去官方渠道"拒绝（该类诉求本有工具链可查）→ layer_4
-   - 回复含不合规承诺、敏感信息泄露或编造办理话术 → layer_7
-6. root_cause_category 判定标准（性质分类，必须与根因层对应）：
-   - semantic 语义理解偏差: 意图/改写/理解错了客户意思 (对应 layer_3/layer_6)
-   - knowledge 知识缺失: 知识库没有可支撑回答的内容 (对应 layer_5)
-   - coverage 覆盖不足: 该说法/场景本没被收录 (对应 layer_3/layer_5)
-   - process 流程设计缺陷: 编排/规则/槽位/Prompt 流程不当 (对应 layer_1/2/4/6/7)
-   实在无法归类填 "uncertain"，不要跨层硬套（如根因层是意图识别却填 knowledge）
-7. 复合根因：主根因之外，若中间产物显示其他层也存在独立缺陷（非传导），
-   填入 contributing_layers（至多 2 个，不含主根因层；无则为空数组）。
-   示例：意图误判为主因，但 rag_hit=false 表明知识库也无兜底内容
-   → root_cause_layer=layer_3, contributing_layers=["layer_5"]
+1. 只依据给定的中间产物判断，不得推测未给出的信息
+2. 证据不足以确定时 root_cause_defect 填 "uncertain"，不要强行归因
+3. 输出严格的 JSON，不要输出任何 JSON 之外的文字
+4. 判定锚点（中间产物满足以下模式时直接定缺陷，证据字段优先于直觉）：
+   - intent 与用户输入语义明显不符 → intent_misread
+   - intent 基本对但置信很低 / 被当闲聊处理, 客户其实在问业务 → intent_uncovered
+   - rag_hit=false 且该问题需要知识作答（非纯操作/转人工诉求）→ knowledge_missing
+   - rag_hit=true 但引用内容旧/答非所问的依据 → knowledge_outdated
+   - rag_hit=true、意图也对, 但回复与输入主题无关或含编造数字 → reply_quality
+   - 意图识别正确, 但回复以"无法查询/请去官方渠道"拒绝（该类诉求本有工具链可查）→ fallback_poor
+   - 回复含不合规承诺、敏感信息泄露或编造办理话术 → compliance_risk
+5. 伴随缺陷：主缺陷之外，若中间产物显示还存在其他独立缺陷（非同一问题的传导），
+   填入 contributing_defects（至多 2 个，不与主缺陷相同；无则为空数组）。
+   示例：主缺陷是意图理解错，同时 rag_hit=false 表明知识库也无兜底内容
+   → root_cause_defect="intent_misread", contributing_defects=["knowledge_missing"]
 """
 
 _JUDGE_USER_TEMPLATE = """<badcase_context>
@@ -136,53 +190,36 @@ layer_7_compliance:
   response_source: {response_source}
 </layer_outputs>
 </badcase_context>
-请分析这个 Badcase 的根因，输出 JSON。
+请分析这个 Badcase 的缺陷，输出 JSON。
 """
 
 _JUDGE_OUTPUT_SCHEMA = (
-    '{"trace_id": "...", "root_cause_layer": "layer_1..layer_7|uncertain", '
-    '"root_cause_category": "semantic|knowledge|process|coverage|uncertain", '
-    '"contributing_layers": ["layer_x", "..."], '
+    '{"trace_id": "...", "root_cause_defect": "knowledge_missing|knowledge_outdated|'
+    'intent_misread|intent_uncovered|rule_flaw|reply_quality|fallback_poor|compliance_risk|uncertain", '
+    '"contributing_defects": ["defect_x", "..."], '
     '"evidence": "≤100字", "confidence": 0.0~1.0, '
-    '"suggested_fix_table": "A_knowledge|B_intent|C_rule|D_model|none", '
     '"needs_human_review": true|false}'
 )
 
 
 @dataclass
 class AttributionResult:
-    """单条归因结果 (3 次自一致性投票后)"""
+    """单条归因结果 (3 次自一致性投票后)
+
+    主维度是缺陷 (defect); 责任层/性质/修复表全部由缺陷派生 (单一事实源)。
+    root_cause_category 落库存缺陷枚举 (旧粗分类由 normalize_defect 兼容)。
+    """
 
     trace_id: str
     root_cause_layer: str
-    root_cause_category: str
+    root_cause_category: str  # 缺陷枚举 (派生自主缺陷)
     evidence: str
     confidence: float
     fix_table: str
     needs_human_review: bool
     majority_ratio: float
-    secondary_layers: list[str] = field(default_factory=list)
-
-
-# 层 → 合法根因性质分类 (首位 = 层默认; LLM 输出跨层错配时校正, 如
-# layer_3×knowledge 这类"意图识别层判知识缺失"的矛盾组合)
-_LAYER_VALID_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "layer_1": ("process",),
-    "layer_2": ("process",),
-    "layer_3": ("semantic", "coverage"),
-    "layer_4": ("process",),
-    "layer_5": ("knowledge", "coverage"),
-    "layer_6": ("semantic", "process"),
-    "layer_7": ("process",),
-}
-
-
-def sanitize_category(layer: str, category: str) -> str:
-    """层×分类绑定校正: 错配 (跨层硬套) 回落本层默认分类"""
-    valid = _LAYER_VALID_CATEGORIES.get(layer or "", ())
-    if not valid:  # uncertain/未知层不校正 (保持 uncertain 语义)
-        return category if category in ROOT_CAUSE_CATEGORIES else "uncertain"
-    return category if category in valid else valid[0]
+    primary_defect: str = "uncertain"
+    secondary_layers: list[str] = field(default_factory=list)  # 伴随缺陷枚举列表
 
 
 def _parse_judge_json(raw: str) -> dict[str, Any] | None:
@@ -271,35 +308,41 @@ class BadcaseJudge:
         if not votes:
             return None
 
-        # 多数票归因 (按 root_cause_layer 聚合)
+        # 多数票归因 (按主缺陷聚合; 兼容升级前按层输出的旧裁判 — 层归一化为缺陷)
         from collections import Counter
 
-        layer_counts = Counter(v.get("root_cause_layer", "uncertain") for v in votes)
-        majority_layer, majority_n = layer_counts.most_common(1)[0]
-        majority_ratio = majority_n / len(votes)
-        same_vote = next(v for v in votes if v.get("root_cause_layer") == majority_layer)
+        def vote_defect(v: dict[str, Any]) -> str:
+            d = v.get("root_cause_defect")
+            if isinstance(d, str) and d in DEFECT_TYPES:
+                return d
+            # 旧 schema (root_cause_layer): 层 → 主导缺陷归一 (保底兼容)
+            layer_to_defect = {"layer_3": "intent_misread", "layer_5": "knowledge_missing", "layer_6": "reply_quality"}
+            return layer_to_defect.get(str(v.get("root_cause_layer") or ""), "uncertain")
 
-        layer = majority_layer if majority_layer in ROOT_CAUSE_LAYERS else "uncertain"
-        category = same_vote.get("root_cause_category", "uncertain")
-        if category not in ROOT_CAUSE_CATEGORIES:
-            category = "uncertain"
-        category = sanitize_category(layer, category)  # 层×分类绑定校正
+        defect_counts = Counter(vote_defect(v) for v in votes)
+        primary_defect, majority_n = defect_counts.most_common(1)[0]
+        majority_ratio = majority_n / len(votes)
+        same_vote = next(v for v in votes if vote_defect(v) == primary_defect)
+
+        # 技术投影全部由缺陷派生 (单一事实源, 不再取 LLM 输出 — 消除跨维度不一致)
+        layer = defect_to_layer(primary_defect)
+        category = primary_defect
         try:
             conf = float(same_vote.get("confidence", 0.0))
         except (TypeError, ValueError):
             conf = 0.0
 
-        # 复合根因聚合: 次要因素层取 ≥2 票独立提及的 (排除主层, 防传导误计)
+        # 伴随缺陷聚合: ≥2 票独立提及的 (排除主缺陷, 防传导误计)
         contrib_counts: Counter[str] = Counter()
         for v in votes:
-            for lyr in v.get("contributing_layers") or []:
-                if isinstance(lyr, str) and lyr in ROOT_CAUSE_LAYERS and lyr != layer:
-                    contrib_counts[lyr] += 1
-        secondary_layers = [lyr for lyr, n in contrib_counts.most_common(2) if n >= 2]
+            for x in v.get("contributing_defects") or []:
+                if isinstance(x, str) and x in DEFECT_TYPES and x != primary_defect:
+                    contrib_counts[x] += 1
+        secondary_layers = [x for x, n in contrib_counts.most_common(2) if n >= 2]
 
-        needs_review = majority_ratio < 1.0 or conf < self._min_conf or layer == "uncertain"
-        fix_table = same_vote.get("suggested_fix_table", "")
-        # 允许集约束: 层×表组合不合法 (含 uncertain 带表、枚举外值) 一律回落默认路由
+        needs_review = majority_ratio < 1.0 or conf < self._min_conf or primary_defect == "uncertain"
+        fix_table = defect_to_fix_table(primary_defect)
+        # 允许集兜底: 派生表必须落在层允许集 (映射表与允许集不一致时的保险)
         if fix_table not in allowed_fix_tables(layer):
             fix_table = fix_table_for_layer(layer)
 
@@ -312,6 +355,7 @@ class BadcaseJudge:
             fix_table=fix_table,
             needs_human_review=needs_review,
             majority_ratio=majority_ratio,
+            primary_defect=primary_defect,
             secondary_layers=secondary_layers,
         )
 
