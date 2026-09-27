@@ -183,6 +183,7 @@ def _to_dict(b: Badcase) -> dict[str, Any]:
         "snapshot": b.snapshot,
         "root_cause_layer": b.root_cause_layer,
         "root_cause_category": b.root_cause_category,
+        "secondary_layers": b.secondary_layers or [],
         "attribution_evidence": b.attribution_evidence,
         "attribution_confidence": b.attribution_confidence,
         "attribution_model": b.attribution_model,
@@ -612,6 +613,7 @@ async def attribute_and_save(
             return None
         row.root_cause_layer = result.root_cause_layer
         row.root_cause_category = result.root_cause_category
+        row.secondary_layers = result.secondary_layers or None
         row.attribution_evidence = result.evidence
         row.attribution_confidence = result.confidence
         llm_used = getattr(judge, "_llm", None)

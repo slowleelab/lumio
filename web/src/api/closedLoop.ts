@@ -15,6 +15,7 @@ export interface Badcase {
   bot_output: string | null
   root_cause_layer: string | null
   root_cause_category: string | null
+  secondary_layers?: string[] | null
   attribution_evidence: string | null
   attribution_confidence: number | null
   attribution_model: string | null

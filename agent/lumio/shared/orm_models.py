@@ -1199,6 +1199,8 @@ class Badcase(Base):
 
     root_cause_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
     root_cause_category: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 复合根因: 次要因素层 (≥2 票独立提及, 不含主根因层); 仅展示, 问题组聚合仍按主根因
+    secondary_layers: Mapped[list | None] = mapped_column(JSON, nullable=True)
     attribution_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
     attribution_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     attribution_model: Mapped[str | None] = mapped_column(String(64), nullable=True)

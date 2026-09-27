@@ -206,6 +206,17 @@
             <span class="muted attrib-meta">
               {{ categoryLabel(detail.root_cause_category) }} · 置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
             </span>
+            <template v-if="(detail.secondary_layers ?? []).length">
+              <span class="muted attrib-meta">次要因素:</span>
+              <el-tag
+                v-for="sl in detail.secondary_layers"
+                :key="sl"
+                size="small"
+                effect="plain"
+                type="warning"
+                class="secondary-tag"
+              >{{ LAYER_LABELS[sl] ?? sl }}</el-tag>
+            </template>
             <span v-if="deviated" class="deviate-hint">偏离默认推荐 ({{ FIX_TABLE_LABELS[defaultTable] }})</span>
           </div>
           <div class="evidence">{{ detail.attribution_evidence }}</div>
@@ -1115,6 +1126,9 @@ onUnmounted(() => {
 .deviate-hint {
   font-size: var(--fs-sm);
   color: var(--el-color-warning);
+}
+.secondary-tag {
+  font-weight: 400;
 }
 .evidence, .snapshot {
   background: var(--color-bg-page, #f5f7fa);

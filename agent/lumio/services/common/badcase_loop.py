@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,16 @@ _JUDGE_SYSTEM_PROMPT = """你是银行智能客服系统的故障根因分析专
    - rag_hit=true 但回复与输入主题无关或含编造数字 → layer_6
    - 意图识别正确，但回复以"无法查询/请去官方渠道"拒绝（该类诉求本有工具链可查）→ layer_4
    - 回复含不合规承诺、敏感信息泄露或编造办理话术 → layer_7
+6. root_cause_category 判定标准（性质分类，必须与根因层对应）：
+   - semantic 语义理解偏差: 意图/改写/理解错了客户意思 (对应 layer_3/layer_6)
+   - knowledge 知识缺失: 知识库没有可支撑回答的内容 (对应 layer_5)
+   - coverage 覆盖不足: 该说法/场景本没被收录 (对应 layer_3/layer_5)
+   - process 流程设计缺陷: 编排/规则/槽位/Prompt 流程不当 (对应 layer_1/2/4/6/7)
+   实在无法归类填 "uncertain"，不要跨层硬套（如根因层是意图识别却填 knowledge）
+7. 复合根因：主根因之外，若中间产物显示其他层也存在独立缺陷（非传导），
+   填入 contributing_layers（至多 2 个，不含主根因层；无则为空数组）。
+   示例：意图误判为主因，但 rag_hit=false 表明知识库也无兜底内容
+   → root_cause_layer=layer_3, contributing_layers=["layer_5"]
 """
 
 _JUDGE_USER_TEMPLATE = """<badcase_context>
@@ -132,6 +142,7 @@ layer_7_compliance:
 _JUDGE_OUTPUT_SCHEMA = (
     '{"trace_id": "...", "root_cause_layer": "layer_1..layer_7|uncertain", '
     '"root_cause_category": "semantic|knowledge|process|coverage|uncertain", '
+    '"contributing_layers": ["layer_x", "..."], '
     '"evidence": "≤100字", "confidence": 0.0~1.0, '
     '"suggested_fix_table": "A_knowledge|B_intent|C_rule|D_model|none", '
     '"needs_human_review": true|false}'
@@ -150,6 +161,28 @@ class AttributionResult:
     fix_table: str
     needs_human_review: bool
     majority_ratio: float
+    secondary_layers: list[str] = field(default_factory=list)
+
+
+# 层 → 合法根因性质分类 (首位 = 层默认; LLM 输出跨层错配时校正, 如
+# layer_3×knowledge 这类"意图识别层判知识缺失"的矛盾组合)
+_LAYER_VALID_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "layer_1": ("process",),
+    "layer_2": ("process",),
+    "layer_3": ("semantic", "coverage"),
+    "layer_4": ("process",),
+    "layer_5": ("knowledge", "coverage"),
+    "layer_6": ("semantic", "process"),
+    "layer_7": ("process",),
+}
+
+
+def sanitize_category(layer: str, category: str) -> str:
+    """层×分类绑定校正: 错配 (跨层硬套) 回落本层默认分类"""
+    valid = _LAYER_VALID_CATEGORIES.get(layer or "", ())
+    if not valid:  # uncertain/未知层不校正 (保持 uncertain 语义)
+        return category if category in ROOT_CAUSE_CATEGORIES else "uncertain"
+    return category if category in valid else valid[0]
 
 
 def _parse_judge_json(raw: str) -> dict[str, Any] | None:
@@ -250,10 +283,19 @@ class BadcaseJudge:
         category = same_vote.get("root_cause_category", "uncertain")
         if category not in ROOT_CAUSE_CATEGORIES:
             category = "uncertain"
+        category = sanitize_category(layer, category)  # 层×分类绑定校正
         try:
             conf = float(same_vote.get("confidence", 0.0))
         except (TypeError, ValueError):
             conf = 0.0
+
+        # 复合根因聚合: 次要因素层取 ≥2 票独立提及的 (排除主层, 防传导误计)
+        contrib_counts: Counter[str] = Counter()
+        for v in votes:
+            for lyr in v.get("contributing_layers") or []:
+                if isinstance(lyr, str) and lyr in ROOT_CAUSE_LAYERS and lyr != layer:
+                    contrib_counts[lyr] += 1
+        secondary_layers = [lyr for lyr, n in contrib_counts.most_common(2) if n >= 2]
 
         needs_review = majority_ratio < 1.0 or conf < self._min_conf or layer == "uncertain"
         fix_table = same_vote.get("suggested_fix_table", "")
@@ -270,6 +312,7 @@ class BadcaseJudge:
             fix_table=fix_table,
             needs_human_review=needs_review,
             majority_ratio=majority_ratio,
+            secondary_layers=secondary_layers,
         )
 
 
