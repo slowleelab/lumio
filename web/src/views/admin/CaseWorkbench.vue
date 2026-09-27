@@ -348,6 +348,7 @@ import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
 import StatusFlowChain from "@/components/common/StatusFlowChain.vue"
+import { intentZh } from "@/utils/intentZh"
 import {
   attributeBadcase,
   resolveBadcase,
@@ -420,14 +421,7 @@ const FIX_TABLE_LABELS: Record<string, string> = {
 
 // ── 列表 ──
 
-const INTENT_ZH: Record<string, string> = {
-  bill_query: "账单查询", account_bill_query: "账单查询", transaction_query: "交易明细查询",
-  txn_query: "交易明细查询", limit_query: "额度查询", installment_inquiry: "分期咨询",
-  reward_query: "积分相关", faq: "知识问答", knowledge_qa: "知识问答", faq_product: "产品咨询",
-  chitchat: "闲聊", nb_chitchat: "闲聊", nb_noise: "无效输入", complaint: "投诉",
-  transfer_agent: "要求转人工", card_loss: "卡片挂失", card_loss_report: "卡片挂失",
-}
-const intentZh = (v: string) => INTENT_ZH[v] ?? v
+// intentZh 来自公共映射 (utils/intentZh, 与问题治理页等共用单一事实源)
 // 选项取自当前页数据去重 (全量枚举太长, 队列里出现什么给什么)
 const intentOptions = computed(() => {
   const seen = new Map<string, string>()
