@@ -63,21 +63,28 @@
       <!-- 右: 组详情 -->
       <div class="detail-panel" v-loading="detailLoading">
         <template v-if="detail">
+          <!-- 统计头: 组名 + 态势数字徽标 — 一眼掌握组规模与推进状态 -->
           <div class="detail-hero">
             <div class="hero-title">
               <span class="group-intent big">{{ intentLabel(detail.intent_label) }}</span>
               <span class="muted">×</span>
               <span class="big">{{ layerLabel(detail.root_cause_layer) }}</span>
+              <el-tag size="small" :type="fixTableType(detail.fix_table)" effect="light">{{ fixTableLabel(detail.fix_table) }}</el-tag>
             </div>
-            <div class="hero-meta muted">
-              {{ detail.case_count }} 个案例 · 组内案例批量治理
-              <template v-if="detail.unconfirmed_count > 0"> · {{ detail.unconfirmed_count }} 例根因待人工确认（批量确认随方案执行）</template>
+            <div class="hero-stats">
+              <span class="stat"><b>{{ detail.case_count }}</b> 案例</span>
+              <span v-if="detailPending > 0" class="stat warn"><b>{{ detailPending }}</b> 待处置</span>
+              <span v-if="detail.unconfirmed_count > 0" class="stat warn"><b>{{ detail.unconfirmed_count }}</b> 根因待确认</span>
+              <span class="stat"><b>{{ detail.case_count - detail.unconfirmed_count }}</b> 已确认</span>
+              <span v-if="detail.plan_owner" class="stat">方案 · {{ detail.plan_owner }}</span>
             </div>
           </div>
 
           <div class="section-title">
             修复方案
-            <span class="muted section-hint">(方案落定 = 治理人确认组内共性根因, 是批量执行的把关前置)</span>
+            <el-tooltip content="方案落定 = 治理人确认组内共性根因, 是批量执行的把关前置" placement="top">
+              <span class="muted section-hint">怎么修 · 谁负责 ⓘ</span>
+            </el-tooltip>
           </div>
           <div class="plan-row">
             <el-select v-model="planTable" size="small" style="width: 150px" placeholder="修复分流表">
@@ -89,8 +96,8 @@
               </el-option>
             </el-select>
             <el-input v-model="planOwner" placeholder="负责人" size="small" style="width: 130px" />
-            <el-button size="small" @click="planText = detail.plan_template || ''">按分流表生成建议</el-button>
             <el-button size="small" type="primary" :loading="acting" @click="savePlan">保存方案</el-button>
+            <el-button size="small" link @click="planText = detail.plan_template || ''">按分流表生成建议</el-button>
             <el-link
               v-if="fixGuideTo"
               type="primary"
@@ -99,11 +106,13 @@
               @click="router.push(fixGuideTo)"
             >前往处理 ›</el-link>
           </div>
-          <el-input v-model="planText" type="textarea" :rows="4" placeholder="修复方案: 做什么、在哪做、验收标准 (可用上方按钮生成建议模板后修改)" />
+          <el-input v-model="planText" type="textarea" :rows="4" placeholder="修复方案: 做什么、在哪做、验收标准 (可用「生成建议」出模板后修改)" />
 
           <div class="section-title">
             批量执行
-            <span class="muted section-hint">(节点带各状态案例数, 点击下一节点批量流转; 逐例走状态机守门, 单例失败不阻断)</span>
+            <el-tooltip content="节点带各状态案例数, 点击下一节点批量流转; 逐例走状态机守门, 单例失败不阻断" placement="top">
+              <span class="muted section-hint">点节点流转 ⓘ</span>
+            </el-tooltip>
           </div>
           <StatusFlowChain
             :current="batchChainCurrent"
@@ -132,7 +141,7 @@
                 <el-tag size="small" :type="fixStatusType(row.fix_status)" effect="plain">{{ fixStatusLabel(row.fix_status) }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="会话时间" width="100">
+            <el-table-column label="会话时间" width="86" align="center">
               <template #default="{ row }">{{ fmtTime(row.session_time) }}</template>
             </el-table-column>
             <el-table-column label="操作" width="76">
@@ -170,6 +179,10 @@ const acting = ref(false)
 const groups = ref<PatternGroup[]>([])
 const unattributed = ref(0)
 const detail = ref<PatternDetail | null>(null)
+// 组态势: 待处置数从案例明细算 (列表接口有 pending_count, 详情没有)
+const detailPending = computed(() =>
+  (detail.value?.cases ?? []).filter((c) => c.fix_status === "pending" || c.fix_status === "reopened").length,
+)
 const planText = ref("")
 const planOwner = ref("")
 const planTable = ref("")
@@ -427,11 +440,32 @@ onMounted(load)
 
 .hero-title {
   font-size: 15px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.hero-meta {
-  font-size: 12px;
-  margin-top: 2px;
+.hero-stats {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 8px;
+
+  .stat {
+    font-size: 12px;
+    color: var(--color-text-secondary);
+
+    b {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--color-text-primary);
+      margin-right: 2px;
+    }
+
+    &.warn b {
+      color: var(--el-color-danger);
+    }
+  }
 }
 
 .section-title {
