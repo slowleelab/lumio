@@ -1,0 +1,13 @@
+# Milvus standalone-lite 用户配置 (demo/CI 栈)
+# 场景: docker.io/minio/minio 已被 MinIO 官方撤库 (2026-09), GH runner 无法
+# 匿名拉取任何公共源的 minio 镜像。Milvus 官方 standalone-lite 姿势启用
+# 内嵌 etcd + 本地存储, 使 demo/CI 栈摆脱 minio/etcd 外部依赖。
+# 本地全功能栈 (make up --profile storage) 仍走外部 minio, 不加载本文件。
+etcd:
+  use:
+    embed: true
+  data:
+    dir: /var/lib/milvus/etcd
+common:
+  storage:
+    type: local

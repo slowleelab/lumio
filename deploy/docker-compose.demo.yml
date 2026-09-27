@@ -27,13 +27,12 @@ services:
       POSTGRES_USER: lumio
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD_DOCKER:-lumio_pass}
       POSTGRES_DATABASE: lumio
+      # MinIO 默认不随 demo 栈启动 (镜像源受限); seed 检测不可达时自动跳过对象存储
       MINIO_ENDPOINT: lumio-minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
     depends_on:
       postgres:
-        condition: service_healthy
-      minio:
         condition: service_healthy
     # 挂载迁移/种子脚本与语料（只读），避免打入生产镜像
     volumes:
@@ -50,6 +49,16 @@ services:
     networks:
       - lumio-net
     restart: "no"
+
+  # ── Milvus standalone-lite (demo/CI: 无外部 minio/etcd) ──
+  # docker.io/minio/minio 已被官方撤库, GH runner 拉不到任何公共源的
+  # minio 镜像 → demo/CI 栈的 milvus 走官方 lite 姿势 (内嵌 etcd +
+  # local storage, 见 milvus-user.yaml), 数据仍在 milvus_data 卷内。
+  milvus:
+    volumes:
+      - milvus_data:/var/lib/milvus
+      - ./milvus-user.yaml:/milvus/configs/user.yaml:ro
+    depends_on: !override {}
 
   # ── Bot 自助服务 ──
   bot:

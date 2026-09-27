@@ -148,14 +148,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Pre-pull minio via mirror
-        # 2026-09 起 GH runner 匿名直拉 docker.io/minio/minio 被拒 (E2E 连续红),
-        # mirror.gcr.io 是 Docker Hub 官方缓存源, retag 后 compose 用本地镜像不再拉远端
-        run: |
-          docker pull mirror.gcr.io/minio/minio:RELEASE.2024-01-16T16-07-38Z \
-            && docker tag mirror.gcr.io/minio/minio:RELEASE.2024-01-16T16-07-38Z minio/minio:RELEASE.2024-01-16T16-07-38Z \
-            || echo "::warning::mirror 拉取失败, compose 将直接拉取 (可能再遇 Docker Hub 拒绝)"
       - name: Start Demo stack
+        # MinIO 不随 demo 栈启动 (compose profiles: storage; 三个公共镜像源均
+        # 拒匿名拉取 docker.io/minio/minio)。对象存储仅是原始文档备份,
+        # 检索主链路在 ES, seed 检测 MinIO 不可达时自动跳过上传。
         working-directory: deploy
         run: docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
       - name: Wait for services

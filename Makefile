@@ -78,11 +78,11 @@ build: ## 构建 Docker 镜像（ES+IK）
 build-app: ## 构建应用 Docker 镜像（构建上下文为 agent/）
 	docker build -f deploy/Dockerfile -t lumio:latest agent/
 
-up: ## 启动所有中间件
-	cd deploy && docker compose up -d
+up: ## 启动所有中间件 (含 MinIO; demo/CI 栈默认跳过 — 镜像源匿名拉取受限)
+	cd deploy && docker compose --profile storage up -d
 
 down: ## 停止所有中间件
-	cd deploy && docker compose down
+	cd deploy && docker compose --profile storage down
 
 # ── AI 网关（Higress + Nacos，opt-in profile，默认不启动） ──
 gateway-up: ## 启动 Higress AI 网关 + Nacos MCP Registry（docker compose --profile gateway）

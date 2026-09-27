@@ -80,6 +80,9 @@ services:
   # ── etcd（Milvus 元数据）──────────────────────────
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
+    # 与 minio 同组: demo/CI 栈走 milvus standalone-lite (内嵌 etcd + local
+    # storage), 本地全功能栈 --profile storage 激活外部 etcd+minio
+    profiles: ["storage"]
     container_name: lumio-etcd
     restart: unless-stopped
     environment:
@@ -99,9 +102,13 @@ services:
     networks:
       - lumio-net
 
-  # ── MinIO（对象存储 + Milvus 依赖）────────────────
+  # ── MinIO（对象存储；Milvus 2.4.24 standalone 不再依赖外部 etcd/pulsar）──
+  # profiles: 默认不启动 (2026-09 起 GH runner 匿名拉取 docker.io/minio/minio
+  # 被拒, CI/demo 栈跳过; 对象存储仅是原始文档备份, 检索主链路在 ES)。
+  # 本地全功能: make up (= docker compose --profile storage up -d)
   minio:
     image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    profiles: ["storage"]
     container_name: lumio-minio
     restart: unless-stopped
     environment:
