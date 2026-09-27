@@ -40,14 +40,11 @@
               <el-tag size="small" :type="fixTableType(row.fix_table)" effect="plain" class="group-ft">{{ fixTableLabel(row.fix_table) }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="案例" width="70" align="center">
+          <el-table-column label="案例 / 待处置" width="112" align="center">
             <template #default="{ row }">
               <span class="case-count">{{ row.case_count }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="待处置" width="64" align="center">
-            <template #default="{ row }">
-              <span :class="{ 'pending-hot': row.pending_count > 0 }">{{ row.pending_count }}</span>
+              <span class="muted count-sep"> / </span>
+              <span :class="{ 'pending-hot': row.pending_count > 0 }" title="待处置">{{ row.pending_count }}</span>
             </template>
           </el-table-column>
           <el-table-column label="方案" width="86" align="center">
@@ -57,7 +54,7 @@
               <el-tag v-else size="small" type="warning" effect="plain">修复中</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="最近发生" width="96">
+          <el-table-column label="最近发生" width="90" align="center">
             <template #default="{ row }">{{ fmtTime(row.last_seen) }}</template>
           </el-table-column>
         </el-table>
@@ -156,6 +153,7 @@ import { computed, onMounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import StatusFlowChain from "@/components/common/StatusFlowChain.vue"
+import { intentZh } from "@/utils/intentZh"
 import {
   batchTransition,
   getPatternDetail,
@@ -217,14 +215,6 @@ const FIX_GUIDE_TO: Record<string, string> = {
   C_rule: "/admin/intent-library",
   D_model: "/admin/prompts",
 }
-const INTENT_FALLBACK: Record<string, string> = {
-  faq: "常见咨询",
-  bill_query: "账单查询",
-  card_loss: "挂失",
-  installment_inquiry: "分期咨询",
-  limit_query: "额度",
-}
-
 const FIX_STATUS: Record<string, { label: string; type: string }> = {
   pending: { label: "待处置", type: "info" },
   fixing: { label: "修复中", type: "warning" },
@@ -234,8 +224,7 @@ const FIX_STATUS: Record<string, { label: string; type: string }> = {
 }
 
 function intentLabel(v: string | null) {
-  if (!v) return "未分类业务"
-  return INTENT_FALLBACK[v] ?? v
+  return intentZh(v) || "未分类业务"
 }
 function layerLabel(v: string | null) {
   return LAYER_LABELS[v ?? ""] ?? v ?? "-"
@@ -253,7 +242,7 @@ function fixStatusType(v: string) {
   return FIX_STATUS[v]?.type ?? "info"
 }
 function fmtTime(t: string | null) {
-  return t ? t.slice(5, 16).replace("T", " ") : "-"
+  return t ? t.slice(5, 10) : "-"
 }
 
 const fixGuideTo = computed(() => FIX_GUIDE_TO[planTable.value || detail.value?.fix_table || ""] ?? null)
@@ -491,5 +480,9 @@ onMounted(load)
   color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
   border-radius: 3px;
+}
+.count-sep {
+  padding: 0 2px;
+  font-size: 11px;
 }
 </style>
