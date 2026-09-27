@@ -208,7 +208,19 @@ async def save_plan(
     """方案 upsert (按 group_key); 方案落定 = 治理人对组内共性根因的确认"""
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+    # 组根因层固定 (group_key 组成部分), 修复表必须落在本层允许集内
+    from lumio.services.common.badcase_loop import allowed_fix_tables
+    from lumio.shared.exceptions import LumioError
     from lumio.shared.orm_models import FixPattern
+
+    layer_allowed = allowed_fix_tables(root_cause_layer)
+    if layer_allowed and fix_table and fix_table not in layer_allowed and fix_table != "none":
+        raise LumioError(
+            code=3001,
+            message=(
+                f"非法组合: 根因层 {root_cause_layer} 不允许修复表 {fix_table} " f"(允许: {'/'.join(layer_allowed)})"
+            ),
+        )
 
     async with sf() as db:
         stmt = pg_insert(FixPattern)
