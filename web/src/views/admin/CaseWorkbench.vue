@@ -132,12 +132,12 @@
         <div class="drawer-title">
           <el-tag :type="fixStatusType(detail?.fix_status || '')" effect="dark">{{ fixStatusLabel(detail?.fix_status || "") }}</el-tag>
           <el-tag size="small" :type="signalType(detail?.signal_source || '')">{{ signalLabel(detail?.signal_source || "") }}</el-tag>
-          <span class="muted" style="font-size: 12px">出现 {{ detail?.occurrences ?? 1 }} 次</span>
+          <span class="muted" style="font-size: 12px">出现 {{ detail?.occurrences ?? 1 }} 次 · {{ fmtTime(detail?.session_time || detail?.created_at) }}</span>
           <el-button size="small" link :disabled="!nextIdx" @click="openNext">下一条 ›</el-button>
         </div>
       </template>
       <div v-if="detail" class="detail-body">
-        <!-- 处置状态机节点链: 流程经过哪些节点一目了然, 点击下一节点即流转 -->
+        <!-- 处置状态机节点链: 全宽置顶 (流程状态是全局上下文, 跨两栏) -->
         <StatusFlowChain
           :current="detail.fix_status"
           :blocked="!detail.root_cause_layer || detail.root_cause_layer === 'uncertain'"
@@ -147,161 +147,185 @@
           @advance="onChainAdvance"
         />
         <el-alert v-if="detail.fix_status === 'rejected'" type="info" :closable="false" class="reject-alert" :title="`已驳回 — ${detail.fix_note || ''}`" />
-        <el-descriptions :column="3" border size="small">
-          <el-descriptions-item label="来源">{{ signalLabel(detail.signal_source) }}</el-descriptions-item>
-          <el-descriptions-item label="出现次数">{{ detail.occurrences ?? 1 }} 次</el-descriptions-item>
-          <el-descriptions-item label="采集时间">{{ fmtTime(detail.created_at) }}</el-descriptions-item>
-          <el-descriptions-item label="会话时间">
-            <span :title="`会话最后一轮对话时间; 采集时间是信号落库/巡检时刻`">{{ fmtTime(detail.session_time) }}</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="会话">
-            <el-link type="primary" :underline="false" @click="gotoAudit(detail)">{{ detail.session_id?.slice(0, 24) }}…</el-link>
-          </el-descriptions-item>
-          <el-descriptions-item label="裁判模型">{{ detail.attribution_model || "-" }}</el-descriptions-item>
-          <el-descriptions-item label="修复状态">
-            <el-tag size="small" :type="fixStatusType(detail.fix_status)">{{ fixStatusLabel(detail.fix_status) }}</el-tag>
-          </el-descriptions-item>
-        </el-descriptions>
 
-        <div class="section-title">对话现场</div>
-        <div v-if="contextLoading" class="muted context-loading">加载会话上下文…</div>
-        <template v-else>
-          <div v-for="(m, i) in contextMessages" :key="i" class="ctx-row" :class="m.speaker === 'customer' ? 'ctx-user' : 'ctx-bot'">
-            <span class="ctx-speaker">{{ m.speaker === "customer" ? "客户" : "Bot" }}</span>
-            <span class="ctx-content">{{ m.content }}</span>
+        <!-- 双栏: 左=现场证据 (发生了什么) / 右=结论与处置 (谁的问题 + 怎么办) -->
+        <div class="detail-grid">
+          <div class="col-evidence">
+            <!-- 卡: 对话现场 (审阅的核心证据) -->
+            <section class="d-card">
+              <div class="d-card-head">
+                对话现场
+                <span class="muted d-hint">上下文 + 问题轮 (下方高亮块)</span>
+              </div>
+              <div v-if="contextLoading" class="muted context-loading">加载会话上下文…</div>
+              <template v-else>
+                <div v-for="(m, i) in contextMessages" :key="i" class="ctx-row" :class="m.speaker === 'customer' ? 'ctx-user' : 'ctx-bot'">
+                  <span class="ctx-speaker">{{ m.speaker === "customer" ? "客户" : "Bot" }}</span>
+                  <span class="ctx-content">{{ m.content }}</span>
+                </div>
+                <div v-if="!contextMessages.length" class="muted">会话历史已过期 (仅存现场轮)</div>
+              </template>
+              <!-- 问题轮: 输入与回复并列为强证据块 -->
+              <div class="case-io">
+                <div class="io-block io-user">
+                  <span class="io-label">客户输入</span>
+                  <div class="io-text">{{ detail.user_input }}</div>
+                </div>
+                <div class="io-block io-bot">
+                  <span class="io-label">Bot 回复</span>
+                  <div class="io-text">{{ detail.bot_output || "-" }}</div>
+                </div>
+              </div>
+              <div class="d-card-foot">
+                <el-link type="primary" :underline="false" @click="gotoAudit(detail)">查看完整会话审计 ›</el-link>
+              </div>
+            </section>
+
+            <!-- 卡: 质检判定 (qa_scan 采集的案例) -->
+            <section v-if="qaVerdict" class="d-card">
+              <div class="d-card-head">
+                质检判定
+                <span class="muted d-hint">全量质检 · 与人工坐席质检同口径</span>
+              </div>
+              <div class="qa-verdict">
+                <el-tag :type="verdictType(qaVerdict)" size="small">{{ verdictLabel(qaVerdict) }}</el-tag>
+                <span v-if="qaSummary" class="qa-summary">{{ qaSummary }}</span>
+              </div>
+              <div v-for="(p, i) in qaProblems" :key="i" class="qa-problem">
+                <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
+                <span class="qa-reason"><template v-if="p.turn">第 {{ p.turn }} 轮 · </template>{{ p.reason || "-" }}</span>
+              </div>
+            </section>
+
+            <!-- 卡: 技术细节 (默认折叠 — 诊断与调试用, 审阅主流程不需要) -->
+            <section class="d-card d-card-plain">
+              <el-collapse class="tech-collapse">
+                <el-collapse-item name="tech">
+                  <template #title>
+                    <div class="d-card-head">
+                      技术细节
+                      <span class="muted d-hint">现场快照 · 逐轮元数据 · 原始数据</span>
+                    </div>
+                  </template>
+                  <div class="tech-meta muted">
+                    来源 {{ signalLabel(detail.signal_source) }} · 采集 {{ fmtTime(detail.created_at) }} · 会话
+                    <el-link type="primary" :underline="false" style="font-size: 11px" @click="gotoAudit(detail)">{{ detail.session_id?.slice(0, 20) }}…</el-link>
+                    <template v-if="detail.attribution_model"> · 裁判 {{ detail.attribution_model }}</template>
+                  </div>
+                  <el-descriptions v-if="snapRows.length" :column="2" border size="small" class="snap-desc">
+                    <el-descriptions-item v-for="r in snapRows" :key="r.label" :label="r.label">{{ r.value }}</el-descriptions-item>
+                  </el-descriptions>
+                  <div v-if="snapTurnsMeta.length" class="turns-meta">
+                    <div class="turns-meta-title">逐轮元数据 (每轮意图与回复来源)</div>
+                    <div v-for="(t, i) in snapTurnsMeta" :key="i" class="turn-meta-row">
+                      <span class="turn-idx">{{ i + 1 }}</span>
+                      <span class="turn-speaker" :class="{ 'is-customer': t.speaker === 'customer' }">{{ t.speaker === "customer" ? "客户" : "Bot" }}</span>
+                      <span v-if="t.speaker === 'customer'" class="turn-intent">意图: {{ t.intent || "-" }}</span>
+                      <span v-else class="turn-src">来源: {{ t.src || "-" }}</span>
+                    </div>
+                  </div>
+                  <pre v-if="snapTranscript" class="snapshot transcript">{{ snapTranscript }}</pre>
+                  <pre v-if="detail.snapshot && Object.keys(detail.snapshot).length" class="snapshot">{{ snapshotPretty }}</pre>
+                  <div v-if="!detail.snapshot || !Object.keys(detail.snapshot).length" class="muted">(采集时未携带快照)</div>
+                </el-collapse-item>
+              </el-collapse>
+            </section>
           </div>
-          <div v-if="!contextMessages.length" class="muted">会话历史已过期 (仅存现场轮)</div>
-        </template>
-        <div class="ctx-row ctx-user highlight">
-          <span class="ctx-speaker">客户</span>
-          <span class="ctx-content">{{ detail.user_input }}</span>
+
+          <div class="col-action">
+            <!-- 卡: 根因归因 (结论) -->
+            <section class="d-card d-card-primary">
+              <div class="d-card-head">
+                根因归因
+                <span class="muted d-hint">裁判结论 · 可人工改判后确认</span>
+                <el-button
+                  v-if="detail.root_cause_layer === 'uncertain'"
+                  size="small" link type="warning" style="margin-left: auto" :loading="acting" @click="runAttribution(detail)"
+                >重试归因</el-button>
+              </div>
+              <template v-if="detail.root_cause_layer">
+                <div class="attrib-row">
+                  <span class="attrib-field">主要缺陷</span>
+                  <el-select v-model="judgedDefect" size="small" style="width: 100%" placeholder="选择主要缺陷">
+                    <el-option v-for="(label, key) in DEFECT_LABELS" :key="key" :label="label" :value="key" />
+                  </el-select>
+                </div>
+                <div v-if="judgedDefect && judgedDefect !== 'uncertain'" class="derived-tags">
+                  <el-tag size="small" effect="plain" type="info">{{ LAYER_LABELS[judgedLayer] ?? judgedLayer }} 层</el-tag>
+                  <el-tag size="small" effect="plain" :type="deviated ? 'warning' : 'success'">
+                    {{ FIX_TABLE_LABELS[judgedTable] ?? judgedTable }}
+                  </el-tag>
+                  <span class="muted attrib-meta">置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%</span>
+                </div>
+                <div class="secondary-row">
+                  <span class="attrib-field">伴随缺陷</span>
+                  <el-select
+                    v-model="judgedSecondary"
+                    multiple
+                    collapse-tags
+                    collapse-tags-tooltip
+                    :multiple-limit="2"
+                    size="small"
+                    style="width: 100%"
+                    :disabled="!judgedDefect || judgedDefect === 'uncertain'"
+                    placeholder="多因: 可多选 (至多 2 个)"
+                    class="secondary-select"
+                  >
+                    <el-option v-for="opt in secondaryOptions" :key="opt.key" :label="opt.label" :value="opt.key" />
+                  </el-select>
+                </div>
+                <div class="table-row" v-if="judgedDefect && judgedDefect !== 'uncertain'">
+                  <span class="attrib-field">修复方式</span>
+                  <el-select v-model="judgedTable" size="small" style="width: 100%" :disabled="!tableOptions.length">
+                    <el-option v-for="opt in tableOptions" :key="opt.key" :label="opt.label" :value="opt.key">
+                      <el-tooltip :content="FIX_TABLE_TIPS[opt.key] || ''" placement="left" :disabled="!FIX_TABLE_TIPS[opt.key]">
+                        <span>
+                          {{ opt.label }}
+                          <span v-if="opt.recommended" class="rec-mark">推荐</span>
+                        </span>
+                      </el-tooltip>
+                    </el-option>
+                  </el-select>
+                  <span v-if="deviated" class="deviate-hint">修复表偏离该缺陷默认 ({{ FIX_TABLE_LABELS[defaultTable] }})</span>
+                </div>
+                <div class="evidence">{{ evidenceZh(detail.attribution_evidence) }}</div>
+                <el-alert v-if="fixGuide" type="success" :closable="false" class="fix-guide">
+                  <template #title>
+                    {{ fixGuide.text }}
+                    <el-link v-if="fixGuide.to" type="primary" :underline="false" style="margin-left: 6px" @click="router.push(fixGuide.to!)">前往处理 ›</el-link>
+                  </template>
+                </el-alert>
+              </template>
+              <template v-else>
+                <div class="attrib-empty">
+                  <div class="muted">尚未归因 — 由 GLM 裁判分析各层中间产物 (约 20-40 秒)</div>
+                  <el-button type="warning" size="small" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因</el-button>
+                </div>
+              </template>
+            </section>
+
+            <!-- 卡: 复合动作与记录 (节点链是主流转, 此处只放工具与记录) -->
+            <section class="d-card">
+              <div class="d-card-head">
+                处置工具
+                <span class="muted d-hint">流转走上方节点链</span>
+              </div>
+              <div class="action-grid">
+                <el-button
+                  v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
+                  size="small" type="primary" plain :loading="recheckState.running" @click="recheckFromBadcase"
+                >{{ recheckState.running ? `重放验证中 ${recheckState.done}/${recheckState.total || "…"}` : `重放验证${detail.fix_status === "deployed" ? "" : " (灰度)"}` }}</el-button>
+                <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
+                <el-button size="small" @click="gotoAudit(detail)">会话审计</el-button>
+              </div>
+              <div v-if="detail.fix_note" class="fix-note">
+                <span class="muted d-hint">最近处理</span>
+                {{ detail.fix_note }}
+                <span class="muted" v-if="detail.resolved_at">· {{ fmtTime(detail.resolved_at) }}</span>
+              </div>
+            </section>
+          </div>
         </div>
-        <div class="ctx-row ctx-bot highlight">
-          <span class="ctx-speaker">Bot</span>
-          <span class="ctx-content">{{ detail.bot_output || "-" }}</span>
-        </div>
-
-        <template v-if="detail.root_cause_layer">
-          <div class="section-title">根因归因 <span class="muted section-hint">(裁判结论 · 可人工改判后确认)</span></div>
-          <!-- 缺陷驱动: 用户只面对"主要缺陷 + 伴随缺陷"两个业务选择, 责任层/修复表/性质全部自动派生 -->
-          <div class="attrib-row">
-            <span class="attrib-field">主要缺陷</span>
-            <el-select v-model="judgedDefect" size="small" style="width: 170px" placeholder="选择主要缺陷">
-              <el-option v-for="(label, key) in DEFECT_LABELS" :key="key" :label="label" :value="key" />
-            </el-select>
-            <span class="muted attrib-meta">
-              置信 {{ Math.round((detail.attribution_confidence ?? 0) * 100) }}%
-            </span>
-            <span v-if="judgedDefect && judgedDefect !== 'uncertain'" class="derived-tags">
-              <el-tag size="small" effect="plain" type="info">{{ LAYER_LABELS[judgedLayer] ?? judgedLayer }} 层</el-tag>
-              <el-tag size="small" effect="plain" :type="deviated ? 'warning' : 'success'">
-                {{ FIX_TABLE_LABELS[judgedTable] ?? judgedTable }}
-              </el-tag>
-            </span>
-          </div>
-          <div class="secondary-row">
-            <span class="attrib-field">伴随缺陷</span>
-            <el-select
-              v-model="judgedSecondary"
-              multiple
-              collapse-tags
-              collapse-tags-tooltip
-              :multiple-limit="2"
-              size="small"
-              style="width: 260px"
-              :disabled="!judgedDefect || judgedDefect === 'uncertain'"
-              placeholder="多因: 可多选 (至多 2 个)"
-              class="secondary-select"
-            >
-              <el-option v-for="opt in secondaryOptions" :key="opt.key" :label="opt.label" :value="opt.key" />
-            </el-select>
-            <span v-if="deviated" class="deviate-hint">修复表偏离该缺陷默认 ({{ FIX_TABLE_LABELS[defaultTable] }})</span>
-            <span v-else class="muted attrib-meta secondary-hint">(层/修复表由缺陷自动带出, 修复表可在下方微调)</span>
-          </div>
-          <div class="table-row" v-if="judgedDefect && judgedDefect !== 'uncertain'">
-            <span class="attrib-field">修复方式</span>
-            <el-select v-model="judgedTable" size="small" style="width: 170px" :disabled="!tableOptions.length">
-              <el-option v-for="opt in tableOptions" :key="opt.key" :label="opt.label" :value="opt.key">
-                <el-tooltip :content="FIX_TABLE_TIPS[opt.key] || ''" placement="right" :disabled="!FIX_TABLE_TIPS[opt.key]">
-                  <span>
-                    {{ opt.label }}
-                    <span v-if="opt.recommended" class="rec-mark">推荐</span>
-                  </span>
-                </el-tooltip>
-              </el-option>
-            </el-select>
-          </div>
-          <div class="evidence">{{ evidenceZh(detail.attribution_evidence) }}</div>
-          <!-- 修复指引: 分流表 → 去哪里改什么 -->
-          <el-alert v-if="fixGuide" type="success" :closable="false" class="fix-guide">
-            <template #title>
-              修复指引 · {{ FIX_TABLE_LABELS[judgedTable || detail.fix_table || ""] || "分流表" }}:
-              {{ fixGuide.text }}
-              <el-link v-if="fixGuide.to" type="primary" :underline="false" style="margin-left: 6px" @click="router.push(fixGuide.to!)">前往处理 ›</el-link>
-            </template>
-          </el-alert>
-        </template>
-        <div v-else class="section-title muted">尚未归因 — 点击下方「GLM 裁判归因」开始 (约 20-40 秒)</div>
-
-        <!-- 质检判定 (qa_scan 采集的案例: 裁判指出的具体问题项) -->
-        <template v-if="qaVerdict">
-          <div class="section-title">
-            质检判定
-            <span class="muted section-hint">(全量质检判定 · 与人工坐席质检同口径)</span>
-          </div>
-          <div class="qa-verdict">
-            <el-tag :type="verdictType(qaVerdict)" size="small">{{ verdictLabel(qaVerdict) }}</el-tag>
-            <span v-if="qaSummary" class="qa-summary">{{ qaSummary }}</span>
-          </div>
-          <div v-for="(p, i) in qaProblems" :key="i" class="qa-problem">
-            <el-tag size="small" type="danger" effect="plain">{{ problemLabel(p.type) }}</el-tag>
-            <span class="qa-reason"><template v-if="p.turn">第 {{ p.turn }} 轮 · </template>{{ p.reason || "-" }}</span>
-          </div>
-        </template>
-
-        <div class="section-title">
-          采集现场快照
-          <span class="muted section-hint">(按问答链路分层展示; 原始数据可折叠查看)</span>
-        </div>
-        <el-descriptions v-if="snapRows.length" :column="2" border size="small">
-          <el-descriptions-item v-for="r in snapRows" :key="r.label" :label="r.label">{{ r.value }}</el-descriptions-item>
-        </el-descriptions>
-        <div v-if="snapTurnsMeta.length" class="turns-meta">
-          <div class="turns-meta-title">逐轮元数据 (对话走向: 每轮意图与回复来源)</div>
-          <div v-for="(t, i) in snapTurnsMeta" :key="i" class="turn-meta-row">
-            <span class="turn-idx">{{ i + 1 }}</span>
-            <span class="turn-speaker" :class="{ 'is-customer': t.speaker === 'customer' }">{{ t.speaker === "customer" ? "客户" : "Bot" }}</span>
-            <span v-if="t.speaker === 'customer'" class="turn-intent">意图: {{ t.intent || "-" }}</span>
-            <span v-else class="turn-src">来源: {{ t.src || "-" }}</span>
-          </div>
-        </div>
-        <pre v-if="snapTranscript" class="snapshot transcript">{{ snapTranscript }}</pre>
-        <el-collapse v-if="detail.snapshot && Object.keys(detail.snapshot).length" class="raw-snap">
-          <el-collapse-item name="raw">
-            <template #title><span class="muted">查看原始快照数据 (调试用)</span></template>
-            <pre class="snapshot">{{ snapshotPretty }}</pre>
-          </el-collapse-item>
-        </el-collapse>
-        <div v-if="!detail.snapshot || !Object.keys(detail.snapshot).length" class="muted">(采集时未携带快照)</div>
-
-        <div class="section-title">处理操作 <span class="muted section-hint">(主推进在上方节点链 — 点击下一节点流转; 此处保留复合动作与工具)</span></div>
-        <div class="action-grid">
-          <!-- 归因是流转前置 (pending→fixing 需明确根因), 不是状态流转, 保留为显式动作 -->
-          <el-button v-if="!detail.root_cause_layer || detail.root_cause_layer === 'uncertain'" size="small" type="warning" :loading="acting" @click="runAttribution(detail)">GLM 裁判归因{{ detail.root_cause_layer === "uncertain" ? " (重试)" : "" }}</el-button>
-          <!-- 验证闭环: 重放原会话 (当前代码重新回答) → 按新判定自动流转 已验证/已重开 -->
-          <el-button
-            v-if="detail.fix_status === 'canary' || detail.fix_status === 'deployed'"
-            size="small" type="primary" plain :loading="recheckState.running" @click="recheckFromBadcase"
-          >{{ recheckState.running ? `重放验证中 ${recheckState.done}/${recheckState.total || "…"}` : `重放验证 (当前代码重新回答${detail.fix_status === "deployed" ? "" : " · 灰度"})` }}</el-button>
-          <!-- 次要操作 -->
-          <el-button size="small" @click="addToGolden(detail)">扩充金标集</el-button>
-          <el-button size="small" @click="gotoAudit(detail)">会话审计</el-button>
-        </div>
-
-        <template v-if="detail.fix_note">
-          <div class="section-title">最近处理记录</div>
-          <div class="fix-note">{{ detail.fix_note }} <span class="muted" v-if="detail.resolved_at">· {{ fmtTime(detail.resolved_at) }}</span></div>
-        </template>
       </div>
     </el-dialog>
   </div>
@@ -1185,6 +1209,105 @@ onUnmounted(() => {
   font-size: 15px;
 }
 .detail-body { padding: 0 4px; }
+
+/* ── 详情页双栏信息架构: 左=现场证据 / 右=结论与处置 ── */
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1.55fr 1fr;
+  gap: 14px;
+  align-items: start;
+  margin-top: 4px;
+}
+.col-action {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.col-evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.d-card {
+  background: var(--el-bg-color, #fff);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  padding: 12px 14px;
+  &.d-card-primary { border-color: var(--el-color-primary-light-7); }
+  &.d-card-plain { padding: 4px 6px; background: transparent; border-style: dashed; }
+}
+.d-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.d-hint { font-weight: 400; font-size: var(--fs-xs, 11px); }
+.d-card-foot {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+  font-size: var(--fs-xs, 11px);
+}
+/* 问题轮证据块: 输入/回复并列为强视觉锚点 */
+.case-io {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+}
+.io-block {
+  border-radius: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  .io-label {
+    display: block;
+    font-size: var(--fs-xs, 11px);
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .io-text {
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+}
+.io-user {
+  border-left: 3px solid var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  .io-label { color: var(--el-color-primary); }
+}
+.io-bot {
+  border-left: 3px solid var(--el-color-warning);
+  background: var(--el-fill-color-light);
+  .io-label { color: var(--el-color-warning); }
+}
+.attrib-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 6px 0 2px;
+}
+.tech-collapse {
+  border-top: none;
+  border-bottom: none;
+  :deep(.el-collapse-item__header) { height: 40px; }
+  :deep(.el-collapse-item__wrap) { background: transparent; }
+}
+.tech-meta { font-size: var(--fs-xs, 11px); margin-bottom: 8px; }
+.snap-desc { margin-bottom: 8px; }
+@media (max-width: 980px) {
+  .detail-grid { grid-template-columns: 1fr; }
+  .col-action { position: static; }
+  .case-io { grid-template-columns: 1fr; }
+}
 .section-title {
   font-weight: 600;
   margin: 14px 0 6px;
