@@ -163,8 +163,8 @@ def print_scan_summary(docs: list[dict]) -> None:
     print(f"\n共 {len(docs)} 个文件")
 
 
-def upload_to_minio(docs: list[dict]) -> None:
-    """上传文件到 MinIO"""
+def upload_to_minio(docs: list[dict]) -> bool:
+    """上传文件到 MinIO (不可达时降级跳过 — 对象存储仅是原始文档备份, 检索主链路在 ES)"""
     import os
 
     from minio import Minio
@@ -181,15 +181,13 @@ def upload_to_minio(docs: list[dict]) -> None:
             secret_key=secret_key,
             secure=False,
         )
+        bucket_name = "lumio-docs"
+        if not client.bucket_exists(bucket_name):
+            print(f"🔧 Bucket '{bucket_name}' 不存在，自动创建...")
+            client.make_bucket(bucket_name)
     except Exception as e:
-        print(f"❌ 连接 MinIO 失败: {e}")
-        print("   请确保 MinIO 已启动: docker-compose up -d minio")
-        sys.exit(1)
-
-    bucket_name = "lumio-docs"
-    if not client.bucket_exists(bucket_name):
-        print(f"🔧 Bucket '{bucket_name}' 不存在，自动创建...")
-        client.make_bucket(bucket_name)
+        print(f"⚠️  MinIO 不可达 ({e}) — 跳过对象存储上传, 知识照常灌入 ES/PG")
+        return False
 
     import io
 
@@ -203,6 +201,7 @@ def upload_to_minio(docs: list[dict]) -> None:
             content_type="text/markdown; charset=utf-8",
         )
         print(f"   ✅ 上传: {doc['object_key']} ({len(data)} bytes)")
+    return True
 
 
 def insert_to_database(docs: list[dict]) -> None:
