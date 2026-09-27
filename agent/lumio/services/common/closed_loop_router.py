@@ -272,6 +272,7 @@ async def resolve_badcase(
         fix_table=body.get("fix_table"),
         note=body.get("note"),
         human_confirmed_layer=body.get("human_confirmed_layer"),
+        human_confirmed_defect=body.get("human_confirmed_defect"),
         secondary_layers=secondary,
     )
     if not ok:

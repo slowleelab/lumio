@@ -9,14 +9,18 @@ from uuid_utils import uuid7
 
 from lumio.services.common.badcase_loop import (
     _LAYER_TO_FIX_TABLE,
+    DEFECT_TYPES,
     BadcaseJudge,
     allowed_fix_tables,
     dedup_key,
+    defect_to_category,
+    defect_to_fix_table,
+    defect_to_layer,
     filter_variants,
     fix_table_for_layer,
     is_valid_layer_table,
+    normalize_defect,
     rule_augment,
-    sanitize_category,
 )
 from lumio.services.common.badcase_store import capture_badcase, update_fix_status
 from lumio.shared.exceptions import LumioError
@@ -98,15 +102,17 @@ def _judge() -> BadcaseJudge:
     return BadcaseJudge(llm, model="test-judge", min_confidence=0.7, samples=3)
 
 
-def _vote(layer="layer_5", cat="knowledge", conf=0.9, fix_table="", contributing=None):
-    return {
-        "root_cause_layer": layer,
-        "root_cause_category": cat,
+def _vote(defect="knowledge_missing", conf=0.9, contributing=None, legacy_layer=None):
+    """缺陷 schema 投票 (legacy_layer 模拟升级前按层输出的旧裁判)"""
+    v: dict[str, object] = {
+        "root_cause_defect": defect,
         "evidence": "e",
         "confidence": conf,
-        "suggested_fix_table": fix_table,
-        "contributing_layers": contributing or [],
+        "contributing_defects": contributing or [],
     }
+    if legacy_layer:
+        v = {"root_cause_layer": legacy_layer, "evidence": "e", "confidence": conf}
+    return v
 
 
 class TestAttribution:
@@ -116,15 +122,17 @@ class TestAttribution:
         j._llm.chat_json = AsyncMock(side_effect=[_vote(), _vote(), _vote()])
         ctx = {"trace_id": "t1", "user_input": "q", "intent": "faq", "confidence": 0.3}
         r = await j.attribute(ctx)
-        assert r.root_cause_layer == "layer_5"
-        assert r.fix_table == fix_table_for_layer("layer_5")
+        assert r.primary_defect == "knowledge_missing"
+        assert r.root_cause_layer == "layer_5"  # 缺陷派生
+        assert r.fix_table == "A_knowledge"  # 缺陷派生
+        assert r.root_cause_category == "knowledge_missing"  # 落库存缺陷枚举
         assert r.needs_human_review is False
         assert r.majority_ratio == 1.0
 
     @pytest.mark.asyncio
     async def test_split_votes_go_human(self) -> None:
         j = _judge()
-        j._llm.chat_json = AsyncMock(side_effect=[_vote("layer_5"), _vote("layer_3", "semantic"), _vote("layer_5")])
+        j._llm.chat_json = AsyncMock(side_effect=[_vote(), _vote("intent_misread"), _vote()])
         ctx = {"trace_id": "t2", "user_input": "q"}
         r = await j.attribute(ctx)
         assert r.needs_human_review is True  # 2/3 多数票不齐 → 人工
@@ -140,9 +148,11 @@ class TestAttribution:
     @pytest.mark.asyncio
     async def test_uncertain_goes_human(self) -> None:
         j = _judge()
-        j._llm.chat_json = AsyncMock(side_effect=[_vote("uncertain", "uncertain", 0.8) for _ in range(3)])
+        j._llm.chat_json = AsyncMock(side_effect=[_vote("uncertain", 0.8) for _ in range(3)])
         r = await j.attribute({"trace_id": "t"})
         assert r.needs_human_review is True
+        assert r.root_cause_layer == "uncertain"
+        assert r.fix_table == "none"  # uncertain 不带修复路由
 
     @pytest.mark.asyncio
     async def test_all_samples_fail_returns_none(self) -> None:
@@ -152,87 +162,75 @@ class TestAttribution:
         assert r is None
 
     @pytest.mark.asyncio
-    async def test_uncertain_with_table_falls_to_none(self) -> None:
-        """uncertain 未定层不带修复路由: 裁判带了表也归 none"""
+    async def test_legacy_layer_votes_normalized(self) -> None:
+        """兼容升级前按层输出的旧裁判: layer_5 → knowledge_missing 派生"""
         j = _judge()
-        j._llm.chat_json = AsyncMock(
-            side_effect=[_vote("uncertain", "uncertain", 0.8, fix_table="B_intent") for _ in range(3)]
-        )
+        j._llm.chat_json = AsyncMock(side_effect=[_vote(legacy_layer="layer_5") for _ in range(3)])
         r = await j.attribute({"trace_id": "t"})
-        assert r.root_cause_layer == "uncertain"
-        assert r.fix_table == "none"
-
-    @pytest.mark.asyncio
-    async def test_cross_layer_table_falls_to_default(self) -> None:
-        """层×表跨层非法 (layer_5 带 B) → 回落本层默认 A"""
-        j = _judge()
-        j._llm.chat_json = AsyncMock(side_effect=[_vote("layer_5", fix_table="B_intent") for _ in range(3)])
-        r = await j.attribute({"trace_id": "t"})
+        assert r.primary_defect == "knowledge_missing"
         assert r.root_cause_layer == "layer_5"
         assert r.fix_table == "A_knowledge"
 
     @pytest.mark.asyncio
-    async def test_allowed_table_kept(self) -> None:
-        """层内允许的表 (layer_6 带 A) → 保留裁判输出"""
-        j = _judge()
-        j._llm.chat_json = AsyncMock(
-            side_effect=[_vote("layer_6", "process", fix_table="A_knowledge") for _ in range(3)]
-        )
-        r = await j.attribute({"trace_id": "t"})
-        assert r.fix_table == "A_knowledge"
+    async def test_projection_consistent_with_allowed_set(self) -> None:
+        """派生投影一致性: 每个缺陷的派生表必须落在其派生层的允许集内"""
+        for defect, spec in DEFECT_TYPES.items():
+            assert spec["fix_table"] in allowed_fix_tables(spec["layer"]), f"{defect} 派生表越出层允许集"
 
     @pytest.mark.asyncio
-    async def test_category_layer_binding_sanitized(self) -> None:
-        """层×分类绑定校正: layer_3 判 knowledge (跨层硬套) → 校正为本层默认 semantic"""
+    async def test_defect_driven_projection(self) -> None:
+        """技术投影全部由缺陷派生: LLM 不再输出层/表, 跨维度不一致从根上消除"""
         j = _judge()
-        j._llm.chat_json = AsyncMock(
-            side_effect=[_vote("layer_3", "knowledge", fix_table="B_intent") for _ in range(3)]
-        )
+        j._llm.chat_json = AsyncMock(side_effect=[_vote("reply_quality") for _ in range(3)])
         r = await j.attribute({"trace_id": "t"})
-        assert r.root_cause_layer == "layer_3"
-        assert r.root_cause_category == "semantic"
+        assert r.root_cause_layer == "layer_6"
+        assert r.fix_table == "D_model"
+        assert r.root_cause_category == "reply_quality"
 
     @pytest.mark.asyncio
-    async def test_secondary_layers_aggregated(self) -> None:
-        """复合根因: 次要因素 ≥2 票独立提及才计入, 排除主层"""
+    async def test_secondary_defects_aggregated(self) -> None:
+        """伴随缺陷: ≥2 票独立提及才计入, 排除主缺陷"""
         j = _judge()
         votes = [
-            _vote("layer_3", "semantic", fix_table="B_intent", contributing=["layer_5", "layer_6"]),
-            _vote("layer_3", "semantic", fix_table="B_intent", contributing=["layer_5", "layer_3"]),
-            _vote("layer_3", "semantic", fix_table="B_intent", contributing=["layer_6"]),
+            _vote("intent_misread", contributing=["knowledge_missing", "reply_quality"]),
+            _vote("intent_misread", contributing=["knowledge_missing", "intent_misread"]),
+            _vote("intent_misread", contributing=["reply_quality"]),
         ]
         j._llm.chat_json = AsyncMock(side_effect=votes)
         r = await j.attribute({"trace_id": "t"})
-        # layer_5×2 与 layer_6×2 均计入 (按票数排序); layer_3 是主层被排除
-        assert r.secondary_layers == ["layer_5", "layer_6"]
+        # knowledge_missing×2 与 reply_quality×2 均计入; intent_misread 是主缺陷被排除
+        assert r.secondary_layers == ["knowledge_missing", "reply_quality"]
 
     @pytest.mark.asyncio
     async def test_secondary_layers_empty_when_none(self) -> None:
         j = _judge()
-        j._llm.chat_json = AsyncMock(side_effect=[_vote("layer_5", "knowledge") for _ in range(3)])
+        j._llm.chat_json = AsyncMock(side_effect=[_vote() for _ in range(3)])
         r = await j.attribute({"trace_id": "t"})
         assert r.secondary_layers == []
 
 
-class TestCategoryBinding:
-    """sanitize_category: 层×分类绑定 (错配回落本层默认, uncertain 放行)"""
+class TestDefectModel:
+    """缺陷权威表: 派生函数 + 旧粗分类兼容"""
 
-    def test_valid_pairs_kept(self) -> None:
-        assert sanitize_category("layer_3", "semantic") == "semantic"
-        assert sanitize_category("layer_5", "knowledge") == "knowledge"
-        assert sanitize_category("layer_5", "coverage") == "coverage"
-        assert sanitize_category("layer_6", "process") == "process"
+    def test_every_defect_has_full_projection(self) -> None:
+        for defect, spec in DEFECT_TYPES.items():
+            assert defect_to_layer(defect) == spec["layer"]
+            assert defect_to_category(defect) == spec["category"]
+            assert defect_to_fix_table(defect) == spec["fix_table"]
 
-    def test_cross_layer_mismatch_corrected(self) -> None:
-        assert sanitize_category("layer_3", "knowledge") == "semantic"
-        assert sanitize_category("layer_5", "semantic") == "knowledge"
-        assert sanitize_category("layer_7", "knowledge") == "process"
+    def test_unknown_defect_falls_uncertain(self) -> None:
+        assert defect_to_layer(None) == "uncertain"
+        assert defect_to_layer("bogus") == "uncertain"
+        assert defect_to_fix_table("bogus") == "none"
 
-    def test_uncertain_passes_through(self) -> None:
-        assert sanitize_category("uncertain", "uncertain") == "uncertain"
-        assert sanitize_category("", "bogus") == "uncertain"  # 未定层 + 枚举外值
-        assert sanitize_category("", "knowledge") == "knowledge"  # 未定层不校正枚举内的分类
-        assert sanitize_category("uncertain", "knowledge") == "knowledge"
+    def test_normalize_defect_legacy_categories(self) -> None:
+        assert normalize_defect("semantic") == "intent_misread"
+        assert normalize_defect("knowledge") == "knowledge_missing"
+        assert normalize_defect("coverage") == "intent_uncovered"
+        assert normalize_defect("process") == "rule_flaw"
+        assert normalize_defect("knowledge_missing") == "knowledge_missing"  # 新枚举原样
+        assert normalize_defect("") == "uncertain"
+        assert normalize_defect("bogus") == "uncertain"
 
 
 class TestLayerTableConstraint:
@@ -351,40 +349,40 @@ class TestLayerTableGate:
         assert ok is True and bc.fix_status == "fixing"
 
     async def test_manual_secondary_layers_persisted(self) -> None:
-        """人工多因: 确认根因同时提交次要因素 → 落库"""
+        """人工多因: 旧层确认接口 + 缺陷值伴随因素 → 落库"""
         bc, f = self._mk(layer="uncertain")
         ok = await update_fix_status(
             f(),
             str(bc.id),
             fix_status="fixing",
             human_confirmed_layer="layer_3",
-            secondary_layers=["layer_5", "layer_6"],
+            secondary_layers=["knowledge_missing", "reply_quality"],
         )
         assert ok is True
-        assert bc.secondary_layers == ["layer_5", "layer_6"]
+        assert bc.secondary_layers == ["knowledge_missing", "reply_quality"]
 
     async def test_manual_secondary_with_primary_rejected(self) -> None:
-        """次要因素含主根因层 → 拦截"""
+        """伴随缺陷含主缺陷派生层确认路径下的同缺陷 → 拦截"""
         bc, f = self._mk(layer="uncertain")
         with pytest.raises(LumioError):
             await update_fix_status(
                 f(),
                 str(bc.id),
                 fix_status="fixing",
-                human_confirmed_layer="layer_3",
-                secondary_layers=["layer_3", "layer_5"],
+                human_confirmed_defect="intent_misread",
+                secondary_layers=["intent_misread", "knowledge_missing"],
             )
 
     async def test_manual_secondary_over_limit_rejected(self) -> None:
-        """次要因素超过 2 个 → 拦截"""
+        """伴随缺陷超过 2 个 → 拦截"""
         bc, f = self._mk(layer="uncertain")
         with pytest.raises(LumioError):
             await update_fix_status(
                 f(),
                 str(bc.id),
                 fix_status="fixing",
-                human_confirmed_layer="layer_3",
-                secondary_layers=["layer_4", "layer_5", "layer_6"],
+                human_confirmed_defect="intent_misread",
+                secondary_layers=["knowledge_missing", "reply_quality", "rule_flaw"],
             )
 
     async def test_manual_secondary_clear_passes(self) -> None:
@@ -394,6 +392,69 @@ class TestLayerTableGate:
         ok = await update_fix_status(f(), str(bc.id), fix_status="canary", secondary_layers=[])
         assert ok is True
         assert bc.secondary_layers is None
+
+    async def test_confirm_defect_derives_projection(self) -> None:
+        """缺陷确认: 层/表/性质全部派生落库 (root_cause_category 存缺陷枚举)"""
+        bc, f = self._mk(layer="uncertain")
+        ok = await update_fix_status(
+            f(),
+            str(bc.id),
+            fix_status="fixing",
+            human_confirmed_defect="fallback_poor",
+            secondary_layers=["knowledge_missing"],
+        )
+        assert ok is True
+        assert bc.root_cause_layer == "layer_4"  # fallback_poor → layer_4
+        assert bc.root_cause_category == "fallback_poor"
+        assert bc.fix_table == "C_rule"  # 派生表
+        assert bc.human_confirmed_layer == "layer_4"
+        assert bc.needs_human_review is False
+        assert bc.secondary_layers == ["knowledge_missing"]
+
+    async def test_confirm_defect_explicit_table_kept(self) -> None:
+        """缺陷确认时显式传表 (同缺陷允许集内换修法) → 尊重人工选择"""
+        bc, f = self._mk(layer="uncertain")
+        ok = await update_fix_status(
+            f(), str(bc.id), fix_status="fixing", human_confirmed_defect="intent_misread", fix_table="C_rule"
+        )
+        assert ok is True
+        assert bc.fix_table == "C_rule"  # layer_3 允许 B/C, 人工选 C (加规则词)
+        assert bc.root_cause_layer == "layer_3"
+
+    async def test_confirm_unknown_defect_rejected(self) -> None:
+        bc, f = self._mk(layer="uncertain")
+        with pytest.raises(LumioError) as ei:
+            await update_fix_status(f(), str(bc.id), fix_status="fixing", human_confirmed_defect="bogus")
+        assert ei.value.code == 2001
+
+    async def test_confirm_defect_uncertain_rejected(self) -> None:
+        bc, f = self._mk(layer="uncertain")
+        with pytest.raises(LumioError):
+            await update_fix_status(f(), str(bc.id), fix_status="fixing", human_confirmed_defect="uncertain")
+
+    async def test_secondary_same_as_primary_defect_rejected(self) -> None:
+        """伴随缺陷不可与主缺陷相同"""
+        bc, f = self._mk(layer="uncertain")
+        with pytest.raises(LumioError):
+            await update_fix_status(
+                f(),
+                str(bc.id),
+                fix_status="fixing",
+                human_confirmed_defect="intent_misread",
+                secondary_layers=["intent_misread"],
+            )
+
+    async def test_legacy_secondary_layer_values_rejected(self) -> None:
+        """旧 layer_x 值不再是合法伴随缺陷输入 (存量展示兼容, 新输入必须缺陷枚举)"""
+        bc, f = self._mk(layer="uncertain")
+        with pytest.raises(LumioError):
+            await update_fix_status(
+                f(),
+                str(bc.id),
+                fix_status="fixing",
+                human_confirmed_defect="intent_misread",
+                secondary_layers=["layer_5"],
+            )
 
 
 # ── 模块 B 规则模板 + 过滤 ──
