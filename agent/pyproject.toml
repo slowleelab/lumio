@@ -91,7 +91,9 @@ coverage = "^7.6"
 [[tool.poetry.source]]
 name = "tuna"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
-priority = "primary"
+# supplemental 而非 primary: 镜像源故障 (2026-10-02 全量 401 致 CI
+# 依赖安装连挂) 时回落官方 PyPI, 本地仍享受镜像加速
+priority = "supplemental"
 
 [build-system]
 requires = ["poetry-core"]
