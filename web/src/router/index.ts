@@ -16,6 +16,7 @@ import IntentLibrary from "@/views/admin/IntentLibrary.vue"
 import DialogueSimulator from "@/views/admin/DialogueSimulator.vue"
 import PromptCenter from "@/views/admin/PromptCenter.vue"
 import PatternCenter from "@/views/admin/PatternCenter.vue"
+import PipelineMap from "@/views/admin/PipelineMap.vue"
 
 const router = createRouter({
   history: createWebHistory(),
@@ -37,6 +38,7 @@ const router = createRouter({
         { path: "badcase", name: "admin-badcase", component: BadcaseWorkbench },
         { path: "cases", name: "admin-cases", component: CaseWorkbench },
         { path: "patterns", name: "admin-patterns", component: PatternCenter },
+        { path: "pipeline", name: "admin-pipeline", component: PipelineMap },
         { path: "quality-report", name: "admin-quality-report", component: QualityReport },
         { path: "intent-library", name: "admin-intent-library", component: IntentLibrary },
         { path: "prompts", name: "admin-prompts", component: PromptCenter },
