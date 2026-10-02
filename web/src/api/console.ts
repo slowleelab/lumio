@@ -190,3 +190,16 @@ export interface PipelineStats {
 export function getPipelineStats(hours = 24): Promise<PipelineStats> {
   return client.get("/admin/pipeline/stats", { params: { hours } })
 }
+
+// ── 处理链路配置下钻 (词表/话术原文, 与后端权威同源) ──
+
+export interface PipelineConfig {
+  key: string
+  title: string
+  words: Record<string, string[]>
+  responses: Record<string, string>
+}
+
+export function getPipelineConfig(key: string): Promise<PipelineConfig> {
+  return client.get("/admin/pipeline/config", { params: { key } })
+}

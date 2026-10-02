@@ -29,6 +29,7 @@ from lumio.services.bot.prompts import (
     CONFIRM_FOLLOWUP_RESPONSE,
     CRISIS_RESPONSE,
     FAREWELL_RESPONSE,
+    FINANCIAL_CRISIS_RESPONSE,
     GREETING_RESPONSE,
     SENSITIVE_REPLY_BRIDGE_RESPONSE,
 )
@@ -336,16 +337,18 @@ class LumioAgent:
         try:
             from lumio.shared.safety import safety_filter
 
-            if safety_filter.is_crisis_input(user_input):
-                logger.warning("危机干预触发: session=%s input=%r", session_id, user_input[:50])
+            _crisis_kind = safety_filter.crisis_kind(user_input)
+            if _crisis_kind is not None:
+                # 分级处置: 人身危机 (安抚+心理热线) / 财产危机 (止损指引+加急转人工)
+                logger.warning("危机干预触发: kind=%s session=%s input=%r", _crisis_kind, session_id, user_input[:50])
                 return self._build_result(
                     session_id,
                     user_input,
-                    CRISIS_RESPONSE,
+                    CRISIS_RESPONSE if _crisis_kind == "personal" else FINANCIAL_CRISIS_RESPONSE,
                     "template",
                     "crisis",
                     should_transfer=True,
-                    transfer_reason="crisis_intervention: 客户表达自伤/轻生意图",
+                    transfer_reason=f"crisis_intervention: {'客户表达自伤/轻生意图' if _crisis_kind == 'personal' else '客户财产正在受损 (诈骗/盗刷/冒用)'}",
                 )
         except Exception:
             pass  # 危机检测失败时放行 (不阻断正常对话)

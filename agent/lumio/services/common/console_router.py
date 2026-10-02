@@ -630,6 +630,95 @@ async def rag_live_metrics(user: AdminAgentUser) -> dict[str, Any]:
 # ── 8. 路由漂移监控 (P0 整改: 意图漂移检测提前) ──
 
 
+@router.get("/pipeline/config")
+async def pipeline_config(
+    user: AdminAgentUser,
+    key: str = Query(..., description="配置块: crisis | guard | noise | greeting | lexicon"),
+) -> dict[str, Any]:
+    """处理链路配置下钻: 节点背后的词表与话术原文 (只读)。
+
+    词表/话术的权威在代码与策略文件里, 此接口原样透出 — 前端展示
+    与权威同源, 不做第二份拷贝 (两处漂移是词表类配置的经典事故源)。
+    """
+    from lumio.services.bot.prompts import (
+        CLARIFY_RESPONSES,
+        CRISIS_RESPONSE,
+        FAREWELL_RESPONSE,
+        FINANCIAL_CRISIS_RESPONSE,
+        GREETING_RESPONSE,
+    )
+    from lumio.shared.safety import safety_filter
+
+    configs: dict[str, dict[str, Any]] = {
+        "crisis": {
+            "title": "危机干预 — 词表与话术",
+            "words": {
+                "人身危机词 (personal)": sorted(safety_filter.CRISIS_WORDS),
+                "财产危机词 (financial)": sorted(safety_filter.FINANCIAL_CRISIS_WORDS),
+            },
+            "responses": {
+                "人身危机话术": CRISIS_RESPONSE,
+                "财产危机话术": FINANCIAL_CRISIS_RESPONSE,
+            },
+        },
+        "noise": {
+            "title": "噪声门 — 澄清话术轮换库",
+            "words": {},
+            "responses": {f"澄清话术 {i + 1}": t for i, t in enumerate(CLARIFY_RESPONSES)},
+        },
+        "greeting": {
+            "title": "问候/告别 — 快速路径话术",
+            "words": {},
+            "responses": {"问候话术": GREETING_RESPONSE, "告别话术": FAREWELL_RESPONSE},
+        },
+    }
+
+    # 入站护栏: 模式词表 + 拦截话术 (模块内约定结构)
+    try:
+        from lumio.services.bot import input_guard as ig
+
+        configs["guard"] = {
+            "title": "入站护栏 — 模式词表与拦截话术",
+            "words": {
+                "角色覆盖模式 (role_override)": list(ig._ROLE_OVERRIDE_PATTERNS),
+                "第三方信息查询模式 (third_party_query)": list(ig._THIRD_PARTY_QUERY_PATTERNS),
+            },
+            "responses": {
+                "角色覆盖拦截话术": ig.ROLE_OVERRIDE_RESPONSE,
+                "第三方查询拦截话术": ig.THIRD_PARTY_QUERY_RESPONSE,
+            },
+        }
+    except Exception:
+        pass
+
+    # 查询工程词表 (lexicon.json): 策略文件原样透出
+    try:
+        import json
+        from pathlib import Path
+
+        lex_path = Path(__file__).resolve().parents[3] / "data" / "policy" / "lexicon.json"
+        tables = json.loads(lex_path.read_text(encoding="utf-8")).get("tables", {})
+        # 词表结构带 owner/origin 元数据, 实际内容在 map/values 子键
+        cm = tables.get("colloquial_map", {})
+        cm_map = cm.get("map", cm) if isinstance(cm, dict) else {}
+        sg = tables.get("synonym_groups", [])
+        sg_values = sg.get("values", sg) if isinstance(sg, dict) else sg
+        configs["lexicon"] = {
+            "title": "查询工程词表 (lexicon.json)",
+            "words": {
+                "口语归一 (colloquial_map)": [f"{k} → {v}" for k, v in cm_map.items()],
+                "同义组 (synonym_groups)": ["、".join(g) if isinstance(g, list) else str(g) for g in sg_values],
+            },
+            "responses": {},
+        }
+    except Exception:
+        pass
+
+    if key not in configs:
+        raise LumioError(code=2001, message=f"未知配置块: {key} (可用: {'/'.join(configs.keys())})")
+    return {"key": key, **configs[key]}
+
+
 @router.get("/pipeline/stats")
 async def pipeline_stats(
     user: AdminAgentUser,

@@ -169,6 +169,22 @@
           <div class="detail-label">修复入口</div>
           <p class="detail-text">{{ selected.fix }}</p>
         </template>
+        <template v-if="selected.configKey">
+          <div class="detail-label detail-label-key">配置与话术 — 实际内容 (与后端权威同源)</div>
+          <div v-if="configLoading" class="muted" style="font-size: 12px">加载配置…</div>
+          <template v-else-if="config">
+            <div v-for="(words, g) in config.words" :key="g" class="cfg-group">
+              <div class="cfg-group-name">{{ g }} <span class="muted">({{ words.length }})</span></div>
+              <div class="cfg-chips">
+                <span v-for="w in words" :key="w" class="cfg-chip">{{ w }}</span>
+              </div>
+            </div>
+            <div v-for="(resp, name) in config.responses" :key="name" class="cfg-group">
+              <div class="cfg-group-name">{{ name }}</div>
+              <p class="cfg-text">{{ resp }}</p>
+            </div>
+          </template>
+        </template>
       </div>
     </el-drawer>
   </div>
@@ -178,7 +194,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 import { DEFECT_LABELS } from "@/utils/defects"
-import { getPipelineStats, type PipelineStats } from "@/api/console"
+import { getPipelineConfig, getPipelineStats, type PipelineConfig, type PipelineStats } from "@/api/console"
 
 const router = useRouter()
 
@@ -191,6 +207,7 @@ interface PipelineNode {
   desc: string
   theory?: string // 设计依据: 为什么存在 / 解决什么问题 (理论 + 动机)
   impl?: string // 实现机制: 具体怎么做的
+  configKey?: string // 配置下钻: 后端配置块 key (词表/话术原文)
   actions?: string[]
   defects?: string[]
   failures?: string
@@ -240,20 +257,22 @@ const PIPELINE_STAGES: Array<{
       },
       {
         id: "crisis",
+        configKey: "crisis",
         name: "危机干预",
-        sub: "听出轻生念头，立刻转人",sub: "自伤/轻生 → 安抚+转人工",
+        sub: "轻生念头 / 正在被骗 / 卡在盗刷, 立刻转人",sub: "自伤/轻生 → 安抚+转人工",
         kind: "guard",
         flows: [
         { kind: "short-circuit", label: "听出来了 → 安抚 + 立刻转人" },
         { kind: "next", label: "没有 → 查有没有人套话" },
         ],
-        theory: "有些话不能让 AI 接。客户流露轻生念头时，任何「智能应答」都可能说错话，而说错的代价无法挽回。这是客服系统的红线：宁可全部转给人，不冒一次险。",
-        impl: "一份人工维护的关键词表识别自伤、轻生类表述——这道防线必须是死规则，不能靠「可能宕机的模型」。命中后立刻安抚并转人工，排在所有环节之前。",
+        theory: "有些话不能让 AI 接，有些事等不起分类器。两类都算危机：一是客户流露轻生念头——任何「智能应答」都可能说错话，代价无法挽回；二是财产正在受损——「我刚把钱转给骗子了」「收到不是我刷的扣款」，每分钟都在损失，若被分类器误判成普通咨询走了慢路径，就错失止付黄金时间。所以都做成前置防线：词表命中就拦截，不赌分类器。",
+        impl: "两套人工维护的词表分级判定：人身类（自杀/轻生及「撑不下去」这类隐喻式表达）→ 安抚话术 + 心理援助热线 + 立刻转人；财产类（被骗了/转给骗子/被盗刷/身份冒用等「正在受害」短语）→ 三步止损指引（110/96110 紧急止付、人工加急冻结、保留凭证）+ 加急转人。词表纪律：财产类只收受害时态，「我怕被骗」「什么是盗刷」这类咨询表述不触发。排在所有环节之前。",
         desc: "客户表达自伤/轻生意图时最高优先级介入: 安抚话术 + 强制转人工, 不走任何 LLM 应答。",
         actions: ["transfer_agent"],
       },
       {
         id: "guard",
+        configKey: "guard",
         name: "入站护栏",
         sub: "防有人套话骗系统",sub: "注入/越权指令拦截",
         kind: "guard",
@@ -270,6 +289,7 @@ const PIPELINE_STAGES: Array<{
       },
       {
         id: "greeting",
+        configKey: "greeting",
         name: "问候/告别",
         sub: "家常话不劳 AI 出场",sub: "固定话术直出",
         flows: [
@@ -319,6 +339,7 @@ const PIPELINE_STAGES: Array<{
       },
       {
         id: "noise",
+        configKey: "noise",
         name: "噪声门",
         sub: "听不懂就别硬答",sub: "弱识别 → 澄清话术",
         kind: "guard",
@@ -552,6 +573,7 @@ const EXEC_CHAINS: ExecChain[] = [
   },
   {
     id: "chainF",
+        configKey: "lexicon",
     name: "链 F · 知识问答",
     sub: "查询工程 + 混合检索",
     route: "决策二 → 高置信咨询",
@@ -601,6 +623,22 @@ function select(node: PipelineNode) {
   }
   selected.value = node
   detailOpen.value = true
+  if (node.configKey) loadConfig(node.configKey)
+}
+
+// 配置下钻: 打开带 configKey 的节点详情时拉取词表/话术原文
+const config = ref<PipelineConfig | null>(null)
+const configLoading = ref(false)
+async function loadConfig(key: string) {
+  configLoading.value = true
+  config.value = null
+  try {
+    config.value = await getPipelineConfig(key)
+  } catch {
+    config.value = null
+  } finally {
+    configLoading.value = false
+  }
 }
 watch(detailOpen, (v) => {
   if (!v) selected.value = null
@@ -1121,6 +1159,37 @@ onBeforeUnmount(stopDemo)
       font-size: 12px;
       line-height: 1.6;
       margin: 0;
+    }
+    .cfg-group {
+      margin-top: 8px;
+    }
+    .cfg-group-name {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--color-text-secondary);
+      margin-bottom: 4px;
+    }
+    .cfg-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .cfg-chip {
+      font-size: 11px;
+      padding: 1px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--el-color-danger-light-6, #f3d19e);
+      background: var(--el-color-warning-light-9, #fdf6ec);
+      color: var(--color-text-secondary);
+    }
+    .cfg-text {
+      font-size: 12px;
+      line-height: 1.7;
+      margin: 0;
+      padding: 8px 10px;
+      background: var(--el-fill-color-light);
+      border-radius: 6px;
+      white-space: pre-wrap;
     }
   }
 }
