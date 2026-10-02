@@ -226,6 +226,32 @@ def test_crisis_input_negative():
     assert sf.is_crisis_input(None) is False
 
 
+def test_crisis_kind_financial():
+    """财产危机: 正在受害表述命中 financial 级"""
+    sf = SafetyFilter()
+    assert sf.crisis_kind("我刚把钱转给骗子了") == "financial"
+    assert sf.crisis_kind("我好像被骗了怎么办") == "financial"
+    assert sf.crisis_kind("收到不是我刷的扣款短信") == "financial"
+    assert sf.crisis_kind("卡里的钱一直在少") == "financial"
+    assert sf.crisis_kind("有人冒用我的身份办卡") == "financial"
+
+
+def test_crisis_kind_personal_priority():
+    """人身危机优先于财产 (同时命中时归 personal)"""
+    sf = SafetyFilter()
+    assert sf.crisis_kind("我不想活了，钱也被骗光了") == "personal"
+
+
+def test_crisis_kind_consulting_not_triggered():
+    """咨询式表述不触发 — 词表纪律: 只收「正在受害」时态"""
+    sf = SafetyFilter()
+    assert sf.crisis_kind("怎么防止被骗") is None
+    assert sf.crisis_kind("我怕被骗，有什么保障") is None
+    assert sf.crisis_kind("什么是盗刷") is None
+    assert sf.crisis_kind("如何避免身份冒用") is None
+    assert sf.crisis_kind("诈骗的常见手法有哪些") is None
+
+
 # ── check_input_detailed 边界 ──
 
 

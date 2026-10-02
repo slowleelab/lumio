@@ -135,6 +135,16 @@ CRISIS_RESPONSE = (
     "随时有人愿意倾听。"
 )
 
+# 财产危机话术: 客户正在受害 (诈骗转账/盗刷/身份冒用) — 等不起慢路径,
+# 立即给出止损动作指引 + 优先转人工。措辞要点: 先安抚不指责, 动作具体可执行。
+FINANCIAL_CRISIS_RESPONSE = (
+    "请您先不要着急，我们马上帮您处理。建议您立即做三件事："
+    "① 如涉及转账，立即拨打 110 或反诈专线 96110 申请紧急止付；"
+    "② 我已为您优先接通人工客服，可立即协助冻结卡片、核查交易；"
+    "③ 请保留转账记录和聊天截图，后续申诉会用到。"
+    "人工客服正在为您加急接入，请稍候。"
+)
+
 __all__ = [
     "BUSINESS_SYSTEM_PROMPT",
     "BUSINESS_TRANSFER_TEMPLATE",
@@ -146,6 +156,7 @@ __all__ = [
     "CRISIS_RESPONSE",
     "FALLBACK_SYSTEM_PROMPT",
     "FAREWELL_RESPONSE",
+    "FINANCIAL_CRISIS_RESPONSE",
     "GREETING_RESPONSE",
     "KNOWLEDGE_SYSTEM_PROMPT",
     "SENSITIVE_REPLY_BRIDGE_RESPONSE",

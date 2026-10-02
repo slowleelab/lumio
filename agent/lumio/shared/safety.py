@@ -221,12 +221,53 @@ class SafetyFilter:
         }
     )
 
-    def is_crisis_input(self, text: str) -> bool:
-        """检测客户输入是否包含危机干预词 (自伤/轻生意图)."""
+    # 财产危机词 — 客户正在受害 (诈骗转账/盗刷/身份冒用), 等不起慢路径:
+    # 这类表述若被分类器误判成普通咨询走了知识链, 错失止付黄金时间。
+    # 词表纪律: 只收「正在发生」的受害短语, 避开咨询式提问 —
+    # 用「被盗刷」不用「盗刷」("什么是盗刷"不触发); 用「被骗了/转给骗子」
+    # 不用「被骗」("我怕被骗"不触发)。
+    FINANCIAL_CRISIS_WORDS: frozenset[str] = frozenset(
+        {
+            "被骗了",
+            "刚被骗",
+            "转给骗子",
+            "转错给骗",
+            "遇到诈骗",
+            "遭遇诈骗",
+            "被诈骗了",
+            "被骗走",
+            "是骗局",
+            "被盗刷",
+            "被刷走",
+            "卡被盗",
+            "钱一直在少",
+            "一直在扣款",
+            "不是我刷的",
+            "不是我消费的",
+            "不是我操作的",
+            "冒用我的身份",
+            "冒用我的信息",
+            "身份被盗",
+        }
+    )
+
+    def crisis_kind(self, text: str) -> str | None:
+        """危机分类: personal (人身安全) / financial (财产正在受损) / None.
+
+        前置防线的判定不依赖分类器 — 词表命中即定级, 处置话术按级出。
+        """
         if not text:
-            return False
+            return None
         normalized = _normalize(text)
-        return any(w in normalized for w in self.CRISIS_WORDS)
+        if any(w in normalized for w in self.CRISIS_WORDS):
+            return "personal"
+        if any(w in normalized for w in self.FINANCIAL_CRISIS_WORDS):
+            return "financial"
+        return None
+
+    def is_crisis_input(self, text: str) -> bool:
+        """检测客户输入是否包含危机干预词 (人身安全或财产正在受损)."""
+        return self.crisis_kind(text) is not None
 
     def filter_output(self, text: str, mask: str | None = None) -> str:
         """过滤输出文本，将敏感词替换为掩码字符
