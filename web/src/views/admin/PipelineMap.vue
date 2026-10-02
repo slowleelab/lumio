@@ -169,6 +169,22 @@
           <div class="detail-label">修复入口</div>
           <p class="detail-text">{{ selected.fix }}</p>
         </template>
+        <template v-if="selected.configKey">
+          <div class="detail-label detail-label-key">配置与话术 — 实际内容 (与后端权威同源)</div>
+          <div v-if="configLoading" class="muted" style="font-size: 12px">加载配置…</div>
+          <template v-else-if="config">
+            <div v-for="(words, g) in config.words" :key="g" class="cfg-group">
+              <div class="cfg-group-name">{{ g }} <span class="muted">({{ words.length }})</span></div>
+              <div class="cfg-chips">
+                <span v-for="w in words" :key="w" class="cfg-chip">{{ w }}</span>
+              </div>
+            </div>
+            <div v-for="(resp, name) in config.responses" :key="name" class="cfg-group">
+              <div class="cfg-group-name">{{ name }}</div>
+              <p class="cfg-text">{{ resp }}</p>
+            </div>
+          </template>
+        </template>
       </div>
     </el-drawer>
   </div>
@@ -178,7 +194,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 import { DEFECT_LABELS } from "@/utils/defects"
-import { getPipelineStats, type PipelineStats } from "@/api/console"
+import { getPipelineConfig, getPipelineStats, type PipelineConfig, type PipelineStats } from "@/api/console"
 
 const router = useRouter()
 
@@ -191,6 +207,7 @@ interface PipelineNode {
   desc: string
   theory?: string // 设计依据: 为什么存在 / 解决什么问题 (理论 + 动机)
   impl?: string // 实现机制: 具体怎么做的
+  configKey?: string // 配置下钻: 后端配置块 key (词表/话术原文)
   actions?: string[]
   defects?: string[]
   failures?: string
@@ -240,6 +257,7 @@ const PIPELINE_STAGES: Array<{
       },
       {
         id: "crisis",
+        configKey: "crisis",
         name: "危机干预",
         sub: "轻生念头 / 正在被骗 / 卡在盗刷, 立刻转人",sub: "自伤/轻生 → 安抚+转人工",
         kind: "guard",
@@ -254,6 +272,7 @@ const PIPELINE_STAGES: Array<{
       },
       {
         id: "guard",
+        configKey: "guard",
         name: "入站护栏",
         sub: "防有人套话骗系统",sub: "注入/越权指令拦截",
         kind: "guard",
@@ -270,6 +289,7 @@ const PIPELINE_STAGES: Array<{
       },
       {
         id: "greeting",
+        configKey: "greeting",
         name: "问候/告别",
         sub: "家常话不劳 AI 出场",sub: "固定话术直出",
         flows: [
@@ -319,6 +339,7 @@ const PIPELINE_STAGES: Array<{
       },
       {
         id: "noise",
+        configKey: "noise",
         name: "噪声门",
         sub: "听不懂就别硬答",sub: "弱识别 → 澄清话术",
         kind: "guard",
@@ -552,6 +573,7 @@ const EXEC_CHAINS: ExecChain[] = [
   },
   {
     id: "chainF",
+        configKey: "lexicon",
     name: "链 F · 知识问答",
     sub: "查询工程 + 混合检索",
     route: "决策二 → 高置信咨询",
@@ -601,6 +623,22 @@ function select(node: PipelineNode) {
   }
   selected.value = node
   detailOpen.value = true
+  if (node.configKey) loadConfig(node.configKey)
+}
+
+// 配置下钻: 打开带 configKey 的节点详情时拉取词表/话术原文
+const config = ref<PipelineConfig | null>(null)
+const configLoading = ref(false)
+async function loadConfig(key: string) {
+  configLoading.value = true
+  config.value = null
+  try {
+    config.value = await getPipelineConfig(key)
+  } catch {
+    config.value = null
+  } finally {
+    configLoading.value = false
+  }
 }
 watch(detailOpen, (v) => {
   if (!v) selected.value = null
@@ -1121,6 +1159,37 @@ onBeforeUnmount(stopDemo)
       font-size: 12px;
       line-height: 1.6;
       margin: 0;
+    }
+    .cfg-group {
+      margin-top: 8px;
+    }
+    .cfg-group-name {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--color-text-secondary);
+      margin-bottom: 4px;
+    }
+    .cfg-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .cfg-chip {
+      font-size: 11px;
+      padding: 1px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--el-color-danger-light-6, #f3d19e);
+      background: var(--el-color-warning-light-9, #fdf6ec);
+      color: var(--color-text-secondary);
+    }
+    .cfg-text {
+      font-size: 12px;
+      line-height: 1.7;
+      margin: 0;
+      padding: 8px 10px;
+      background: var(--el-fill-color-light);
+      border-radius: 6px;
+      white-space: pre-wrap;
     }
   }
 }
