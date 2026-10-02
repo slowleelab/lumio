@@ -630,6 +630,39 @@ async def rag_live_metrics(user: AdminAgentUser) -> dict[str, Any]:
 # ── 8. 路由漂移监控 (P0 整改: 意图漂移检测提前) ──
 
 
+@router.get("/pipeline/stats")
+async def pipeline_stats(
+    user: AdminAgentUser,
+    db: DbSession,
+    hours: int = Query(24, ge=1, le=168, description="统计窗口（小时）"),
+) -> dict[str, Any]:
+    """处理链路实时流量: decision_log 按 action 聚合 (次数 + 平均耗时)。
+
+    管理端「处理链路」页每个环节节点的实时徽标数据源 — 运营看到的
+    是活的链路 (各环节 24h 处理量/耗时/拦截量), 不是静态说明书。
+    """
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    rows = (
+        await db.execute(
+            select(
+                DecisionLog.action,
+                func.count().label("cnt"),
+                func.avg(DecisionLog.latency_ms).label("avg_ms"),
+            )
+            .where(DecisionLog.created_at >= since)
+            .group_by(DecisionLog.action)
+            .order_by(func.count().desc())
+        )
+    ).all()
+    return {
+        "hours": hours,
+        "total": int(sum(r.cnt for r in rows)),
+        "actions": {
+            r.action: {"count": int(r.cnt), "avg_ms": round(float(r.avg_ms or 0), 1)} for r in rows
+        },
+    }
+
+
 @router.get("/routing/drift")
 async def routing_drift(
     user: AdminAgentUser,

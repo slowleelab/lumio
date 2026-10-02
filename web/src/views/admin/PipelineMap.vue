@@ -5,7 +5,23 @@
         <h2>处理链路</h2>
         <p class="muted head-sub">客户消息从接收到结果输出的完整链路 — 点击节点查看环节职责、决策链对应动作与常见缺陷映射</p>
       </div>
-      <el-tag size="small" effect="plain" type="info">与 bot_agent.run() 权威实现同步</el-tag>
+      <div class="head-right">
+        <el-select v-model="statsHours" size="small" style="width: 108px" @change="loadStats">
+          <el-option label="近 24 小时" :value="24" />
+          <el-option label="近 3 天" :value="72" />
+          <el-option label="近 7 天" :value="168" />
+        </el-select>
+        <span v-if="stats" class="muted stats-total">共 {{ fmtCount(stats.total) }} 条决策</span>
+      </div>
+    </div>
+
+    <!-- 图例 -->
+    <div class="legend">
+      <span class="lg"><i class="dot dot-danger" />拦截/风险</span>
+      <span class="lg"><i class="dot dot-primary" />理解/路由</span>
+      <span class="lg"><i class="dot dot-success" />执行链路</span>
+      <span class="lg"><i class="dot dot-info" />留痕</span>
+      <span class="lg muted">节点右上角 = 真实流量 (近 {{ stats?.hours ?? 24 }}h 次数 · 均耗时)</span>
     </div>
 
     <div class="map-body">
@@ -24,9 +40,10 @@
             <template v-if="lane.key !== 'exec'">
               <template v-for="(node, i) in lane.nodes" :key="node.id">
                 <div v-if="i" class="arrow">›</div>
-                <button class="node" :class="{ active: selected?.id === node.id }" @click="select(node)">
+                <button class="node" :class="{ active: selected?.id === node.id, guard: node.kind === 'guard' }" @click="select(node)">
                   <span class="node-name">{{ node.name }}</span>
                   <span class="node-sub">{{ node.sub }}</span>
+                  <span v-if="badgeFor(node)" class="node-badge" :class="{ hot: node.kind === 'guard' }">{{ badgeFor(node) }}</span>
                 </button>
                 <div v-if="node.branch" class="branch-mark">{{ node.branch }}</div>
               </template>
@@ -40,6 +57,7 @@
                 </div>
                 <div class="chain-sub">{{ chain.sub }}</div>
                 <div class="chain-route muted">{{ chain.route }}</div>
+                <div v-if="badgeFor(chain)" class="chain-badge">{{ badgeFor(chain) }}</div>
               </div>
             </template>
           </div>
@@ -98,9 +116,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue"
+import { onMounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { DEFECT_LABELS } from "@/utils/defects"
+import { getPipelineStats, type PipelineStats } from "@/api/console"
 
 const router = useRouter()
 
@@ -109,6 +128,7 @@ interface PipelineNode {
   name: string
   sub: string
   branch?: string
+  kind?: "guard" // 拦截/风险类节点 (红色视觉 + 徽标高亮)
   desc: string
   actions?: string[]
   defects?: string[]
@@ -146,6 +166,7 @@ const PIPELINE_STAGES: Array<{
         id: "crisis",
         name: "危机干预",
         sub: "自伤/轻生 → 安抚+转人工",
+        kind: "guard",
         desc: "客户表达自伤/轻生意图时最高优先级介入: 安抚话术 + 强制转人工, 不走任何 LLM 应答。",
         actions: ["transfer_agent"],
       },
@@ -153,6 +174,7 @@ const PIPELINE_STAGES: Array<{
         id: "guard",
         name: "入站护栏",
         sub: "注入/越权指令拦截",
+        kind: "guard",
         desc: "检测提示注入、诱导系统指令等攻击性输入, 命中直接返回拦截话术, 不进入理解层。",
         actions: ["injection_blocked"],
         failures: "绕过护栏诱导系统行为",
@@ -194,6 +216,7 @@ const PIPELINE_STAGES: Array<{
         id: "noise",
         name: "噪声门",
         sub: "弱识别 → 澄清话术",
+        kind: "guard",
         desc: "弱识别/乱码/孤词输入用固定澄清话术回应, 不让 AI 猜测作答; 连续两次没听懂标记误杀候选待人工复核。",
         actions: ["noise_blocked", "mis_kill_candidate"],
         defects: ["intent_uncovered"],
@@ -246,6 +269,7 @@ const PIPELINE_STAGES: Array<{
         id: "outbound",
         name: "出站合规闸门",
         sub: "幻觉/违规话术拦截",
+        kind: "guard",
         desc: "回复出站前统一审查: 索要卡号密码等敏感话术、无知识依据的编造数字、声称已办理但实际未执行、敏感词 — 命中即替换为安全话术并留痕。",
         actions: ["outbound_guard"],
         defects: ["compliance_risk", "reply_quality"],
@@ -362,6 +386,33 @@ function select(node: PipelineNode) {
 function gotoPatterns(defect: string) {
   router.push({ path: "/admin/patterns", query: { defect } })
 }
+
+// ── 实时流量: decision_log 按 action 聚合 (节点徽标 = 该环节首选动作的真实量/耗时) ──
+const stats = ref<PipelineStats | null>(null)
+const statsHours = ref(24)
+const statsLoading = ref(false)
+async function loadStats() {
+  statsLoading.value = true
+  try {
+    stats.value = await getPipelineStats(statsHours.value)
+  } catch {
+    stats.value = null
+  } finally {
+    statsLoading.value = false
+  }
+}
+function fmtCount(n: number): string {
+  return n >= 10000 ? `${(n / 10000).toFixed(1)}w` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+function badgeFor(node: PipelineNode): string {
+  const key = node.actions?.[0]
+  if (!key || !stats.value) return ""
+  const a = stats.value.actions[key]
+  if (!a) return ""
+  const ms = a.avg_ms >= 1000 ? `${(a.avg_ms / 1000).toFixed(1)}s` : `${Math.round(a.avg_ms)}ms`
+  return `${fmtCount(a.count)} · ${ms}`
+}
+onMounted(loadStats)
 </script>
 
 <style scoped lang="scss">
@@ -372,7 +423,7 @@ function gotoPatterns(defect: string) {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
   h2 {
     margin: 0 0 4px;
     font-size: 17px;
@@ -380,6 +431,41 @@ function gotoPatterns(defect: string) {
   .head-sub {
     font-size: 12.5px;
     margin: 0;
+  }
+}
+.head-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  .stats-total {
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+}
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px dashed var(--el-border-color-lighter);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  font-size: 11.5px;
+  color: var(--color-text-secondary);
+  .lg {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    &.dot-danger { background: var(--el-color-danger); }
+    &.dot-primary { background: var(--el-color-primary); }
+    &.dot-success { background: var(--el-color-success); }
+    &.dot-info { background: var(--el-color-info); }
   }
 }
 .map-body {
@@ -398,7 +484,7 @@ function gotoPatterns(defect: string) {
 .lanes {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 0;
 }
 .lane {
   border: 1px solid var(--el-border-color-lighter);
@@ -408,6 +494,25 @@ function gotoPatterns(defect: string) {
   &.lane-side {
     border-style: dashed;
     background: transparent;
+    margin-top: 14px;
+  }
+  /* 层间流向: 每条主泳道底部中心向下箭头 (出闸是终点, 不再流出) */
+  &:not(.lane-side) {
+    margin-bottom: 18px;
+    position: relative;
+    &::after {
+      content: "▼";
+      position: absolute;
+      left: 50%;
+      bottom: -16px;
+      transform: translateX(-50%);
+      color: var(--el-color-primary-light-5);
+      font-size: 11px;
+      line-height: 1;
+    }
+    &.lane-egress::after {
+      display: none;
+    }
   }
 }
 .lane-head {
@@ -457,6 +562,7 @@ function gotoPatterns(defect: string) {
 .node {
   flex: 1 1 120px;
   min-width: 118px;
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -478,6 +584,18 @@ function gotoPatterns(defect: string) {
     background: transparent;
     border-style: dashed;
   }
+  /* 拦截/风险类节点: 红色系视觉 */
+  &.guard {
+    border-color: var(--el-color-danger-light-5);
+    .node-name {
+      color: var(--el-color-danger);
+    }
+    &.active,
+    &:hover {
+      border-color: var(--el-color-danger);
+      background: var(--el-color-danger-light-9);
+    }
+  }
   .node-name {
     font-size: 12.5px;
     font-weight: 600;
@@ -487,6 +605,23 @@ function gotoPatterns(defect: string) {
     font-size: 11px;
     color: var(--color-text-secondary);
     line-height: 1.4;
+  }
+  .node-badge {
+    position: absolute;
+    top: -8px;
+    right: 6px;
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 999px;
+    background: var(--el-color-primary-light-8);
+    color: var(--el-color-primary);
+    white-space: nowrap;
+    font-weight: 600;
+    &.hot {
+      background: var(--el-color-danger-light-8);
+      color: var(--el-color-danger);
+    }
   }
 }
 .arrow {
@@ -551,6 +686,17 @@ function gotoPatterns(defect: string) {
     font-size: 10.5px;
     margin-top: 4px;
     line-height: 1.4;
+  }
+  .chain-badge {
+    margin-top: 6px;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--el-color-primary);
+    background: var(--el-color-primary-light-9);
+    border-radius: 4px;
+    padding: 2px 6px;
+    display: inline-block;
+    width: fit-content;
   }
 }
 

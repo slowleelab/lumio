@@ -178,3 +178,15 @@ export function getRagQualitySummary(days = 7, topN = 10): Promise<RagQualitySum
 export function getRagLiveMetrics(): Promise<RagLiveMetrics> {
   return client.get("/admin/rag/live-metrics")
 }
+
+// ── 处理链路实时流量 (decision_log 按 action 聚合) ──
+
+export interface PipelineStats {
+  hours: number
+  total: number
+  actions: Record<string, { count: number; avg_ms: number }>
+}
+
+export function getPipelineStats(hours = 24): Promise<PipelineStats> {
+  return client.get("/admin/pipeline/stats", { params: { hours } })
+}
