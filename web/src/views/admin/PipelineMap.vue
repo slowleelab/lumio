@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h2>处理链路</h2>
-        <p class="muted head-sub">客户消息从接收到结果输出的完整链路 — 点击节点查看环节职责、决策链对应动作与常见缺陷映射</p>
+        <p class="muted head-sub">客户消息从接收到结果输出的完整旅程 — 中央主干自上而下, 点击节点看环节详情</p>
       </div>
       <div class="head-right">
         <el-select v-model="statsHours" size="small" style="width: 108px" @change="loadStats">
@@ -15,93 +15,130 @@
       </div>
     </div>
 
-    <!-- 图例 -->
-    <div class="legend">
-      <span class="lg"><i class="dot dot-danger" />拦截/风险</span>
-      <span class="lg"><i class="dot dot-primary" />理解/路由</span>
-      <span class="lg"><i class="dot dot-success" />执行链路</span>
-      <span class="lg"><i class="dot dot-info" />留痕</span>
-      <span class="lg-sep" />
-      <span class="lg"><i class="fsym sc">⏹</i>命中短路 (拦截后直接返回)</span>
-      <span class="lg"><i class="fsym nx">→</i>串行 (依次传递)</span>
-      <span class="lg"><i class="fsym br">↳</i>条件分支</span>
-      <span class="lg"><i class="fsym pa">‖</i>并行 (同时执行)</span>
-      <span class="lg"><i class="fsym ca">⇢</i>级联 (上游结果喂下游)</span>
-      <span class="lg"><i class="fsym as">⚡</i>异步 (不等待)</span>
-      <span class="lg muted">右上角 = 真实流量 (近 {{ stats?.hours ?? 24 }}h)</span>
+    <!-- 演示控制 -->
+    <div class="demo-bar">
+      <el-button size="small" :type="demo.running ? 'danger' : 'primary'" round @click="toggleDemo">
+        {{ demo.running ? "■ 停止演示" : "▶ 演示一次消息流转" }}
+      </el-button>
+      <span v-if="demo.running" class="demo-step muted">{{ demo.label }}</span>
+      <span v-else class="muted demo-hint">示例: "上个月账单多少" — 沿主线高亮走一遍入闸 → 理解 → 路由 → 链 B → 出闸</span>
     </div>
 
-    <div class="map-body">
-      <!-- 链路主体: 五层泳道垂直流 -->
-      <div class="lanes">
-        <div v-for="lane in PIPELINE_STAGES" :key="lane.key" class="lane" :class="'lane-' + lane.key">
-          <div class="lane-head">
-            <span class="lane-idx">{{ lane.idx }}</span>
-            <div>
-              <div class="lane-name">{{ lane.name }}</div>
-              <div class="lane-sub muted">{{ lane.sub }}</div>
-            </div>
-            <el-tag v-if="lane.cost" size="small" effect="plain" :type="lane.costType || 'info'">{{ lane.cost }}</el-tag>
-          </div>
-          <div class="lane-nodes" :class="{ chains: lane.key === 'exec' }">
-            <template v-if="lane.key !== 'exec'">
-              <template v-for="(node, i) in lane.nodes" :key="node.id">
-                <div v-if="i" class="arrow" title="串行: 上一环通过后进入本环">›</div>
-                <button class="node" :class="{ active: selected?.id === node.id, guard: node.kind === 'guard' }" @click="select(node)">
-                  <span class="node-name">{{ node.name }}</span>
-                  <span class="node-sub">{{ node.sub }}</span>
-                  <!-- 出边流转: 命中短路 / 通过下一环 / 条件分支 -->
-                  <span v-if="node.flows?.length" class="node-flows">
-                    <span v-for="f in node.flows" :key="f.label" class="flow-tag" :class="'fk-' + f.kind">{{ FLOW_SYM[f.kind] }} {{ f.label }}</span>
-                  </span>
-                  <span v-if="badgeFor(node)" class="node-badge" :class="{ hot: node.kind === 'guard' }">{{ badgeFor(node) }}</span>
-                </button>
-              </template>
-            </template>
-            <template v-else>
-              <!-- 执行链层: 决策分叉后的五条互斥分支 (链内结构各异) -->
-              <div v-for="chain in EXEC_CHAINS" :key="chain.id" class="chain-card" :class="'chain-' + chain.id" @click="select(chain)">
-                <div class="chain-head">
-                  <span class="chain-name">{{ chain.name }}</span>
-                  <el-tag size="small" effect="dark" :type="chain.tagType">{{ chain.table }}</el-tag>
-                </div>
-                <div class="chain-sub">{{ chain.sub }}</div>
-                <!-- 链内 mini 步骤流: 串行 → / 并行 ‖ / 级联 ⇢ -->
-                <div class="chain-steps">
-                  <template v-for="(st, j) in chain.steps" :key="st.label">
-                    <span v-if="j" class="step-join" :class="'sj-' + st.join">{{ st.join === "parallel" ? "‖" : st.join === "cascade" ? "⇢" : "→" }}</span>
-                    <span class="step-chip" :class="{ group: st.group }">{{ st.label }}</span>
-                  </template>
-                </div>
-                <div class="chain-route muted">{{ chain.route }}</div>
-                <div v-if="badgeFor(chain)" class="chain-badge">{{ badgeFor(chain) }}</div>
-              </div>
-            </template>
-          </div>
+    <!-- 图例 -->
+    <div class="legend">
+      <span class="lg"><i class="fsym sc">⏹</i>命中短路</span>
+      <span class="lg"><i class="fsym br">↳</i>条件分支</span>
+      <span class="lg"><i class="fsym pa">‖</i>并行</span>
+      <span class="lg"><i class="fsym ca">⇢</i>级联注入</span>
+      <span class="lg"><i class="fsym as">⚡</i>异步</span>
+      <span class="lg-sep" />
+      <span class="lg"><i class="dot dot-danger" />拦截环节</span>
+      <span class="lg"><i class="dot dot-primary" />理解/路由</span>
+      <span class="lg"><i class="dot dot-success" />执行链</span>
+      <span class="lg muted">节点角标 = 真实流量 (近 {{ stats?.hours ?? 24 }}h)</span>
+    </div>
+
+    <!-- ── 主干链路: 中央垂直干线, 节点挂线 (手机友好, 自带连线视觉) ── -->
+    <div class="trunk" :class="{ demoing: demo.running }">
+      <div v-for="(lane, li) in PIPELINE_STAGES" :key="lane.key" class="stage" :class="'stage-' + lane.key">
+        <!-- 阶段带 -->
+        <div class="stage-band">
+          <span class="stage-idx">{{ lane.idx }}</span>
+          <span class="stage-name">{{ lane.name }}</span>
+          <span class="stage-sub muted">{{ lane.sub }}</span>
+          <el-tag v-if="lane.cost" size="small" effect="plain" :type="lane.costType || 'info'">{{ lane.cost }}</el-tag>
         </div>
-        <!-- 旁路 -->
-        <div class="lane lane-side">
-          <div class="lane-head">
-            <span class="lane-idx">⓪</span>
-            <div>
-              <div class="lane-name">旁路 (不阻塞主链)</div>
-              <div class="lane-sub muted">与主链并行执行, 结果异步生效</div>
+
+        <!-- 入闸/理解/路由/出闸: 主干节点序列 -->
+        <div v-if="lane.key !== 'exec'" class="stage-nodes">
+          <template v-for="(node, i) in lane.nodes" :key="node.id">
+            <div v-if="i" class="link-seg"><span class="link-dot" />通过</div>
+            <button
+              class="t-node"
+              :class="{
+                guard: node.kind === 'guard',
+                lit: demoSeq.includes(node.id),
+                now: demo.running && demoSeq[demo.step] === node.id,
+                selected: selected?.id === node.id,
+              }"
+              @click="select(node)"
+            >
+              <span class="tn-head">
+                <span class="tn-name">{{ node.name }}</span>
+                <span v-if="badgeFor(node)" class="tn-badge" :class="{ hot: node.kind === 'guard' }">{{ badgeFor(node) }}</span>
+              </span>
+              <span class="tn-sub">{{ node.sub }}</span>
+              <span v-if="node.flows?.length" class="tn-flows">
+                <span v-for="f in node.flows" :key="f.label" class="flow-tag" :class="'fk-' + f.kind">{{ FLOW_SYM[f.kind] }} {{ f.label }}</span>
+              </span>
+            </button>
+          </template>
+        </div>
+
+        <!-- 执行层: 分叉扇形 → 五链 → 收敛 -->
+        <div v-else class="stage-exec">
+          <div class="fan-head">
+            <span class="fan-label">决策分叉 — 按消息性质走且只走一条链</span>
+          </div>
+          <svg class="fan-svg" viewBox="0 0 1000 90" preserveAspectRatio="none">
+            <path
+              v-for="(chain, ci) in EXEC_CHAINS" :key="chain.id"
+              class="fan-path"
+              :class="{ lit: demoSeq.includes(chain.id) }"
+              :d="fanPath(ci, EXEC_CHAINS.length)"
+            />
+          </svg>
+          <div class="exec-grid">
+            <div
+              v-for="chain in EXEC_CHAINS" :key="chain.id"
+              class="chain-card"
+              :class="[
+                'chain-' + chain.id,
+                { lit: demoSeq.includes(chain.id), now: demo.running && demoSeq[demo.step] === chain.id, selected: selected?.id === chain.id },
+              ]"
+              @click="select(chain)"
+            >
+              <div class="chain-head">
+                <span class="chain-name">{{ chain.name }}</span>
+                <el-tag size="small" effect="dark" :type="chain.tagType">{{ chain.table }}</el-tag>
+              </div>
+              <div class="chain-route muted">{{ chain.route }}</div>
+              <div class="chain-steps">
+                <template v-for="(st, j) in chain.steps" :key="st.label">
+                  <span v-if="j" class="step-join" :class="'sj-' + st.join">{{ st.join === "parallel" ? "‖" : st.join === "cascade" ? "⇢" : "→" }}</span>
+                  <span class="step-chip">{{ st.label }}</span>
+                </template>
+              </div>
+              <span v-if="badgeFor(chain)" class="chain-badge">{{ badgeFor(chain) }}</span>
             </div>
           </div>
-          <div class="lane-nodes">
-            <button class="node side" @click="select(SIDE_NODE)">
-              <span class="node-name">跨会话画像学习</span>
-              <span class="node-sub">首次对话从历史推断客户画像</span>
-            </button>
-          </div>
+          <div class="fan-join"><span class="link-dot" />各链输出统一汇入出闸</div>
         </div>
       </div>
 
-      <!-- 节点详情: 右侧固定栏 -->
-      <aside class="node-detail" v-if="selected">
+      <!-- 旁路 -->
+      <div class="stage stage-side">
+        <div class="stage-band">
+          <span class="stage-idx side">⓪</span>
+          <span class="stage-name">旁路</span>
+          <span class="stage-sub muted">与主链并行 · 异步生效</span>
+          <span class="flow-tag fk-async">⚡ 不阻塞消息处理</span>
+        </div>
+        <div class="stage-nodes">
+          <button class="t-node side" :class="{ selected: selected?.id === SIDE_NODE.id }" @click="select(SIDE_NODE)">
+            <span class="tn-head"><span class="tn-name">跨会话画像学习</span></span>
+            <span class="tn-sub">首次对话异步推断客户画像, 写入会话状态供后续轮参考</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 节点详情: 桌面右侧吸附 / 手机底部滑出 -->
+    <el-drawer v-model="detailOpen" :position="isMobile ? 'bottom' : 'right'" :size="isMobile ? '62%' : '400px'" :with-header="false" class="node-drawer">
+      <div v-if="selected" class="node-detail">
         <div class="detail-head">
           <span class="detail-name">{{ selected.name }}</span>
-          <el-button size="small" link @click="selected = null">关闭 ×</el-button>
+          <el-button size="small" link @click="detailOpen = false">关闭 ×</el-button>
         </div>
         <p class="detail-desc">{{ selected.desc }}</p>
         <template v-if="selected.actions?.length">
@@ -111,12 +148,9 @@
           </div>
         </template>
         <template v-if="selected.defects?.length">
-          <div class="detail-label">常见缺陷 (点击可跳转问题治理)</div>
+          <div class="detail-label">常见缺陷 (点击跳转问题治理)</div>
           <div class="detail-tags">
-            <el-tag
-              v-for="d in selected.defects" :key="d" size="small" type="warning" effect="plain"
-              style="cursor: pointer" @click="gotoPatterns(d)"
-            >{{ DEFECT_LABELS[d] ?? d }}</el-tag>
+            <el-tag v-for="d in selected.defects" :key="d" size="small" type="warning" effect="plain" style="cursor: pointer" @click="gotoPatterns(d)">{{ DEFECT_LABELS[d] ?? d }}</el-tag>
           </div>
         </template>
         <template v-if="selected.failures">
@@ -127,13 +161,13 @@
           <div class="detail-label">修复入口</div>
           <p class="detail-text">{{ selected.fix }}</p>
         </template>
-      </aside>
-    </div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue"
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 import { DEFECT_LABELS } from "@/utils/defects"
 import { getPipelineStats, type PipelineStats } from "@/api/console"
@@ -144,10 +178,8 @@ interface PipelineNode {
   id: string
   name: string
   sub: string
-  branch?: string
-  kind?: "guard" // 拦截/风险类节点 (红色视觉 + 徽标高亮)
-  // 出边流转语义: 该环节结果去哪、怎么去 (短路/串行/分支/并行/级联/异步)
   flows?: Array<{ kind: FlowKind; label: string }>
+  kind?: "guard"
   desc: string
   actions?: string[]
   defects?: string[]
@@ -165,7 +197,6 @@ const FLOW_SYM: Record<FlowKind, string> = {
   async: "⚡",
 }
 
-// ── 链路权威数据 (与 bot_agent.run() 同步; 改链路先改代码再同步此处) ──
 const PIPELINE_STAGES: Array<{
   key: string
   idx: string
@@ -390,6 +421,19 @@ interface ExecChain extends PipelineNode {
   steps: ChainStep[]
 }
 
+
+interface ChainStep {
+  label: string
+  join?: "serial" | "parallel" | "cascade"
+}
+
+interface ExecChain extends PipelineNode {
+  table: string
+  tagType: string
+  route: string
+  steps: ChainStep[]
+}
+
 const EXEC_CHAINS: ExecChain[] = [
   {
     id: "chainA",
@@ -486,6 +530,7 @@ const EXEC_CHAINS: ExecChain[] = [
   },
 ]
 
+
 const SIDE_NODE: PipelineNode = {
   id: "profile",
   name: "跨会话画像学习",
@@ -494,15 +539,31 @@ const SIDE_NODE: PipelineNode = {
   defects: [],
 }
 
+// 详情: 抽屉 (手机底部 / 桌面右侧)
 const selected = ref<PipelineNode | null>(null)
-function select(node: PipelineNode) {
-  selected.value = selected.value?.id === node.id ? null : node
+const detailOpen = ref(false)
+const isMobile = ref(typeof window !== "undefined" ? window.innerWidth < 900 : false)
+if (typeof window !== "undefined") {
+  const onResize = () => (isMobile.value = window.innerWidth < 900)
+  window.addEventListener("resize", onResize)
+  onBeforeUnmount(() => window.removeEventListener("resize", onResize))
 }
+function select(node: PipelineNode) {
+  if (selected.value?.id === node.id) {
+    detailOpen.value = false
+    return
+  }
+  selected.value = node
+  detailOpen.value = true
+}
+watch(detailOpen, (v) => {
+  if (!v) selected.value = null
+})
 function gotoPatterns(defect: string) {
   router.push({ path: "/admin/patterns", query: { defect } })
 }
 
-// ── 实时流量: decision_log 按 action 聚合 (节点徽标 = 该环节首选动作的真实量/耗时) ──
+// ── 实时流量徽标 ──
 const stats = ref<PipelineStats | null>(null)
 const statsHours = ref(24)
 const statsLoading = ref(false)
@@ -528,11 +589,64 @@ function badgeFor(node: PipelineNode): string {
   return `${fmtCount(a.count)} · ${ms}`
 }
 onMounted(loadStats)
+
+// ── 分叉扇形: 决策汇点 → 五链入口的贝塞尔连线 ──
+function fanPath(ci: number, total: number): string {
+  const w = 1000
+  const x0 = w / 2
+  const x1 = ((ci + 0.5) / total) * w
+  return `M ${x0} 4 C ${x0} 44, ${x1} 44, ${x1} 86`
+}
+
+// ── 演示动线: 示例消息沿主线逐环节点亮 ──
+const demoSeqFull = ["pending", "crisis", "guard", "classify", "anaphora", "noise", "decision1", "decision2", "chainB", "outbound", "transfer", "sink"]
+const demo = ref({ running: false, step: 0, label: "", timer: 0 as unknown as ReturnType<typeof setInterval> })
+const demoLabels: Record<string, string> = {
+  pending: "① 无确认窗口, 通过",
+  crisis: "② 非危机表述, 通过",
+  guard: "③ 无注入风险, 通过",
+  classify: "④ 识别为 账单查询 (查询类, 置信 88%)",
+  anaphora: "⑤ 无指代, 通过",
+  noise: "⑥ 识别清晰, 通过",
+  decision1: "⑦ 决策一: 只读查询 → 链 B",
+  decision2: "—",
+  chainB: "⑧ 链 B: 直连账单工具 → 缓存 → 摘要",
+  outbound: "⑨ 出站审查通过 (数字有据)",
+  transfer: "⑩ 无转人工信号",
+  sink: "⑪ 回复推送 + 三表落库, 完成 ✓",
+}
+const demoSeq = computed(() => demoSeqFull)
+function toggleDemo() {
+  if (demo.value.running) {
+    stopDemo()
+    return
+  }
+  demo.value.running = true
+  demo.value.step = 0
+  demo.value.label = demoLabels[demoSeqFull[0]] ?? ""
+  demo.value.timer = setInterval(() => {
+    demo.value.step += 1
+    if (demo.value.step >= demoSeqFull.length) {
+      demo.value.label = "完成 ✓ (2 秒后自动复位)"
+      setTimeout(stopDemo, 2000)
+      return
+    }
+    demo.value.label = demoLabels[demoSeqFull[demo.value.step]] ?? ""
+    document.getElementById("node-" + demoSeqFull[demo.value.step])?.scrollIntoView({ block: "center", behavior: "smooth" })
+  }, 1300)
+}
+function stopDemo() {
+  clearInterval(demo.value.timer)
+  demo.value.running = false
+  demo.value.step = 0
+  demo.value.label = ""
+}
+onBeforeUnmount(stopDemo)
 </script>
 
 <style scoped lang="scss">
 .pipeline-map {
-  padding: 4px 2px;
+  padding: 4px 2px 24px;
 }
 .page-head {
   display: flex;
@@ -557,15 +671,32 @@ onMounted(loadStats)
     white-space: nowrap;
   }
 }
+.demo-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: linear-gradient(120deg, var(--el-color-primary-light-9), var(--el-color-success-light-9));
+  margin-bottom: 10px;
+  .demo-step {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--el-color-primary);
+  }
+  .demo-hint {
+    font-size: 11.5px;
+  }
+}
 .legend {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
   flex-wrap: wrap;
-  padding: 8px 12px;
+  padding: 7px 12px;
   border: 1px dashed var(--el-border-color-lighter);
   border-radius: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
   font-size: 11.5px;
   color: var(--color-text-secondary);
   .lg {
@@ -578,16 +709,6 @@ onMounted(loadStats)
     height: 12px;
     background: var(--el-border-color-lighter);
   }
-  .fsym {
-    font-style: normal;
-    font-weight: 700;
-    &.sc { color: var(--el-color-danger); }
-    &.nx { color: var(--color-text-muted); }
-    &.br { color: var(--el-color-primary); }
-    &.pa { color: var(--el-color-success); }
-    &.ca { color: var(--el-color-warning); }
-    &.as { color: var(--el-color-info); }
-  }
   .dot {
     width: 8px;
     height: 8px;
@@ -595,174 +716,145 @@ onMounted(loadStats)
     &.dot-danger { background: var(--el-color-danger); }
     &.dot-primary { background: var(--el-color-primary); }
     &.dot-success { background: var(--el-color-success); }
-    &.dot-info { background: var(--el-color-info); }
   }
-}
-.map-body {
-  display: grid;
-  grid-template-columns: 1fr 300px;
-  gap: 14px;
-  align-items: start;
-}
-@media (max-width: 1100px) {
-  .map-body {
-    grid-template-columns: 1fr;
+  .fsym {
+    font-style: normal;
+    font-weight: 700;
+    &.sc { color: var(--el-color-danger); }
+    &.br { color: var(--el-color-primary); }
+    &.pa { color: var(--el-color-success); }
+    &.ca { color: var(--el-color-warning); }
+    &.as { color: var(--el-color-info); }
   }
 }
 
-/* 泳道 */
-.lanes {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
+/* ── 主干: 阶段垂直堆叠, 内部连线 ── */
+.trunk {
+  max-width: 980px;
+  margin: 0 auto;
 }
-.lane {
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
-  padding: 10px 12px;
-  background: var(--el-bg-color, #fff);
-  &.lane-side {
-    border-style: dashed;
-    background: transparent;
-    margin-top: 14px;
-  }
-  /* 层间流向: 每条主泳道底部中心向下箭头 (出闸是终点, 不再流出) */
-  &:not(.lane-side) {
-    margin-bottom: 18px;
-    position: relative;
-    &::after {
-      content: "▼";
-      position: absolute;
-      left: 50%;
-      bottom: -16px;
-      transform: translateX(-50%);
-      color: var(--el-color-primary-light-5);
-      font-size: 11px;
-      line-height: 1;
-    }
-    &.lane-egress::after {
-      display: none;
-    }
-  }
+.stage {
+  position: relative;
+  padding: 0 0 6px 0;
+  margin-bottom: 4px;
 }
-.lane-head {
+.stage-band {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 8px;
-}
-.lane-idx {
-  flex-shrink: 0;
-  width: 24px;
-  height: 24px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  background: var(--el-color-primary-light-8);
-  color: var(--el-color-primary);
-  font-weight: 700;
-  font-size: 12px;
-}
-.lane-side .lane-idx {
-  background: var(--el-fill-color);
-  color: var(--color-text-muted);
-}
-.lane-name {
-  font-size: 13px;
-  font-weight: 600;
-}
-.lane-sub {
-  font-size: 11.5px;
-}
-.lane-head .el-tag {
-  margin-left: auto;
-}
-.lane-nodes {
-  display: flex;
-  align-items: stretch;
-  gap: 6px;
-  flex-wrap: wrap;
-  &.chains {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
-    gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--el-fill-color-light);
+  margin: 0 auto 14px;
+  width: fit-content;
+  max-width: 100%;
+  .stage-idx {
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: var(--el-color-primary);
+    color: #fff;
+    font-size: 11.5px;
+    font-weight: 700;
+    &.side {
+      background: var(--el-color-info);
+    }
+  }
+  .stage-name {
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .stage-sub {
+    font-size: 11px;
   }
 }
-.node {
-  flex: 1 1 120px;
-  min-width: 118px;
-  position: relative;
+.stage-nodes {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  text-align: left;
-  padding: 8px 10px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  background: var(--el-fill-color-blank);
-  cursor: pointer;
-  transition: all 0.15s;
-  &:hover {
-    border-color: var(--el-color-primary-light-5);
+  align-items: center;
+}
+.link-seg {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 2px 0;
+  color: var(--color-text-muted);
+  font-size: 10px;
+  &::before,
+  &::after {
+    content: "";
+    width: 2px;
+    height: 8px;
+    background: var(--el-color-primary-light-5);
   }
-  &.active {
-    border-color: var(--el-color-primary);
-    background: var(--el-color-primary-light-9);
+  .link-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--el-color-primary-light-3);
+  }
+}
+.t-node {
+  position: relative;
+  width: min(560px, 94%);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  padding: 10px 14px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-left: 4px solid var(--el-color-primary-light-5);
+  border-radius: 10px;
+  background: var(--el-bg-color, #fff);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 4%);
+  cursor: pointer;
+  transition: all 0.2s;
+  &:hover {
+    border-left-color: var(--el-color-primary);
+    box-shadow: 0 3px 10px rgb(0 0 0 / 8%);
+  }
+  &.guard {
+    border-left-color: var(--el-color-danger-light-3);
+    .tn-name { color: var(--el-color-danger); }
+    &:hover { border-left-color: var(--el-color-danger); }
   }
   &.side {
-    background: transparent;
     border-style: dashed;
+    box-shadow: none;
+    border-left-style: dashed;
   }
-  /* 拦截/风险类节点: 红色系视觉 */
-  &.guard {
-    border-color: var(--el-color-danger-light-5);
-    .node-name {
-      color: var(--el-color-danger);
-    }
-    &.active,
-    &:hover {
-      border-color: var(--el-color-danger);
-      background: var(--el-color-danger-light-9);
-    }
+  &.selected {
+    border-color: var(--el-color-primary);
+    border-left-color: var(--el-color-primary);
   }
-  .node-name {
-    font-size: 12.5px;
-    font-weight: 600;
-    color: var(--color-text-primary);
+  /* 演示动线: 路径点亮 / 当前环节呼吸 */
+  &.lit {
+    border-left-color: var(--el-color-success);
+    background: var(--el-color-success-light-9);
   }
-  .node-sub {
-    font-size: 11px;
-    color: var(--color-text-secondary);
-    line-height: 1.4;
+  &.now {
+    border-left-color: var(--el-color-warning);
+    background: var(--el-color-warning-light-9);
+    animation: breathe 1.2s ease-in-out infinite;
+    box-shadow: 0 0 0 4px var(--el-color-warning-light-9);
   }
-  /* 出边流转标签: 命中短路红 / 通过灰 / 分支蓝 / 并行绿 / 级联橙 */
-  .node-flows {
+  .tn-head {
     display: flex;
-    flex-direction: column;
-    gap: 1px;
-    margin-top: 4px;
-    padding-top: 4px;
-    border-top: 1px dashed var(--el-border-color-lighter);
+    align-items: center;
+    gap: 8px;
   }
-  .flow-tag {
-    font-size: 10px;
-    line-height: 1.5;
-    white-space: normal;
+  .tn-name {
+    font-size: 13.5px;
+    font-weight: 700;
   }
-  .fk-short-circuit { color: var(--el-color-danger); }
-  .fk-next { color: var(--color-text-muted); }
-  .fk-branch { color: var(--el-color-primary); }
-  .fk-parallel { color: var(--el-color-success); }
-  .fk-cascade { color: var(--el-color-warning); }
-  .fk-async { color: var(--el-color-info); }
-  .node-badge {
-    position: absolute;
-    top: -8px;
-    right: 6px;
+  .tn-badge {
     font-size: 10px;
     line-height: 1;
-    padding: 3px 6px;
+    padding: 3px 7px;
     border-radius: 999px;
     background: var(--el-color-primary-light-8);
     color: var(--el-color-primary);
@@ -773,48 +865,112 @@ onMounted(loadStats)
       color: var(--el-color-danger);
     }
   }
+  .tn-sub {
+    font-size: 11.5px;
+    color: var(--color-text-secondary);
+    line-height: 1.5;
+  }
+  .tn-flows {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 10px;
+    margin-top: 4px;
+    padding-top: 5px;
+    border-top: 1px dashed var(--el-border-color-lighter);
+  }
 }
-.arrow {
-  align-self: center;
-  color: var(--el-border-color);
-  font-size: 13px;
-}
-.branch-mark {
-  align-self: center;
+.flow-tag {
   font-size: 10.5px;
-  color: var(--el-color-danger);
-  background: var(--el-color-danger-light-9);
-  padding: 1px 6px;
-  border-radius: 999px;
-  white-space: nowrap;
+  line-height: 1.5;
+}
+.fk-short-circuit { color: var(--el-color-danger); }
+.fk-next { color: var(--color-text-muted); }
+.fk-branch { color: var(--el-color-primary); }
+.fk-parallel { color: var(--el-color-success); }
+.fk-cascade { color: var(--el-color-warning); }
+.fk-async { color: var(--el-color-info); }
+@keyframes breathe {
+  0%, 100% { box-shadow: 0 0 0 3px var(--el-color-warning-light-9); }
+  50% { box-shadow: 0 0 0 7px var(--el-color-warning-light-9); }
 }
 
-/* 执行链卡 */
+/* ── 执行层: 分叉扇形 + 五链 ── */
+.stage-exec {
+  .fan-head {
+    text-align: center;
+    margin-bottom: 2px;
+    .fan-label {
+      font-size: 11px;
+      color: var(--color-text-muted);
+      background: var(--el-fill-color-light);
+      padding: 2px 10px;
+      border-radius: 999px;
+    }
+  }
+  .fan-svg {
+    width: 100%;
+    height: 90px;
+    display: block;
+  }
+  .fan-path {
+    fill: none;
+    stroke: var(--el-color-primary-light-5);
+    stroke-width: 2;
+    &.lit {
+      stroke: var(--el-color-success);
+      stroke-width: 3;
+    }
+  }
+  .exec-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(176px, 1fr));
+    gap: 10px;
+  }
+  .fan-join {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 6px 0 0;
+    color: var(--color-text-muted);
+    font-size: 10.5px;
+    &::before {
+      content: "";
+      width: 2px;
+      height: 10px;
+      background: var(--el-color-primary-light-5);
+    }
+  }
+}
 .chain-card {
+  position: relative;
   border: 1px solid var(--el-border-color-lighter);
-  border-left: 3px solid var(--el-color-info);
-  border-radius: 8px;
-  padding: 8px 10px;
+  border-top: 3px solid var(--el-color-info);
+  border-radius: 10px;
+  padding: 10px 12px;
   cursor: pointer;
-  transition: all 0.15s;
-  background: var(--el-fill-color-blank);
+  background: var(--el-bg-color, #fff);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 4%);
+  transition: all 0.2s;
   &:hover {
-    border-color: var(--el-color-primary-light-5);
+    box-shadow: 0 3px 10px rgb(0 0 0 / 8%);
   }
-  &.chain-A {
-    border-left-color: var(--el-color-warning);
+  &.chain-A { border-top-color: var(--el-color-warning); }
+  &.chain-B { border-top-color: var(--el-color-primary); }
+  &.chain-C { border-top-color: var(--el-color-success); }
+  &.chain-D { border-top-color: var(--el-color-danger-light-5); }
+  &.chain-F { border-top-color: var(--el-color-primary-light-3); }
+  &.selected {
+    border-color: var(--el-color-primary);
+    border-top-color: var(--el-color-primary);
   }
-  &.chain-B {
-    border-left-color: var(--el-color-primary);
+  &.lit {
+    border-top-color: var(--el-color-success);
+    background: var(--el-color-success-light-9);
   }
-  &.chain-C {
-    border-left-color: var(--el-color-success);
-  }
-  &.chain-D {
-    border-left-color: var(--el-color-danger-light-5);
-  }
-  &.chain-F {
-    border-left-color: var(--el-color-primary-light-3);
+  &.now {
+    border-top-color: var(--el-color-warning);
+    background: var(--el-color-warning-light-9);
+    animation: breathe 1.2s ease-in-out infinite;
   }
   .chain-head {
     display: flex;
@@ -827,9 +983,8 @@ onMounted(loadStats)
     font-size: 12.5px;
     font-weight: 700;
   }
-  .chain-sub {
-    font-size: 11px;
-    color: var(--color-text-secondary);
+  .chain-route {
+    font-size: 10.5px;
     line-height: 1.4;
   }
   .chain-steps {
@@ -856,62 +1011,63 @@ onMounted(loadStats)
     &.sj-cascade { color: var(--el-color-warning); }
     &.sj-serial { color: var(--el-border-color); }
   }
-  .chain-route {
-    font-size: 10.5px;
-    margin-top: 4px;
-    line-height: 1.4;
-  }
   .chain-badge {
-    margin-top: 6px;
-    font-size: 10.5px;
+    position: absolute;
+    top: -9px;
+    right: 8px;
+    font-size: 10px;
     font-weight: 600;
+    line-height: 1;
+    padding: 3px 7px;
+    border-radius: 999px;
+    background: var(--el-color-primary-light-8);
     color: var(--el-color-primary);
-    background: var(--el-color-primary-light-9);
-    border-radius: 4px;
-    padding: 2px 6px;
-    display: inline-block;
-    width: fit-content;
   }
 }
+.stage-side .stage-nodes {
+  .t-node {
+    width: min(460px, 94%);
+  }
+}
+</style>
 
-/* 详情栏 */
-.node-detail {
-  position: sticky;
-  top: 8px;
-  border: 1px solid var(--el-color-primary-light-7);
-  border-radius: 10px;
-  padding: 12px 14px;
-  background: var(--el-color-primary-light-9, #f0f7ff);
-  .detail-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    .detail-name {
-      font-size: 14px;
-      font-weight: 700;
+<style lang="scss">
+/* 抽屉挂 body, 全局样式 */
+.node-drawer {
+  .el-drawer__body {
+    padding: 14px 16px;
+  }
+  .node-detail {
+    .detail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      .detail-name {
+        font-size: 15px;
+        font-weight: 700;
+      }
     }
-  }
-  .detail-desc {
-    font-size: 12.5px;
-    line-height: 1.7;
-    margin: 8px 0;
-  }
-  .detail-label {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--color-text-secondary);
-    margin: 10px 0 5px;
-  }
-  .detail-tags {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-  }
-  .detail-text {
-    font-size: 12px;
-    line-height: 1.6;
-    margin: 0;
-    white-space: pre-wrap;
+    .detail-desc {
+      font-size: 12.5px;
+      line-height: 1.7;
+      margin: 10px 0;
+    }
+    .detail-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--color-text-secondary);
+      margin: 12px 0 5px;
+    }
+    .detail-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .detail-text {
+      font-size: 12px;
+      line-height: 1.6;
+      margin: 0;
+    }
   }
 }
 </style>
