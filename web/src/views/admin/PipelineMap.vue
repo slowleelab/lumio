@@ -21,7 +21,14 @@
       <span class="lg"><i class="dot dot-primary" />理解/路由</span>
       <span class="lg"><i class="dot dot-success" />执行链路</span>
       <span class="lg"><i class="dot dot-info" />留痕</span>
-      <span class="lg muted">节点右上角 = 真实流量 (近 {{ stats?.hours ?? 24 }}h 次数 · 均耗时)</span>
+      <span class="lg-sep" />
+      <span class="lg"><i class="fsym sc">⏹</i>命中短路 (拦截后直接返回)</span>
+      <span class="lg"><i class="fsym nx">→</i>串行 (依次传递)</span>
+      <span class="lg"><i class="fsym br">↳</i>条件分支</span>
+      <span class="lg"><i class="fsym pa">‖</i>并行 (同时执行)</span>
+      <span class="lg"><i class="fsym ca">⇢</i>级联 (上游结果喂下游)</span>
+      <span class="lg"><i class="fsym as">⚡</i>异步 (不等待)</span>
+      <span class="lg muted">右上角 = 真实流量 (近 {{ stats?.hours ?? 24 }}h)</span>
     </div>
 
     <div class="map-body">
@@ -39,23 +46,33 @@
           <div class="lane-nodes" :class="{ chains: lane.key === 'exec' }">
             <template v-if="lane.key !== 'exec'">
               <template v-for="(node, i) in lane.nodes" :key="node.id">
-                <div v-if="i" class="arrow">›</div>
+                <div v-if="i" class="arrow" title="串行: 上一环通过后进入本环">›</div>
                 <button class="node" :class="{ active: selected?.id === node.id, guard: node.kind === 'guard' }" @click="select(node)">
                   <span class="node-name">{{ node.name }}</span>
                   <span class="node-sub">{{ node.sub }}</span>
+                  <!-- 出边流转: 命中短路 / 通过下一环 / 条件分支 -->
+                  <span v-if="node.flows?.length" class="node-flows">
+                    <span v-for="f in node.flows" :key="f.label" class="flow-tag" :class="'fk-' + f.kind">{{ FLOW_SYM[f.kind] }} {{ f.label }}</span>
+                  </span>
                   <span v-if="badgeFor(node)" class="node-badge" :class="{ hot: node.kind === 'guard' }">{{ badgeFor(node) }}</span>
                 </button>
-                <div v-if="node.branch" class="branch-mark">{{ node.branch }}</div>
               </template>
             </template>
             <template v-else>
-              <!-- 执行链层: 决策分叉后的五条并行链路 -->
+              <!-- 执行链层: 决策分叉后的五条互斥分支 (链内结构各异) -->
               <div v-for="chain in EXEC_CHAINS" :key="chain.id" class="chain-card" :class="'chain-' + chain.id" @click="select(chain)">
                 <div class="chain-head">
                   <span class="chain-name">{{ chain.name }}</span>
                   <el-tag size="small" effect="dark" :type="chain.tagType">{{ chain.table }}</el-tag>
                 </div>
                 <div class="chain-sub">{{ chain.sub }}</div>
+                <!-- 链内 mini 步骤流: 串行 → / 并行 ‖ / 级联 ⇢ -->
+                <div class="chain-steps">
+                  <template v-for="(st, j) in chain.steps" :key="st.label">
+                    <span v-if="j" class="step-join" :class="'sj-' + st.join">{{ st.join === "parallel" ? "‖" : st.join === "cascade" ? "⇢" : "→" }}</span>
+                    <span class="step-chip" :class="{ group: st.group }">{{ st.label }}</span>
+                  </template>
+                </div>
                 <div class="chain-route muted">{{ chain.route }}</div>
                 <div v-if="badgeFor(chain)" class="chain-badge">{{ badgeFor(chain) }}</div>
               </div>
@@ -129,11 +146,23 @@ interface PipelineNode {
   sub: string
   branch?: string
   kind?: "guard" // 拦截/风险类节点 (红色视觉 + 徽标高亮)
+  // 出边流转语义: 该环节结果去哪、怎么去 (短路/串行/分支/并行/级联/异步)
+  flows?: Array<{ kind: FlowKind; label: string }>
   desc: string
   actions?: string[]
   defects?: string[]
   failures?: string
   fix?: string
+}
+
+type FlowKind = "short-circuit" | "next" | "branch" | "parallel" | "cascade" | "async"
+const FLOW_SYM: Record<FlowKind, string> = {
+  "short-circuit": "⏹",
+  next: "→",
+  branch: "↳",
+  parallel: "‖",
+  cascade: "⇢",
+  async: "⚡",
 }
 
 // ── 链路权威数据 (与 bot_agent.run() 同步; 改链路先改代码再同步此处) ──
@@ -158,6 +187,10 @@ const PIPELINE_STAGES: Array<{
         id: "pending",
         name: "确认状态机",
         sub: "pending_action 拦截",
+        flows: [
+        { kind: "branch", label: "有窗口 → 解读确认/取消 (短路返回)" },
+        { kind: "next", label: "无窗口 → 危机干预" },
+        ],
         desc: "存在未过期的确认窗口 (敏感操作/L3 转人工确认) 时, 本轮消息不再走分类, 直接解读为「确认/取消」。连续无法判定则自动取消窗口、放行新消息。",
         actions: ["user_confirm"],
         failures: "客户回「是」被当成新消息重新分类 (P0 已修复: 拦截只依赖会话状态, 不依赖工具执行器)",
@@ -167,6 +200,10 @@ const PIPELINE_STAGES: Array<{
         name: "危机干预",
         sub: "自伤/轻生 → 安抚+转人工",
         kind: "guard",
+        flows: [
+        { kind: "short-circuit", label: "命中 → 安抚+强制转人工" },
+        { kind: "next", label: "通过 → 入站护栏" },
+        ],
         desc: "客户表达自伤/轻生意图时最高优先级介入: 安抚话术 + 强制转人工, 不走任何 LLM 应答。",
         actions: ["transfer_agent"],
       },
@@ -175,6 +212,10 @@ const PIPELINE_STAGES: Array<{
         name: "入站护栏",
         sub: "注入/越权指令拦截",
         kind: "guard",
+        flows: [
+        { kind: "short-circuit", label: "命中 → 拦截话术" },
+        { kind: "next", label: "通过 → 问候/告别" },
+        ],
         desc: "检测提示注入、诱导系统指令等攻击性输入, 命中直接返回拦截话术, 不进入理解层。",
         actions: ["injection_blocked"],
         failures: "绕过护栏诱导系统行为",
@@ -184,6 +225,10 @@ const PIPELINE_STAGES: Array<{
         id: "greeting",
         name: "问候/告别",
         sub: "固定话术直出",
+        flows: [
+        { kind: "short-circuit", label: "命中 → 模板直出 (告别同时结束会话)" },
+        { kind: "next", label: "通过 → 意图分类" },
+        ],
         desc: "问候/告别不调 LLM 直接模板回复; 告别同时真正结束会话并清除残留确认窗口。",
         actions: ["turn_start"],
       },
@@ -199,6 +244,10 @@ const PIPELINE_STAGES: Array<{
         id: "classify",
         name: "意图分类",
         sub: "L1 规则 → L2 BERT → L3 LLM",
+        flows: [
+        { kind: "branch", label: "L1 命中 → 高置信直连工具" },
+        { kind: "next", label: "逐级兜底 → 指代消解" },
+        ],
         desc: "三级漏斗: L1 规则关键词零成本, L2 本地模型 (置信封顶防假置信), L3 才动 LLM 兜底。同时产出实体、情感与候补意图, 快慢两路互验防幻觉。",
         actions: ["intent_classify"],
         defects: ["intent_misread", "intent_uncovered"],
@@ -209,6 +258,9 @@ const PIPELINE_STAGES: Array<{
         id: "anaphora",
         name: "指代消解",
         sub: "「它/那张卡」回指历史",
+        flows: [
+        { kind: "next", label: "消解结果 → 噪声门 (与槽位/路由共用同一份实体)" },
+        ],
         desc: "当前句回指历史实体时解析回具体所指 (closed_loop 灰度开关), 消解结果与槽位填充、路由共用同一份。",
         defects: ["intent_misread"],
       },
@@ -217,6 +269,11 @@ const PIPELINE_STAGES: Array<{
         name: "噪声门",
         sub: "弱识别 → 澄清话术",
         kind: "guard",
+        flows: [
+        { kind: "short-circuit", label: "命中 → 固定澄清话术" },
+        { kind: "branch", label: "连续 2 次未懂 → 标记误杀候选" },
+        { kind: "next", label: "通过 → 决策一" },
+        ],
         desc: "弱识别/乱码/孤词输入用固定澄清话术回应, 不让 AI 猜测作答; 连续两次没听懂标记误杀候选待人工复核。",
         actions: ["noise_blocked", "mis_kill_candidate"],
         defects: ["intent_uncovered"],
@@ -236,6 +293,12 @@ const PIPELINE_STAGES: Array<{
         name: "决策一 · 交易性质",
         sub: "高风险/交易/查询/咨询",
         branch: "高风险 → 转人工",
+        flows: [
+        { kind: "branch", label: "高风险 ↳ 直接转人工" },
+        { kind: "branch", label: "交易 ↳ 链 A" },
+        { kind: "branch", label: "查询 ↳ 链 B" },
+        { kind: "branch", label: "咨询 ↳ 决策二" },
+        ],
         desc: "按意图的交易性质三分流: 高风险诉求 (争议/欺诈/信贷) 直接转人工; 资金变动类进链 A; 只读查询进链 B; 咨询类进决策二。",
         actions: ["route_decision"],
         defects: ["fallback_poor", "rule_flaw"],
@@ -246,6 +309,11 @@ const PIPELINE_STAGES: Array<{
         id: "decision2",
         name: "决策二 · 咨询分流",
         sub: "复合/低置信/高置信",
+        flows: [
+        { kind: "branch", label: "复合意图 ↳ 链 C (级联)" },
+        { kind: "branch", label: "低置信 ↳ 链 D (并行竞速)" },
+        { kind: "branch", label: "高置信 ↳ 链 F" },
+        ],
         desc: "咨询流量二次分流: 检出复合意图进链 C 级联; 置信 0.4~0.6 进链 D 并行竞速; 高置信咨询进链 F 知识问答。",
         actions: ["route_decision"],
         defects: ["rule_flaw"],
@@ -270,6 +338,10 @@ const PIPELINE_STAGES: Array<{
         name: "出站合规闸门",
         sub: "幻觉/违规话术拦截",
         kind: "guard",
+        flows: [
+        { kind: "short-circuit", label: "命中 → 替换安全话术 (留痕)" },
+        { kind: "next", label: "通过 → 转人工判定" },
+        ],
         desc: "回复出站前统一审查: 索要卡号密码等敏感话术、无知识依据的编造数字、声称已办理但实际未执行、敏感词 — 命中即替换为安全话术并留痕。",
         actions: ["outbound_guard"],
         defects: ["compliance_risk", "reply_quality"],
@@ -280,6 +352,11 @@ const PIPELINE_STAGES: Array<{
         id: "transfer",
         name: "转人工判定",
         sub: "L1/L2/L3 触发分级",
+        flows: [
+        { kind: "short-circuit", label: "L1/L2 触发 → 直接转接" },
+        { kind: "branch", label: "L3 触发 → 先征询客户再转" },
+        { kind: "next", label: "未触发 → 结果组装" },
+        ],
         desc: "负面反馈、投诉、连续澄清等信号分级触发转人工; L3 走确认链 (先征询客户) 而非直接转接。澄清两轮仍未解决也会主动提议转人工。",
         actions: ["transfer_agent"],
         defects: ["fallback_poor"],
@@ -290,6 +367,10 @@ const PIPELINE_STAGES: Array<{
         id: "sink",
         name: "结果落库",
         sub: "对话/消息/决策三表",
+        flows: [
+        { kind: "parallel", label: "对话/消息/决策 三表同时落库" },
+        { kind: "async", label: "回复推送客户" },
+        ],
         desc: "回复推送客户的同时落三表: dialogue_log 对话轮次、chat_message 消息处理、decision_log 每步决策 (决策链页签的数据来源) — 供审计与质检回放。",
         actions: ["chain_complete", "topic_track"],
       },
@@ -297,10 +378,16 @@ const PIPELINE_STAGES: Array<{
   },
 ]
 
+interface ChainStep {
+  label: string
+  join?: "serial" | "parallel" | "cascade" // 与前一步的连接语义
+}
+
 interface ExecChain extends PipelineNode {
   table: string
   tagType: string
   route: string
+  steps: ChainStep[]
 }
 
 const EXEC_CHAINS: ExecChain[] = [
@@ -311,6 +398,11 @@ const EXEC_CHAINS: ExecChain[] = [
     route: "决策一 → 资金变动类 (还款/挂失/调额)",
     table: "C·规则",
     tagType: "warning",
+    steps: [
+    { label: "确认状态机" },
+    { label: "MCP 工具循环", join: "serial" },
+    { label: "敏感操作核验", join: "serial" },
+      ],
     desc: "交易类诉求走确认状态机 + LLM 编排的 MCP 工具循环; 敏感操作强制二次确认, 高风险动作走短信核验信号。",
     actions: ["tool_call"],
     defects: ["rule_flaw", "compliance_risk"],
@@ -324,6 +416,12 @@ const EXEC_CHAINS: ExecChain[] = [
     route: "决策一 → 只读查询 (账单/明细/积分)",
     table: "C·规则",
     tagType: "primary",
+    steps: [
+    { label: "槽位抽取" },
+    { label: "直连工具", join: "serial" },
+    { label: "结果缓存", join: "serial" },
+    { label: "单次摘要", join: "serial" },
+      ],
     desc: "查询类诉求不走 LLM 工具循环: 槽位抽取参数 → 直连 MCP 工具 → Redis 结果缓存 → LLM 单次摘要成回复。缺参数时槽位反问补齐。",
     actions: ["tool_call", "cache_hit"],
     defects: ["fallback_poor", "reply_quality"],
@@ -337,6 +435,11 @@ const EXEC_CHAINS: ExecChain[] = [
     route: "决策二 → 复合意图 (账单为什么这么多)",
     table: "D·模型",
     tagType: "success",
+    steps: [
+    { label: "链 B 取数" },
+    { label: "注入 RAG 上下文", join: "cascade" },
+    { label: "联合生成", join: "serial" },
+      ],
     desc: "「查询 + 咨询」复合诉求: 链 B 先取业务数据, 结构化结果注入 RAG 上下文, 联合生成数据与解释融合的回复 (cascade 标记留痕)。",
     actions: ["tool_call", "rag_retrieve", "llm_generate"],
     defects: ["reply_quality"],
@@ -350,6 +453,11 @@ const EXEC_CHAINS: ExecChain[] = [
     route: "决策二 → 低置信 (0.4~0.6)",
     table: "D·模型",
     tagType: "warning",
+    steps: [
+    { label: "FAQ 三路" },
+    { label: "RAG 检索", join: "parallel" },
+    { label: "归并取优", join: "serial" },
+      ],
     desc: "低置信咨询双路并发: FAQ 三路匹配与 RAG 检索各自带超时, 归并取高分 — FAQ 高分直出标准答案, 否则 RAG 生成, 双空回落澄清。两路得分均留痕。",
     actions: ["faq_retrieve", "rag_retrieve"],
     defects: ["knowledge_missing"],
@@ -363,6 +471,13 @@ const EXEC_CHAINS: ExecChain[] = [
     route: "决策二 → 高置信咨询",
     table: "A·知识库",
     tagType: "primary",
+    steps: [
+    { label: "查询工程" },
+    { label: "FAQ 网关", join: "serial" },
+    { label: "混合检索", join: "serial" },
+    { label: "重排" },
+    { label: "生成 (带引用)", join: "serial" },
+      ],
     desc: "知识咨询主链: 查询工程三层 (口语归一/同义扩展/多查询展开, 全规则零成本) → FAQ 检索网关 (命中即直出标准答案) → RAG 混合检索 (BM25+向量+RRF) → 重排 → LLM 生成带引用来源。",
     actions: ["faq_retrieve", "rag_retrieve", "llm_generate"],
     defects: ["knowledge_missing", "knowledge_outdated", "reply_quality"],
@@ -457,6 +572,21 @@ onMounted(loadStats)
     display: inline-flex;
     align-items: center;
     gap: 5px;
+  }
+  .lg-sep {
+    width: 1px;
+    height: 12px;
+    background: var(--el-border-color-lighter);
+  }
+  .fsym {
+    font-style: normal;
+    font-weight: 700;
+    &.sc { color: var(--el-color-danger); }
+    &.nx { color: var(--color-text-muted); }
+    &.br { color: var(--el-color-primary); }
+    &.pa { color: var(--el-color-success); }
+    &.ca { color: var(--el-color-warning); }
+    &.as { color: var(--el-color-info); }
   }
   .dot {
     width: 8px;
@@ -606,6 +736,26 @@ onMounted(loadStats)
     color: var(--color-text-secondary);
     line-height: 1.4;
   }
+  /* 出边流转标签: 命中短路红 / 通过灰 / 分支蓝 / 并行绿 / 级联橙 */
+  .node-flows {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px dashed var(--el-border-color-lighter);
+  }
+  .flow-tag {
+    font-size: 10px;
+    line-height: 1.5;
+    white-space: normal;
+  }
+  .fk-short-circuit { color: var(--el-color-danger); }
+  .fk-next { color: var(--color-text-muted); }
+  .fk-branch { color: var(--el-color-primary); }
+  .fk-parallel { color: var(--el-color-success); }
+  .fk-cascade { color: var(--el-color-warning); }
+  .fk-async { color: var(--el-color-info); }
   .node-badge {
     position: absolute;
     top: -8px;
@@ -681,6 +831,30 @@ onMounted(loadStats)
     font-size: 11px;
     color: var(--color-text-secondary);
     line-height: 1.4;
+  }
+  .chain-steps {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 3px 0;
+    margin-top: 6px;
+  }
+  .step-chip {
+    font-size: 10px;
+    padding: 1px 6px;
+    border: 1px solid var(--el-border-color-lighter);
+    border-radius: 4px;
+    color: var(--color-text-secondary);
+    background: var(--el-fill-color-blank);
+    white-space: nowrap;
+  }
+  .step-join {
+    font-size: 11px;
+    font-weight: 700;
+    margin: 0 3px;
+    &.sj-parallel { color: var(--el-color-success); }
+    &.sj-cascade { color: var(--el-color-warning); }
+    &.sj-serial { color: var(--el-border-color); }
   }
   .chain-route {
     font-size: 10.5px;
