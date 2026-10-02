@@ -349,6 +349,7 @@ import { ElMessage, ElMessageBox } from "element-plus"
 import { Search } from "@element-plus/icons-vue"
 import StatusFlowChain from "@/components/common/StatusFlowChain.vue"
 import { intentZh } from "@/utils/intentZh"
+import { DEFECT_LABELS } from "@/utils/defects"
 import {
   attributeBadcase,
   resolveBadcase,
@@ -694,18 +695,7 @@ const acting = ref(false)
 const contextMessages = ref<{ speaker: string; content: string }[]>([])
 const contextLoading = ref(false)
 
-// 缺陷类型 (与后端 badcase_loop.DEFECT_TYPES 同构; 领域专家视角: 质检运营
-// 面对"业务缺陷"而非系统分层 — 层/性质/修复表是缺陷的技术投影, 自动带出)
-const DEFECT_LABELS: Record<string, string> = {
-  knowledge_missing: "知识缺失",
-  knowledge_outdated: "知识过时",
-  intent_misread: "意图理解错",
-  intent_uncovered: "说法未覆盖",
-  rule_flaw: "流程/规则缺陷",
-  reply_quality: "回复质量差",
-  fallback_poor: "兜底不当",
-  compliance_risk: "合规风险",
-}
+// 缺陷类型来自公共映射 (utils/defects, 与处理链路页等共用单一事实源)
 const DEFECT_TO_LAYER: Record<string, string> = {
   knowledge_missing: "layer_5", knowledge_outdated: "layer_5",
   intent_misread: "layer_3", intent_uncovered: "layer_3",

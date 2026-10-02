@@ -27,6 +27,10 @@
           <el-icon><Aim /></el-icon>
           <template #title>问题治理</template>
         </el-menu-item>
+        <el-menu-item index="/admin/pipeline">
+          <el-icon><Connection /></el-icon>
+          <template #title>处理链路</template>
+        </el-menu-item>
         <el-menu-item index="/admin/intent-library">
           <el-icon><Notebook /></el-icon>
           <template #title>意图库管理</template>
@@ -105,6 +109,7 @@ import {
   DataAnalysis,
   Tickets,
   Aim,
+  Connection,
   Notebook,
   EditPen,
   VideoPlay,
