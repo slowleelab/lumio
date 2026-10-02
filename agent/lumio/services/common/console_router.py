@@ -657,9 +657,7 @@ async def pipeline_stats(
     return {
         "hours": hours,
         "total": int(sum(r.cnt for r in rows)),
-        "actions": {
-            r.action: {"count": int(r.cnt), "avg_ms": round(float(r.avg_ms or 0), 1)} for r in rows
-        },
+        "actions": {r.action: {"count": int(r.cnt), "avg_ms": round(float(r.avg_ms or 0), 1)} for r in rows},
     }
 
 
