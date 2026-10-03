@@ -49,10 +49,13 @@
           <el-tag v-if="lane.cost" size="small" effect="plain" :type="lane.costType || 'info'">{{ lane.cost }}</el-tag>
         </div>
 
-        <!-- 入闸/理解/路由/出闸: 主干节点序列 -->
-        <div v-if="lane.key !== 'exec'" class="stage-nodes">
+        <!-- 入闸/理解/路由/出闸: 主干节点序列 (理解层带接力组框) -->
+        <div v-if="lane.key !== 'exec'" class="stage-nodes" :class="{ relay: lane.groupNote }">
+          <div v-if="lane.groupNote" class="relay-note">{{ lane.groupNote }}</div>
           <template v-for="(node, i) in lane.nodes" :key="node.id">
-            <div v-if="i" class="link-seg"><span class="link-dot" />通过</div>
+            <div v-if="i" class="link-seg" :class="{ handoff: lane.links }">
+              <span class="link-dot" />{{ lane.links?.[i - 1] ?? "通过" }}
+            </div>
             <button
               class="t-node"
               :class="{
@@ -231,6 +234,9 @@ const PIPELINE_STAGES: Array<{
   sub: string
   cost?: string
   costType?: string
+  // 节点间连接段文字 (缺省「通过」): 表达传递物 — 理解层三步接力共用一份数据包
+  links?: string[]
+  groupNote?: string // 泳道组说明角标 (如理解层「串行接力」)
   nodes: PipelineNode[]
 }> = [
   {
@@ -308,6 +314,8 @@ const PIPELINE_STAGES: Array<{
     idx: "②",
     name: "理解 — 意图与实体",
     sub: "三级漏斗按成本递增, 快慢双路互验",
+    groupNote: "串行接力 · 三步共用同一份数据包",
+    links: ["交接: 意图 + 置信 + 实体", "交接: 实体补全 + 分类来源"],
     nodes: [
       {
         id: "classify",
@@ -318,7 +326,7 @@ const PIPELINE_STAGES: Array<{
         { kind: "next", label: "认不出 → 下沉一层, 最后请大模型" },
         ],
         theory: "像医院分诊：挂号窗口先问一句（规则，零成本），常见病当场解决；拿不准的找分诊护士（本地小模型，毫秒级）；真疑难杂症才挂专家号（大模型，准但贵）。大部分话在前两步就解决了。再配两套识别互相核对——说法不一致就强制复核，防一套系统自己骗自己。",
-        impl: "第一层规则词表精确匹配；第二层本地 BERT，注意向量相似度高不等于真认对了（跨领域时经常糊），所以给它封顶：不过线就下沉；第三层才请大模型，按固定格式回答。每层的判断依据和两套识别各自的置信都写进决策日志，事后能查「哪一路在瞎说」。",
+        impl: "第一层规则词表精确匹配；第二层本地 BERT，注意向量相似度高不等于真认对了（跨领域时经常糊），所以给它封顶：不过线就下沉；第三层才请大模型，按固定格式回答。产出一份包含 意图 + 置信 + 实体 + 分类来源 的数据包 — 置信给噪声门把关用，实体交给指代消解补全，分类来源决定噪声门拦不拦。每层判断依据和两套识别各自置信都写进决策日志，事后能查「哪一路在瞎说」。",
         desc: "三级漏斗: L1 规则关键词零成本, L2 本地模型 (置信封顶防假置信), L3 才动 LLM 兜底。同时产出实体、情感与候补意图, 快慢两路互验防幻觉。",
         actions: ["intent_classify"],
         defects: ["intent_misread", "intent_uncovered"],
@@ -333,7 +341,7 @@ const PIPELINE_STAGES: Array<{
         { kind: "next", label: "带着完整实体 → 交给噪声门" },
         ],
         theory: "客户上一句问白金卡年费，下一句问「那它积分呢」——「它」是哪张卡，人一听就知道，机器得回头查。不查或查错，后面的检索词就是残的。",
-        impl: "发现「它 / 那张 / 这个」这类回指词时，回会话历史找出具体所指，替换后再往下走；消解结果全链路共用一份，不会各查各的。",
+        impl: "接上游分类交来的数据包 (意图 + 实体)；发现「它 / 那张 / 这个」这类回指词时，回会话历史找出具体所指，把实体补全后再把整包交给噪声门 — 后续槽位填充、路由用的都是这同一份实体，不会各查各的。",
         desc: "当前句回指历史实体时解析回具体所指 (closed_loop 灰度开关), 消解结果与槽位填充、路由共用同一份。",
         defects: ["intent_misread"],
       },
@@ -349,7 +357,7 @@ const PIPELINE_STAGES: Array<{
         { kind: "next", label: "听懂了 → 进路由" },
         ],
         theory: "硬答是幻觉的头号来源——模型被逼着输出，就只能编。所以识别不出的话统一回「没听清，您可以说…」，让客户换个说法。配套一条：连续两次没听懂就标记出来交人工看看，怕的是把真诉求当成了噪声。（学术上叫「选择性预测」：没把握就弃权）",
-        impl: "识别落在「没把握」区间（兜底、低置信、两套打架）就走澄清话术，不进检索不进生成。客户若正在回答上一轮的提问（比如补卡号），不拦——上文缺槽快照做依据。连续失败写「误杀候选」进人工复核。",
+        impl: "接上游交来的完整数据包，看两样东西：分类来源 (兜底 / 低置信 / 两套打架 → 拦) 和实体完整度。客户若正在回答上一轮的提问 (比如补卡号)，不拦 — 上文缺槽快照做依据，这是三者协同的第三处：分类说没把握，但消解发现客户在补上轮的槽，放行。通过后把数据包原样交给路由。连续失败写「误杀候选」进人工复核。",
         desc: "弱识别/乱码/孤词输入用固定澄清话术回应, 不让 AI 猜测作答; 连续两次没听懂标记误杀候选待人工复核。",
         actions: ["noise_blocked", "mis_kill_candidate"],
         defects: ["intent_uncovered"],
@@ -859,6 +867,25 @@ onBeforeUnmount(stopDemo)
   display: flex;
   flex-direction: column;
   align-items: center;
+  &.relay {
+    position: relative;
+    padding: 18px 16px 14px;
+    border: 1.5px dashed var(--el-color-primary-light-5);
+    border-radius: 12px;
+    background: var(--el-color-primary-light-9, transparent);
+  }
+}
+.relay-note {
+  position: absolute;
+  top: -9px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--el-color-primary);
+  background: var(--el-bg-color, #fff);
+  padding: 0 10px;
+  white-space: nowrap;
 }
 .link-seg {
   display: flex;
@@ -868,6 +895,14 @@ onBeforeUnmount(stopDemo)
   padding: 2px 0;
   color: var(--color-text-muted);
   font-size: 10px;
+  &.handoff {
+    color: var(--el-color-primary);
+    font-weight: 600;
+    ::v-deep(.link-dot),
+    .link-dot {
+      background: var(--el-color-primary);
+    }
+  }
   &::before,
   &::after {
     content: "";
