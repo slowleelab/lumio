@@ -330,3 +330,46 @@ async def test_check_mcp_connected_is_up(monkeypatch) -> None:
     result = await health_mod._check_mcp(app)
     assert result["status"] == "up"
     assert result["tool_count"] == 3
+
+
+# ── MCP 探测按服务职责区分 (assist 不用 MCP 工具, 不该报 down) ──
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_skipped_for_assist_app(monkeypatch):
+    """assist 服务的 app 不初始化 mcp_client (职责不用), 探测应 skip 而非 down"""
+    import lumio.shared.health as health_mod
+
+    monkeypatch.setattr(health_mod, "get_settings", lambda: _mcp_settings(True))
+    from lumio.shared.health import _check_mcp
+
+    class AssistState:
+        mcp_client = None
+
+    class AssistApp:
+        title = "Lumio 坐席辅助服务"
+        state = AssistState()
+
+    result = await _check_mcp(AssistApp())
+    assert result["status"] == "skip"
+    assert result["reason"] == "mcp_unused_by_service"
+
+
+@pytest.mark.asyncio
+async def test_mcp_check_down_for_bot_app_without_client(monkeypatch):
+    """bot 服务未初始化 client 仍应显式 down (掩盖故障的教训: 1efbd1ad)"""
+    import lumio.shared.health as health_mod
+
+    monkeypatch.setattr(health_mod, "get_settings", lambda: _mcp_settings(True))
+    from lumio.shared.health import _check_mcp
+
+    class BotState:
+        mcp_client = None
+
+    class BotApp:
+        title = "Lumio 机器人服务"
+        state = BotState()
+
+    result = await _check_mcp(BotApp())
+    assert result["status"] == "down"
+    assert result["reason"] == "not_initialized"
