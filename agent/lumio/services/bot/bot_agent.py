@@ -675,16 +675,23 @@ class LumioAgent:
             missing_slots = []
         llm = getattr(self._degradation_mgr, "_llm", None)
         resolver = AnaphoraResolver(llm_client=llm or None)
-        enriched, meta = await resolver.resolve(user_input, state.last_entities, entities, missing_slots=missing_slots)
+        enriched, meta = await resolver.resolve(
+            user_input,
+            state.last_entities,
+            entities,
+            missing_slots=missing_slots,
+            intent=intent.value if intent else None,
+        )
         source = meta.get("source")
         if source not in (None, "none"):
             logger.info(
-                "指代消解 %s: session=%s source=%s candidates=%s resolved=%s",
+                "指代消解 %s: session=%s source=%s candidates=%s resolved=%s%s",
                 user_input[:30],
                 session_id,
                 source,
                 meta.get("candidates"),
                 meta.get("resolved"),
+                " [歧义放弃, 下游缺槽反问兜底]" if meta.get("ambiguous") else "",
             )
         return enriched
 
