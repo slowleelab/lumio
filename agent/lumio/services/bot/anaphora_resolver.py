@@ -59,6 +59,27 @@ _ANAPHORA_RULES: list[tuple[re.Pattern[str], list[str]]] = [
     ),
 ]
 
+# 意图 → 期望实体类型 (纯代词回指的裁决依据): "它多少钱"在历史池同时有
+# 卡与金额时, 年费类意图期望卡 → 消解到卡; 交易类意图期望金额 → 消解到金额。
+# 意图参与的是"类型级"裁决 (跨类型多候选); 同类型多值 (两张卡) 意图帮不了,
+# 仍遵守唯一性约束不猜值。
+_INTENT_EXPECTED_TYPES: dict[str, tuple[str, ...]] = {
+    "annual_fee": ("card_tail", "CARD_NUMBER", "card_type"),
+    "limit_query": ("card_tail", "CARD_NUMBER", "card_type"),
+    "bill_query": ("period", "card_tail", "CARD_NUMBER"),
+    "account_bill_query": ("period", "card_tail", "CARD_NUMBER"),
+    "transaction_query": ("amount", "period"),
+    "txn_query": ("amount", "period"),
+    "installment_inquiry": ("amount", "period", "card_tail", "CARD_NUMBER"),
+    "installment_manage": ("amount", "period", "card_tail", "CARD_NUMBER"),
+    "reward_query": ("card_tail", "CARD_NUMBER", "card_type"),
+    "card_loss": ("card_tail", "CARD_NUMBER", "card_type"),
+    "card_loss_report": ("card_tail", "CARD_NUMBER", "card_type"),
+    "card_activation": ("card_tail", "CARD_NUMBER", "card_type"),
+    "card_limit_adjust": ("card_tail", "CARD_NUMBER", "card_type"),
+    "repayment_manage": ("amount", "period"),
+}
+
 # 规则层解析置信度 (命中唯一候选时给的高置信, 但 < 1 以保留余地)
 _RULE_CONFIDENCE = 0.8
 
@@ -129,6 +150,7 @@ class AnaphoraResolver:
         history_entities: list[Entity],
         current_entities: list[Entity],
         missing_slots: list[tuple[str, str]] | None = None,
+        intent: str | None = None,
     ) -> tuple[list[Entity], dict[str, Any]]:
         """消解当前句把历史实体池中的具体所指, 合并进当前实体。
 
@@ -137,9 +159,13 @@ class AnaphoraResolver:
             history_entities: 历史(跨轮)实体池, 通常来自 SessionState.last_entities。
             current_entities: 本轮已抽取的实体。
             missing_slots: 上轮仍在等待的必填槽 [(name, label), ...], 用于零主回指补槽。
+            intent: 当前意图 (枚举值字符串)。参与纯代词路的类型级裁决 —
+                "它"在历史池有卡+金额两类候选时, 按意图期望类型过滤后唯一即解析;
+                同类型多值 (两张卡) 意图无法裁决, 仍不猜。未提供时维持全局唯一约束。
 
         Returns:
-            (enriched_entities, meta)。meta 含 {triggered, kind, source, candidates, resolved} 供观测。
+            (enriched_entities, meta)。meta 含 {triggered, kind, source, candidates, resolved, ambiguous}
+            供观测; ambiguous=True 表示存在回指但候选不唯一而放弃 (下游链路缺槽反问兜底)。
         """
         hist: list[Entity] = []
         for e in history_entities or []:
@@ -170,7 +196,7 @@ class AnaphoraResolver:
             if resolved is not None:
                 return _resolved_return(current_entities, resolved, "mention", "rule")
             # 存在回指但历史无法唯一确定 → 交 LLM(默认关); 仍不明则放弃
-            resolved = await self._llm_try(text, hist)
+            resolved = await self._llm_try(text, hist, intent)
             if resolved is not None:
                 return _resolved_return(current_entities, resolved, "mention", "llm")
             return current_entities, {
@@ -179,6 +205,7 @@ class AnaphoraResolver:
                 "source": "none",
                 "candidates": len(hist),
                 "resolved": None,
+                "ambiguous": True,
             }
 
         # 2) 零主回指: 上文在等必填槽、本句未填 → 从历史补该缺槽的唯一候选值.
@@ -199,12 +226,18 @@ class AnaphoraResolver:
                         "resolved": None,
                     }
 
-        # 3) 纯代词回指: 历史实体池全局恰好一个候选时解析
+        # 3) 纯代词回指: 全局恰好一个候选时解析; 意图提供类型级裁决 —
+        # 历史"卡+金额"两类候选时按当前意图期望类型过滤后唯一即解析
+        # (年费类问"它多少钱"→它=卡; 交易类→它=金额)。过滤后仍多值不猜。
         if _match_pronoun(text):
             resolved = self._gather_global_unique(hist)
             if resolved is not None:
                 return _resolved_return(current_entities, resolved, "pronoun", "rule")
-            resolved = await self._llm_try(text, hist)
+            if intent:
+                resolved = self._gather_intent_filtered(hist, intent)
+                if resolved is not None:
+                    return _resolved_return(current_entities, resolved, "pronoun", "rule+intent")
+            resolved = await self._llm_try(text, hist, intent)
             if resolved is not None:
                 return _resolved_return(current_entities, resolved, "pronoun", "llm")
             return current_entities, {
@@ -213,6 +246,8 @@ class AnaphoraResolver:
                 "source": "none",
                 "candidates": len(hist),
                 "resolved": None,
+                # 存在回指但无法唯一确定 → 放弃消解; 实体缺则下游查询链缺槽反问兜底
+                "ambiguous": True,
             }
 
         return current_entities, {
@@ -223,17 +258,34 @@ class AnaphoraResolver:
             "resolved": None,
         }
 
-    async def _llm_try(self, text: str, hist: list[Entity]) -> Entity | None:
+    async def _llm_try(self, text: str, hist: list[Entity], intent: str | None = None) -> Entity | None:
         """按灰度开关尝试 LLM 兜底; 开关关/无客户端/失败 → None(不阻断)。"""
         from lumio.shared.config import get_settings
 
         if not hist or self._llm is None or not get_settings().classification.anaphora_llm_fallback_enabled:
             return None
         try:
-            return await self._llm_resolve(text, hist)
+            return await self._llm_resolve(text, hist, intent)
         except Exception as exc:
             logger.warning("指代消解 LLM 兜底失败(不阻断): %s", exc)
             return None
+
+    @staticmethod
+    def _gather_intent_filtered(hist: list[Entity], intent: str) -> Entity | None:
+        """意图类型级裁决: 按意图期望类型过滤历史候选, 过滤后恰一个唯一值才解析。
+
+        同类型多值 (历史两张卡) 意图无法裁决 → 仍返回 None 不猜 (唯一性约束不放松)。
+        """
+        expected = _INTENT_EXPECTED_TYPES.get(intent or "")
+        if not expected:
+            return None
+        for t in expected:
+            distinct = sorted({e.value for e in hist if e.entity_type == t and e.value})
+            if len(distinct) == 1:
+                return Entity(entity_type=t, value=distinct[0], confidence=_RULE_CONFIDENCE)
+            if len(distinct) > 1:
+                return None  # 同类型多值: 意图裁决不了具体值
+        return None
 
     @staticmethod
     def _gather_rule_candidate(
@@ -277,11 +329,12 @@ class AnaphoraResolver:
             return Entity(entity_type=entity_type, value=value, confidence=_RULE_CONFIDENCE)
         return None
 
-    async def _llm_resolve(self, text: str, hist: list[Entity]) -> Entity | None:
-        """LLM 兜底: 从候选实体池中挑出当前句回指的具体所指。"""
+    async def _llm_resolve(self, text: str, hist: list[Entity], intent: str | None = None) -> Entity | None:
+        """LLM 兜底: 从候选实体池中挑出当前句回指的具体所指 (意图作为语义线索传入)。"""
         if not hist:
             return None
         candidate_lines = "; ".join(f"{e.entity_type}={e.value}" for e in hist[:12])
+        intent_hint = f"\n客户当前在咨询的业务意图: {intent}" if intent else ""
         system_prompt = (
             "你是一个银行信用卡客服的指代消解器。客户上一条消息可能用指示词(这张/那笔/这期等)回指"
             "之前提到的某条具体信息。请你从给出的候选实体中, 选出他确切指代的那一条。\n"
@@ -291,8 +344,9 @@ class AnaphoraResolver:
         )
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"候选实体: {candidate_lines}\n客户当前消息: {text}"},
+            {"role": "user", "content": f"候选实体: {candidate_lines}{intent_hint}\n客户当前消息: {text}"},
         ]
+        assert self._llm is not None  # 调用方 _llm_try 已确保非空
         result = await self._llm.chat_json(messages, temperature=0.1, max_tokens=64, timeout=15.0)
         if not isinstance(result, dict):
             return None

@@ -190,3 +190,62 @@ class TestResolveMisc:
         # "那张卡" 偏好序先试 card_tail(无)再 CARD_NUMBER → dict 里被归一为 CARD_NUMBER
         assert ("CARD_NUMBER", "6222888866660000") in [(e.entity_type, e.value) for e in enriched]
         assert meta["source"] == "rule"
+
+
+# ── 意图参与纯代词裁决 (愿景落地: "它"在卡+金额两类候选时按意图过滤) ──
+
+
+class TestIntentFilteredPronoun:
+    async def test_pronoun_resolves_by_intent_expectation(self) -> None:
+        """历史池=卡+金额两类候选, 年费意图问"它" → 消解到卡"""
+        r = AnaphoraResolver()
+        hist = [
+            Entity(entity_type="card_type", value="白金卡"),
+            Entity(entity_type="amount", value="8650"),
+        ]
+        enriched, meta = await r.resolve("它多少钱", hist, [], intent="annual_fee")
+        assert meta["triggered"] is True
+        assert meta["source"] == "rule+intent"
+        assert any(e.entity_type == "card_type" and e.value == "白金卡" for e in enriched)
+
+    async def test_pronoun_intent_picks_amount_for_txn(self) -> None:
+        """同一历史池, 交易类意图 → 消解到金额"""
+        r = AnaphoraResolver()
+        hist = [
+            Entity(entity_type="card_type", value="白金卡"),
+            Entity(entity_type="amount", value="8650"),
+        ]
+        enriched, meta = await r.resolve("它有疑问", hist, [], intent="transaction_query")
+        assert meta["source"] == "rule+intent"
+        assert any(e.entity_type == "amount" and e.value == "8650" for e in enriched)
+
+    async def test_same_type_multi_value_still_no_guess(self) -> None:
+        """同类型多值 (历史两张卡): 意图裁决不了具体值 → 仍不猜"""
+        r = AnaphoraResolver()
+        hist = [
+            Entity(entity_type="card_type", value="白金卡"),
+            Entity(entity_type="card_type", value="金卡"),
+        ]
+        enriched, meta = await r.resolve("它多少钱", hist, [], intent="annual_fee")
+        assert meta["resolved"] is None
+        assert meta.get("ambiguous") is True
+        assert enriched == []
+
+    async def test_unknown_intent_falls_back_to_global_unique(self) -> None:
+        """未映射的意图: 维持全局唯一约束 (两类候选 → 放弃), 不因传了意图而更激进"""
+        r = AnaphoraResolver()
+        hist = [
+            Entity(entity_type="card_type", value="白金卡"),
+            Entity(entity_type="amount", value="8650"),
+        ]
+        _, meta = await r.resolve("它多少钱", hist, [], intent="chitchat")
+        assert meta["resolved"] is None
+        assert meta.get("ambiguous") is True
+
+    async def test_no_intent_back_compat_global_unique(self) -> None:
+        """不传意图 (向后兼容): 全局唯一才解析 — 既有调用行为不变"""
+        r = AnaphoraResolver()
+        hist = [Entity(entity_type="card_type", value="白金卡")]
+        enriched, meta = await r.resolve("它多少钱", hist, [])
+        assert meta["source"] == "rule"
+        assert any(e.value == "白金卡" for e in enriched)
