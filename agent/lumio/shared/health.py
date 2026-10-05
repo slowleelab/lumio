@@ -119,12 +119,18 @@ async def _check_mcp(app: Any) -> dict[str, Any]:
     """检查 MCP 工具连接状态 (会话 1efbd1ad 复盘: MCP 工具断了 /health 仍全绿, 掩盖故障).
 
     - 未启用 -> skip
+    - 坐席辅助服务 (assist) -> skip (不使用 MCP 工具, 其 lifespan 不初始化
+     mcp_client — 此前对 assist 也探测, None 被判 down, 服务自部署起
+     永远 degraded: 探测项必须与服务职责匹配, 否则告警噪音掩盖真故障。
+     判据只认 assist, 未知 app 保守照旧探测 — 宁误报不漏报)
     - 客户端未初始化/未连接 -> down (显式报警, 而非静默降级)
     - 已连接 -> up, 附带工具数
     """
     settings = get_settings()
     if not settings.mcp.enabled:
         return {"status": "skip", "reason": "disabled"}
+    if "坐席辅助" in str(getattr(app, "title", "")):
+        return {"status": "skip", "reason": "mcp_unused_by_service"}
     client = getattr(app.state, "mcp_client", None)
     if client is None:
         return {"status": "down", "reason": "not_initialized"}
