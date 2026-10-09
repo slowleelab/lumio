@@ -11,7 +11,7 @@
             :title="stageQuery[st.key] ? `点击下钻到案例工作台 (${st.label})` : st.label"
             @click="stageQuery[st.key] && router.push({ path: '/admin/cases', query: stageQuery[st.key]! })"
           >
-            <span class="fw-count">{{ st.count }}</span>
+            <span class="fw-count">{{ st.count }}<em v-if="stageQuery[st.key]" class="fw-drill">↧</em></span>
             <span class="fw-label">{{ st.label }}</span>
           </div>
         </template>
@@ -234,12 +234,35 @@ const recheck = ref({ running: false, total: 0, done: 0, passed: 0 })
 let recheckTimer: ReturnType<typeof setInterval> | null = null
 async function runGroupRecheck() {
   if (!detail.value) return
+  const n = detail.value.cases.filter((c: PatternCase) => c.fix_status === "deployed").length
+  try {
+    await ElMessageBox.confirm(
+      `将对组内 ${n} 个已上线案例逐个重放 (当前代码重新回答), 按新质检判定自动流转: 通过 → 已根治, 未通过 → 重开重新治理。全程约 ${Math.ceil(n * 0.75)} 分钟, 期间可离开页面。确认执行?`,
+      "组级根治验证",
+      { type: "warning", confirmButtonText: "开始验证", cancelButtonText: "再想想" }
+    )
+  } catch {
+    return
+  }
   try {
     const r = await startGroupRecheck(detail.value.group_key)
     recheck.value = { running: true, total: r.total, done: 0, passed: 0 }
     if (!recheckTimer) recheckTimer = setInterval(() => void pollRecheck(), 2500)
   } catch {
     /* handled */
+  }
+}
+
+// 刷新/切页回来: 后台任务可能仍在跑 — 恢复进度与轮询 (与批量归因恢复同模式)
+async function resumeRecheckIfNeeded() {
+  try {
+    const st = await getGroupRecheckStatus()
+    if (st.running) {
+      recheck.value = { running: true, total: st.total, done: st.done, passed: st.passed }
+      if (!recheckTimer) recheckTimer = setInterval(() => void pollRecheck(), 2500)
+    }
+  } catch {
+    /* 状态接口异常静默 */
   }
 }
 async function pollRecheck() {
@@ -444,6 +467,7 @@ function gotoQc(row: { session_id: string }) {
 
 onMounted(async () => {
   void loadFunnel()
+  void resumeRecheckIfNeeded()
   // 三页联动: 案例工作台/处理链路跳转带入 — group_key 直开组详情;
   // defect (缺陷枚举) 映射责任层过滤组列表 (高亮该缺陷的治理对象)
   const gk = route.query.group_key as string | undefined
@@ -575,9 +599,16 @@ const visibleGroups = computed(() =>
 }
 .fw-stage.clickable {
   cursor: pointer;
+  border: 1px solid var(--el-color-primary-light-5);
   transition: all 0.15s;
+  .fw-drill {
+    font-style: normal;
+    font-size: 11px;
+    color: var(--el-color-primary);
+    margin-left: 2px;
+  }
   &:hover {
-    border: 1px solid var(--el-color-primary);
+    border-color: var(--el-color-primary);
     transform: translateY(-1px);
   }
 }
