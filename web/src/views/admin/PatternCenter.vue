@@ -1,5 +1,28 @@
 <template>
   <div class="pattern-page">
+    <!-- 飞轮漏斗: 发现→处置→修复→上线→根治 一屏判读 (P0 打通全链条) -->
+    <div class="flywheel" v-if="funnel">
+      <div class="fw-stages">
+        <template v-for="(st, i) in funnel.stages" :key="st.key">
+          <div v-if="i" class="fw-arrow">›</div>
+          <div class="fw-stage" :title="st.label">
+            <span class="fw-count">{{ st.count }}</span>
+            <span class="fw-label">{{ st.label }}</span>
+          </div>
+        </template>
+        <template v-if="funnel.reopened > 0">
+          <div class="fw-arrow fw-back">↩</div>
+          <div class="fw-stage fw-reopened" title="复检未过, 重开重新治理">
+            <span class="fw-count">{{ funnel.reopened }}</span>
+            <span class="fw-label">回流</span>
+          </div>
+        </template>
+      </div>
+      <div class="fw-meta muted">
+        已根治平均周期 {{ funnel.avg_cycle_days != null ? funnel.avg_cycle_days + " 天" : "—" }}
+        · 复发案例自动继承组状态 · 上线后组级重放一键根治验证
+      </div>
+    </div>
     <div class="page-header">
       <h2>
         问题治理
@@ -110,6 +133,11 @@
 
           <div class="section-title">
             批量执行
+            <el-button
+              v-if="detail.cases.some((c: PatternCase) => c.fix_status === 'deployed')"
+              size="small" type="success" plain :loading="recheck.running" style="margin-left: 10px"
+              @click="runGroupRecheck"
+            >{{ recheck.running ? `根治验证中 ${recheck.done}/${recheck.total}` : "组级重放验证 (一键根治)" }}</el-button>
             <el-tooltip content="节点带各状态案例数, 点击下一节点批量流转; 逐例走状态机守门, 单例失败不阻断" placement="top">
               <span class="muted section-hint">点节点流转 ⓘ</span>
             </el-tooltip>
@@ -158,11 +186,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 import { useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import StatusFlowChain from "@/components/common/StatusFlowChain.vue"
 import { intentZh } from "@/utils/intentZh"
+import { getFunnelStats, getGroupRecheckStatus, startGroupRecheck, type FunnelStats } from "@/api/patterns"
 import {
   batchTransition,
   getPatternDetail,
@@ -175,6 +204,44 @@ import {
 const router = useRouter()
 const loading = ref(false)
 const detailLoading = ref(false)
+
+// ── P0 飞轮: 漏斗统计 + 组级重放验证 ──
+const funnel = ref<FunnelStats | null>(null)
+async function loadFunnel() {
+  try {
+    funnel.value = await getFunnelStats()
+  } catch {
+    funnel.value = null
+  }
+}
+const recheck = ref({ running: false, total: 0, done: 0, passed: 0 })
+let recheckTimer: ReturnType<typeof setInterval> | null = null
+async function runGroupRecheck() {
+  if (!detail.value) return
+  try {
+    const r = await startGroupRecheck(detail.value.group_key)
+    recheck.value = { running: true, total: r.total, done: 0, passed: 0 }
+    if (!recheckTimer) recheckTimer = setInterval(() => void pollRecheck(), 2500)
+  } catch {
+    /* handled */
+  }
+}
+async function pollRecheck() {
+  try {
+    const st = await getGroupRecheckStatus()
+    recheck.value = { running: st.running, total: st.total, done: st.done, passed: st.passed }
+    if (!st.running) {
+      if (recheckTimer) {
+        clearInterval(recheckTimer)
+        recheckTimer = null
+      }
+      ElMessage.success(`组级重放完成: 通过 ${st.passed}/${st.total}${st.failed ? `, ${st.failed} 例重开重新治理` : ""}`)
+      await Promise.all([load(), loadFunnel(), detail.value ? reloadDetail() : Promise.resolve()])
+    }
+  } catch {
+    /* 轮询失败静默重试 */
+  }
+}
 const acting = ref(false)
 const groups = ref<PatternGroup[]>([])
 const unattributed = ref(0)
@@ -359,7 +426,10 @@ function gotoQc(row: { session_id: string }) {
   router.push({ path: "/admin/badcase", query: { keyword: row.session_id.slice(0, 24) } })
 }
 
-onMounted(load)
+onMounted(() => {
+  void loadFunnel()
+  load()
+})
 </script>
 
 <style scoped>
@@ -389,6 +459,57 @@ onMounted(load)
 
 .hint {
   margin: 0;
+}
+
+/* 飞轮漏斗 */
+.flywheel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border: 1px solid var(--el-color-success-light-7);
+  border-radius: 10px;
+  background: linear-gradient(120deg, var(--el-color-success-light-9), var(--el-color-primary-light-9));
+  margin-bottom: 12px;
+}
+.fw-stages {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.fw-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 58px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: var(--el-bg-color, #fff);
+  .fw-count {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--el-color-primary);
+    line-height: 1.2;
+  }
+  .fw-label {
+    font-size: 10.5px;
+    color: var(--color-text-secondary);
+  }
+  &.fw-reopened .fw-count {
+    color: var(--el-color-danger);
+  }
+}
+.fw-arrow {
+  color: var(--el-color-success);
+  font-size: 15px;
+  font-weight: 700;
+  &.fw-back {
+    color: var(--el-color-danger);
+  }
+}
+.fw-meta {
+  font-size: 11px;
 }
 
 .pattern-layout {

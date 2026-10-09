@@ -85,3 +85,33 @@ export function batchTransition(groupKey: string, fixStatus: string, caseIds?: s
     case_ids: caseIds ?? null,
   })
 }
+
+// ── P0 飞轮: 组级重放验证 + 漏斗统计 ──
+
+export interface GroupRecheckStatus {
+  running: boolean
+  group_key: string
+  total: number
+  done: number
+  passed: number
+  failed: number
+  error: string
+}
+
+export function startGroupRecheck(groupKey: string): Promise<{ started: boolean; total: number }> {
+  return client.post(`/admin/patterns/${encodeURIComponent(groupKey)}/recheck`, {})
+}
+
+export function getGroupRecheckStatus(): Promise<GroupRecheckStatus> {
+  return client.get("/admin/patterns/recheck/status")
+}
+
+export interface FunnelStats {
+  stages: Array<{ key: string; label: string; count: number }>
+  reopened: number
+  avg_cycle_days: number | null
+}
+
+export function getFunnelStats(): Promise<FunnelStats> {
+  return client.get("/admin/patterns/funnel-stats")
+}
