@@ -188,3 +188,25 @@ async def test_group_not_found(pattern_db) -> None:
     sf, _ = pattern_db
     with pytest.raises(LumioError):
         await get_pattern_endpoint("nope::_nope", _ADMIN, _fake_request(sf))
+
+
+async def test_funnel_stats_shape(pattern_db) -> None:
+    """飞轮漏斗: 五阶段结构 + 计数非负 + 回流计数"""
+
+    from lumio.services.common.pattern_router import funnel_stats_endpoint
+
+    res = await funnel_stats_endpoint(_ADMIN, _fake_request(pattern_db[0]))
+    stages = res["stages"]
+    assert [st["key"] for st in stages] == ["total", "pending", "fixing", "deployed", "verified"]
+    assert all(st["count"] >= 0 for st in stages)
+    assert stages[0]["count"] >= sum(st["count"] for st in stages[1:])
+    assert isinstance(res["reopened"], int)
+
+
+async def test_group_recheck_requires_deployed(pattern_db) -> None:
+    """组级重放前置: 无 deployed 案例的组拒绝启动"""
+    from lumio.services.common.pattern_router import group_recheck_endpoint
+
+    await _mk_case(pattern_db[0], pattern_db[1], "pat-t-nor", "pat_test_nor", "layer_3", "无上线案例的组")
+    with pytest.raises(LumioError):
+        await group_recheck_endpoint("pat_test_nor::layer_3", _ADMIN, _fake_request(pattern_db[0]))

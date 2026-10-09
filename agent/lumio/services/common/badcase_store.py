@@ -621,6 +621,23 @@ async def attribute_and_save(
         row.needs_human_review = result.needs_human_review
         row.fix_table = result.fix_table
         await session.commit()
+
+    # P0 飞轮 · 复发自动继承: 同组 (意图×根因层) 已有推进中的治理时, 新案例
+    # 继承组状态而非从 pending 重新排队 — 组方案落定时共性根因已经人工把关,
+    # 复发案例同组即同根因, 不再重复立项/确认; deployed 组的增量案例随后
+    # 由组级重放验证一并覆盖。
+    if result.root_cause_layer not in ("", "uncertain", None):
+        try:
+            inherited = await _inherit_group_progress(session_factory, row)
+            if inherited:
+                logger.info(
+                    "复发自动继承: id=%s → %s (组 %s 已在治理)",
+                    badcase_id,
+                    inherited,
+                    f"{row.intent_label}::{result.root_cause_layer}",
+                )
+        except Exception as exc:
+            logger.warning("复发继承失败(不阻断): id=%s err=%s", badcase_id, exc)
     logger.info(
         "Badcase 归因完成: id=%s layer=%s conf=%.2f review=%s",
         badcase_id,
@@ -629,6 +646,49 @@ async def attribute_and_save(
         result.needs_human_review,
     )
     return result
+
+
+_INHERIT_ORDER = ("fixing", "canary", "deployed")
+
+
+async def _inherit_group_progress(session_factory: async_sessionmaker[AsyncSession], row: Badcase) -> str | None:
+    """查同组 (intent_label × root_cause_layer) open 案例的最推进状态, 继承到本案例。
+
+    只继承 fixing/canary/deployed (pending 不需要继承; verified/rejected 是终态
+    — 组根治后复发属于新问题周期, 应重新走确认)。继承时同步落人工确认层
+    (组方案已确认过), fix_table 取行上归因结果。
+    """
+    from sqlalchemy import func, select
+
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(Badcase.fix_status, func.count())
+                .where(
+                    Badcase.intent_label == row.intent_label,
+                    Badcase.root_cause_layer == row.root_cause_layer,
+                    Badcase.fix_status.in_(("fixing", "canary", "deployed")),
+                    Badcase.id != row.id,
+                )
+                .group_by(Badcase.fix_status)
+            )
+        ).all()
+    if not rows:
+        return None
+    statuses = {s for s, _ in rows}
+    inherited = next((s for s in _INHERIT_ORDER if s in statuses), None)
+    if inherited is None:
+        return None
+    note = f"复发自动继承组状态 (同组已在 {inherited} 治理中)"
+    await update_fix_status(
+        session_factory,
+        str(row.id),
+        fix_status=inherited,
+        fix_table=row.fix_table,
+        human_confirmed_layer=row.root_cause_layer,
+        note=note,
+    )
+    return inherited
 
 
 # 处置状态机转移表: 后端守门, 前端按钮只是引导不是约束。
