@@ -242,6 +242,10 @@
                 type="primary" size="small" :loading="acting" :disabled="!judgedDefect || judgedDefect === 'uncertain'" @click="confirmResolve"
               >✓ 确认判定{{ attribEdit ? "" : " · 进入修复" }}</el-button>
               <el-button
+                v-if="detail.intent_label && detail.root_cause_layer && detail.root_cause_layer !== 'uncertain'"
+                size="small" link type="primary" @click="gotoGroup"
+              >同组治理 ›</el-button>
+              <el-button
                 v-if="(detail.fix_status === 'pending' || detail.fix_status === 'reopened') && judgedDefect && judgedDefect !== 'uncertain'"
                 size="small" @click="attribEdit = !attribEdit"
               >{{ attribEdit ? "收起改判" : "改判" }}</el-button>
@@ -555,6 +559,15 @@ const nextIdx = computed(() => {
 function openNext() {
   const row = caseRows.value[nextIdx.value!]
   if (row) openDetail(row)
+}
+
+function gotoGroup() {
+  // 三页联动: 案例详情 → 问题治理的同组 (自动打开组详情, 带方案视角)
+  if (!detail.value?.intent_label || !detail.value?.root_cause_layer) return
+  router.push({
+    path: "/admin/patterns",
+    query: { group_key: `${detail.value.intent_label}::${detail.value.root_cause_layer}` },
+  })
 }
 
 function openDetail(row: Badcase) {
@@ -1105,7 +1118,7 @@ function fmtTime(iso?: string | null) {
   return iso ? iso.slice(0, 19).replace("T", " ") : "-"
 }
 
-onMounted(() => {
+onMounted(async () => {
   // 质检页/报表跳转带入筛选: fix_status (处置) / root_cause_layer (根因) / keyword (问题句或会话)
   const fs = route.query.fix_status as string | undefined
   if (fs && fixStatusLabelMap[fs]) caseFilters.value.fix_status = fs
@@ -1115,7 +1128,22 @@ onMounted(() => {
   if (il) caseFilters.value.intent_label = il
   const kw = (route.query.keyword || route.query.session_id) as string | undefined
   if (kw) caseFilters.value.keyword = kw
-  loadCases()
+  await loadCases()
+  // 三页联动: 问题治理跳转直开该案例详情 (列表默认分页内找不到时按 id 精确拉取)
+  const cid = route.query.case_id as string | undefined
+  if (cid) {
+    const row = caseRows.value.find((c) => c.id === cid)
+    if (row) {
+      openDetail(row)
+    } else {
+      try {
+        const fresh = await getBadcase(cid)
+        if (fresh) openDetail(fresh)
+      } catch {
+        /* 案例可能已被清理 */
+      }
+    }
+  }
   pollBatch() // 恢复可能进行中的批量归因进度
 })
 onUnmounted(() => {
