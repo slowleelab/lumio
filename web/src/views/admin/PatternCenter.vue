@@ -5,7 +5,12 @@
       <div class="fw-stages">
         <template v-for="(st, i) in funnel.stages" :key="st.key">
           <div v-if="i" class="fw-arrow">›</div>
-          <div class="fw-stage" :title="st.label">
+          <div
+            class="fw-stage"
+            :class="{ clickable: stageQuery[st.key] }"
+            :title="stageQuery[st.key] ? `点击下钻到案例工作台 (${st.label})` : st.label"
+            @click="stageQuery[st.key] && router.push({ path: '/admin/cases', query: stageQuery[st.key]! })"
+          >
             <span class="fw-count">{{ st.count }}</span>
             <span class="fw-label">{{ st.label }}</span>
           </div>
@@ -48,7 +53,7 @@
       <div class="group-panel">
         <el-table
           v-loading="loading"
-          :data="groups"
+          :data="visibleGroups"
           size="small"
           highlight-current-row
           @row-click="(row: PatternGroup) => openGroup(row)"
@@ -175,6 +180,7 @@
             <el-table-column label="操作" width="76">
               <template #default="{ row }">
                 <el-button size="small" link type="primary" @click="gotoQc(row)">核查</el-button>
+                <el-button size="small" link type="primary" @click="router.push({ path: '/admin/cases', query: { case_id: row.id } })">处置</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -187,7 +193,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue"
-import { useRouter } from "vue-router"
+import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
 import StatusFlowChain from "@/components/common/StatusFlowChain.vue"
 import { intentZh } from "@/utils/intentZh"
@@ -202,10 +208,20 @@ import {
 } from "@/api/patterns"
 
 const router = useRouter()
+const route = useRoute()
 const loading = ref(false)
 const detailLoading = ref(false)
 
 // ── P0 飞轮: 漏斗统计 + 组级重放验证 ──
+// 漏斗阶段 → 案例工作台下钻参数 (发现=全量不带筛选)
+const stageQuery: Record<string, Record<string, string> | null> = {
+  total: null,
+  pending: { fix_status: "pending" },
+  fixing: { fix_status: "fixing" },
+  deployed: { fix_status: "deployed" },
+  verified: { fix_status: "verified" },
+}
+
 const funnel = ref<FunnelStats | null>(null)
 async function loadFunnel() {
   try {
@@ -426,10 +442,56 @@ function gotoQc(row: { session_id: string }) {
   router.push({ path: "/admin/badcase", query: { keyword: row.session_id.slice(0, 24) } })
 }
 
-onMounted(() => {
+onMounted(async () => {
   void loadFunnel()
-  load()
+  // 三页联动: 案例工作台/处理链路跳转带入 — group_key 直开组详情;
+  // defect (缺陷枚举) 映射责任层过滤组列表 (高亮该缺陷的治理对象)
+  const gk = route.query.group_key as string | undefined
+  const defect = route.query.defect as string | undefined
+  if (gk) {
+    await openGroupByKey(gk)
+  } else if (defect) {
+    await load()
+    defectLayerFilter.value = DEFECT_TO_LAYER[defect] || ""
+  } else {
+    load()
+  }
 })
+
+async function openGroupByKey(groupKey: string) {
+  detailLoading.value = true
+  try {
+    await load()
+    detail.value = await getPatternDetail(groupKey)
+    planText.value = detail.value?.plan_text ?? ""
+    planOwner.value = detail.value?.plan_owner ?? ""
+    const allowed = LAYER_ALLOWED_TABLES[detail.value?.root_cause_layer || ""] || []
+    planTable.value = allowed.includes(detail.value?.fix_table ?? "") ? detail.value?.fix_table ?? "" : DEFECT_TO_TABLE[detail] || ""
+    planTable.value = allowed.includes(planTable.value) ? planTable.value : allowed[0] || ""
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+// 缺陷 → 责任层/默认表 (与 utils/defects 及后端 DEFECT_TYPES 同构)
+const DEFECT_TO_LAYER: Record<string, string> = {
+  knowledge_missing: "layer_5", knowledge_outdated: "layer_5",
+  intent_misread: "layer_3", intent_uncovered: "layer_3",
+  rule_flaw: "layer_4", reply_quality: "layer_6",
+  fallback_poor: "layer_4", compliance_risk: "layer_7",
+}
+const DEFECT_TO_TABLE: Record<string, string> = {
+  knowledge_missing: "A_knowledge", knowledge_outdated: "A_knowledge",
+  intent_misread: "B_intent", intent_uncovered: "B_intent",
+  rule_flaw: "C_rule", reply_quality: "D_model",
+  fallback_poor: "C_rule", compliance_risk: "C_rule",
+}
+const defectLayerFilter = ref("")
+
+// 缺陷下钻过滤: 只看该责任层的组 (处理链路缺陷标签跳转进入时)
+const visibleGroups = computed(() =>
+  defectLayerFilter.value ? groups.value.filter((g) => g.root_cause_layer === defectLayerFilter.value) : groups.value
+)
 </script>
 
 <style scoped>
@@ -510,6 +572,14 @@ onMounted(() => {
 }
 .fw-meta {
   font-size: 11px;
+}
+.fw-stage.clickable {
+  cursor: pointer;
+  transition: all 0.15s;
+  &:hover {
+    border: 1px solid var(--el-color-primary);
+    transform: translateY(-1px);
+  }
 }
 
 .pattern-layout {
