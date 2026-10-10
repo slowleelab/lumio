@@ -750,13 +750,21 @@ function shortModel(m?: string | null) {
 function fmtTime(iso?: string | null) {
   return iso ? iso.slice(0, 19).replace("T", " ") : "-"
 }
-onMounted(() => {
-  // 报表卡片跳转带入筛选: 判定域 query.category (兼容旧值 pending_review → 处置待处置) + 处置域 query.disposition
+onMounted(async () => {
+  // 跳转带入: 判定域 query.category + 关键词筛选 (问题治理"核查"等) + session_id 直开详情
   const q = route.query.category as string | undefined
   if (q && ["pass", "warn", "fail", "unscanned"].includes(q)) {
     qcFilters.value.category = q
   }
-  loadQc()
+  const kw = (route.query.keyword || route.query.session_id) as string | undefined
+  if (kw) qcFilters.value.keyword = kw
+  await loadQc()
+  // 三页联动: 问题治理"核查"跳转 → 直开该会话核查详情 (不必在列表里再找)
+  const sid = route.query.session_id as string | undefined
+  if (sid) {
+    const row = qcRows.value.find((r) => r.session_id === sid || r.session_id.startsWith(sid.slice(0, 20)))
+    if (row) openQcDetail(row)
+  }
 })
 onUnmounted(() => {
   if (replayTimer) clearInterval(replayTimer)

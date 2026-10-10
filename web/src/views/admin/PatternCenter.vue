@@ -462,7 +462,7 @@ async function runBatch(target: string) {
 }
 
 function gotoQc(row: { session_id: string }) {
-  router.push({ path: "/admin/badcase", query: { keyword: row.session_id.slice(0, 24) } })
+  router.push({ path: "/admin/badcase", query: { keyword: row.session_id, session_id: row.session_id } })
 }
 
 onMounted(async () => {
