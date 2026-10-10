@@ -100,6 +100,11 @@
             :title="`该会话已立案 ${row.case_count} 项, 跳案例工作台处置`"
             @click.stop="router.push({ path: '/admin/cases', query: { keyword: row.session_id } })"
           >立案</el-button>
+          <el-button
+            v-else-if="row.verdict === 'fail'" link type="warning" size="small"
+            :title="'同题已并进既有案例 (30 天一案), 点击直达归并案例'"
+            @click.stop="gotoMerged(row)"
+          >{{ mergedLoading === row.session_id ? "查找…" : "归并案" }}</el-button>
         </template>
       </el-table-column>
       <template #empty>
@@ -235,7 +240,8 @@
               <el-link type="primary" :underline="false" @click="router.push({ path: '/admin/cases', query: { keyword: qcDetail.session_id } })">去案例工作台 ›</el-link>
             </template>
             <template v-else-if="qcDetail.verdict === 'fail'">
-              <span class="muted">判定不合格但未单独开案 — 同题已并入既有案例组 (30 天一案), 可在案例工作台按问题句搜索</span>
+              <span class="muted">判定不合格但未单独开案 — 同题已并入既有案例组 (30 天一案) </span>
+              <el-link type="primary" :underline="false" @click="gotoMerged({ session_id: qcDetail.session_id })">直达归并案例 ›</el-link>
             </template>
             <template v-else><span class="muted">质检合格 · 无问题案例</span></template>
           </div>
@@ -280,6 +286,7 @@ import {
   replayQualitySession,
   getReplayStatus,
   humanVerdictQualitySession,
+  findMergedBadcase,
   type QcSessionRow,
   type QualityProblem,
 } from "@/api/closedLoop"
@@ -291,6 +298,25 @@ const route = useRoute()
 
 // ── 页签: 质检记录 (全量会话判定) / 问题案例 (归因整改闭环) ──
 // ── 统一会话质检列表 (判定 ⟕ 问题案例, 会话维度一行) ──
+const mergedLoading = ref("")
+
+// 未立案 fail 记录直达归并案例: 反查 (问题轮客户句算去重键匹配 pending 案)
+async function gotoMerged(row: { session_id: string }) {
+  mergedLoading.value = row.session_id
+  try {
+    const r = await findMergedBadcase(row.session_id)
+    if (r.badcase_id) {
+      router.push({ path: "/admin/cases", query: { case_id: r.badcase_id } })
+    } else {
+      ElMessage.info(r.reason === "not_merged" ? "未找到归并案例 — 该题可能已被处置结案, 可按问题句搜索" : "该会话无不合格判定或无对话轮次")
+    }
+  } catch {
+    /* handled */
+  } finally {
+    mergedLoading.value = ""
+  }
+}
+
 const qcRows = ref<QcSessionRow[]>([])
 const qcTotal = ref(0)
 const qcPage = ref(1)

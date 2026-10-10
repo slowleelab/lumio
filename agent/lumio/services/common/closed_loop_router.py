@@ -221,6 +221,84 @@ async def _batch_attribute_task(request: Request, limit: int, flt: dict[str, Any
         _batch_state["running"] = False
 
 
+@router.get("/badcases/merged-by-session/{session_id}")
+async def find_merged_badcase(session_id: str, user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
+    """反查未立案 fail 会话归并到的案例 (质检 → 案例工作台直达)。
+
+    未立案记录 = 同题已并进既有 pending 案例 (capture 去重聚合)。此处按该会话
+    质检判定的问题轮取客户句 (与 capture 同口径), 算 dedup_key 反查归并案。
+    单次点击单次查询 — 列表不预查, 零列表开销。
+    """
+    from lumio.services.common.badcase_loop import dedup_key
+    from lumio.shared.orm_models import Badcase, DialogueLog, QualityRecord
+
+    signal_source_qa = "qa_scan"
+
+    # 取最近一条"带问题项"的 fail 判定 — 人工复检落库可能不带 problems (空数组),
+    # 此时取更早的 AI 判定才能拿到问题轮 (现场: replay-sim-knowledge_gap-17)
+    qr_rows = (
+        (
+            await db.execute(
+                select(QualityRecord.problems)
+                .where(QualityRecord.session_id == session_id, QualityRecord.verdict == "fail")
+                .order_by(QualityRecord.scanned_at.desc())
+                .limit(5)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    qr = next((p for p in qr_rows if p), None)
+    if qr is None and qr_rows:
+        return {"badcase_id": None, "reason": "fail_without_problems"}
+    turns = (
+        await db.execute(
+            select(DialogueLog.speaker, DialogueLog.content)
+            .where(DialogueLog.session_id == session_id)
+            .order_by(DialogueLog.timestamp)
+        )
+    ).all() or []
+    if not turns:
+        return {"badcase_id": None, "reason": "no_turns"}
+    first_customer = next((c for sp, c in turns if sp == "customer"), turns[0][1])
+    problem_turns: list[int] = []
+    for p in qr or []:
+        try:
+            t = int(p.get("turn")) if p.get("turn") is not None else None
+        except (TypeError, ValueError):
+            t = None
+        if t and 1 <= t <= len(turns) and t not in problem_turns:
+            problem_turns.append(t)
+    # 与 capture 同口径: 问题轮的客户句 (bot 轮退回首句)
+    candidates = []
+    for t in problem_turns[:3]:
+        idx = t - 1
+        content = turns[idx][1] if turns[idx][0] == "customer" else first_customer
+        if content:
+            candidates.append(dedup_key(content))
+    if not candidates:
+        candidates = [dedup_key(first_customer or "")]
+    row = (
+        await db.execute(
+            select(Badcase.id, Badcase.user_input, Badcase.signal_detail)
+            .where(
+                Badcase.dedup_group_id.in_(candidates),
+                Badcase.signal_source == signal_source_qa,
+                Badcase.fix_status == "pending",
+            )
+            .order_by(Badcase.created_at.desc())
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return {"badcase_id": None, "reason": "not_merged"}
+    return {
+        "badcase_id": str(row.id),
+        "user_input": row.user_input[:60],
+        "occurrences": int((row.signal_detail or {}).get("occurrences", 1)),
+    }
+
+
 @router.post("/badcases/attribute-batch")
 async def attribute_batch(user: AdminOnlyUser, request: Request, body: dict[str, Any] | None = None) -> dict[str, Any]:
     """批量归因待归因坏例 (后台任务; 可带 signal_source/keyword 过滤, 按当前筛选范围跑)"""
