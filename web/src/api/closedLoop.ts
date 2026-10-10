@@ -305,3 +305,13 @@ export interface QualityTrendPoint {
 export function getQualityTrend(days = 14): Promise<{ days: QualityTrendPoint[] }> {
   return client.get("/admin/closed-loop/quality/trend", { params: { days } })
 }
+
+// 未立案 fail 会话反查归并案例 (质检 → 案例工作台直达)
+export function findMergedBadcase(sessionId: string): Promise<{
+  badcase_id: string | null
+  reason?: string
+  user_input?: string
+  occurrences?: number
+}> {
+  return client.get(`/admin/closed-loop/badcases/merged-by-session/${encodeURIComponent(sessionId)}`)
+}
