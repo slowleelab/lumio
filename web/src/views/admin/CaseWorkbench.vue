@@ -246,6 +246,10 @@
                 size="small" link type="primary" @click="gotoGroup"
               >同组治理 ›</el-button>
               <el-button
+                v-if="detail.session_id"
+                size="small" link type="primary" @click="router.push({ path: '/admin/badcase', query: { keyword: detail.session_id, session_id: detail.session_id } })"
+              >核查会话 ›</el-button>
+              <el-button
                 v-if="(detail.fix_status === 'pending' || detail.fix_status === 'reopened') && judgedDefect && judgedDefect !== 'uncertain'"
                 size="small" @click="attribEdit = !attribEdit"
               >{{ attribEdit ? "收起改判" : "改判" }}</el-button>
