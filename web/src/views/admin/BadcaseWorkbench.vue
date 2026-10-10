@@ -51,11 +51,17 @@
       <el-table-column label="轮数" width="54" align="center">
         <template #default="{ row }">{{ row.turns ?? "-" }}</template>
       </el-table-column>
-      <el-table-column label="判定" width="76" align="center">
+      <el-table-column label="判定" width="104" align="center">
         <template #default="{ row }">
           <el-tag v-if="row.verdict === 'pass'" size="small" type="success">合格</el-tag>
           <el-tag v-else-if="row.verdict" size="small" type="danger" :title="row.verdict === 'warn' ? '提醒级问题 (原判定: 提醒)' : ''">不合格</el-tag>
           <span v-else class="muted">-</span>
+          <el-tag
+            v-if="(row.case_count ?? 0) > 0"
+            size="small" type="warning" effect="plain" class="qc-case-badge"
+            :title="`已立案 ${row.case_count} 项, 点击去案例工作台处置`"
+            @click.stop="router.push({ path: '/admin/cases', query: { keyword: row.session_id } })"
+          >{{ row.case_count }} 案 ↗</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="状态" width="84" align="center">
@@ -86,9 +92,14 @@
           <span v-else class="muted">-</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="70" fixed="right">
+      <el-table-column label="操作" width="96" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click.stop="openQcDetail(row)">详情</el-button>
+          <el-button
+            v-if="(row.case_count ?? 0) > 0" link type="warning" size="small"
+            :title="`该会话已立案 ${row.case_count} 项, 跳案例工作台处置`"
+            @click.stop="router.push({ path: '/admin/cases', query: { keyword: row.session_id } })"
+          >立案</el-button>
         </template>
       </el-table-column>
       <template #empty>
@@ -913,6 +924,10 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+}
+.qc-case-badge {
+  cursor: pointer;
+  margin-left: 4px;
 }
 .qc-cases-digest {
   display: flex;
