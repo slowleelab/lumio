@@ -447,7 +447,7 @@ function fixTableFor(_row: Badcase): string | undefined {
 const fixStatusLabelMap: Record<string, string> = {
   pending: "待处置",
   fixing: "修复中",
-  canary: "已灰度",
+  canary: "灰度中",
   deployed: "已上线",
   verified: "已验证",
   reopened: "已重开",
@@ -1101,7 +1101,7 @@ function evidenceZh(text?: string | null): string {
 }
 
 function fixStatusLabel(s: string) {
-  const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "已灰度", deployed: "已上线", verified: "已验证", reopened: "已重开", rejected: "已驳回" }
+  const m: Record<string, string> = { pending: "待修", fixing: "修复中", canary: "灰度中", deployed: "已上线", verified: "已验证", reopened: "已重开", rejected: "已驳回" }
   return m[s] ?? s
 }
 function fixStatusType(s: string): string {

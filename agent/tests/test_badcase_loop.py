@@ -1031,3 +1031,64 @@ async def test_remote_recovery_reschedules_remote(monkeypatch) -> None:
     jc._schedule_remote_recovery.__wrapped__ if hasattr(jc._schedule_remote_recovery, "__wrapped__") else None
     # 直接调用内部恢复语义: 在无循环场景函数体走 except RuntimeError 同步复位 — 用线程模拟过于重,
     # 以行为断言代替: 当前测试在事件循环内, 该分支由下方空循环场景的既有覆盖兜底。
+
+
+class TestStateMachineV2:
+    """状态机 v2: canary 可选旁路 (fixing→deployed 直达) + rejected 可重开"""
+
+    def _mk(self, *, status: str = "fixing", layer: str | None = "layer_3", fix_table: str | None = "B_intent"):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from uuid_utils import uuid7
+
+        bc = Badcase(
+            id=uuid7(),
+            trace_id="t",
+            session_id="s",
+            signal_source="transfer",
+            user_input="x",
+            fix_status=status,
+            root_cause_layer=layer,
+            fix_table=fix_table,
+        )
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.get = AsyncMock(return_value=bc)
+        session.commit = AsyncMock()
+
+        class F:
+            def __call__(self):
+                return session
+
+        return bc, F
+
+    async def test_fixing_direct_to_deployed(self) -> None:
+        """主链直达: fixing → deployed 不再强制路过 canary"""
+        bc, f = self._mk(status="fixing")
+        ok = await update_fix_status(f(), str(bc.id), fix_status="deployed", note="修复上线 (知识已入库)")
+        assert ok is True and bc.fix_status == "deployed"
+
+    async def test_canary_side_path_still_valid(self) -> None:
+        """旁路保留: fixing → canary → deployed 仍合法"""
+        bc, f = self._mk(status="fixing")
+        ok = await update_fix_status(f(), str(bc.id), fix_status="canary")
+        assert ok is True
+        ok2 = await update_fix_status(f(), str(bc.id), fix_status="deployed")
+        assert ok2 is True
+
+    async def test_rejected_can_reopen(self) -> None:
+        """误判恢复: rejected → pending 重开"""
+        bc, f = self._mk(status="rejected", layer=None, fix_table=None)
+        ok = await update_fix_status(f(), str(bc.id), fix_status="pending", note="误判重开")
+        assert ok is True and bc.fix_status == "pending"
+
+    async def test_skip_canary_from_pending_still_blocked(self) -> None:
+        """pending → deployed 仍禁止 (必须先确认根因进修复)"""
+        import pytest
+
+        from lumio.shared.exceptions import LumioError
+
+        bc, f = self._mk(status="pending")
+        with pytest.raises(LumioError):
+            await update_fix_status(f(), str(bc.id), fix_status="deployed")

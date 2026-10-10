@@ -693,14 +693,21 @@ async def _inherit_group_progress(session_factory: async_sessionmaker[AsyncSessi
 
 # 处置状态机转移表: 后端守门, 前端按钮只是引导不是约束。
 # 终态 (verified/rejected) 拒绝一切流转 — 重开靠重新采集开新行 (去重机制按处置终态开新组)。
+# 状态机 v2 (运营修复场景重设计):
+# - canary 降为可选旁路: 修复是一次性运营动作 (补知识/改词表/改提示词), 无真实
+#   "灰度环境" — deployed 实测备注 0/105 提及灰度流程, canary 全部为批量路过。
+#   fixing → deployed 直达为主链; 想分两步的保留 fixing → canary → deployed。
+# - rejected 允许重开: 误判驳回 (规模轮误采集等) 后情况变化时, 不必等重新采集
+#   开新行 (rejected 终态曾让 149 例中的误判永久死亡)。
+# - verified 唯一达成路径仍是重放验证 (组级一键根治)。
 _FIX_TRANSITIONS: dict[str, frozenset[str]] = {
     "pending": frozenset({"fixing", "rejected"}),
-    "fixing": frozenset({"canary", "rejected"}),
+    "fixing": frozenset({"canary", "deployed", "rejected"}),
     "canary": frozenset({"deployed", "rejected"}),
     "deployed": frozenset({"verified", "reopened", "rejected"}),
     "reopened": frozenset({"fixing", "rejected"}),
     "verified": frozenset(),
-    "rejected": frozenset(),
+    "rejected": frozenset({"pending"}),  # 误判恢复: 重开回待处置
 }
 
 

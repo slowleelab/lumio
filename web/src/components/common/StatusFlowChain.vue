@@ -37,7 +37,8 @@
         <el-button size="small" link type="warning" :loading="loading" @click="$emit('advance', 'fixing')">重新修复</el-button>
       </template>
       <template v-if="current === 'rejected'">
-        <span class="branch-reject">✕ 已驳回 (终态) — {{ rejectNote }}</span>
+        <span class="branch-reject">✕ 已驳回 — {{ rejectNote }}</span>
+        <el-button size="small" link type="warning" :loading="loading" @click="$emit('advance', 'pending')">误判? 重开</el-button>
       </template>
       <el-button
         v-if="!terminal && allowReject"
@@ -56,7 +57,7 @@
  * 状态流转节点链 — 每段流转挂明确命名的动作触发 (边即按钮)
  *
  * 与后端 badcase_store._FIX_TRANSITIONS 同构:
- *   pending → fixing → canary → deployed → verified(终)
+ *   pending → fixing → deployed → verified(终); canary 为可选旁路 (fixing→canary→deployed)
  *   各态 → rejected(终); deployed → reopened → fixing(回环)
  * 动作语义: 确认根因 / 修复完成 / 灰度通过 / 重放验证 — verified 只能经
  * 重放验证达成 (调用方在 advance 分发中路由到重放动作, 不做直接状态改写)。
@@ -97,26 +98,37 @@ const emit = defineEmits<{ (e: "advance", to: Status): void }>()
 const NODES: { key: Status; label: string; hint: string }[] = [
   { key: "pending", label: "待处置", hint: "案例已立案待处理" },
   { key: "fixing", label: "修复中", hint: "修复进行中" },
-  { key: "canary", label: "已灰度", hint: "灰度环境生效" },
+  { key: "canary", label: "灰度中 (可选)", hint: "修复动作全量生效前的中间态 — 运营修复通常直达上线, 此节点保留给需要分步的场景" },
   { key: "deployed", label: "已上线", hint: "全量生效" },
   { key: "verified", label: "已验证", hint: "重放验证通过 · 销项 (终态)" },
 ]
 
 const EDGES: EdgeDef[] = [
   { from: "pending", to: "fixing", label: "确认根因", batchLabel: "批量确认根因", blockedHint: "先完成 GLM 裁判归因, 根因明确后解锁" },
-  { from: "fixing", to: "canary", label: "修复完成", batchLabel: "批量转灰度" },
-  { from: "canary", to: "deployed", label: "灰度通过", batchLabel: "批量上线" },
+  { from: "fixing", to: "deployed", label: "修复上线", batchLabel: "批量上线", blockedHint: "" },
+  { from: "fixing", to: "canary", label: "先灰度 (可选)", batchLabel: "批量转灰度", blockedHint: "" },
+  { from: "canary", to: "deployed", label: "灰度通过", batchLabel: "批量上线", blockedHint: "" },
   { from: "deployed", to: "verified", label: "重放验证", batchLabel: "" },
 ]
 
-const chainNodes = computed(() => (props.batchMode ? NODES.filter((n) => n.key !== "verified") : NODES))
-const chainEdges = computed(() => (props.batchMode ? EDGES.filter((e) => e.to !== "verified") : EDGES))
+// 主链四节点 (canary 可选旁路, 仅当前有 canary 案例或 current=canary 时显示);
+// segments 按节点序配对边, 可选节点插入时自动用旁路边
+const chainNodes = computed(() => {
+  const showCanary = props.current === "canary" || (props.counts?.canary ?? 0) > 0
+  return NODES.filter((n) => n.key !== "canary" || showCanary)
+})
+const chainEdges = computed(() => {
+  const showCanary = props.current === "canary" || (props.counts?.canary ?? 0) > 0
+  if (props.batchMode) return EDGES.filter((e) => e.to !== "verified" && (e.to !== "canary" || showCanary))
+  if (!showCanary) return EDGES.filter((e) => e.to !== "canary" && e.from !== "canary")
+  return EDGES.filter((e) => e.to !== "verified")
+})
 
 const segments = computed(() =>
   chainNodes.value.map((node, i) => ({ node, edge: chainEdges.value[i] ?? null })),
 )
 
-const terminal = computed(() => props.current === "verified" || props.current === "rejected")
+const terminal = computed(() => props.current === "verified")  // rejected 可重开, 非终态
 const mainPosition = computed<number>(() => {
   if (props.current === "reopened") return 1
   const idx = chainNodes.value.findIndex((n) => n.key === props.current)

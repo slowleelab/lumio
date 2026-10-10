@@ -337,7 +337,7 @@ const FIX_GUIDE_TO: Record<string, string> = {
 const FIX_STATUS: Record<string, { label: string; type: string }> = {
   pending: { label: "待处置", type: "info" },
   fixing: { label: "修复中", type: "warning" },
-  canary: { label: "已灰度", type: "primary" },
+  canary: { label: "灰度中 (可选)", type: "primary" },
   deployed: { label: "已上线", type: "success" },
   reopened: { label: "复检未过", type: "danger" },
 }
@@ -441,7 +441,7 @@ async function savePlan() {
 
 async function runBatch(target: string) {
   if (!detail.value) return
-  const verb = { fixing: "确认根因并转入修复中", canary: "批量转灰度", deployed: "批量上线" }[target] ?? target
+  const verb = { fixing: "确认根因并转入修复中", canary: "批量转灰度 (可选旁路)", deployed: "批量上线" }[target] ?? target
   const n = batchCounts.value[target === "fixing" ? "pending" : target === "canary" ? "fixing" : "canary"] ?? 0
   await ElMessageBox.confirm(
     target === "fixing"
