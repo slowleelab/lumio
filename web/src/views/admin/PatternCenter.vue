@@ -117,7 +117,7 @@
       <!-- 组内案例: 全宽表格 (列不再挤压) -->
       <div class="case-section">
         <div class="section-title">组内案例 <span class="muted section-hint">({{ detail.cases.length }} 例 · 按会话时间倒序)</span></div>
-        <el-table :data="detail.cases" size="small" class="case-table" max-height="520">
+        <el-table :data="detail.cases" size="small" class="case-table" >
           <el-table-column label="问题句" min-width="300">
             <template #default="{ row }">
               <div class="case-q">{{ row.user_input }}</div>
