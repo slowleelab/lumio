@@ -2,16 +2,20 @@
   <div class="badcase-page">
     <div class="page-header">
       <h2>智能质检</h2>
+      <span v-if="qcStats.total > 0" class="qc-summary muted">
+        合格率 {{ qcStats.passRate }}% · 不合格 {{ qcStats.fail }} · 提醒 {{ qcStats.warn }} · 合格 {{ qcStats.pass }} / 共 {{ qcStats.total }}
+      </span>
     </div>
 
 
     <div class="filters">
-      <el-select v-model="qcFilters.category" placeholder="判定" clearable size="small" style="width: 110px" @change="reloadQc">
-        <el-option label="合格" value="pass" />
-        <el-option label="提醒级" value="warn" />
-        <el-option label="不合格" value="fail" />
-        <el-option label="未质检" value="unscanned" />
-      </el-select>
+      <div class="filter-chips">
+        <button
+          v-for="c in FILTER_CHIPS" :key="c.value"
+          class="chip" :class="{ active: qcFilters.category === c.value }"
+          @click="qcFilters.category = qcFilters.category === c.value ? '' : c.value; reloadQc()"
+        >{{ c.label }}</button>
+      </div>
       <el-input
         v-model="qcFilters.keyword"
         placeholder="搜索会话 ID / 用户输入…"
@@ -125,7 +129,7 @@
 
 
     <!-- ══ 质检详情抽屉 · 工作台三段式: 结论 Hero → 证据 Tabs → 吸底行动区 ══ -->
-    <el-dialog v-model="qcDetailVisible" width="88%" top="3vh" destroy-on-close class="qc-center-dialog" :close-on-click-modal="false">
+    <el-dialog v-model="qcDetailVisible" width="64%" top="4vh" destroy-on-close class="qc-center-dialog" :close-on-click-modal="false">
       <template #header>
         <div class="drawer-title">
           <span class="session-id">{{ qcDetail?.session_id }}</span>
@@ -136,7 +140,7 @@
 
       <div v-if="qcDetail" class="qc-detail" v-loading="qcReplayLoading">
         <!-- ── 结论 Hero: 10 秒扫视 (判定 · 摘要 · 元信息) ── -->
-        <div class="qc-hero" :class="`qc-hero--${qcDetail.verdict || 'none'}`">
+        <div class="qc-hero">
           <div class="qc-hero-main">
             <div class="qc-hero-verdict">{{ verdictLabel(qcDetail.verdict || "") || "未质检" }}</div>
             <div class="qc-hero-meta">
@@ -322,6 +326,23 @@ const qcTotal = ref(0)
 const qcPage = ref(1)
 const qcPageSize = ref(50)
 const qcLoading = ref(false)
+const FILTER_CHIPS = [
+  { label: "全部", value: "" },
+  { label: "不合格", value: "fail" },
+  { label: "提醒", value: "warn" },
+  { label: "合格", value: "pass" },
+  { label: "未质检", value: "unscanned" },
+]
+
+// 统计 (当前页数据派生, 零额外请求)
+const qcStats = computed(() => {
+  const t = qcRows.value.length || 0
+  const pass = qcRows.value.filter((r) => r.verdict === "pass").length
+  const warn = qcRows.value.filter((r) => r.verdict === "warn").length
+  const fail = qcRows.value.filter((r) => r.verdict === "fail").length
+  return { total: t, pass, warn, fail, passRate: t ? Math.round((pass / t) * 100) : 0 }
+})
+
 const qcFilters = ref<{ category: string; keyword: string }>({ category: "", keyword: "" })
 const selected = ref<QcSessionRow[]>([])
 
@@ -1140,4 +1161,19 @@ onUnmounted(() => {
   overflow: auto;
   padding-top: 12px;
 }
+
+/* ── 深度优化: chips 筛选 + 统计行 + hero 简化 ── */
+.qc-summary { font-size: 12px; margin-left: 12px; }
+.filter-chips { display: flex; gap: 6px; }
+.chip {
+  padding: 4px 12px; font-size: 12px; border: 1px solid var(--el-border-color);
+  border-radius: 999px; background: transparent; cursor: pointer; color: var(--color-text-secondary);
+  transition: all 0.15s;
+  &:hover { border-color: var(--el-color-primary); color: var(--el-color-primary); }
+  &.active { background: var(--el-color-primary); border-color: var(--el-color-primary); color: #fff; }
+}
+.qc-hero { padding: 10px 14px; border-bottom: 1px solid var(--el-border-color-lighter); }
+.qc-hero-verdict { font-size: 16px; font-weight: 600; }
+.qc-hero-summary { font-size: 12.5px; line-height: 1.6; }
+.qc-center-dialog :deep(.el-dialog__body) { max-height: 68vh; overflow-y: auto; padding: 0 20px 12px; }
 </style>
