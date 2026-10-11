@@ -1,6 +1,6 @@
 <template>
   <div class="pattern-page">
-    <!-- 飞轮漏斗: 发现→处置→修复→上线→根治 一屏判读 (P0 打通全链条) -->
+    <!-- ═══ 顶部: 飞轮漏斗带 (全宽横条, 阶段可点下钻) ═══ -->
     <div class="flywheel" v-if="funnel">
       <div class="fw-stages">
         <template v-for="(st, i) in funnel.stages" :key="st.key">
@@ -28,125 +28,81 @@
         · 复发案例自动继承组状态 · 上线后组级重放一键根治验证
       </div>
     </div>
-    <div class="page-header">
-      <h2>
-        问题治理
-        <span class="page-subtitle">共性问题聚成专项 · 一次修复覆盖整组 — 与案例工作台分工: 那边管单案例流转, 这里管模式治理</span>
-      </h2>
-      <div class="header-actions">
-        <el-button size="small" @click="load">刷新</el-button>
+
+    <!-- ═══ 组选择带: 横向滚动卡条 (替代左列列表, 详情占满宽度) ═══ -->
+    <div class="group-strip" v-loading="loading">
+      <div
+        v-for="g in visibleGroups" :key="g.group_key"
+        class="group-card"
+        :class="{ active: detail?.group_key === g.group_key }"
+        @click="openGroup(g)"
+      >
+        <div class="gc-head">
+          <span class="gc-intent">{{ intentLabel(g.intent_label) }}</span>
+          <span class="muted">×</span>
+          <span class="gc-layer">{{ layerLabel(g.root_cause_layer) }}</span>
+        </div>
+        <el-tag size="small" :type="fixTableType(g.fix_table)" effect="plain" class="gc-ft">{{ fixTableLabel(g.fix_table) }}</el-tag>
+        <div class="gc-meta">
+          <span class="gc-count">{{ g.case_count }} 例</span>
+          <span v-if="g.pending_count > 0" class="gc-pending">{{ g.pending_count }} 待处置</span>
+          <el-tag v-if="g.plan_status === 'planned'" size="small" type="primary" effect="plain">方案已定</el-tag>
+          <el-tag v-else-if="g.plan_status === 'fixing'" size="small" type="warning" effect="plain">修复中</el-tag>
+        </div>
+      </div>
+      <div v-if="unattributed > 0" class="gc-unattributed muted" title="待归因案例未入组">
+        +{{ unattributed }} 例待归因 →
+        <el-link type="primary" :underline="false" @click="router.push('/admin/cases')">去案例工作台</el-link>
       </div>
     </div>
 
-    <el-alert type="info" :closable="false" class="hint">
-      <template #title>
-        问题组由未结案例按「业务分类 × 根因层」实时聚合 — 新案例自动入组, 治理完成后同类复发自动重开组。
-        <template v-if="unattributed > 0">
-          另有 <b>{{ unattributed }}</b> 例待归因案例未入组（归因需人工把关, 到
-          <el-link type="primary" :underline="false" @click="router.push('/admin/cases')">案例工作台</el-link> 处理）。
-        </template>
-      </template>
-    </el-alert>
-
-    <div class="pattern-layout">
-      <!-- 左: 问题组列表 -->
-      <div class="group-panel">
-        <el-table
-          v-loading="loading"
-          :data="visibleGroups"
-          size="small"
-          highlight-current-row
-          @row-click="(row: PatternGroup) => openGroup(row)"
-        >
-          <el-table-column label="问题组" min-width="180">
-            <template #default="{ row }">
-              <div class="group-name">
-                <span class="group-intent">{{ intentLabel(row.intent_label) }}</span>
-                <span class="muted">×</span>
-                <span>{{ layerLabel(row.root_cause_layer) }}</span>
-              </div>
-              <el-tag size="small" :type="fixTableType(row.fix_table)" effect="plain" class="group-ft">{{ fixTableLabel(row.fix_table) }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="案例 / 待处置" width="112" align="center">
-            <template #default="{ row }">
-              <span class="case-count">{{ row.case_count }}</span>
-              <span class="muted count-sep"> / </span>
-              <span :class="{ 'pending-hot': row.pending_count > 0 }" title="待处置">{{ row.pending_count }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="方案" width="86" align="center">
-            <template #default="{ row }">
-              <el-tag v-if="row.plan_status === 'none'" size="small" type="info" effect="plain">未定方案</el-tag>
-              <el-tag v-else-if="row.plan_status === 'planned'" size="small" type="primary" effect="plain">方案已定</el-tag>
-              <el-tag v-else size="small" type="warning" effect="plain">修复中</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="最近发生" width="76" align="center">
-            <template #default="{ row }">{{ fmtTime(row.last_seen) }}</template>
-          </el-table-column>
-        </el-table>
+    <!-- ═══ 组详情: 全宽单列 (替代右列, 案例表不再被挤压) ═══ -->
+    <div class="detail-full" v-if="detail" v-loading="detailLoading">
+      <!-- 治理头: 组名 + 态势数字 + 主行动 -->
+      <div class="detail-hero">
+        <div class="hero-left">
+          <div class="hero-title">
+            <span class="group-intent big">{{ intentLabel(detail.intent_label) }}</span>
+            <span class="muted">×</span>
+            <span class="big">{{ layerLabel(detail.root_cause_layer) }}</span>
+            <el-tag size="small" :type="fixTableType(detail.fix_table)" effect="light">{{ fixTableLabel(detail.fix_table) }}</el-tag>
+          </div>
+          <div class="hero-stats">
+            <span class="stat"><b>{{ detail.case_count }}</b> 案例</span>
+            <span v-if="detailPending > 0" class="stat warn"><b>{{ detailPending }}</b> 待处置</span>
+            <span v-if="detail.unconfirmed_count > 0" class="stat warn"><b>{{ detail.unconfirmed_count }}</b> 根因待确认</span>
+            <span class="stat"><b>{{ detail.case_count - detail.unconfirmed_count }}</b> 已确认</span>
+            <span v-if="detail.plan_owner" class="stat">方案 · {{ detail.plan_owner }}</span>
+          </div>
+        </div>
+        <div class="hero-actions">
+          <el-button
+            v-if="detail.cases.some((c: PatternCase) => c.fix_status === 'deployed')"
+            type="success" size="small" plain :loading="recheck.running"
+            @click="runGroupRecheck"
+          >{{ recheck.running ? `根治验证中 ${recheck.done}/${recheck.total}` : "⚡ 组级重放验证 (一键根治)" }}</el-button>
+          <el-link v-if="fixGuideTo" type="primary" :underline="false" @click="router.push(fixGuideTo)">前往修复入口 ›</el-link>
+        </div>
       </div>
 
-      <!-- 右: 组详情 -->
-      <div class="detail-panel" v-loading="detailLoading">
-        <template v-if="detail">
-          <!-- 统计头: 组名 + 态势数字徽标 — 一眼掌握组规模与推进状态 -->
-          <div class="detail-hero">
-            <div class="hero-title">
-              <span class="group-intent big">{{ intentLabel(detail.intent_label) }}</span>
-              <span class="muted">×</span>
-              <span class="big">{{ layerLabel(detail.root_cause_layer) }}</span>
-              <el-tag size="small" :type="fixTableType(detail.fix_table)" effect="light">{{ fixTableLabel(detail.fix_table) }}</el-tag>
-            </div>
-            <div class="hero-stats">
-              <span class="stat"><b>{{ detail.case_count }}</b> 案例</span>
-              <span v-if="detailPending > 0" class="stat warn"><b>{{ detailPending }}</b> 待处置</span>
-              <span v-if="detail.unconfirmed_count > 0" class="stat warn"><b>{{ detail.unconfirmed_count }}</b> 根因待确认</span>
-              <span class="stat"><b>{{ detail.case_count - detail.unconfirmed_count }}</b> 已确认</span>
-              <span v-if="detail.plan_owner" class="stat">方案 · {{ detail.plan_owner }}</span>
-            </div>
-          </div>
-
-          <div class="section-title">
-            修复方案
-            <el-tooltip content="方案落定 = 治理人确认组内共性根因, 是批量执行的把关前置" placement="top">
-              <span class="muted section-hint">怎么修 · 谁负责 ⓘ</span>
-            </el-tooltip>
-          </div>
+      <!-- 方案 + 批量执行: 并排两卡 (不再上下堆叠) -->
+      <div class="action-duo">
+        <div class="duo-card">
+          <div class="duo-title">修复方案</div>
           <div class="plan-row">
-            <el-select v-model="planTable" size="small" style="width: 150px" placeholder="修复分流表">
+            <el-select v-model="planTable" size="small" style="width: 140px" placeholder="修复分流表">
               <el-option v-for="opt in planTableOptions" :key="opt.key" :label="opt.label" :value="opt.key">
-                <span>
-                  {{ opt.label }}
-                  <span v-if="opt.recommended" class="rec-mark">推荐</span>
-                </span>
+                <span>{{ opt.label }}<span v-if="opt.recommended" class="rec-mark">推荐</span></span>
               </el-option>
             </el-select>
-            <el-input v-model="planOwner" placeholder="负责人" size="small" style="width: 130px" />
-            <el-button size="small" type="primary" :loading="acting" @click="savePlan">保存方案</el-button>
-            <el-button size="small" link @click="planText = detail.plan_template || ''">按分流表生成建议</el-button>
-            <el-link
-              v-if="fixGuideTo"
-              type="primary"
-              :underline="false"
-              style="margin-left: 4px"
-              @click="router.push(fixGuideTo)"
-            >前往处理 ›</el-link>
+            <el-input v-model="planOwner" placeholder="负责人" size="small" style="width: 110px" />
+            <el-button size="small" type="primary" :loading="acting" @click="savePlan">保存</el-button>
+            <el-button size="small" link @click="planText = detail.plan_template || ''">生成建议</el-button>
           </div>
-          <el-input v-model="planText" type="textarea" :rows="4" placeholder="修复方案: 做什么、在哪做、验收标准 (可用「生成建议」出模板后修改)" />
-
-          <div class="section-title">
-            批量执行
-            <el-button
-              v-if="detail.cases.some((c: PatternCase) => c.fix_status === 'deployed')"
-              size="small" type="success" plain :loading="recheck.running" style="margin-left: 10px"
-              @click="runGroupRecheck"
-            >{{ recheck.running ? `根治验证中 ${recheck.done}/${recheck.total}` : "组级重放验证 (一键根治)" }}</el-button>
-            <el-tooltip content="节点带各状态案例数, 点击下一节点批量流转; 逐例走状态机守门, 单例失败不阻断" placement="top">
-              <span class="muted section-hint">点节点流转 ⓘ</span>
-            </el-tooltip>
-          </div>
+          <el-input v-model="planText" type="textarea" :rows="3" placeholder="修复方案: 做什么、在哪做、验收标准" />
+        </div>
+        <div class="duo-card">
+          <div class="duo-title">批量执行 <span class="muted duo-hint">点节点流转</span></div>
           <StatusFlowChain
             :current="batchChainCurrent"
             :counts="batchCounts"
@@ -155,39 +111,42 @@
             batch-mode
             @advance="(to: string) => runBatch(to)"
           />
+        </div>
+      </div>
 
-          <div class="section-title">组内案例 <span class="muted section-hint">({{ detail.cases.length }} 例, 按会话时间倒序)</span></div>
-          <el-table :data="detail.cases" size="small" class="case-table" max-height="420">
-            <el-table-column label="问题句" min-width="240">
-              <template #default="{ row }">
-                <div class="case-q">{{ row.user_input }}</div>
-              </template>
-            </el-table-column>
-            <el-table-column label="根因确认" width="96" align="center">
-              <template #default="{ row }">
-                <el-tag v-if="row.needs_human_review" size="small" type="warning" effect="plain">待确认</el-tag>
-                <el-tag v-else size="small" type="success" effect="plain">已确认</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="处置" width="86" align="center">
-              <template #default="{ row }">
-                <el-tag size="small" :type="fixStatusType(row.fix_status)" effect="plain">{{ fixStatusLabel(row.fix_status) }}</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="会话时间" width="86" align="center">
-              <template #default="{ row }">{{ fmtTime(row.session_time) }}</template>
-            </el-table-column>
-            <el-table-column label="操作" width="76">
-              <template #default="{ row }">
-                <el-button size="small" link type="primary" @click="gotoQc(row)">核查</el-button>
-                <el-button size="small" link type="primary" @click="router.push({ path: '/admin/cases', query: { case_id: row.id } })">处置</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </template>
-        <div v-else-if="!detailLoading" class="muted empty-hint">← 从左侧选择问题组</div>
+      <!-- 组内案例: 全宽表格 (列不再挤压) -->
+      <div class="case-section">
+        <div class="section-title">组内案例 <span class="muted section-hint">({{ detail.cases.length }} 例 · 按会话时间倒序)</span></div>
+        <el-table :data="detail.cases" size="small" class="case-table" max-height="520">
+          <el-table-column label="问题句" min-width="300">
+            <template #default="{ row }">
+              <div class="case-q">{{ row.user_input }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="根因确认" width="100" align="center">
+            <template #default="{ row }">
+              <el-tag v-if="row.needs_human_review" size="small" type="warning" effect="plain">待确认</el-tag>
+              <el-tag v-else size="small" type="success" effect="plain">已确认</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="处置" width="90" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" :type="fixStatusType(row.fix_status)" effect="plain">{{ fixStatusLabel(row.fix_status) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="会话时间" width="90" align="center">
+            <template #default="{ row }">{{ fmtTime(row.session_time) }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="120" align="center">
+            <template #default="{ row }">
+              <el-button size="small" link type="primary" @click="gotoQc(row)">核查</el-button>
+              <el-button size="small" link type="primary" @click="router.push({ path: '/admin/cases', query: { case_id: row.id } })">处置</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
       </div>
     </div>
+    <div v-else-if="!detailLoading" class="muted empty-hint">← 从上方选择问题组</div>
   </div>
 </template>
 
@@ -518,234 +477,112 @@ const visibleGroups = computed(() =>
 )
 </script>
 
-<style scoped>
+<style scoped lang="scss">
 .pattern-page {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  max-width: 1080px;
+  margin: 0 auto;
 }
 
-.page-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.page-header h2 {
-  margin: 0;
-  font-size: 18px;
-}
-
-.page-subtitle {
-  font-size: 12px;
-  color: var(--color-text-muted, #909399);
-  font-weight: normal;
-  margin-left: 8px;
-}
-
-.hint {
-  margin: 0;
-}
-
-/* 飞轮漏斗 */
+/* ── 飞轮漏斗带 (全宽横条) ── */
 .flywheel {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 10px 14px;
+  padding: 10px 16px;
   border: 1px solid var(--el-color-success-light-7);
   border-radius: 10px;
   background: linear-gradient(120deg, var(--el-color-success-light-9), var(--el-color-primary-light-9));
   margin-bottom: 12px;
 }
-.fw-stages {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
+.fw-stages { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .fw-stage {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  min-width: 58px;
-  padding: 4px 10px;
-  border-radius: 8px;
+  display: flex; flex-direction: column; align-items: center;
+  min-width: 58px; padding: 4px 10px; border-radius: 8px;
   background: var(--el-bg-color, #fff);
-  .fw-count {
-    font-size: 18px;
-    font-weight: 700;
-    color: var(--el-color-primary);
-    line-height: 1.2;
-  }
-  .fw-label {
-    font-size: 10.5px;
-    color: var(--color-text-secondary);
-  }
-  &.fw-reopened .fw-count {
-    color: var(--el-color-danger);
+  .fw-count { font-size: 18px; font-weight: 700; color: var(--el-color-primary); line-height: 1.2; }
+  .fw-label { font-size: 10.5px; color: var(--color-text-secondary); }
+  &.fw-reopened .fw-count { color: var(--el-color-danger); }
+  &.clickable { cursor: pointer; border: 1px solid var(--el-color-primary-light-5); transition: all 0.15s;
+    .fw-drill { font-style: normal; font-size: 11px; color: var(--el-color-primary); margin-left: 2px; }
+    &:hover { border-color: var(--el-color-primary); transform: translateY(-1px); }
   }
 }
-.fw-arrow {
-  color: var(--el-color-success);
-  font-size: 15px;
-  font-weight: 700;
-  &.fw-back {
-    color: var(--el-color-danger);
-  }
+.fw-arrow { color: var(--el-color-success); font-size: 15px; font-weight: 700; &.fw-back { color: var(--el-color-danger); } }
+.fw-meta { font-size: 11px; }
+
+/* ── 组选择带: 横向滚动卡条 ── */
+.group-strip {
+  display: flex; gap: 8px;
+  overflow-x: auto; padding-bottom: 8px;
+  margin-bottom: 14px;
+  scrollbar-width: thin;
+  &::-webkit-scrollbar { height: 5px; }
+  &::-webkit-scrollbar-thumb { background: var(--el-border-color-lighter); border-radius: 3px; }
 }
-.fw-meta {
-  font-size: 11px;
-}
-.fw-stage.clickable {
-  cursor: pointer;
-  border: 1px solid var(--el-color-primary-light-5);
+.group-card {
+  flex-shrink: 0; width: 180px;
+  border: 1px solid var(--el-border-color-lighter); border-radius: 10px;
+  padding: 10px 12px; cursor: pointer;
+  background: var(--el-bg-color, #fff);
   transition: all 0.15s;
-  .fw-drill {
-    font-style: normal;
-    font-size: 11px;
-    color: var(--el-color-primary);
-    margin-left: 2px;
-  }
-  &:hover {
-    border-color: var(--el-color-primary);
-    transform: translateY(-1px);
-  }
+  &:hover { border-color: var(--el-color-primary-light-5); transform: translateY(-1px); box-shadow: 0 3px 8px rgb(0 0 0 / 6%); }
+  &.active { border-color: var(--el-color-primary); background: var(--el-color-primary-light-9); }
+  .gc-head { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; flex-wrap: wrap; }
+  .gc-intent { font-size: 13px; font-weight: 700; color: var(--color-text-primary); }
+  .gc-layer { font-size: 13px; font-weight: 600; }
+  .gc-ft { margin-bottom: 6px; }
+  .gc-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+  .gc-count { color: var(--color-text-secondary); }
+  .gc-pending { color: var(--el-color-danger); font-weight: 600; }
+}
+.gc-unattributed {
+  flex-shrink: 0; display: flex; align-items: center; gap: 4px;
+  font-size: 11px; padding: 0 10px; white-space: nowrap;
 }
 
-.pattern-layout {
-  display: grid;
-  /* 左栏需容纳列表全部列 (问题组 180 + 案例/待处置 112 + 方案 86 + 时间 76 ≈ 470px) */
-  grid-template-columns: 486px 1fr;
-  gap: 14px;
-  align-items: start;
-}
-
-@media (max-width: 1100px) {
-  .pattern-layout {
-    grid-template-columns: 1fr;
-  }
-}
-
-.group-panel :deep(.el-table__row) {
-  cursor: pointer;
-}
-
-.group-name {
-  font-size: 13px;
-}
-
-.group-intent {
-  font-weight: 600;
-}
-
-.group-intent.big {
-  font-size: 16px;
-}
-
-.group-ft {
-  margin-top: 2px;
-}
-
-.case-count {
-  font-weight: 700;
-}
-
-.pending-hot {
-  color: var(--el-color-danger);
-  font-weight: 600;
-}
-
-.detail-panel {
-  min-height: 320px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  padding: 16px;
-}
-
+/* ── 组详情: 全宽单列 ── */
+.detail-full { min-height: 320px; }
 .detail-hero {
-  margin-bottom: 6px;
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 14px; margin-bottom: 14px; padding: 14px 16px;
+  border: 1px solid var(--el-color-primary-light-7); border-radius: 10px;
+  background: var(--el-color-primary-light-9, transparent);
 }
-
-.hero-title {
-  font-size: 15px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.hero-stats {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-top: 8px;
-
-  .stat {
-    font-size: 12px;
-    color: var(--color-text-secondary);
-
-    b {
-      font-size: 16px;
-      font-weight: 700;
-      color: var(--color-text-primary);
-      margin-right: 2px;
-    }
-
-    &.warn b {
-      color: var(--el-color-danger);
-    }
+.hero-title { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.hero-stats { display: flex; align-items: center; gap: 14px; margin-top: 8px;
+  .stat { font-size: 12px; color: var(--color-text-secondary);
+    b { font-size: 16px; font-weight: 700; color: var(--color-text-primary); margin-right: 2px; }
+    &.warn b { color: var(--el-color-danger); }
   }
 }
+.hero-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; flex-shrink: 0; }
 
-.section-title {
-  font-weight: 600;
-  margin: 16px 0 8px;
+/* ── 方案 + 批量执行: 并排两卡 ── */
+.action-duo {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px;
+  @media (max-width: 768px) { grid-template-columns: 1fr; }
 }
+.duo-card {
+  border: 1px solid var(--el-border-color-lighter); border-radius: 10px; padding: 12px 14px;
+  background: var(--el-bg-color, #fff);
+}
+.duo-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.duo-hint { font-weight: 400; font-size: 11px; margin-left: 4px; }
+.plan-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.rec-mark { margin-left: 6px; padding: 0 5px; font-size: 11px; line-height: 16px;
+  color: var(--el-color-primary); background: var(--el-color-primary-light-9); border-radius: 3px; }
+.count-sep { padding: 0 2px; font-size: 11px; }
 
-.section-hint {
-  font-weight: normal;
-  font-size: 12px;
-}
+/* ── 组内案例 ── */
+.case-section { margin-top: 4px; }
+.section-title { font-weight: 600; margin: 14px 0 8px; }
+.section-hint { font-weight: 400; font-size: 11px; }
+.case-q { font-size: 12.5px; line-height: 1.5; word-break: break-all; }
+.empty-hint { text-align: center; padding: 80px 0; }
+.muted { color: var(--color-text-muted, #909399); }
 
-.plan-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
-}
-
-.batch-row {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.case-q {
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.empty-hint {
-  text-align: center;
-  padding: 60px 0;
-}
-
-.muted {
-  color: var(--color-text-muted, #909399);
-}
-
-.rec-mark {
-  margin-left: 6px;
-  padding: 0 5px;
-  font-size: 11px;
-  line-height: 16px;
-  color: var(--el-color-primary);
-  background: var(--el-color-primary-light-9);
-  border-radius: 3px;
-}
-.count-sep {
-  padding: 0 2px;
-  font-size: 11px;
+@media (max-width: 768px) {
+  .detail-hero { flex-direction: column; }
+  .hero-actions { flex-direction: row; }
 }
 </style>
