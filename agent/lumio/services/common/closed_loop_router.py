@@ -7,6 +7,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumio.services.common.badcase_loop import (
     BadcaseJudge,
@@ -393,8 +394,6 @@ async def badcase_stats(user: AdminAgentUser, db: DbSession) -> dict[str, Any]:
 
     now = datetime.now(_UTC)
     day_ago = now - timedelta(days=1)
-    from sqlalchemy import func, select
-
     from lumio.shared.orm_models import Badcase
 
     total = (await db.execute(select(func.count()).select_from(Badcase))).scalar() or 0
@@ -623,8 +622,11 @@ async def quality_human_verdict_endpoint(
     """人工判定: 追加一条 judge_model=人工判定 的质检记录, 覆盖当前判定。
 
     与复检 (AI 重跑) 互补: 人对会话质量下结论 (合格/不合格), 状态列随之变为「人工质检」。
+    判定不合格 → 自动立案进案例工作台 (与 AI 裁判 fail 同走 capture_badcase,
+    走完整归因→治理闭环, 不再只是改个结论标签)。
     """
-    from lumio.services.common.badcase_store import record_human_verdict
+    from lumio.services.common.badcase_store import capture_badcase, record_human_verdict
+    from lumio.shared.orm_models import DialogueLog
 
     session_id = str((body or {}).get("session_id") or "").strip()
     verdict = str((body or {}).get("verdict") or "").strip()
@@ -641,10 +643,63 @@ async def quality_human_verdict_endpoint(
         note if isinstance(note, str) else None,
         [dict(p) for p in problems if isinstance(p, dict)][:8] if problems is not None else None,
     )
+
+    # 人工判定不合格 → 自动立案 (与 AI fail 同链路), 走完整归因→治理闭环
+    badcase_created = None
+    if verdict == "fail":
+        turns = (
+            await db.execute(
+                select(DialogueLog.speaker, DialogueLog.content)
+                .where(DialogueLog.session_id == session_id)
+                .order_by(DialogueLog.timestamp)
+            )
+        ).all() or []
+        if turns:
+            first_customer = next((c for sp, c in turns if sp == "customer"), turns[0][1])
+            # 与 AI 采集同口径: 取问题轮的客户句 (无轮次信息用首轮兜底)
+            problem_turns = []
+            for p in problems or rec.problems or []:
+                try:
+                    t = int(p.get("turn")) if p.get("turn") is not None else None
+                except (TypeError, ValueError):
+                    t = None
+                if t and 1 <= t <= len(turns) and t not in problem_turns:
+                    problem_turns.append(t)
+            if not problem_turns:
+                problem_turns = [1]
+            for turn_no in problem_turns[:3]:
+                idx = turn_no - 1
+                user_input = turns[idx][1] if turns[idx][0] == "customer" else first_customer
+                bot_output = next(
+                    (turns[j][1] for j in (idx, idx + 1) if j < len(turns) and turns[j][0] == "bot"),
+                    None,
+                )
+                bc = await capture_badcase(
+                    _session_factory_from_session(db),
+                    trace_id=session_id,
+                    session_id=session_id,
+                    customer_id=None,
+                    signal_source="qa_scan",
+                    intent_label=None,
+                    user_input=(user_input or "")[:500],
+                    bot_output=(bot_output or "")[:2000],
+                    signal_detail={
+                        "verdict": "fail",
+                        "problems": problems or rec.problems or [],
+                        "source": "human_verdict",
+                        "judge_model": "人工判定",
+                    },
+                    snapshot=None,
+                    session_time=rec.session_time,
+                )
+                if bc:
+                    badcase_created = str(bc.id)
+                    break  # 同题去重会归并, 只需首案
+
     # 判定改合格但案例还挂着 → 提示驳回 (两域独立, 不自动联动只提醒)
     open_badcase = False
     if verdict == "pass":
-        from sqlalchemy import func, select
+        from sqlalchemy import func
 
         from lumio.shared.orm_models import Badcase
 
@@ -665,7 +720,28 @@ async def quality_human_verdict_endpoint(
         "judge_model": rec.judge_model,
         "scanned_at": rec.scanned_at.isoformat() if rec.scanned_at else None,
         "open_badcase": bool(open_badcase),
+        "badcase_id": badcase_created,
     }
+
+
+def _session_factory_from_session(db: AsyncSession):
+    """从当前 AsyncSession 构造一个兼容 session_factory (capture_badcase 参数签名需要)"""
+
+    class _F:
+        def __call__(self):
+            return _SessionCtx(db)
+
+    class _SessionCtx:
+        def __init__(self, s):
+            self._s = s
+
+        async def __aenter__(self):
+            return self._s
+
+        async def __aexit__(self, *a):
+            return False
+
+    return _F()
 
 
 @router.post("/quality/rescan")
