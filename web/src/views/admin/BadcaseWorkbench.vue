@@ -639,25 +639,53 @@ const humanJudging = ref<"pass" | "fail" | null>(null)
 async function doHumanVerdict(v: "pass" | "fail") {
   if (!qcDetail.value) return
   const label = v === "pass" ? "合格" : "不合格"
-  try {
-    await ElMessageBox.confirm(
-      `以人工质检身份将该会话判定为「${label}」? 判定记录追加落库, 原 AI 判定保留可追溯。`,
-      "人工判定",
-      { type: "warning", confirmButtonText: `判定为${label}`, cancelButtonText: "取消" },
-    )
-  } catch {
-    return
+
+  // fail 时弹理由输入: 判定不合格必须说明原因 (无原因的 fail 无法指导修复)
+  let reason = ""
+  if (v === "fail") {
+    try {
+      const r = await ElMessageBox.prompt(
+        "请简述判为不合格的原因 (将作为问题标注落库, 指导后续归因修复):",
+        "人工判定 — 不合格",
+        {
+          type: "warning",
+          confirmButtonText: "判定为不合格",
+          cancelButtonText: "取消",
+          inputPlaceholder: "如: 第 2 轮客户问年费, 回复答非所问",
+          inputValidator: (val: string) => (val && val.trim().length >= 4) || "请填写至少 4 个字的原因",
+        },
+      )
+      reason = (r.value || "").trim()
+    } catch {
+      return
+    }
+  } else {
+    try {
+      await ElMessageBox.confirm(
+        `以人工质检身份将该会话判定为「合格」? 原 AI 判定保留可追溯。`,
+        "人工判定",
+        { type: "warning", confirmButtonText: "判定为合格", cancelButtonText: "取消" },
+      )
+    } catch {
+      return
+    }
   }
+
   humanJudging.value = v
   try {
-    const r = await humanVerdictQualitySession(qcDetail.value.session_id, v)
+    // fail 带理由: 构造 problems 数组传给后端 (作为人工标注落库)
+    const problemsToSend =
+      v === "fail" && reason
+        ? [{ type: "A", turn: 1, reason, source: "human" }]
+        : undefined
+    const r = await humanVerdictQualitySession(qcDetail.value.session_id, v, undefined, problemsToSend)
     if (qcDetail.value) {
       qcDetail.value = {
         ...qcDetail.value,
         verdict: v,
         qc_status: "human",
         judge_model: "人工判定",
-        problems: v === "pass" ? [] : qcDetail.value.problems,
+        problems: v === "pass" ? [] : problemsToSend ?? qcDetail.value.problems,
       }
     }
     await loadQc()
