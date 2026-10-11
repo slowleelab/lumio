@@ -17,6 +17,7 @@ import DialogueSimulator from "@/views/admin/DialogueSimulator.vue"
 import PromptCenter from "@/views/admin/PromptCenter.vue"
 import PatternCenter from "@/views/admin/PatternCenter.vue"
 import PipelineMap from "@/views/admin/PipelineMap.vue"
+import QualityLoop from "@/views/admin/QualityLoop.vue"
 
 const router = createRouter({
   history: createWebHistory(),
@@ -35,8 +36,9 @@ const router = createRouter({
         { path: "audit", name: "admin-audit", component: AuditConversations },
         { path: "ops-logs", name: "admin-ops-logs", component: OperationLogs },
         { path: "rag-metrics", name: "admin-rag-metrics", component: RagMetrics },
-        { path: "badcase", name: "admin-badcase", component: BadcaseWorkbench },
-        { path: "cases", name: "admin-cases", component: CaseWorkbench },
+        { path: "quality-loop", name: "admin-quality-loop", component: QualityLoop },
+        { path: "badcase", redirect: { path: "/admin/quality-loop", query: { tab: "qc" } } },
+        { path: "cases", redirect: { path: "/admin/quality-loop", query: { tab: "cases" } } },
         { path: "patterns", name: "admin-patterns", component: PatternCenter },
         { path: "pipeline", name: "admin-pipeline", component: PipelineMap },
         { path: "quality-report", name: "admin-quality-report", component: QualityReport },

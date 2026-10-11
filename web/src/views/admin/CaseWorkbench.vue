@@ -351,6 +351,7 @@
 </template>
 
 <script setup lang="ts">
+const emit = defineEmits<{ (e: "cases-loaded", total: number): void }>()
 import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
@@ -471,6 +472,7 @@ async function loadCases() {
     })
     caseRows.value = res.badcases ?? []
     caseTotal.value = res.total
+    emit("cases-loaded", res.total)
   } catch {
     /* handled */
   } finally {
