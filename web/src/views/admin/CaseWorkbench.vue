@@ -127,7 +127,7 @@
       @size-change="reloadCases"
     />
 
-    <el-dialog v-model="detailVisible" width="88%" top="3vh" destroy-on-close class="case-center-dialog" :close-on-click-modal="false">
+    <el-dialog v-model="detailVisible" width="64%" top="4vh" destroy-on-close class="case-center-dialog" :close-on-click-modal="false">
       <template #header>
         <div class="drawer-title">
           <el-tag :type="fixStatusType(detail?.fix_status || '')" effect="dark">{{ fixStatusLabel(detail?.fix_status || "") }}</el-tag>
@@ -1241,9 +1241,8 @@ onUnmounted(() => {
 }
 .detail-body { padding: 0 4px; }
 
-/* ── 一屏判读: 判读卡 (唯一常驻) + 次级折叠区 ── */
 .verdict-card {
-  padding: 14px 16px;
+  padding: 12px 14px;
 }
 .verdict-line {
   display: flex;
@@ -1262,13 +1261,14 @@ onUnmounted(() => {
   overflow: hidden;
   position: relative;
   &::after {
-    content: "";
+    content: "[点击展开]";
     position: absolute;
     bottom: 0;
-    left: 0;
     right: 0;
-    height: 1.6em;
-    background: linear-gradient(transparent, var(--color-bg-page, #f5f7fa));
+    font-size: 10px;
+    color: var(--el-color-primary);
+    background: var(--el-bg-color, #fff);
+    padding: 0 4px;
   }
   &.open {
     max-height: none;
@@ -1301,7 +1301,6 @@ onUnmounted(() => {
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 10px;
   padding: 12px 14px;
-  &.d-card-primary { border-color: var(--el-color-primary-light-7); }
   &.d-card-plain { padding: 4px 6px; background: transparent; border-style: dashed; }
 }
 .d-card-head {
@@ -1324,12 +1323,11 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
-  margin-top: 10px;
 }
 .io-block {
-  border-radius: 8px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
   .io-label {
     display: block;
     font-size: var(--fs-xs, 11px);
@@ -1344,14 +1342,11 @@ onUnmounted(() => {
   }
 }
 .io-user {
-  border-left: 3px solid var(--el-color-primary);
-  background: var(--el-color-primary-light-9);
   .io-label { color: var(--el-color-primary); }
 }
 .io-bot {
-  border-left: 3px solid var(--el-color-warning);
   background: var(--el-fill-color-light);
-  .io-label { color: var(--el-color-warning); }
+  .io-label { color: var(--color-text-muted); }
 }
 .attrib-empty {
   display: flex;
@@ -1659,7 +1654,7 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--color-text-secondary);
 }
-.case-center-dialog :deep(.el-dialog__body) {
+.case-center-dialog :deep(.el-dialog__body) { max-height: 72vh; overflow-y: auto; 
   height: 78vh;
   overflow: auto;
   padding-top: 12px;
