@@ -151,6 +151,21 @@
           <div class="qc-hero-summary">{{ qcDetail.summary || "裁判未给出摘要" }}</div>
         </div>
 
+        <!-- 人工判不合格内联理由编辑: 非模态, 可参照对话现场写多条理由 -->
+        <div v-if="humanFailDraft !== null" class="hf-editor">
+          <div class="hf-title">人工判定 — 不合格 <span class="muted">请逐条填写原因 (每行一条, 至少一条), 落库后作为问题标注指导修复</span></div>
+          <el-input
+            v-model="humanFailDraft"
+            type="textarea"
+            :rows="4"
+            placeholder="每行一条理由, 如:\n第 2 轮客户问年费, 回复答非所问\n第 3 轮客户要求转人工, 未触发转接"
+          />
+          <div class="hf-actions">
+            <el-button type="primary" size="small" :loading="humanJudging === 'fail'" @click="confirmHumanFail">确认判定为不合格</el-button>
+            <el-button size="small" @click="humanFailDraft = null">取消</el-button>
+          </div>
+        </div>
+
         <!-- ── 证据: 三个视图共享同一空间, 切换替代滚动 ── -->
         <el-tabs v-model="qcEvidenceTab" class="qc-evidence">
           
@@ -280,6 +295,7 @@
 </template>
 
 <script setup lang="ts">
+const emit = defineEmits<{ (e: "qc-loaded", total: number): void }>()
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { ElMessage, ElMessageBox } from "element-plus"
@@ -357,6 +373,7 @@ async function loadQc() {
     })
     qcRows.value = res.sessions
     qcTotal.value = res.total
+    emit("qc-loaded", res.total)
   } catch {
     /* handled */
   } finally {
@@ -640,26 +657,12 @@ async function doHumanVerdict(v: "pass" | "fail") {
   if (!qcDetail.value) return
   const label = v === "pass" ? "合格" : "不合格"
 
-  // fail 时弹理由输入: 判定不合格必须说明原因 (无原因的 fail 无法指导修复)
-  let reason = ""
+  // fail → 内联编辑模式 (非模态, 可参照对话现场写多条)
   if (v === "fail") {
-    try {
-      const r = await ElMessageBox.prompt(
-        "请简述判为不合格的原因 (将作为问题标注落库, 指导后续归因修复):",
-        "人工判定 — 不合格",
-        {
-          type: "warning",
-          confirmButtonText: "判定为不合格",
-          cancelButtonText: "取消",
-          inputPlaceholder: "如: 第 2 轮客户问年费, 回复答非所问",
-          inputValidator: (val: string) => (val && val.trim().length >= 4) || "请填写至少 4 个字的原因",
-        },
-      )
-      reason = (r.value || "").trim()
-    } catch {
-      return
-    }
-  } else {
+    humanFailDraft.value = ""
+    return // 等用户在详情内联编辑区填写后点确认
+  }
+  {
     try {
       await ElMessageBox.confirm(
         `以人工质检身份将该会话判定为「合格」? 原 AI 判定保留可追溯。`,
@@ -671,12 +674,29 @@ async function doHumanVerdict(v: "pass" | "fail") {
     }
   }
 
+  await sendHumanVerdict(v)
+}
+
+const humanFailDraft = ref<string | null>(null)
+
+async function confirmHumanFail() {
+  const raw = (humanFailDraft.value || "").trim()
+  const lines = raw.split(/\n+/).map((l) => l.trim()).filter((l) => l.length >= 2)
+  if (!lines.length) {
+    ElMessage.warning("请至少填写一条原因 (每行一条)")
+    return
+  }
+  await sendHumanVerdict("fail", lines)
+}
+
+async function sendHumanVerdict(v: "pass" | "fail", reasons?: string[]) {
+  if (!qcDetail.value) return
   humanJudging.value = v
   try {
-    // fail 带理由: 构造 problems 数组传给后端 (作为人工标注落库)
+    // 多条理由 → 多条问题标注 (每行一条 = 一个问题)
     const problemsToSend =
-      v === "fail" && reason
-        ? [{ type: "A", turn: 1, reason, source: "human" }]
+      v === "fail" && reasons?.length
+        ? reasons.slice(0, 5).map((reason, i) => ({ type: "A", turn: i + 1, reason, source: "human" }))
         : undefined
     const r = await humanVerdictQualitySession(qcDetail.value.session_id, v, undefined, problemsToSend)
     if (qcDetail.value) {
@@ -685,11 +705,12 @@ async function doHumanVerdict(v: "pass" | "fail") {
         verdict: v,
         qc_status: "human",
         judge_model: "人工判定",
-        problems: v === "pass" ? [] : problemsToSend ?? qcDetail.value.problems,
+        problems: v === "pass" ? [] : (problemsToSend as QualityProblem[]) ?? qcDetail.value.problems,
       }
     }
+    humanFailDraft.value = null
     await loadQc()
-    ElMessage.success(`人工判定完成: ${label}`)
+    ElMessage.success(`人工判定完成: ${v === "pass" ? "合格" : "不合格"}`)
     if (r?.open_badcase) {
       ElMessage.warning("该会话仍有待处置的问题案例 — 判定已改合格, 建议进整改闭环驳回该案例", { duration: 6000 })
     }
@@ -1204,4 +1225,15 @@ onUnmounted(() => {
 .qc-hero-verdict { font-size: 16px; font-weight: 600; }
 .qc-hero-summary { font-size: 12.5px; line-height: 1.6; }
 .qc-center-dialog :deep(.el-dialog__body) { max-height: 68vh; overflow-y: auto; padding: 0 20px 12px; }
+
+/* 人工判不合格内联编辑区 */
+.hf-editor {
+  margin: 10px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--el-color-warning-light-6);
+  border-radius: 8px;
+  background: var(--el-color-warning-light-9, #fdf6ec);
+  .hf-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; .muted { font-weight: 400; font-size: 11px; margin-left: 6px; } }
+  .hf-actions { display: flex; gap: 8px; margin-top: 8px; }
+}
 </style>

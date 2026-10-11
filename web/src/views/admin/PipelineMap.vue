@@ -701,7 +701,7 @@ watch(detailOpen, (v) => {
   if (!v) selected.value = null
 })
 function gotoPatterns(defect: string) {
-  router.push({ path: "/admin/patterns", query: { defect } })
+  router.push({ path: "/admin/quality-loop", query: { tab: "cases", defect } })
 }
 
 // ── 实时流量徽标 ──

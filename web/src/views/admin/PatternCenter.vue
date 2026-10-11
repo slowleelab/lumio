@@ -37,7 +37,7 @@
         </el-table>
         <div v-if="unattributed > 0" class="unattributed-row muted">
           另有 {{ unattributed }} 例待归因 →
-          <el-link type="primary" :underline="false" @click="router.push('/admin/cases')">去案例工作台</el-link>
+          <el-link type="primary" :underline="false" @click="router.push({ path: '/admin/quality-loop', query: { tab: 'cases' } })">去案例工作台</el-link>
         </div>
       </div>
 
@@ -100,7 +100,7 @@
             <el-table-column label="" width="100" align="center">
               <template #default="{ row }">
                 <el-button size="small" link type="primary" @click="gotoQc(row)">核查</el-button>
-                <el-button size="small" link type="primary" @click="router.push({ path: '/admin/cases', query: { case_id: row.id } })">处置</el-button>
+                <el-button size="small" link type="primary" @click="router.push({ path: '/admin/quality-loop', query: { tab: 'cases', case_id: row.id } })">处置</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -325,7 +325,7 @@ function fixTableType(v: string | null) { const m: Record<string, string> = { A_
 function fixStatusType(s: string) { const m: Record<string, string> = { pending: "info", fixing: "warning", canary: "primary", deployed: "success", verified: "success", reopened: "danger", rejected: "info" }; return m[s] ?? "info" }
 function fmtTime(t: string | null) { return t ? t.slice(5, 10) : "-" }
 function gotoQc(row: { session_id: string }) {
-  router.push({ path: "/admin/badcase", query: { keyword: row.session_id, session_id: row.session_id } })
+  router.push({ path: "/admin/quality-loop", query: { tab: "qc", keyword: row.session_id, session_id: row.session_id } })
 }
 function fixStatusTypeCss(s: string) { return fixStatusType(s) }
 

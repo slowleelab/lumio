@@ -15,13 +15,9 @@
         class="sidebar-menu"
       >
         <div class="menu-section">闭环运营</div>
-        <el-menu-item index="/admin/badcase">
+        <el-menu-item index="/admin/quality-loop">
           <el-icon><DataAnalysis /></el-icon>
-          <template #title>智能质检</template>
-        </el-menu-item>
-        <el-menu-item index="/admin/cases">
-          <el-icon><Tickets /></el-icon>
-          <template #title>案例工作台</template>
+          <template #title>质量闭环</template>
         </el-menu-item>
         <el-menu-item index="/admin/patterns">
           <el-icon><Aim /></el-icon>
