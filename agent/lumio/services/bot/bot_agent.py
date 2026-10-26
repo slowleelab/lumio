@@ -38,6 +38,7 @@ from lumio.services.bot.slot_tracker import _ENTITY_TO_SLOT, SlotTracker
 from lumio.services.bot.tool_executor import ConfirmDecision, ToolCallingExecutor, detect_confirmation
 from lumio.services.bot.tool_selection import select_tools_for_intent
 from lumio.services.common.bert_classifier import ood_verdict
+from lumio.services.common.classifier import LOW_CONF_FLOOR as CLARIFY_FLOOR
 from lumio.services.common.classifier import IntentClassifier, get_domain
 from lumio.services.common.decision_log import DecisionAction, log_decision
 from lumio.services.common.degradation import DegradationManager
@@ -841,7 +842,7 @@ class LumioAgent:
         # 而分派先于 handler 把请求抢走, 落进知识链/竞速后被出站闸拦成"没太理解"。
         # 此处等价补位: 有等待快照 + 本轮低置信 → 换回等待意图按其流量性质分派
         # (等待意图多为查询类 → 查询直达 → _load_slot_prompt 消费快照与本轮槽值直查)。
-        if confidence < CLARIFY_CONFIDENCE_FLOOR:
+        if confidence < CLARIFY_FLOOR:
             try:
                 await_intent, awaiting = await self._session_awaiting_slots(session_id)
             except Exception:
@@ -3938,7 +3939,11 @@ class LumioAgent:
         else:
             sensitive_reply = False
         is_replying = _is_replying_to_context(user_input, entities, missing) or sensitive_reply
-        low_conf = intent.primary_confidence < CLARIFY_CONFIDENCE_FLOOR
+        # 低置信 = 数字低于地板 OR 否定性结论 (闲聊/噪声/兜底/域代表) — 语义化判定,
+        # 不再依赖分类器封顶数字 (旧方案: 篡改 primary_confidence 让下游"碰巧"拦截;
+        # 重构: 分类器只标 is_negative, 噪声门根据标记显式决策, primary_confidence 保留原始值)
+        is_negative = getattr(intent, "is_negative", False)
+        low_conf = intent.primary_confidence < CLARIFY_FLOOR or is_negative
         is_noise = _is_noise_input(user_input)
         # P1: energy-OOD "认不认"信号 (仅 ood_enabled 且 BERT 快路径有 energy 时启用).
         # energy "unknown" → 倾向 OOD/噪声; "ambiguous" → 落在模糊带, 交 LLM 仲裁.
@@ -3958,6 +3963,7 @@ class LumioAgent:
             "missing_slots": missing,
             "is_noise_shape": is_noise,
             "low_confidence": low_conf,
+            "is_negative": is_negative,
             "confidence": intent.primary_confidence,
             "sensitive_reply": sensitive_reply,
             "awaiting_hit": awaiting_hit,
@@ -4207,7 +4213,7 @@ def _is_farewell(text: str) -> bool:
 # 乱答防上线判决阈值: 意图分类置信低于此即视为"分类未识别"(与 classifier 的
 # fallback 判定阈值一致)。knowledge 与 fallback 两条生成路径共同遵守——低于此
 # 时不交给 LLM 编造作答, 一律回确定性澄清话术(零幻觉、秒回)。
-CLARIFY_CONFIDENCE_FLOOR = 0.3
+
 
 # 近线槽位追问下限: 置信低于澄清线但 ≥ 此值、且意图有必填缺槽时, 用槽位追问
 # 替代通用澄清话术 (只问不答, 零幻觉风险)。低于此值的乱码仍是通用澄清。

@@ -208,6 +208,8 @@ def fix_adjacent_typos(text: str) -> str:
 # 又掩盖噪声信号让下游 low_conf 噪声闸漏放. 仅 BERT 为快路径时激进兜底; 与
 # bot_agent 的 CLARIFY_CONFIDENCE_FLOOR (0.3) 对齐, 低于它本来就该回确定性澄清.
 _LOW_CONF_FLOOR = 0.3
+# 公共置信地板: bot_agent 噪声门从此导入 (单一定义, 防漂移)
+LOW_CONF_FLOOR = _LOW_CONF_FLOOR
 
 # 闲聊/噪声意图置信封顶 (会话 8700a2ea 复盘): LLM 慢路径对闲聊的自评置信会到
 # 0.7+ ("锄禾日当午"→chitchat@0.70), 中高置信让它跳过低置信护栏直通知识链生成。
@@ -1043,25 +1045,17 @@ class IntentClassifier:
         """
         _t_start = time.monotonic()
         intent_result, entities, sentiment, source = await self._classify_impl(text, history, followup_context)
-        # 闲聊/噪声置信封顶 (会话 8700a2ea): 无论快慢路径, NB_CHITCHAT/NB_NOISE 的
-        # primary_confidence 一律压到 _NONBUSINESS_CONF_CAP — LLM 自评通胀的 0.7+
-        # 会跳过低置信护栏。fast_conf 不动 (保留原始分歧证据)。
-        if (
-            intent_result.primary_intent in _NONBUSINESS_CAP_INTENTS
-            and intent_result.primary_confidence > _NONBUSINESS_CONF_CAP
-        ):
-            logger.debug(
-                "闲聊/噪声置信封顶: %s@%.2f → %.2f (text=%r)",
-                intent_result.primary_intent.value,
-                intent_result.primary_confidence,
-                _NONBUSINESS_CONF_CAP,
-                text[:20],
-            )
-            intent_result.primary_confidence = _NONBUSINESS_CONF_CAP
-        # 分类状态随结果透传 (意图体系拆分·路由层): 区分 真识别(bert/vector/llm/rule)
-        # 与 弱识别/兜底(fallback/bert:lowconf/bert:ood) — 此前兜底轮在审计里被
-        # 记成"识别意图: faq（知识咨询）", faq 四职合一的观感即来源于此。
+        # 否定性结论标记 (置信度语义化重构, 替代旧的置信封顶): 闲聊/噪声意图和
+        # 兜底源是"没认出业务意图"的否定性分类, 不是肯定性识别 — 标记 is_negative,
+        # primary_confidence 保留原始值不篡改, 下游 (噪声门/快路径采纳) 根据标记
+        # 自行决策 (会话 8700a2ea: LLM 自评 chitchat@0.70 曾跳过低置信护栏直通知识链)。
         intent_result.classification_source = source
+        if intent_result.primary_intent in _NONBUSINESS_CAP_INTENTS or source in (
+            "fallback",
+            "bert:lowconf",
+            "bert:ood",
+        ):
+            intent_result.is_negative = True
         # 级联分层埋点 (架构整改 Phase 4): 各层终态计数 + 分层延迟
         try:
             from lumio.shared.metrics import INTENT_TIER_LATENCY, INTENT_TIER_REQUESTS
@@ -1168,10 +1162,18 @@ class IntentClassifier:
                     # 置信封顶到该意图采纳阈之下, 强制落 L3 让 LLM 终判; 精确叶子不受影响。
                     # 已知边界: 同域精确叶子分支 (快路径叶子与向量域一致) 仍按相似度直返 —
                     # 域级双信号同向 (BERT 叶子 + 向量域确认), 可信度高于域代表兜底。
+                    # 域代表兜底: 余弦相似度 ≠ 分类置信 (粒度塌缩 + 异域近邻),
+                    # 标记 is_negative 让快路径采纳排除此分支, 强制落 L3 终判。
+                    # 余弦原始值保留在 primary_confidence (供审计), 不篡改。
                     v_conf = round(min(vm.score, 0.99), 4)
-                    if v_leaf_is_representative:
-                        v_conf = min(v_conf, round(_fast_accept_threshold(v_leaf, self._threshold) - 0.05, 4))
-                    logger.info("L2 向量域命中: %s@%.3f → 叶子 %s@%.3f", v_domain.value, vm.score, v_leaf.value, v_conf)
+                    logger.info(
+                        "L2 向量域命中: %s@%.3f → 叶子 %s@%.3f%s",
+                        v_domain.value,
+                        vm.score,
+                        v_leaf.value,
+                        v_conf,
+                        " (域代表)" if v_leaf_is_representative else "",
+                    )
                     fast_result = IntentResult(
                         primary_intent=v_leaf,
                         primary_confidence=v_conf,
@@ -1180,6 +1182,7 @@ class IntentClassifier:
                         energy=fast_result.energy,
                         fast_conf=fast_result.primary_confidence,
                         fast_intent=fast_result.primary_intent,
+                        is_negative=v_leaf_is_representative,
                     )
                     fast_source = "vector"
             except Exception as exc:
@@ -1255,8 +1258,12 @@ class IntentClassifier:
         # 带上下文理解 (词法只判"可能不是自包含句", 语义判断仍归 LLM)。
         _followup_gate = bool(followup_context) and bool(history) and _looks_followup(text)
 
-        if not _followup_gate and fast_result.primary_confidence >= _fast_accept_threshold(
-            fast_result.primary_intent, self._threshold
+        # 快路径直采: 置信过线 且 非否定性结论 (闲聊/噪声/兜底/向量域代表不直采,
+        # 一律落 L3 或噪声门 — 置信度语义化重构, 替代旧的数字封顶)
+        if (
+            not _followup_gate
+            and not getattr(fast_result, "is_negative", False)
+            and fast_result.primary_confidence >= _fast_accept_threshold(fast_result.primary_intent, self._threshold)
         ):
             logger.debug(
                 "Fast Path 命中: intent=%s, confidence=%.2f, source=%s",

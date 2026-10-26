@@ -428,6 +428,11 @@ class IntentResult(BaseModel):
     # 真识别; "fallback"|"bert:lowconf"|"bert:ood" = 弱识别/兜底; None = 分类器
     # 异常未识别。兜底轮的 faq 标签是存储兼容残差, 不代表"识别为知识咨询"。
     classification_source: str | None = Field(default=None, exclude=True)
+    # 否定性结论标记 (置信度语义化重构): 闲聊/噪声/兜底/向量域代表等"否定性分类"
+    # (本质是"没认出业务意图"而非"认出了某个意图") 置 True。primary_confidence
+    # 保留原始值不篡改, 下游 (噪声门/快路径采纳/闲聊短路) 根据此标记自行决策,
+    # 不再依赖"数字碰巧在阈值下"的间接效果。
+    is_negative: bool = Field(default=False, exclude=True)
     # 对话理解升级 (追问轮, 会话 replay-5ac11e27 复盘): 慢路径带上下文的产物。
     # rewritten_query = 上下文改写 (query rewriting) 后的自包含问题 (None=用原句); refers_to_last =
     # 是否指涉上一轮系统结果; context_answer = 上轮工具结果中已有答案的复述
