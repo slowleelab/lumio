@@ -975,7 +975,7 @@ async def test_dual_path_chitchat_conf_capped() -> None:
     intent, _entities, _sentiment, source = await classifier.classify("锄禾日当午")
 
     assert intent.primary_intent == IntentLabel.NB_CHITCHAT
-    assert intent.primary_confidence <= 0.29
+    assert intent.is_negative is True  # 否定性结论标记
     # 快慢分歧证据保留原始值
     assert intent.fast_conf is None or intent.fast_conf >= 0.0
     assert source == "llm"
@@ -997,7 +997,7 @@ async def test_fast_path_chitchat_conf_capped() -> None:
     )
     intent, _entities, _sentiment, source = await classifier.classify("哈哈哈")
 
-    assert intent.primary_confidence <= 0.29
+    assert intent.is_negative is True  # 否定性结论标记
 
 
 @pytest.mark.asyncio
@@ -1041,7 +1041,7 @@ async def test_chitchat_legacy_alias_conf_capped() -> None:
     classifier = IntentClassifier(rule_classifier=rule, llm_classifier=mock_llm_classifier, fast_threshold=0.7)
     intent, _entities, _sentiment, _source = await classifier.classify("锄禾日当午")
 
-    assert intent.primary_confidence <= 0.29
+    assert intent.is_negative is True  # 否定性结论标记
 
 
 # ── 次选意图分数 (会话 22ad: 弱次选挡闲聊短路) + OOD 短路 (免 6s LLM 复核) ──
@@ -1096,7 +1096,7 @@ async def test_llm_result_inherits_fast_alternative_scores(monkeypatch: pytest.M
     # LLM 只出主意图, 次选继承快路径的带分数次选
     assert intent.alternatives == [IntentLabel.BILL_QUERY]
     assert intent.alternative_scores == [0.22]
-    assert intent.primary_confidence <= 0.29  # 出口封顶
+    assert intent.is_negative is True  # 否定性结论标记
 
 
 @pytest.mark.asyncio
@@ -1128,7 +1128,7 @@ async def test_ood_unknown_short_circuits_llm_for_chitchat(monkeypatch: pytest.M
 
     assert source == "bert:ood"
     mock_llm.classify.assert_not_called()  # 6s 慢路径被省掉
-    assert intent.primary_confidence <= 0.29  # 出口封顶仍生效
+    assert intent.is_negative is True  # 否定性结论标记 (置信度语义化重构)
 
 
 @pytest.mark.asyncio

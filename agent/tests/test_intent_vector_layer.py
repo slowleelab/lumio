@@ -64,7 +64,8 @@ async def test_l2_domain_representative_caps_to_llm(classifier_with_vector) -> N
     result, _, _, source = await clf.classify("我想转账但限额怎么办")
     vec.search.assert_awaited_once()
     clf._llm.classify.assert_awaited_once()  # L3 被触发
-    assert result.primary_confidence < 0.85  # 高相似度不再透传为高置信
+    assert result.is_negative is True  # 域代表兜底标记; 余弦原始值 0.85 保留供审计
+    assert result.primary_confidence == 0.85
 
 
 @pytest.mark.asyncio
