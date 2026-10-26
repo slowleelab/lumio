@@ -211,14 +211,13 @@ _LOW_CONF_FLOOR = 0.3
 # 公共置信地板: bot_agent 噪声门从此导入 (单一定义, 防漂移)
 LOW_CONF_FLOOR = _LOW_CONF_FLOOR
 
-# 闲聊/噪声意图置信封顶 (会话 8700a2ea 复盘): LLM 慢路径对闲聊的自评置信会到
-# 0.7+ ("锄禾日当午"→chitchat@0.70), 中高置信让它跳过低置信护栏直通知识链生成。
-# 闲聊本质是"没认出业务意图", 记账置信必须压到低置信地板以下, 让下游噪声闸/
-# 澄清/竞速按"不确定"对待。fast_conf 保留原始值作分歧证据, 只封 primary。
-_NONBUSINESS_CONF_CAP = 0.29
+# 否定性结论标记意图集 (会话 8700a2ea 复盘): LLM 慢路径对闲聊的自评置信会到
+# 0.7+ ("锄禾日当午"→chitchat@0.70)。置信度语义化重构后不再篡改数字, 而是
+# 给这类结论打 is_negative=True, 下游 (噪声门/快路径直采/竞速) 据标记按
+# "不确定"对待, primary_confidence 保留原始值供审计。fast_conf 保留分歧证据。
 # 注意含旧 flat 别名 IntentLabel.CHITCHAT — BERT/LLM 分类器直接构造别名对象,
-# 不会自动归一化到 NB_CHITCHAT (E2E 实测 poll 显示 chitchat@0.7 漏封)
-_NONBUSINESS_CAP_INTENTS = frozenset({IntentLabel.NB_CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.CHITCHAT})
+# 不会自动归一化到 NB_CHITCHAT (E2E 实测 poll 显示 chitchat@0.7 漏标)
+_NONBUSINESS_NEGATIVE_INTENTS = frozenset({IntentLabel.NB_CHITCHAT, IntentLabel.NB_NOISE, IntentLabel.CHITCHAT})
 
 
 def _collect_alternatives(
@@ -1050,7 +1049,7 @@ class IntentClassifier:
         # primary_confidence 保留原始值不篡改, 下游 (噪声门/快路径采纳) 根据标记
         # 自行决策 (会话 8700a2ea: LLM 自评 chitchat@0.70 曾跳过低置信护栏直通知识链)。
         intent_result.classification_source = source
-        if intent_result.primary_intent in _NONBUSINESS_CAP_INTENTS or source in (
+        if intent_result.primary_intent in _NONBUSINESS_NEGATIVE_INTENTS or source in (
             "fallback",
             "bert:lowconf",
             "bert:ood",
@@ -1298,7 +1297,7 @@ class IntentClassifier:
         # (分布外)。业务意图即使 unknown 仍走 LLM (可能是新意图/长尾问法, 不能误杀)。
         if (
             fast_source == "bert"
-            and fast_result.primary_intent in _NONBUSINESS_CAP_INTENTS
+            and fast_result.primary_intent in _NONBUSINESS_NEGATIVE_INTENTS
             and fast_result.energy is not None
             and ood_verdict(
                 fast_result.energy,
