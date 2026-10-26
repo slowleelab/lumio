@@ -84,11 +84,14 @@ def test_route_definition_to_knowledge() -> None:
 # ── gate 层 ──
 
 
-def test_gate_chitchat_capped() -> None:
-    """闲聊意图置信封顶 ≤0.29 (会话 8700a2ea)"""
-    from lumio.services.common.classifier import _NONBUSINESS_CONF_CAP
+def test_gate_chitchat_marked_negative() -> None:
+    """闲聊/噪声意图在否定性标记集内 (会话 8700a2ea) — 含旧 flat 别名防漏标"""
+    from lumio.services.common.classifier import _NONBUSINESS_NEGATIVE_INTENTS
+    from lumio.shared.models import IntentLabel
 
-    assert _NONBUSINESS_CONF_CAP <= 0.29
+    assert IntentLabel.NB_CHITCHAT in _NONBUSINESS_NEGATIVE_INTENTS
+    assert IntentLabel.NB_NOISE in _NONBUSINESS_NEGATIVE_INTENTS
+    assert IntentLabel.CHITCHAT in _NONBUSINESS_NEGATIVE_INTENTS
 
 
 def test_gate_retrieval_nonsense_blocked() -> None:
